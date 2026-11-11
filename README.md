@@ -195,8 +195,8 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
 - The register datapath lowered today is FP32 (and `i32` for the bitwise ops),
   straight-line, with literal offsets: `neg`/`abs`, `add`/`sub`/`mul`/`max` on
   equal shapes, `cmplt`/`cmpgt`/`cmpge` producing a `bool`, `sel` consuming one,
-  and `bitand`/`bitor`/`bitxor`/`bitnot` on `i32`. All of them run end to end
-  through the C ABI. A loop with a constant bound is unrolled before lowering,
+  and `bitand`/`bitor`/`bitxor`/`bitnot` on `i32`, plus logical `or`/`and` on
+  `bool`. All of them run end to end through the C ABI. A loop with a constant bound is unrolled before lowering,
   and constant index arithmetic (including the offset of each iteration) folds
   to a literal.
 - A loop with a symbolic bound, symbolic offsets, `cast`, broadcast, `matmul`,

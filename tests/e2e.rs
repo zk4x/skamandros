@@ -885,6 +885,16 @@ copy_to %out from %b0 [0]
     run("%c = cmpgt %x %y\n%r = sel %c %x %y", &|a, b| a.max(b));
     run("%c = cmpge %x %y\n%r = sel %c %x %y", &|a, b| a.max(b));
     run("%r = max %x %y", &|a, b| a.max(b));
+    // A bool lane is -1/0, so `or`/`and` use the bitwise SFPU ops. `lt | ge`
+    // is true and `lt & ge` is false for every pair.
+    run(
+        "%lt = cmplt %x %y\n%ge = cmpge %x %y\n%c = or %lt %ge\n%r = sel %c %x %y",
+        &|a, _| a,
+    );
+    run(
+        "%lt = cmplt %x %y\n%ge = cmpge %x %y\n%c = and %lt %ge\n%r = sel %c %x %y",
+        &|_, b| b,
+    );
 
     assert_eq!(
         unsafe { release(&mut err) },

@@ -200,6 +200,10 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     {
                         true
                     }
+                    // A bool lane is `-1`/`0`, so the bitwise and/or *is* the
+                    // logical one (this is what zyx's `tt_sfp_integer` does for
+                    // `BOp::And`/`Or` too).
+                    crate::ir::DType::Bool if matches!(op, BinOp::And | BinOp::Or) => true,
                     other => {
                         return Err(Error(format!(
                             "op {at}: {} on {other} is not lowered yet",
@@ -361,8 +365,8 @@ fn binary(op: BinOp, at: usize) -> Result<SfpOp, Error> {
         BinOp::Add => Ok(SfpOp::Add),
         BinOp::Sub => Ok(SfpOp::Sub),
         BinOp::Mul => Ok(SfpOp::Mul),
-        BinOp::BitAnd => Ok(SfpOp::BitAnd),
-        BinOp::BitOr => Ok(SfpOp::BitOr),
+        BinOp::And | BinOp::BitAnd => Ok(SfpOp::BitAnd),
+        BinOp::Or | BinOp::BitOr => Ok(SfpOp::BitOr),
         BinOp::BitXor => Ok(SfpOp::BitXor),
         other => Err(Error(format!(
             "op {at}: {} has no SFPU encoding yet",
