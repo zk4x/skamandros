@@ -34,6 +34,9 @@ pub struct Module {
 
 /// Compile one program. Every refusal is an error, never a partial module.
 pub fn compile(k: &Kernel) -> Result<Module, Error> {
+    k.verify()?;
+    let k = crate::unroll::constant_loops(k)?;
+    let k = &k;
     let types = k.verify()?;
     let grid = match types.grid {
         [Dim::Const(columns), Dim::Const(rows)] => [columns, rows],

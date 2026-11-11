@@ -42,6 +42,11 @@ pub enum MirOp {
     SemPost { sem: u8 },
     /// `SEMWAIT` on this core, holding `before`'s blocks.
     SemWait { sem: u8, before: u8 },
+    /// `SEMWAIT` C0 only: wait until `sem` is non-zero, without taking it. The
+    /// consumer's claim; the matching [`MirOp::SemGet`] comes after the work.
+    SemWaitData { sem: u8 },
+    /// `SEMGET`: release what [`MirOp::SemWaitData`] claimed.
+    SemGet { sem: u8 },
     /// The next `len` ops form one row body run `count` times, stepping the
     /// `Dst` row by one per iteration. Placed by [`crate::optimize::fuse`].
     Repeat { len: u16, count: u16 },

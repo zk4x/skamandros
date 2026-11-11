@@ -142,7 +142,10 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                         )));
                     }
                 }
-                MirOp::SemPost { sem } | MirOp::SemWait { sem, .. } => {
+                MirOp::SemPost { sem }
+                | MirOp::SemWait { sem, .. }
+                | MirOp::SemWaitData { sem }
+                | MirOp::SemGet { sem } => {
                     if sem >= tt_isa::sync::Semaphore::COUNT {
                         return Err(Error(format!(
                             "{name}[{at}]: semaphore {sem} does not exist"

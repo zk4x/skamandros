@@ -176,13 +176,18 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   mover on RISCV B, the three compute cores (unpack on T0, math on T1, pack on
   T2) released together, and the outbound mover. A 32x32 FP32 tile of inputs
   comes back negated, every datum.
-- The three compute programs are paced by two semaphores. Thread 0 runs the
-  setup program (`SEMINIT` each semaphore to value 0, max 1, as tt-metal's boot
-  sequence does) to completion before the three roles are released, so no role
-  depends on another role's initialisation having already run.
+- The three compute programs are paced as a ring by three semaphores: the
+  packer hands a `Dst` slot back, the unpacker publishes each loaded unit, and
+  the math core publishes each stored one. Thread 0 runs the setup program
+  (`SEMINIT` each semaphore with max 1, as tt-metal's boot sequence does) to
+  completion before the three roles are released, so no role depends on another
+  role's initialisation having already run.
 - A launch is one Tensix tile: a module whose grid is larger than 1x1 is
   refused. A symbolic grid parses and verifies but is not lowered.
 - The register datapath lowered today is FP32, straight-line, with literal
-  offsets, and `neg`/`abs` plus `add`/`sub`/`mul` on equal shapes. Loops,
-  symbolic offsets, `cast`, broadcast, `matmul` and `relu` are accepted by the
-  format and verifier and refused loudly by lowering, not guessed at.
+  offsets, and `neg`/`abs` plus `add`/`sub`/`mul` on equal shapes. A loop with a
+  constant bound is unrolled before lowering, and constant index arithmetic
+  (including the offset of each iteration) folds to a literal. A loop with a
+  symbolic bound, symbolic offsets, `cast`, broadcast, `matmul` and `relu` are
+  accepted by the format and verifier and refused loudly by lowering, not
+  guessed at.

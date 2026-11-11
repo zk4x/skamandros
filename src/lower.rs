@@ -6,8 +6,11 @@
 //! `load` configures and fills the unpacker on T0, the register ops become
 //! load/op/store bodies on T1, `store_to` configures and drains the packer on
 //! T2. `copy_to` crosses the L1 boundary and is emitted by [`crate::mover`], not
-//! here. The three cores are paced by two semaphores: the unpacker publishes
-//! each loaded unit, and the math core publishes each stored one.
+//! here. The three cores run as a ring paced by three semaphores: the packer
+//! hands a `Dst` slot back, the unpacker publishes each loaded unit, and the
+//! math core publishes each stored one. One slot is in flight at a time, so a
+//! program that loads a second unit before storing the first is refused rather
+//! than left to wait for a slot that never comes.
 //!
 //! Addresses come from the L1 plan, `Dst` slots from the allocation; the caller
 //! named none of them.
@@ -25,6 +28,9 @@ pub const TILE_DATUMS: u32 = 1024;
 pub const SEM_UNPACKED: u8 = 0;
 /// Semaphore the math core publishes a stored unit on.
 pub const SEM_READY: u8 = 1;
+/// Semaphore the packer hands a `Dst` slot back on. It starts at 1: the first
+/// load has one slot to fill.
+pub const SEM_SLOT: u8 = 2;
 
 /// Lower `k` to the three compute programs.
 pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Machine, Error> {
@@ -33,6 +39,25 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
     for (at, op) in k.ops.iter().enumerate() {
         if let Some(value) = op.defined() {
             def[value as usize] = Some(at);
+        }
+    }
+    // The hand-off gives the unpacker one `Dst` slot until the packer returns
+    // it. A program that wants a second unit loaded before the first is stored
+    // would wait for a slot that never comes, so it is refused here rather than
+    // deadlocking on the device.
+    let mut outstanding = 0usize;
+    for (at, op) in k.ops.iter().enumerate() {
+        match op {
+            Op::Load { .. } => {
+                outstanding += 1;
+                if outstanding > 1 {
+                    return Err(Error(format!(
+                        "op {at}: {outstanding} loaded units are in flight; the `Dst` hand-off gives one slot"
+                    )));
+                }
+            }
+            Op::StoreTo { .. } => outstanding = outstanding.saturating_sub(1),
+            _ => {}
         }
     }
     for (at, op) in k.ops.iter().enumerate() {
@@ -72,6 +97,13 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 let row = match alloc.place_of(value) {
                     crate::alloc::Place::Dst(slot) => u32::from(slot) * DST_ROWS,
                 };
+                // The unpacker writes `Dst`: it waits for a slot the packer has
+                // given back, so the first unit's result cannot be overwritten
+                // before it has been packed.
+                m.t0.push(MirOp::SemWait {
+                    sem: SEM_SLOT,
+                    before: 0,
+                });
                 m.t0.push(MirOp::Setdst { row });
                 m.t0.push(MirOp::Setadczw { unit: 0, face: 0 });
                 m.t0.push(MirOp::Setadcx {
@@ -114,15 +146,18 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     .ok_or_else(|| Error(format!("op {at}: buffer %{buffer} was not placed")))?;
                 let dst = base + offset * dtype.bytes();
                 m.t1.push(MirOp::SemPost { sem: SEM_READY });
-                m.t2.push(MirOp::SemWait {
-                    sem: SEM_READY,
-                    before: 0,
-                });
+                // The packer claims the unit, packs it, and only then releases
+                // the semaphore — so the math core cannot overwrite `Dst` until
+                // the pack has actually read it (`_llk_pack_dest_section_done_`).
+                m.t2.push(MirOp::SemWaitData { sem: SEM_READY });
                 m.t2.push(MirOp::Pack {
                     dst,
                     rows,
                     last: true,
                 });
+                m.t2.push(MirOp::SemGet { sem: SEM_READY });
+                // The pack has retired, so the `Dst` slot is free again.
+                m.t2.push(MirOp::SemPost { sem: SEM_SLOT });
                 let _ = value;
             }
             Op::Cast { .. } => {

@@ -74,18 +74,24 @@ pub fn encode(m: &Machine) -> Result<Words, Error> {
 /// `t6_semaphore_init(sem, 0, 1)` for each semaphore and only then releases the
 /// three TRISCs. Initialising from one core *before* the others start is what
 /// makes it race-free; a `SEMINIT` issued by a role itself could reset a value
-/// another role has already posted.
+/// another role has already posted. The semaphore that counts free `Dst` slots
+/// starts at one instead of zero, because the first load has a slot to fill.
 pub fn setup() -> Result<Vec<u32>, Error> {
     Ok(semaphore_init()?.into_iter().map(|i| i.word()).collect())
 }
 
-/// `SEMINIT` each semaphore to value 0, max 1 — the boot sequence's shape.
+/// `SEMINIT` each semaphore with max 1 — the boot sequence's shape.
 fn semaphore_init() -> Result<Vec<Instruction>, Error> {
     let mut out = Vec::new();
-    for index in [crate::lower::SEM_UNPACKED, crate::lower::SEM_READY] {
+    for (index, value) in [
+        (crate::lower::SEM_UNPACKED, 0),
+        (crate::lower::SEM_READY, 0),
+        // One `Dst` slot is free at the start; the packer hands each back.
+        (crate::lower::SEM_SLOT, 1),
+    ] {
         let sem = semaphore(index)?;
         out.push(
-            sync::init(sem, 0, 1)
+            sync::init(sem, value, 1)
                 .map_err(|e| Error(format!("SEMINIT on semaphore {index}: {e}")))?,
         );
     }
@@ -408,6 +414,13 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Vec<Instruction>) -> Res
             let s = semaphore(sem)?;
             out.extend(sync::take(s, Before::EVERYTHING));
         }
+        MirOp::SemWaitData { sem } => {
+            let s = semaphore(sem)?;
+            out.push(sync::wait_nonzero(s, Before::EVERYTHING));
+        }
+        MirOp::SemGet { sem } => {
+            out.push(sync::get(semaphore(sem)?));
+        }
         other => return Err(Error(format!("{other:?} is not a math instruction"))),
     }
     Ok(())
@@ -423,6 +436,15 @@ fn encode_pack(ops: &[MirOp], out: &mut Vec<Instruction>) -> Result<(), Error> {
         match *op {
             MirOp::SemWait { sem, .. } => {
                 out.extend(sync::take(semaphore(sem)?, Before::EVERYTHING));
+            }
+            MirOp::SemWaitData { sem } => {
+                out.push(sync::wait_nonzero(semaphore(sem)?, Before::EVERYTHING));
+            }
+            MirOp::SemGet { sem } => {
+                // The claim is released only once the pack has read `Dst`, the
+                // order `_llk_pack_dest_section_done_` uses.
+                out.push(wait_for_packer(Before::EVERYTHING).expect("named bits"));
+                out.push(sync::get(semaphore(sem)?));
             }
             MirOp::SemPost { sem } => {
                 out.extend(sync::post_after(sync::Unit::Packer, semaphore(sem)?));

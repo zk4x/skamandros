@@ -202,3 +202,71 @@ grid 1,1
         "unpack, math and pack"
     );
 }
+
+/// A loop with a constant bound is unrolled before anything reads the program,
+/// and `%o = mul %i %step` folds to the literal offset of each iteration.
+#[test]
+fn a_constant_loop_unrolls_into_literal_offsets() {
+    const LOOP_TWO: &str = "\
+version 2
+%in = param f32 2048
+%out = param f32 2048
+%b0 = buffer f32 32,64
+%two = const i32 2
+%step = const i32 1024
+%i = loop %two
+%o = mul %i %step
+copy_to %b0 from %in [%o]
+%x = load %b0 [%o]
+%y = neg %x
+store_to %b0 from %y [%o]
+copy_to %out from %b0 [%o]
+endloop
+grid 1,1
+";
+    let k = Kernel::parse(LOOP_TWO).expect("the loop kernel parses");
+    let u = TT::unroll::constant_loops(&k).expect("the loop unrolls");
+    assert!(
+        u.ops
+            .iter()
+            .all(|op| !matches!(op, TT::ir::Op::Loop { .. } | TT::ir::Op::EndLoop)),
+        "no loop survives: {:?}",
+        u.ops
+    );
+    let loads: Vec<TT::ir::Dim> = u
+        .ops
+        .iter()
+        .filter_map(|op| match *op {
+            TT::ir::Op::Load { offset, .. } => Some(offset),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(loads, vec![TT::ir::Dim::Const(0), TT::ir::Dim::Const(1024)]);
+    u.verify().expect("the unrolled program verifies");
+
+    let m = TT::compile::compile(&k).expect("the loop kernel compiles");
+    assert!(!m.reader.is_empty() && !m.writer.is_empty());
+    assert!(m.cores.iter().all(|c| !c.is_empty()));
+}
+
+/// A loop with a symbolic bound is left alone, and lowering still refuses it
+/// loudly rather than unrolling a guess.
+#[test]
+fn a_dynamic_loop_is_still_refused() {
+    const DYNAMIC: &str = "\
+version 2
+%n = param i32 0
+%in = param f32 2048
+%out = param f32 2048
+%b0 = buffer f32 32,32
+%i = loop %n
+%x = load %b0 [0]
+%y = neg %x
+store_to %b0 from %y [0]
+endloop
+grid 1,1
+";
+    let k = Kernel::parse(DYNAMIC).expect("the dynamic loop parses");
+    let err = TT::compile::compile(&k).expect_err("a dynamic loop is not lowered");
+    assert!(err.to_string().contains("loops are not lowered"), "{err}");
+}
