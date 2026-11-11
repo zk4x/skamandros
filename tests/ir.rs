@@ -14,7 +14,7 @@ use TT::ir::Kernel;
 #[test]
 fn the_unified_program_round_trips() {
     const PROGRAM: &str = "\
-version 3
+version 4
 grid 4,6
 %p0 = param bf16 1024,132,453
 %p1 = param bf16 1024,232
@@ -55,7 +55,7 @@ endloop
     // Symbolic grid and symbolic parameter dims, with the grid after the values
     // it reads: a scalar parameter is a rank-0 shape.
     const SYMBOLIC: &str = "\
-version 3
+version 4
 %d = param i32 0
 %x = param bf16 1024,%d
 grid %d,8
@@ -69,13 +69,13 @@ grid %d,8
 #[test]
 fn a_buffer_shape_that_is_not_one_or_a_multiple_of_32_is_refused() {
     for shape in ["33,32", "32,33", "16,32"] {
-        let text = format!("version 3\n%x = buffer f32 {shape}\ngrid 1,1\n");
+        let text = format!("version 4\n%x = buffer f32 {shape}\ngrid 1,1\n");
         let err = Kernel::parse(&text).expect_err(shape);
         assert!(err.to_string().contains("multiple of 32"), "{err}");
     }
     // A buffer is always two-dimensional and always constant.
     for shape in ["32", "32,%d"] {
-        let text = format!("version 3\n%d = const i32 4\n%x = buffer f32 {shape}\ngrid 1,1\n");
+        let text = format!("version 4\n%d = const i32 4\n%x = buffer f32 {shape}\ngrid 1,1\n");
         assert!(
             Kernel::parse(&text).is_err(),
             "{shape} is not a buffer shape"
@@ -85,7 +85,7 @@ fn a_buffer_shape_that_is_not_one_or_a_multiple_of_32_is_refused() {
 
 #[test]
 fn a_zero_dimension_is_not_the_way_to_write_a_tensor() {
-    let text = "version 3\n%p = param f32 0,32\ngrid 1,1\n";
+    let text = "version 4\n%p = param f32 0,32\ngrid 1,1\n";
     let err = Kernel::parse(text).expect_err("a zero in a dimension list");
     assert!(err.to_string().contains("zero"), "{err}");
 }
@@ -93,7 +93,7 @@ fn a_zero_dimension_is_not_the_way_to_write_a_tensor() {
 #[test]
 fn an_implicit_dtype_conversion_is_refused() {
     let text = "\
-version 3
+version 4
 %a = const f32 1.0
 %b = const i32 1
 %c = add %a %b
@@ -105,7 +105,7 @@ grid 1,1
 
 #[test]
 fn a_use_before_its_definition_is_refused() {
-    let text = "version 3\n%x = add %a %b\n%a = const i32 1\n%b = const i32 2\ngrid 1,1\n";
+    let text = "version 4\n%x = add %a %b\n%a = const i32 1\n%b = const i32 2\ngrid 1,1\n";
     let err = Kernel::parse(text).expect_err("undefined value");
     assert!(err.to_string().contains("unknown value"), "{err}");
 }
@@ -113,7 +113,7 @@ fn a_use_before_its_definition_is_refused() {
 #[test]
 fn a_value_does_not_escape_its_loop() {
     let text = "\
-version 3
+version 4
 %n = const i32 4
 %i = loop %n
 %x = add %i %n
@@ -127,9 +127,9 @@ grid 1,1
 
 #[test]
 fn a_program_needs_exactly_one_grid() {
-    let err = Kernel::parse("version 3\n%x = const i32 1\n").expect_err("no grid");
+    let err = Kernel::parse("version 4\n%x = const i32 1\n").expect_err("no grid");
     assert!(err.to_string().contains("no grid"), "{err}");
-    let err = Kernel::parse("version 3\ngrid 1,1\ngrid 2,2\n").expect_err("two grids");
+    let err = Kernel::parse("version 4\ngrid 1,1\ngrid 2,2\n").expect_err("two grids");
     assert!(err.to_string().contains("more than one grid"), "{err}");
 }
 
@@ -138,7 +138,7 @@ fn an_unknown_version_is_refused_in_both_forms() {
     let err = Kernel::parse("version 1\ngrid 1,1\n").expect_err("version 1");
     assert!(err.to_string().contains("version 1"), "{err}");
 
-    let mut bytes = Kernel::parse("version 3\ngrid 1,1\n%x = const i32 1\n")
+    let mut bytes = Kernel::parse("version 4\ngrid 1,1\n%x = const i32 1\n")
         .unwrap()
         .to_bytes();
     assert_eq!(&bytes[..4], b"TTIR");
@@ -148,7 +148,7 @@ fn an_unknown_version_is_refused_in_both_forms() {
     bytes[4] = 2;
     bytes[0] = b'X';
     assert!(Kernel::from_bytes(&bytes).is_err(), "a wrong magic");
-    let mut bytes = Kernel::parse("version 3\ngrid 1,1\n%x = const i32 1\n")
+    let mut bytes = Kernel::parse("version 4\ngrid 1,1\n%x = const i32 1\n")
         .unwrap()
         .to_bytes();
     bytes.push(0);
@@ -161,7 +161,7 @@ fn an_unknown_version_is_refused_in_both_forms() {
 #[test]
 fn a_copy_kernel_compiles_to_mover_programs_only() {
     const COPY: &str = "\
-version 3
+version 4
 %in = param f32 8192
 %out = param f32 8192
 %b0 = buffer f32 32,64
@@ -184,15 +184,16 @@ grid 1,1
 #[test]
 fn an_elementwise_kernel_compiles_to_all_five_programs() {
     const NEG: &str = "\
-version 3
+version 4
 %in = param f32 4096
 %out = param f32 4096
-%b0 = buffer f32 32,32
-copy_to %b0 from %in [0]
-%x = load %b0 [0]
+%bi = buffer f32 32,32
+%bo = buffer f32 32,32
+copy_to %bi from %in [0]
+%x = load %bi [0]
 %y = neg %x
-store_to %b0 from %y [0]
-copy_to %out from %b0 [0]
+store_to %bo from %y [0]
+copy_to %out from %bo [0]
 grid 1,1
 ";
     let k = Kernel::parse(NEG).expect("the elementwise kernel parses");
@@ -211,7 +212,7 @@ grid 1,1
 #[test]
 fn a_direct_parameter_access_gets_its_movers() {
     const DIRECT: &str = "\
-version 3
+version 4
 %in = param f32 4096
 %out = param f32 4096
 %x = load %in [0]
@@ -264,19 +265,20 @@ grid 1,1
 #[test]
 fn a_constant_loop_unrolls_into_literal_offsets() {
     const LOOP_TWO: &str = "\
-version 3
+version 4
 %in = param f32 2048
 %out = param f32 2048
-%b0 = buffer f32 32,64
+%bi = buffer f32 32,64
+%bo = buffer f32 32,64
 %two = const i32 2
 %step = const i32 1024
 %i = loop %two
 %o = mul %i %step
-copy_to %b0 from %in [%o]
-%x = load %b0 [%o]
+copy_to %bi from %in [%o]
+%x = load %bi [%o]
 %y = neg %x
-store_to %b0 from %y [%o]
-copy_to %out from %b0 [%o]
+store_to %bo from %y [%o]
+copy_to %out from %bo [%o]
 endloop
 grid 1,1
 ";
@@ -310,15 +312,18 @@ grid 1,1
 #[test]
 fn a_dynamic_loop_is_still_refused() {
     const DYNAMIC: &str = "\
-version 3
+version 4
 %n = param i32 0
 %in = param f32 2048
 %out = param f32 2048
-%b0 = buffer f32 32,32
+%bi = buffer f32 32,32
+%bo = buffer f32 32,32
 %i = loop %n
-%x = load %b0 [0]
+copy_to %bi from %in [0]
+%x = load %bi [0]
 %y = neg %x
-store_to %b0 from %y [0]
+store_to %bo from %y [0]
+copy_to %out from %bo [0]
 endloop
 grid 1,1
 ";
@@ -332,7 +337,7 @@ grid 1,1
 #[test]
 fn comparisons_make_a_bool_and_sel_takes_one() {
     const SELECT: &str = "\
-version 3
+version 4
 %x = const i32 3
 %y = const i32 5
 %lt = cmplt %x %y
@@ -347,11 +352,11 @@ grid 1,1
     assert_eq!(types.values[3].dtype, TT::ir::DType::I32, "sel is i32");
 
     // A bool condition is required, and a value with no bool is not one.
-    let bad = "version 3\n%x = const i32 3\n%m = sel %x %x %x\ngrid 1,1\n";
+    let bad = "version 4\n%x = const i32 3\n%m = sel %x %x %x\ngrid 1,1\n";
     let err = Kernel::parse(bad).expect_err("an i32 condition is refused");
     assert!(err.to_string().contains("not bool"), "{err}");
 
-    let err = Kernel::parse("version 3\n%x = const i32 3\n%y = relu %x\ngrid 1,1\n")
+    let err = Kernel::parse("version 4\n%x = const i32 3\n%y = relu %x\ngrid 1,1\n")
         .expect_err("relu is not an op");
     assert!(err.to_string().contains("relu"), "{err}");
 }

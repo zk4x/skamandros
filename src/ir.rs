@@ -431,11 +431,14 @@ pub enum Op {
     /// `endloop`.
     EndLoop,
     /// DRAM into L1, or L1 into DRAM: exactly one side is a parameter, the other
-    /// a buffer. `offset` is in datums and indexes both sides.
+    /// a buffer. Each side has its own datum offset, because a circular buffer
+    /// names its page by the ring pointer while the parameter names the access's
+    /// own index (zyx's `Op::Copy` carries `src_idx`/`dst_idx`).
     CopyTo {
         dst: ValueId,
         src: ValueId,
-        offset: Dim,
+        dst_offset: Dim,
+        src_offset: Dim,
     },
     /// L1 buffer into a register value.
     Load {
@@ -511,9 +514,15 @@ impl Op {
             }
         }
         match self {
-            Op::CopyTo { dst, src, offset } => {
+            Op::CopyTo {
+                dst,
+                src,
+                dst_offset,
+                src_offset,
+            } => {
                 let mut v = vec![*dst, *src];
-                v.extend(dim(offset));
+                v.extend(dim(dst_offset));
+                v.extend(dim(src_offset));
                 v
             }
             Op::Load { buffer, offset, .. } => {
@@ -799,12 +808,17 @@ impl Kernel {
                     }
                     continue;
                 }
-                Op::CopyTo { dst, src, offset } => {
+                Op::CopyTo {
+                    dst,
+                    src,
+                    dst_offset,
+                    src_offset,
+                } => {
                     let d = *lookup(&values, &visible, dst, at)?;
                     let s = *lookup(&values, &visible, src, at)?;
-                    let (buffer, param) = match (d.kind, s.kind) {
-                        (ValueKind::Buffer, ValueKind::Param) => (dst, src),
-                        (ValueKind::Param, ValueKind::Buffer) => (src, dst),
+                    let (buffer, param, buffer_offset, param_offset) = match (d.kind, s.kind) {
+                        (ValueKind::Buffer, ValueKind::Param) => (dst, src, dst_offset, src_offset),
+                        (ValueKind::Param, ValueKind::Buffer) => (src, dst, src_offset, dst_offset),
                         _ => {
                             return Err(Error::new(format!(
                                 "op {at}: a copy moves between a parameter and a buffer, not a {} and a {}",
@@ -827,15 +841,22 @@ impl Kernel {
                             p.dtype.name()
                         )));
                     }
-                    check_dim(&values, &visible, offset, at, "the copy offset")?;
+                    check_dim(
+                        &values,
+                        &visible,
+                        dst_offset,
+                        at,
+                        "the destination copy offset",
+                    )?;
+                    check_dim(&values, &visible, src_offset, at, "the source copy offset")?;
                     let Op::Buffer { shape, .. } = self.ops[def[buffer as usize]] else {
                         return Err(Error::new(format!("op {at}: %{buffer} is not a buffer")));
                     };
                     let (unit_shape, _, _) = unit_of(shape, b.dtype)?;
                     let total = shape[0] * shape[1];
-                    check_offset(offset, total, unit_shape.datums(), at, "buffer")?;
+                    check_offset(buffer_offset, total, unit_shape.datums(), at, "buffer")?;
                     if let Some(count) = param_elements(self, &def, param) {
-                        check_offset(offset, count, unit_shape.datums(), at, "parameter")?;
+                        check_offset(param_offset, count, unit_shape.datums(), at, "parameter")?;
                     }
                     continue;
                 }
@@ -1244,7 +1265,7 @@ fn param_elements(k: &Kernel, def: &[usize], param: ValueId) -> Option<u32> {
 /// The byte form's magic.
 pub const MAGIC: [u8; 4] = *b"TTIR";
 /// The IR version this build reads and writes.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 impl Kernel {
     /// The byte form: the same program as [`Kernel::to_text`], little-endian and
@@ -1294,11 +1315,17 @@ impl Kernel {
                     put_dim(&mut b, *bound);
                 }
                 Op::EndLoop => b.push(5),
-                Op::CopyTo { dst, src, offset } => {
+                Op::CopyTo {
+                    dst,
+                    src,
+                    dst_offset,
+                    src_offset,
+                } => {
                     b.push(6);
                     put_u32(&mut b, *dst);
                     put_u32(&mut b, *src);
-                    put_dim(&mut b, *offset);
+                    put_dim(&mut b, *dst_offset);
+                    put_dim(&mut b, *src_offset);
                 }
                 Op::Load {
                     value,
@@ -1429,7 +1456,8 @@ impl Kernel {
                 6 => Op::CopyTo {
                     dst: r.u32()?,
                     src: r.u32()?,
-                    offset: r.dim()?,
+                    dst_offset: r.dim()?,
+                    src_offset: r.dim()?,
                 },
                 7 => {
                     let name = r.name()?;
@@ -1636,9 +1664,21 @@ impl Kernel {
                 let dst = t.value(&p.symbols)?;
                 t.expect("from")?;
                 let src = t.value(&p.symbols)?;
-                let offset = t.bracket(&p.symbols)?;
+                let dst_offset = t.bracket(&p.symbols)?;
+                // The second bracket names the source offset. One bracket is
+                // shorthand for both sides carrying the same index.
+                let src_offset = if matches!(t.peek(), Some(Token::LBracket)) {
+                    t.bracket(&p.symbols)?
+                } else {
+                    dst_offset
+                };
                 t.end()?;
-                p.ops.push(Op::CopyTo { dst, src, offset });
+                p.ops.push(Op::CopyTo {
+                    dst,
+                    src,
+                    dst_offset,
+                    src_offset,
+                });
                 continue;
             }
             if first == "store_to" {
@@ -1734,13 +1774,22 @@ impl Kernel {
                     ));
                 }
                 Op::EndLoop => s.push_str("endloop\n"),
-                Op::CopyTo { dst, src, offset } => {
+                Op::CopyTo {
+                    dst,
+                    src,
+                    dst_offset,
+                    src_offset,
+                } => {
                     s.push_str(&format!(
-                        "copy_to %{} from %{} [{}]\n",
+                        "copy_to %{} from %{} [{}]",
                         name(*dst),
                         name(*src),
-                        self.dim_text(*offset)
+                        self.dim_text(*dst_offset)
                     ));
+                    if dst_offset != src_offset {
+                        s.push_str(&format!(" [{}]", self.dim_text(*src_offset)));
+                    }
+                    s.push('\n');
                 }
                 Op::Load {
                     value,

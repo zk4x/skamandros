@@ -143,10 +143,16 @@ impl Unroller<'_> {
                 Op::Loop { value: id, bound }
             }
             Op::EndLoop => Op::EndLoop,
-            Op::CopyTo { dst, src, offset } => Op::CopyTo {
+            Op::CopyTo {
+                dst,
+                src,
+                dst_offset,
+                src_offset,
+            } => Op::CopyTo {
                 dst: self.map(dst, subs)?,
                 src: self.map(src, subs)?,
-                offset: self.dim(offset, subs)?,
+                dst_offset: self.dim(dst_offset, subs)?,
+                src_offset: self.dim(src_offset, subs)?,
             },
             Op::Load {
                 value,

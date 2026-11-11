@@ -18,7 +18,7 @@ values. It names no processor, no `Dst` slot, no `Src` bank, no lane register,
 no semaphore, no unpacker, no packer and no Tensix word:
 
 ```
-version 3
+version 4
 grid 1,1
 %in  = param f32 1024,128
 %out = param f32 1024,128
@@ -69,6 +69,16 @@ form (`TTIR`).
   stages the access through a one-unit L1 buffer and inserts the inbound or
   outbound copy. `copy_to` is still accepted, but it is not required and names no
   mover.
+- **A copy has a destination offset and a source offset.** `copy_to %b from %in
+  [d] [s]` — both normal `i32` scalars or literals, destination first; one
+  bracket is shorthand for both. The staged copy above puts the access index on
+  the parameter side and `0` on the buffer side, because a buffer is a ring page
+  while the parameter names the access.
+- **Every buffer has one producer and one consumer**: the reader publishes and
+  the unpacker consumes an input buffer; the packer publishes and the writer
+  consumes an output buffer; a compute-free DRAM-to-DRAM transfer is one buffer
+  the reader publishes and the writer drains. A buffer used in both directions
+  is a loud error, as in tt-metal's circular buffers.
 - **Register values get resources automatically.** A value's `Dst` slot follows
   from liveness, lane registers are each body's temporaries, and the cross-core
   hand-offs are one semaphore per producer/consumer seam.

@@ -45,6 +45,7 @@ pub fn compile(k: &Kernel) -> Result<Module, Error> {
     let k = mover::add_movers(k, &types)?;
     let k = &k;
     let types = k.verify()?;
+    mover::check_roles(k, &types)?;
     let grid = match types.grid {
         [Dim::Const(columns), Dim::Const(rows)] => [columns, rows],
         _ => {

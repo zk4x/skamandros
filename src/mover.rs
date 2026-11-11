@@ -110,7 +110,8 @@ pub fn add_movers(k: &Kernel, types: &Types) -> Result<Kernel, Error> {
                 out.ops.push(Op::CopyTo {
                     dst: staged,
                     src: map[buffer as usize],
-                    offset: remap_dim(offset, &map),
+                    dst_offset: Dim::Const(0),
+                    src_offset: remap_dim(offset, &map),
                 });
                 let value = define(&mut out, k, value, &mut map);
                 out.ops.push(Op::Load {
@@ -140,7 +141,8 @@ pub fn add_movers(k: &Kernel, types: &Types) -> Result<Kernel, Error> {
                 out.ops.push(Op::CopyTo {
                     dst: map[buffer as usize],
                     src: staged,
-                    offset: remap_dim(offset, &map),
+                    dst_offset: remap_dim(offset, &map),
+                    src_offset: Dim::Const(0),
                 });
             }
             _ => {
@@ -155,6 +157,68 @@ pub fn add_movers(k: &Kernel, types: &Types) -> Result<Kernel, Error> {
         }
     }
     Ok(out)
+}
+
+/// `tt_add_movers`'s invariant: a circular buffer has one producer and one
+/// consumer. The reader publishes and the unpacker consumes an input buffer; the
+/// packer publishes and the writer consumes an output buffer. A buffer used in
+/// both directions would share one counter pair and one page ring, which the
+/// hardware's CB cannot do, so it is refused rather than guessed at.
+pub fn check_roles(k: &Kernel, types: &Types) -> Result<(), Error> {
+    use crate::ir::ValueKind;
+    let mut producer: Vec<Option<&str>> = vec![None; types.values.len()];
+    let mut consumer: Vec<Option<&str>> = vec![None; types.values.len()];
+    for (at, op) in k.ops.iter().enumerate() {
+        let (buffer, role, publishes) = match *op {
+            Op::CopyTo { dst, src, .. } => match (types.of(dst).kind, types.of(src).kind) {
+                (ValueKind::Buffer, ValueKind::Param) => (dst, "the reader", true),
+                (ValueKind::Param, ValueKind::Buffer) => (src, "the writer", false),
+                _ => continue,
+            },
+            Op::Load { buffer, .. } => (buffer, "the unpacker", false),
+            Op::StoreTo { buffer, .. } => (buffer, "the packer", true),
+            _ => continue,
+        };
+        let slot = if publishes {
+            &mut producer
+        } else {
+            &mut consumer
+        };
+        match slot[buffer as usize] {
+            None => slot[buffer as usize] = Some(role),
+            Some(previous) if previous == role => {}
+            Some(previous) => {
+                return Err(Error(format!(
+                    "op {at}: buffer %{buffer} already has {previous} as its {}; a circular buffer has one producer and one consumer",
+                    if publishes { "producer" } else { "consumer" }
+                )));
+            }
+        }
+    }
+    for (value, info) in types.values.iter().enumerate() {
+        if info.kind != ValueKind::Buffer {
+            continue;
+        }
+        let pair = (producer[value], consumer[value]);
+        match pair {
+            (Some("the reader"), Some("the unpacker"))
+            | (Some("the packer"), Some("the writer"))
+            // A pure transfer (DRAM to DRAM through one page) has no compute:
+            // the reader publishes and the writer drains the same buffer.
+            | (Some("the reader"), Some("the writer")) => {}
+            (Some(p), Some(c)) => {
+                return Err(Error(format!(
+                    "buffer %{value} is published by {p} and consumed by {c}; a circular buffer is reader/unpacker, packer/writer or a pure reader/writer transfer"
+                )));
+            }
+            _ => {
+                return Err(Error(format!(
+                    "buffer %{value} needs one producer and one consumer (a copy in and a load, or a store and a copy out)"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The staged buffer's shape for a direct parameter access. A tensor parameter
@@ -231,10 +295,16 @@ fn remap(op: &Op, map: &[ValueId], value: Option<ValueId>) -> Op {
             bound: d(bound),
         },
         Op::EndLoop => Op::EndLoop,
-        Op::CopyTo { dst, src, offset } => Op::CopyTo {
+        Op::CopyTo {
+            dst,
+            src,
+            dst_offset,
+            src_offset,
+        } => Op::CopyTo {
             dst: v(dst),
             src: v(src),
-            offset: d(offset),
+            dst_offset: d(dst_offset),
+            src_offset: d(src_offset),
         },
         Op::Load { buffer, offset, .. } => Op::Load {
             value: own(),
@@ -322,50 +392,60 @@ fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
     }
     let mut copies = Vec::new();
     for (at, op) in k.ops.iter().enumerate() {
-        let Op::CopyTo { dst, src, offset } = *op else {
+        let Op::CopyTo {
+            dst,
+            src,
+            dst_offset,
+            src_offset,
+        } = *op
+        else {
             continue;
         };
-        let (param, buffer) = match (types.of(dst).kind, types.of(src).kind) {
-            (crate::ir::ValueKind::Buffer, crate::ir::ValueKind::Param) => {
-                if !inbound {
-                    continue;
+        let (param, buffer, param_offset, buffer_offset) =
+            match (types.of(dst).kind, types.of(src).kind) {
+                (crate::ir::ValueKind::Buffer, crate::ir::ValueKind::Param) => {
+                    if !inbound {
+                        continue;
+                    }
+                    (src, dst, src_offset, dst_offset)
                 }
-                (src, dst)
-            }
-            (crate::ir::ValueKind::Param, crate::ir::ValueKind::Buffer) => {
-                if inbound {
-                    continue;
+                (crate::ir::ValueKind::Param, crate::ir::ValueKind::Buffer) => {
+                    if inbound {
+                        continue;
+                    }
+                    (dst, src, dst_offset, src_offset)
                 }
-                (dst, src)
-            }
-            _ => {
-                return Err(Error(format!(
-                    "op {at}: a copy moves between a parameter and a buffer"
-                )));
-            }
-        };
+                _ => {
+                    return Err(Error(format!(
+                        "op {at}: a copy moves between a parameter and a buffer"
+                    )));
+                }
+            };
         let Op::Buffer { shape, dtype, .. } = k.ops[def[buffer as usize].expect("defined")] else {
             unreachable!("the type says it is a buffer");
         };
         let (_, _, unit_bytes) = unit_of(shape, dtype)?;
-        let offset = match offset {
-            Dim::Const(n) => n,
-            Dim::Value(v) => {
-                return Err(Error(format!(
-                    "op {at}: the offset %{v} is symbolic; only a literal offset is lowered yet"
-                )));
-            }
+        let literal = |offset: Dim, what: &str| match offset {
+            Dim::Const(n) => Ok(n),
+            Dim::Value(v) => Err(Error(format!(
+                "op {at}: the {what} offset %{v} is symbolic; only a literal offset is lowered yet"
+            ))),
         };
+        let param_offset = literal(param_offset, "parameter")?;
+        let buffer_offset = literal(buffer_offset, "buffer")?;
         let base = plan.buf[buffer as usize]
             .ok_or_else(|| Error(format!("op {at}: buffer %{buffer} was not placed")))?;
-        let byte_offset = offset
+        let param_bytes = param_offset
             .checked_mul(dtype.bytes())
-            .ok_or_else(|| Error(format!("op {at}: the offset overflows")))?;
+            .ok_or_else(|| Error(format!("op {at}: the parameter offset overflows")))?;
+        let buffer_bytes = buffer_offset
+            .checked_mul(dtype.bytes())
+            .ok_or_else(|| Error(format!("op {at}: the buffer offset overflows")))?;
         copies.push(Copy {
             param: param_index[param as usize].expect("a parameter has an index"),
-            offset: byte_offset,
+            offset: param_bytes,
             l1: base
-                .checked_add(byte_offset)
+                .checked_add(buffer_bytes)
                 .ok_or_else(|| Error(format!("op {at}: the buffer address overflows")))?,
             bytes: unit_bytes,
         });

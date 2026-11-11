@@ -73,7 +73,7 @@ fn library() -> &'static Library {
 }
 
 const COPY: &str = "\
-version 3
+version 4
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -157,7 +157,7 @@ fn a_refused_program_comes_back_as_an_error_not_a_crash() {
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
 
-    let bad = "version 3\ngrid 1,1\n%out = param f32 1024\n%x = neg %y\n";
+    let bad = "version 4\ngrid 1,1\n%out = param f32 1024\n%x = neg %y\n";
     let mut module: *mut c_void = std::ptr::null_mut();
     let mut err: *mut c_char = std::ptr::null_mut();
     let code = unsafe { compile(bad.as_ptr().cast(), bad.len(), &mut module, &mut err) };
@@ -237,7 +237,7 @@ fn the_error_codes_are_the_documented_ones() {
 /// A copy kernel over a two-page buffer: DRAM into L1, and the same L1 buffer
 /// back into DRAM, in 32x32 units.
 const COPY_8K: &str = "\
-version 3
+version 4
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
@@ -251,36 +251,38 @@ copy_to %out from %b0 [1024]
 /// One 32x32 tile through the datapath: DRAM into L1, unpack, negate, pack,
 /// L1 into DRAM. The program names no core, no `Dst` slot and no unpacker.
 const NEG_TILE: &str = "\
-version 3
+version 4
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
-%b0 = buffer f32 32,32
-copy_to %b0 from %in [0]
-%x = load %b0 [0]
+%bi = buffer f32 32,32
+%bo = buffer f32 32,32
+copy_to %bi from %in [0]
+%x = load %bi [0]
 %y = neg %x
-store_to %b0 from %y [0]
-copy_to %out from %b0 [0]
+store_to %bo from %y [0]
+copy_to %out from %bo [0]
 ";
 
 /// The same elementwise kernel over two tiles, written as a loop. The bound and
 /// the step are constants, so the loop is unrolled and each iteration's offset
 /// becomes a literal.
 const NEG_TWO_TILES: &str = "\
-version 3
+version 4
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
-%b0 = buffer f32 32,64
+%bi = buffer f32 32,64
+%bo = buffer f32 32,64
 %two = const i32 2
 %step = const i32 1024
 %i = loop %two
 %o = mul %i %step
-copy_to %b0 from %in [%o]
-%x = load %b0 [%o]
+copy_to %bi from %in [%o] [%o]
+%x = load %bi [%o]
 %y = neg %x
-store_to %b0 from %y [%o]
-copy_to %out from %b0 [%o]
+store_to %bo from %y [%o]
+copy_to %out from %bo [%o] [%o]
 endloop
 ";
 
@@ -288,7 +290,7 @@ endloop
 /// named directly and `mover::add_movers` supplies the staging and the traffic,
 /// as zyx's `tt_add_movers` does.
 const NEG_TILE_DIRECT: &str = "\
-version 3
+version 4
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -716,30 +718,32 @@ fn an_unrolled_loop_runs_on_the_simulator() {
 #[test]
 fn arithmetic_ops_run_on_the_simulator() {
     const TWO_LOAD: &str = "\
-version 3
+version 4
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
 %b0 = buffer f32 32,64
+%bo = buffer f32 32,32
 copy_to %b0 from %in [0]
 copy_to %b0 from %in [1024]
 %x = load %b0 [0]
 %y = load %b0 [1024]
 %r = OP %x %y
-store_to %b0 from %r [0]
-copy_to %out from %b0 [0]
+store_to %bo from %r [0]
+copy_to %out from %bo [0]
 ";
     const ONE_LOAD: &str = "\
-version 3
+version 4
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
 %b0 = buffer f32 32,32
+%bo = buffer f32 32,32
 copy_to %b0 from %in [0]
 %x = load %b0 [0]
 %r = abs %x
-store_to %b0 from %r [0]
-copy_to %out from %b0 [0]
+store_to %bo from %r [0]
+copy_to %out from %bo [0]
 ";
 
     let _device = device();
@@ -882,18 +886,19 @@ copy_to %out from %b0 [0]
 #[test]
 fn comparisons_select_and_max_run_on_the_simulator() {
     const TEMPLATE: &str = "\
-version 3
+version 4
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
 %b0 = buffer f32 32,64
+%bo = buffer f32 32,32
 copy_to %b0 from %in [0]
 copy_to %b0 from %in [1024]
 %x = load %b0 [0]
 %y = load %b0 [1024]
 BODY
-store_to %b0 from %r [0]
-copy_to %out from %b0 [0]
+store_to %bo from %r [0]
+copy_to %out from %bo [0]
 ";
 
     let _device = device();
@@ -1015,30 +1020,32 @@ copy_to %out from %b0 [0]
 #[test]
 fn bitwise_ops_run_on_the_simulator() {
     const TWO_LOAD: &str = "\
-version 3
+version 4
 grid 1,1
 %in = param i32 2048
 %out = param i32 2048
 %b0 = buffer i32 32,64
+%bo = buffer i32 32,32
 copy_to %b0 from %in [0]
 copy_to %b0 from %in [1024]
 %x = load %b0 [0]
 %y = load %b0 [1024]
 %r = OP %x %y
-store_to %b0 from %r [0]
-copy_to %out from %b0 [0]
+store_to %bo from %r [0]
+copy_to %out from %bo [0]
 ";
     const ONE_LOAD: &str = "\
-version 3
+version 4
 grid 1,1
 %in = param i32 1024
 %out = param i32 1024
 %b0 = buffer i32 32,32
+%bo = buffer i32 32,32
 copy_to %b0 from %in [0]
 %x = load %b0 [0]
 %r = bitnot %x
-store_to %b0 from %r [0]
-copy_to %out from %b0 [0]
+store_to %bo from %r [0]
+copy_to %out from %bo [0]
 ";
 
     let _device = device();
