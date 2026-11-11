@@ -53,41 +53,45 @@ pub fn d2h(address: u64, out: &mut [u8]) -> Result<(), Error> {
     with_device(|d| d.dram_read(address, out))
 }
 
+/// Why a launch did not happen, or did not finish.
+#[derive(Debug)]
+pub enum LaunchError {
+    /// The caller's parameter count is not the module's.
+    Argument(String),
+    /// The module is valid, but this build cannot run it.
+    Unsupported(String),
+    /// The device failed.
+    Device(Error),
+}
+
 /// Run a module over its grid with one DRAM address per parameter.
 ///
 /// The launch arguments are built here, not by the caller: the grid, this
 /// tile's high word, and each parameter's `(low, high)` pair. A count that
 /// disagrees with the module is refused.
-pub fn launch(module: &Module, params: &[u64]) -> Result<(), Error> {
+pub fn launch(module: &Module, params: &[u64]) -> Result<(), LaunchError> {
     if module.params as usize != params.len() {
-        return Err(Error(format!(
+        return Err(LaunchError::Argument(format!(
             "the module takes {} parameters, {n} were given",
             module.params,
             n = params.len()
         )));
     }
     if module.grid != [1, 1] {
-        return Err(Error(format!(
+        return Err(LaunchError::Unsupported(format!(
             "a launch over a {}x{} grid is not implemented",
             module.grid[0], module.grid[1]
         )));
     }
     if module.cores.iter().any(|program| !program.is_empty()) {
-        return Err(Error(
+        return Err(LaunchError::Unsupported(
             "this module has compute programs; the three compute cores are not launched yet".into(),
         ));
     }
     if module.reader.is_empty() && module.writer.is_empty() {
-        return Err(Error("the module has no program to run".into()));
+        return Err(LaunchError::Unsupported("the module has no program to run".into()));
     }
-    with_device(|device| run(device, module, params))
-}
-
-/// `ttSynchronize`: a launch is synchronous, so this has nothing to wait for.
-pub fn synchronize() -> Result<(), Error> {
-    // Still touch the device: a caller that synchronized without initializing
-    // should be told, not silently succeed.
-    with_device(|_| Ok(()))
+    with_device(|device| run(device, module, params)).map_err(LaunchError::Device)
 }
 
 fn run(device: &mut Device, module: &Module, params: &[u64]) -> Result<(), Error> {

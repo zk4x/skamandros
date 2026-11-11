@@ -3,220 +3,218 @@
 
 //! The C ABI: the only stable surface `libTT.so` exports.
 //!
-//! Everything crosses as bytes plus scalars. A call returns `0` on success and a
-//! non-zero code on failure, with a message in the out parameters; the caller
-//! frees any buffer with [`tt_free`]. No Rust type, no allocation the caller did
-//! not ask for.
+//! Everything crosses as pointers, lengths and scalars. A call returns
+//! [`ttStatus`], and on failure writes a NUL-terminated message to the `err` out
+//! pointer, which the caller frees with [`ttFree`]. A compiled module is an
+//! opaque handle ([`ttModule`]): the caller never sees its bytes, only the
+//! pointer [`ttCompile`]/[`ttModuleLoad`] hands back and [`ttLaunch`] consumes.
+//!
+//! # Errors
+//!
+//! One code, one meaning:
+//!
+//! * [`ttStatus::TT_ERROR_ARGUMENT`] -- a required pointer is null, a length is
+//!   zero, the parameter count is not the module's, or a null buffer was given a
+//!   nonzero length. Nothing was read or written.
+//! * [`ttStatus::TT_ERROR_PROGRAM`] -- the text or bytes are not a program this
+//!   compiler accepts. Nothing was done.
+//! * [`ttStatus::TT_ERROR_MODULE`] -- the handle is not one this library handed
+//!   out, or it was already unloaded. Nothing was done.
+//! * [`ttStatus::TT_ERROR_UNSUPPORTED`] -- the program is valid and compiled, but
+//!   this build cannot run it. Nothing was done.
+//! * [`ttStatus::TT_ERROR_DEVICE`] -- the device, a transfer or a launch failed.
+//!   This is the only code that can leave the device in an unknown state.
 
-use std::ffi::{c_char, c_int};
+#![allow(non_camel_case_types)]
 
-use crate::compile;
+use std::collections::BTreeMap;
+use std::ffi::{CString, c_char, c_void};
+use std::sync::{Mutex, MutexGuard};
+
+use crate::compile::{self, Module};
 use crate::ir::Kernel;
 use crate::runtime;
 
-/// Success.
-pub const TT_OK: c_int = 0;
-/// The program was refused; the error buffer says why.
-pub const TT_INVALID: c_int = 1;
-/// A null pointer or a zero length where one is required.
-pub const TT_ARGUMENT: c_int = 2;
-/// The device could not do what was asked; the error buffer says why.
-pub const TT_DEVICE: c_int = 3;
-
 /// The ABI version this library implements.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
+
+/// What every call returns.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ttStatus {
+    /// Success. `*err` is null.
+    TT_OK = 0,
+    /// A caller mistake: a null required pointer, a zero length, a wrong
+    /// parameter count. Nothing was read or written.
+    TT_ERROR_ARGUMENT = 1,
+    /// The text or bytes were not a program this compiler accepts.
+    TT_ERROR_PROGRAM = 2,
+    /// The handle is not one this library handed out, or was already unloaded.
+    TT_ERROR_MODULE = 3,
+    /// The program compiled, but this build cannot run it yet.
+    TT_ERROR_UNSUPPORTED = 4,
+    /// The device, a transfer or the launch failed.
+    TT_ERROR_DEVICE = 5,
+}
+
+/// A compiled module. Opaque: the pointer is the handle, and its contents are
+/// the library's.
+#[repr(C)]
+pub struct ttModule {
+    _private: [u8; 0],
+}
+
+/// Every module this library has handed out. The map owns each module, so a
+/// handle stays valid until [`ttModuleUnload`], and a pointer that is not a key
+/// names nothing.
+static MODULES: Mutex<BTreeMap<usize, Box<Module>>> = Mutex::new(BTreeMap::new());
+
+fn modules() -> MutexGuard<'static, BTreeMap<usize, Box<Module>>> {
+    // Poisoning needs a panic while the map is held, which cannot leave it
+    // inconsistent; recover rather than fail every later compile.
+    MODULES.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+fn add_module(module: Module) -> *mut ttModule {
+    let mut modules = modules();
+    let boxed = Box::new(module);
+    let ptr = (&*boxed) as *const Module as *mut ttModule;
+    modules.insert(ptr as usize, boxed);
+    ptr
+}
+
+fn lookup_module(modules: &BTreeMap<usize, Box<Module>>, handle: *mut ttModule) -> Option<&Module> {
+    modules.get(&(handle as usize)).map(|m| &**m)
+}
 
 /// The ABI version. A consumer compares this against the header it was built
 /// with.
 #[unsafe(no_mangle)]
-pub extern "C" fn tt_abi_version() -> u32 {
+pub extern "C" fn ttAbiVersion() -> u32 {
     ABI_VERSION
 }
 
-/// Compile a program.
+/// Compile a program from its text form.
 ///
-/// `ir`/`ir_len` is the text form (or, if it starts with `TTIR`, the byte form).
-/// On success `*out` is a module (see `Module::to_bytes`) and `*out_len` its
-/// length. On failure the code is non-zero, `*out` is null, and `*err`/`*err_len`
-/// carry a message.
+/// On success `*out` is a module handle and `*err` is null. On failure `*out` is
+/// null and the code says why.
 ///
 /// # Safety
 ///
-/// Every pointer must be valid for its stated length; `out`, `out_len`, `err`
-/// and `err_len` must be writable.
+/// `text` must be readable for `len` bytes; `out` and `err` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tt_compile(
-    ir: *const u8,
-    ir_len: usize,
-    out: *mut *mut u8,
-    out_len: *mut usize,
+pub unsafe extern "C" fn ttCompile(
+    text: *const c_char,
+    len: usize,
+    out: *mut *mut ttModule,
     err: *mut *mut c_char,
-    err_len: *mut usize,
-) -> c_int {
-    if out.is_null() || out_len.is_null() || err.is_null() || err_len.is_null() {
-        return TT_ARGUMENT;
+) -> ttStatus {
+    clear(err);
+    if out.is_null() {
+        return fail(ttStatus::TT_ERROR_ARGUMENT, "ttCompile: out is null", err);
     }
-    unsafe {
-        *out = std::ptr::null_mut();
-        *out_len = 0;
-        *err = std::ptr::null_mut();
-        *err_len = 0;
+    unsafe { *out = std::ptr::null_mut() };
+    if text.is_null() || len == 0 {
+        return fail(ttStatus::TT_ERROR_ARGUMENT, "ttCompile: the program is empty", err);
     }
-    if ir.is_null() || ir_len == 0 {
-        return fail(TT_ARGUMENT, "empty program", err, err_len);
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(ir, ir_len) };
-    let parsed = if bytes.starts_with(b"TTIR") {
-        Kernel::from_bytes(bytes)
-    } else {
-        match std::str::from_utf8(bytes) {
-            Ok(text) => Kernel::parse(text),
-            Err(e) => {
-                return fail(TT_INVALID, &format!("the program is not UTF-8: {e}"), err, err_len);
-            }
-        }
+    let bytes = unsafe { std::slice::from_raw_parts(text as *const u8, len) };
+    let Ok(source) = std::str::from_utf8(bytes) else {
+        return fail(ttStatus::TT_ERROR_PROGRAM, "ttCompile: the program is not UTF-8", err);
     };
-    let kernel = match parsed {
+    let kernel = match Kernel::parse(source) {
         Ok(k) => k,
-        Err(e) => return fail(TT_INVALID, &e.to_string(), err, err_len),
+        Err(e) => return fail(ttStatus::TT_ERROR_PROGRAM, e.to_string(), err),
     };
     let module = match compile::compile(&kernel) {
         Ok(m) => m,
-        Err(e) => return fail(TT_INVALID, &e.to_string(), err, err_len),
+        Err(e) => return fail(ttStatus::TT_ERROR_PROGRAM, e.to_string(), err),
     };
-    let mut bytes = module.to_bytes();
-    let len = bytes.len();
-    let ptr = bytes.as_mut_ptr();
-    std::mem::forget(bytes);
-    unsafe {
-        *out = ptr;
-        *out_len = len;
-    }
-    TT_OK
+    unsafe { *out = add_module(module) };
+    ttStatus::TT_OK
 }
 
-/// Free a buffer the library returned.
+/// Compile a program from its byte form (`TTIR`).
+///
+/// Same contract as [`ttCompile`]; the input must be the byte form, not text.
 ///
 /// # Safety
 ///
-/// `ptr`/`len` must be a pair the library returned, freed once.
+/// `bytes` must be readable for `len` bytes; `out` and `err` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tt_free(ptr: *mut u8, len: usize) {
-    if ptr.is_null() || len == 0 {
-        return;
-    }
-    unsafe {
-        drop(Vec::from_raw_parts(ptr, len, len));
-    }
-}
-
-/// The grid a module launches over.
-///
-/// # Safety
-///
-/// `module`/`len` must be a module the library returned, and the two out
-/// pointers writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn tt_module_grid(
-    module: *const u8,
+pub unsafe extern "C" fn ttModuleLoad(
+    bytes: *const u8,
     len: usize,
-    x: *mut u32,
-    y: *mut u32,
-) -> c_int {
-    if module.is_null() || len == 0 || x.is_null() || y.is_null() {
-        return TT_ARGUMENT;
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(module, len) };
-    match compile::Module::from_bytes(bytes) {
-        Ok(m) => {
-            unsafe {
-                *x = m.grid[0];
-                *y = m.grid[1];
-            }
-            TT_OK
-        }
-        Err(_) => TT_INVALID,
-    }
-}
-
-/// Copy one of a module's five programs into the caller's buffer.
-///
-/// `core` is `0` reader, `1` writer, `2` T0, `3` T1, `4` T2. The words are copied
-/// into `out` (at most `cap` of them) and the program's true length is written to
-/// `out_len`; a shorter buffer is an error, never a truncation.
-///
-/// # Safety
-///
-/// `module`/`len` must be a module the library returned; `out` must be writable
-/// for `cap` words; `out_len` writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn tt_module_program(
-    module: *const u8,
-    len: usize,
-    core: u32,
-    out: *mut u32,
-    cap: usize,
-    out_len: *mut usize,
-) -> c_int {
-    if module.is_null() || len == 0 || out_len.is_null() {
-        return TT_ARGUMENT;
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(module, len) };
-    let m = match compile::Module::from_bytes(bytes) {
-        Ok(m) => m,
-        Err(_) => return TT_INVALID,
-    };
-    let words: &[u32] = match core {
-        0 => &m.reader,
-        1 => &m.writer,
-        2..=4 => &m.cores[core as usize - 2],
-        _ => return TT_ARGUMENT,
-    };
-    unsafe { *out_len = words.len() };
-    // A null `out` is a length query.
+    out: *mut *mut ttModule,
+    err: *mut *mut c_char,
+) -> ttStatus {
+    clear(err);
     if out.is_null() {
-        return TT_OK;
+        return fail(ttStatus::TT_ERROR_ARGUMENT, "ttModuleLoad: out is null", err);
     }
-    if words.len() > cap {
-        return TT_ARGUMENT;
+    unsafe { *out = std::ptr::null_mut() };
+    if bytes.is_null() || len == 0 {
+        return fail(ttStatus::TT_ERROR_ARGUMENT, "ttModuleLoad: the program is empty", err);
     }
-    if !words.is_empty() {
-        unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), out, words.len()) };
+    let bytes = unsafe { std::slice::from_raw_parts(bytes, len) };
+    let kernel = match Kernel::from_bytes(bytes) {
+        Ok(k) => k,
+        Err(e) => return fail(ttStatus::TT_ERROR_PROGRAM, e.to_string(), err),
+    };
+    let module = match compile::compile(&kernel) {
+        Ok(m) => m,
+        Err(e) => return fail(ttStatus::TT_ERROR_PROGRAM, e.to_string(), err),
+    };
+    unsafe { *out = add_module(module) };
+    ttStatus::TT_OK
+}
+
+/// Drop a module this library handed out. A second unload of the same handle is
+/// [`ttStatus::TT_ERROR_MODULE`], never a double free.
+///
+/// # Safety
+///
+/// `module` must be a handle [`ttCompile`]/[`ttModuleLoad`] returned, or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ttModuleUnload(module: *mut ttModule, err: *mut *mut c_char) -> ttStatus {
+    clear(err);
+    if module.is_null() {
+        return fail(ttStatus::TT_ERROR_ARGUMENT, "ttModuleUnload: the handle is null", err);
     }
-    TT_OK
+    match modules().remove(&(module as usize)) {
+        Some(_) => ttStatus::TT_OK,
+        None => fail(ttStatus::TT_ERROR_MODULE, "ttModuleUnload: not a live module handle", err),
+    }
 }
 
 /// Open the device.
 ///
 /// Idempotent. The simulator is initialized once per process, from
-/// `$TT_TTSIM_LIB` or `libttsim_bh.so` in the current directory. On failure the
-/// code is non-zero and `*err`/`*err_len` carry a message.
+/// `$TT_TTSIM_LIB` or `libttsim_bh.so` in the current directory.
 ///
 /// # Safety
 ///
-/// `err` and `err_len` must be writable.
+/// `err` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ttInit(err: *mut *mut c_char, err_len: *mut usize) -> c_int {
-    if err.is_null() || err_len.is_null() {
-        return TT_ARGUMENT;
-    }
-    unsafe {
-        *err = std::ptr::null_mut();
-        *err_len = 0;
-    }
+pub unsafe extern "C" fn ttInit(err: *mut *mut c_char) -> ttStatus {
+    clear(err);
     match runtime::init() {
-        Ok(()) => TT_OK,
-        Err(e) => fail(TT_DEVICE, &e.to_string(), err, err_len),
+        Ok(()) => ttStatus::TT_OK,
+        Err(e) => fail(ttStatus::TT_ERROR_DEVICE, e.to_string(), err),
     }
 }
 
-/// Close the device. DRAM allocations from it are gone; a later `ttInit` opens
-/// a fresh device over the same simulator.
+/// Close the device. DRAM allocations from it are gone; a later [`ttInit`]
+/// opens a fresh device over the same simulator. Module handles are unaffected.
+///
+/// # Safety
+///
+/// `err` must be writable.
 #[unsafe(no_mangle)]
-pub extern "C" fn ttRelease() -> c_int {
+pub unsafe extern "C" fn ttRelease(err: *mut *mut c_char) -> ttStatus {
+    clear(err);
     match runtime::release() {
-        Ok(()) => TT_OK,
-        Err(e) => fail(TT_DEVICE, &e.to_string(), std::ptr::null_mut(), std::ptr::null_mut()),
+        Ok(()) => ttStatus::TT_OK,
+        Err(e) => fail(ttStatus::TT_ERROR_DEVICE, e.to_string(), err),
     }
 }
 
@@ -227,28 +225,23 @@ pub extern "C" fn ttRelease() -> c_int {
 ///
 /// # Safety
 ///
-/// `addr`, `err` and `err_len` must be writable.
+/// `addr` and `err` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ttMemAlloc(
-    bytes: usize,
-    addr: *mut u64,
-    err: *mut *mut c_char,
-    err_len: *mut usize,
-) -> c_int {
-    if addr.is_null() || err.is_null() || err_len.is_null() {
-        return TT_ARGUMENT;
+pub unsafe extern "C" fn ttMemAlloc(bytes: usize, addr: *mut u64, err: *mut *mut c_char) -> ttStatus {
+    clear(err);
+    if addr.is_null() {
+        return fail(ttStatus::TT_ERROR_ARGUMENT, "ttMemAlloc: addr is null", err);
     }
-    unsafe {
-        *addr = 0;
-        *err = std::ptr::null_mut();
-        *err_len = 0;
+    unsafe { *addr = 0 };
+    if bytes == 0 {
+        return fail(ttStatus::TT_ERROR_ARGUMENT, "ttMemAlloc: zero bytes", err);
     }
     match runtime::alloc(bytes) {
         Ok(at) => {
             unsafe { *addr = at };
-            TT_OK
+            ttStatus::TT_OK
         }
-        Err(e) => fail(TT_DEVICE, &e.to_string(), err, err_len),
+        Err(e) => fail(ttStatus::TT_ERROR_DEVICE, e.to_string(), err),
     }
 }
 
@@ -256,26 +249,22 @@ pub unsafe extern "C" fn ttMemAlloc(
 ///
 /// # Safety
 ///
-/// `src` must be readable for `len` bytes; `err` and `err_len` writable.
+/// `src` must be readable for `len` bytes; `err` writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ttMemcpyH2D(
     dst: u64,
     src: *const u8,
     len: usize,
     err: *mut *mut c_char,
-    err_len: *mut usize,
-) -> c_int {
-    if src.is_null() || len == 0 || err.is_null() || err_len.is_null() {
-        return TT_ARGUMENT;
-    }
-    unsafe {
-        *err = std::ptr::null_mut();
-        *err_len = 0;
+) -> ttStatus {
+    clear(err);
+    if src.is_null() || len == 0 {
+        return fail(ttStatus::TT_ERROR_ARGUMENT, "ttMemcpyH2D: the source is empty", err);
     }
     let bytes = unsafe { std::slice::from_raw_parts(src, len) };
     match runtime::h2d(dst, bytes) {
-        Ok(()) => TT_OK,
-        Err(e) => fail(TT_DEVICE, &e.to_string(), err, err_len),
+        Ok(()) => ttStatus::TT_OK,
+        Err(e) => fail(ttStatus::TT_ERROR_DEVICE, e.to_string(), err),
     }
 }
 
@@ -283,26 +272,22 @@ pub unsafe extern "C" fn ttMemcpyH2D(
 ///
 /// # Safety
 ///
-/// `dst` must be writable for `len` bytes; `err` and `err_len` writable.
+/// `dst` must be writable for `len` bytes; `err` writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ttMemcpyD2H(
     dst: *mut u8,
     src: u64,
     len: usize,
     err: *mut *mut c_char,
-    err_len: *mut usize,
-) -> c_int {
-    if dst.is_null() || len == 0 || err.is_null() || err_len.is_null() {
-        return TT_ARGUMENT;
-    }
-    unsafe {
-        *err = std::ptr::null_mut();
-        *err_len = 0;
+) -> ttStatus {
+    clear(err);
+    if dst.is_null() || len == 0 {
+        return fail(ttStatus::TT_ERROR_ARGUMENT, "ttMemcpyD2H: the destination is empty", err);
     }
     let out = unsafe { std::slice::from_raw_parts_mut(dst, len) };
     match runtime::d2h(src, out) {
-        Ok(()) => TT_OK,
-        Err(e) => fail(TT_DEVICE, &e.to_string(), err, err_len),
+        Ok(()) => ttStatus::TT_OK,
+        Err(e) => fail(ttStatus::TT_ERROR_DEVICE, e.to_string(), err),
     }
 }
 
@@ -313,65 +298,77 @@ pub unsafe extern "C" fn ttMemcpyD2H(
 ///
 /// # Safety
 ///
-/// `module`/`len` must be a module the library returned; `params` readable for
-/// `nparams` addresses; `err` and `err_len` writable.
+/// `module` must be a live handle; `params` readable for `nparams` addresses;
+/// `err` writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ttLaunch(
-    module: *const u8,
-    len: usize,
+    module: *mut ttModule,
     params: *const u64,
     nparams: usize,
     err: *mut *mut c_char,
-    err_len: *mut usize,
-) -> c_int {
-    if module.is_null() || len == 0 || err.is_null() || err_len.is_null() {
-        return TT_ARGUMENT;
+) -> ttStatus {
+    clear(err);
+    if module.is_null() {
+        return fail(ttStatus::TT_ERROR_ARGUMENT, "ttLaunch: the handle is null", err);
     }
     if params.is_null() && nparams != 0 {
-        return TT_ARGUMENT;
+        return fail(ttStatus::TT_ERROR_ARGUMENT, "ttLaunch: params is null", err);
     }
-    unsafe {
-        *err = std::ptr::null_mut();
-        *err_len = 0;
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(module, len) };
-    let m = match compile::Module::from_bytes(bytes) {
-        Ok(m) => m,
-        Err(e) => return fail(TT_INVALID, &e.to_string(), err, err_len),
-    };
     let addresses = if nparams == 0 {
         &[][..]
     } else {
         unsafe { std::slice::from_raw_parts(params, nparams) }
     };
-    match runtime::launch(&m, addresses) {
-        Ok(()) => TT_OK,
-        Err(e) => fail(TT_DEVICE, &e.to_string(), err, err_len),
+    let modules = modules();
+    let Some(m) = lookup_module(&modules, module) else {
+        return fail(ttStatus::TT_ERROR_MODULE, "ttLaunch: not a live module handle", err);
+    };
+    // The count is the caller's contract, not the device's business: refuse it
+    // before anything is touched.
+    if m.params as usize != addresses.len() {
+        return fail(
+            ttStatus::TT_ERROR_ARGUMENT,
+            format!("ttLaunch: the module takes {} parameters, {} were given", m.params, addresses.len()),
+            err,
+        );
+    }
+    match runtime::launch(m, addresses) {
+        Ok(()) => ttStatus::TT_OK,
+        Err(runtime::LaunchError::Argument(m)) => fail(ttStatus::TT_ERROR_ARGUMENT, m, err),
+        Err(runtime::LaunchError::Unsupported(m)) => fail(ttStatus::TT_ERROR_UNSUPPORTED, m, err),
+        Err(runtime::LaunchError::Device(e)) => fail(ttStatus::TT_ERROR_DEVICE, e.to_string(), err),
     }
 }
 
-/// Wait for a launch. A launch is synchronous, so this only reports whether a
-/// device is open.
+/// Free a string this library returned. A null pointer is a no-op.
+///
+/// Module handles are not freed here; use [`ttModuleUnload`].
+///
+/// # Safety
+///
+/// `ptr` must be null or a pointer [`fail`]'s callers wrote, freed once.
 #[unsafe(no_mangle)]
-pub extern "C" fn ttSynchronize() -> c_int {
-    match runtime::synchronize() {
-        Ok(()) => TT_OK,
-        Err(e) => fail(TT_DEVICE, &e.to_string(), std::ptr::null_mut(), std::ptr::null_mut()),
+pub unsafe extern "C" fn ttFree(ptr: *mut c_void) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe { drop(CString::from_raw(ptr as *mut c_char)) };
+}
+
+/// Clear the caller's error out-parameter, if there is one.
+fn clear(err: *mut *mut c_char) {
+    if !err.is_null() {
+        unsafe { *err = std::ptr::null_mut() };
     }
 }
 
-fn fail(code: c_int, message: &str, err: *mut *mut c_char, err_len: *mut usize) -> c_int {
-    if err.is_null() || err_len.is_null() {
-        return code;
+/// Leave `message` for the caller and return `status`. A null `err` is
+/// tolerated: the status is the answer, the message is the explanation.
+fn fail(status: ttStatus, message: impl AsRef<str>, err: *mut *mut c_char) -> ttStatus {
+    if !err.is_null() {
+        let text = message.as_ref().replace('\0', " ");
+        let msg = CString::new(text).expect("NULs were replaced");
+        unsafe { *err = msg.into_raw() };
     }
-    let mut bytes = message.as_bytes().to_vec();
-    bytes.push(0);
-    let len = bytes.len();
-    let ptr = bytes.as_mut_ptr() as *mut c_char;
-    std::mem::forget(bytes);
-    unsafe {
-        *err = ptr;
-        *err_len = len;
-    }
-    code
+    status
 }

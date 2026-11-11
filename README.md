@@ -62,41 +62,60 @@ above, and a byte form (`TTIR`).
 ## API
 
 ```c
-uint32_t tt_abi_version(void);
+typedef struct ttModule *ttModule;
 
-int tt_compile(const uint8_t *ir, size_t ir_len,
-               uint8_t **out, size_t *out_len,
-               char **err, size_t *err_len);
+typedef enum {
+    TT_OK                = 0,
+    TT_ERROR_ARGUMENT    = 1,
+    TT_ERROR_PROGRAM     = 2,
+    TT_ERROR_MODULE      = 3,
+    TT_ERROR_UNSUPPORTED = 4,
+    TT_ERROR_DEVICE      = 5,
+} ttStatus;
 
-void tt_free(uint8_t *ptr, size_t len);
+uint32_t ttAbiVersion(void);
+
+ttStatus ttCompile    (const char *text, size_t len, ttModule *out, char **err);
+ttStatus ttModuleLoad (const uint8_t *bytes, size_t len, ttModule *out, char **err);
+ttStatus ttModuleUnload(ttModule module, char **err);
+
+ttStatus ttInit(char **err);
+ttStatus ttRelease(char **err);
+
+ttStatus ttMemAlloc(size_t bytes, uint64_t *addr, char **err);
+ttStatus ttMemcpyH2D(uint64_t dst, const void *src, size_t len, char **err);
+ttStatus ttMemcpyD2H(void *dst, uint64_t src, size_t len, char **err);
+
+ttStatus ttLaunch(ttModule module, const uint64_t *params, size_t nparams, char **err);
+
+void ttFree(void *ptr);
 ```
 
-`ir` is the text form, or the byte form if it starts with `TTIR`. On success
-`out` is a module: magic `TTMD`, version, grid, parameter count, then the
-reader, writer and T0/T1/T2 programs, each a word count and its words. On
-failure the code is non-zero, `out` is null, and `err` carries a message.
+`ttCompile` takes the program's text form and `ttModuleLoad` its byte form
+(`TTIR`); each refuses the other form rather than guessing. Both return an
+opaque module handle, stored inside the library: the caller never sees the
+programs, only the pointer it passes to `ttLaunch` and gives back to
+`ttModuleUnload`.
 
-The runtime:
+A buffer address is opaque too: what `ttMemAlloc` hands back is what
+`ttMemcpy*` and `ttLaunch` take. A launch is synchronous — every program has
+finished when it returns. `ttRelease` closes the device; the simulator stays
+initialized, so a later `ttInit` opens a fresh device over it, and module
+handles are unaffected.
 
-```c
-int ttInit(char **err, size_t *err_len);
-int ttRelease(void);
+Every code has one meaning:
 
-int ttMemAlloc(size_t bytes, uint64_t *addr, char **err, size_t *err_len);
-int ttMemcpyH2D(uint64_t dst, const void *src, size_t len, char **err, size_t *err_len);
-int ttMemcpyD2H(void *dst, uint64_t src, size_t len, char **err, size_t *err_len);
+| code | meaning |
+|---|---|
+| `TT_OK` | success; `*err` is null |
+| `TT_ERROR_ARGUMENT` | a null required pointer, a zero length, or a parameter count that is not the module's; nothing was read or written |
+| `TT_ERROR_PROGRAM` | the text or bytes are not a program this compiler accepts; nothing was done |
+| `TT_ERROR_MODULE` | the handle is not one this library handed out, or was already unloaded; nothing was done |
+| `TT_ERROR_UNSUPPORTED` | the program compiled, but this build cannot run it; nothing was done |
+| `TT_ERROR_DEVICE` | the device, a transfer or the launch failed; the only state that can be left unknown |
 
-int ttLaunch(const uint8_t *module, size_t len,
-             const uint64_t *params, size_t nparams,
-             char **err, size_t *err_len);
-int ttSynchronize(void);
-```
-
-A buffer address is opaque: what `ttMemAlloc` hands back is what `ttMemcpy*`
-and `ttLaunch` take. A launch is synchronous — every program has finished when
-it returns — so `ttSynchronize` has nothing to wait for and only reports that a
-device is open. `ttRelease` closes the device; the simulator stays initialized,
-so a later `ttInit` opens a fresh device over it.
+An error message is a NUL-terminated string the caller frees with `ttFree`; a
+null pointer there is a no-op.
 
 The device is `libttsim` through `dlopen`: `$TT_TTSIM_LIB`, or
 `libttsim_bh.so` in the current directory. Nothing links it.
@@ -113,9 +132,10 @@ before running it (`cargo build && cargo test`); `cargo test` alone does not
 rebuild the `cdylib` if only its Rust sources changed.
 
 The measure is the end-to-end suite (`tests/e2e.rs`): it `dlopen`s the built
-`libTT.so` with `libloading` — nothing links the Rust library — and drives the C
-ABI exactly as a consumer would. Unit tests exist under the modules; they are not
-the measure.
+`libTT.so` with `libloading` and drives the C ABI exactly as a consumer would.
+The test crate is linked to the library (it is the same package), and uses it
+only to build the byte-form fixture; every call under test goes through the
+loaded `.so`. Unit tests exist under the modules; they are not the measure.
 
 ## Layout
 
@@ -129,7 +149,7 @@ the measure.
 | `encode` | machine IR → Tensix instructions |
 | `mover` | the reader/writer RISC-V programs |
 | `riscv` | RV32IM encoders and the branch assembler |
-| `compile` | the pipeline, and the module bytes |
+| `compile` | the pipeline, and the module it produces |
 | `device` | the simulator, the TLB window, DRAM/L1 access, core start |
 | `runtime` | the open device, allocations, transfers and the launch |
 | `abi` | the `extern "C"` surface |
