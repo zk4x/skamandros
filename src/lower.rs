@@ -17,7 +17,7 @@
 
 use crate::alloc::Alloc;
 use crate::ir::{BinOp, Dim, Error, Kernel, Op, RegShape, Types, UnOp, unit_of};
-use crate::mir::{Machine, MirOp, SfpOp};
+use crate::mir::{CmpOp, Machine, MirOp, SfpOp};
 use crate::planner::Plan;
 
 /// `Dst` rows one 32x32 F32 tile occupies (`tt_isa`'s SFPU row is 16 datums).
@@ -157,6 +157,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     m.t1.push(MirOp::Sfpload {
                         lreg: la,
                         row: src + row,
+                        int: false,
                     });
                     m.t1.push(MirOp::Sfp {
                         op: sfp,
@@ -167,12 +168,13 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     m.t1.push(MirOp::Sfpstore {
                         lreg: ld,
                         row: out + row,
+                        int: false,
                     });
                 }
             }
             Op::Binary { value, op, a, b } => {
-                let left = types.of(a);
-                let right = types.of(b);
+                let left = *types.of(a);
+                let right = *types.of(b);
                 if left.shape != right.shape {
                     return Err(Error(format!(
                         "op {at}: broadcast of a {} and a {} is not lowered yet",
@@ -192,32 +194,100 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 let out = dst_row(alloc, value);
                 let (la, ld) = alloc.lreg[value as usize];
                 let lb = 2u8;
-                let sfp = binary(op, at)?;
+                // A comparison writes `-1`/`0` lanes, so its result is stored in
+                // the integer format; everything else here is FP32.
+                let int_out = matches!(op, BinOp::Cmplt | BinOp::Cmpgt | BinOp::Cmpge);
                 for row in (0..rows).step_by(2) {
                     m.t1.push(MirOp::Sfpload {
                         lreg: la,
                         row: sa + row,
+                        int: false,
                     });
                     m.t1.push(MirOp::Sfpload {
                         lreg: lb,
                         row: sb + row,
+                        int: false,
                     });
-                    m.t1.push(MirOp::Sfp {
-                        op: sfp,
-                        a: la,
-                        b: Some(lb),
+                    match op {
+                        BinOp::Cmplt | BinOp::Cmpgt | BinOp::Cmpge => {
+                            let cmp = match op {
+                                BinOp::Cmplt => CmpOp::Lt,
+                                BinOp::Cmpgt => CmpOp::Gt,
+                                _ => CmpOp::Ge,
+                            };
+                            m.t1.push(MirOp::Compare {
+                                op: cmp,
+                                a: la,
+                                b: lb,
+                                d: ld,
+                            });
+                        }
+                        BinOp::Max => m.t1.push(MirOp::Max {
+                            a: la,
+                            b: lb,
+                            d: ld,
+                        }),
+                        _ => m.t1.push(MirOp::Sfp {
+                            op: binary(op, at)?,
+                            a: la,
+                            b: Some(lb),
+                            d: ld,
+                        }),
+                    }
+                    m.t1.push(MirOp::Sfpstore {
+                        lreg: ld,
+                        row: out + row,
+                        int: int_out,
+                    });
+                }
+            }
+            Op::Select {
+                value,
+                cond,
+                if_true,
+                if_false,
+            } => {
+                let shape = types.of(if_true).shape;
+                let rows = rows_of(shape, at)?;
+                let sc = dst_row(alloc, cond);
+                let st = dst_row(alloc, if_true);
+                let sf = dst_row(alloc, if_false);
+                let out = dst_row(alloc, value);
+                let ld = alloc.lreg[value as usize].1;
+                let lc = 3u8;
+                let lt = 0u8;
+                let lf = 2u8;
+                if types.of(cond).dtype != crate::ir::DType::Bool {
+                    return Err(Error(format!("op {at}: sel's condition is not bool")));
+                }
+                for row in (0..rows).step_by(2) {
+                    m.t1.push(MirOp::Sfpload {
+                        lreg: lc,
+                        row: sc + row,
+                        int: true,
+                    });
+                    m.t1.push(MirOp::Sfpload {
+                        lreg: lt,
+                        row: st + row,
+                        int: false,
+                    });
+                    m.t1.push(MirOp::Sfpload {
+                        lreg: lf,
+                        row: sf + row,
+                        int: false,
+                    });
+                    m.t1.push(MirOp::Select {
+                        cond: lc,
+                        t: lt,
+                        f: lf,
                         d: ld,
                     });
                     m.t1.push(MirOp::Sfpstore {
                         lreg: ld,
                         row: out + row,
+                        int: false,
                     });
                 }
-            }
-            Op::Select { .. } => {
-                return Err(Error(format!(
-                    "op {at}: sel is not lowered yet; the SFPU condition-code sequence is not in the tree"
-                )));
             }
             Op::Matmul { .. } => {
                 return Err(Error(format!(

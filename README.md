@@ -193,11 +193,12 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
 - A launch is one Tensix tile: a module whose grid is larger than 1x1 is
   refused. A symbolic grid parses and verifies but is not lowered.
 - The register datapath lowered today is FP32, straight-line, with literal
-  offsets, and `neg`/`abs` plus `add`/`sub`/`mul` on equal shapes; all four run
-  end to end through the C ABI, `add`/`sub`/`mul` on two loaded tiles. A loop
-  with a constant bound is unrolled before lowering, and constant index
-  arithmetic (including the offset of each iteration) folds to a literal.
+  offsets: `neg`/`abs`, `add`/`sub`/`mul`/`max` on equal shapes, `cmplt`/`cmpgt`/
+  `cmpge` producing a `bool`, and `sel` consuming one. All of them run end to end
+  through the C ABI. A loop with a constant bound is unrolled before lowering,
+  and constant index arithmetic (including the offset of each iteration) folds
+  to a literal.
 - A loop with a symbolic bound, symbolic offsets, `cast`, broadcast, `matmul`,
-  `sel`, the remaining unary and binary ops, the `bool` datapath in a parameter
-  or buffer, and the reduce op are accepted by the format and verifier and
-  refused loudly by lowering, not guessed at.
+  `eq`/`noteq`, the remaining unary and binary ops, the `bool` datapath in a
+  parameter or buffer, and the reduce op are accepted by the format and verifier
+  and refused loudly by lowering, not guessed at.

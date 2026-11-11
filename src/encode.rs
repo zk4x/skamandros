@@ -14,7 +14,7 @@
 //! stride or a `Dst` address.
 
 use crate::ir::Error;
-use crate::mir::{Machine, MirOp, SfpOp};
+use crate::mir::{CmpOp, Machine, MirOp, SfpOp};
 use tt_isa::backend::{
     self, Before, ConfigWords, ThreadConfigEntry, block, cond, wait_for_packer, wait_for_unpacker0,
 };
@@ -104,6 +104,13 @@ fn semaphore_init(slots: u8) -> Result<Vec<Instruction>, Error> {
         );
     }
     Ok(out)
+}
+
+/// `SFPENCC`: gate lanes by the lane flags (on) or stop doing so (off), and
+/// reset every lane's flag to true. Bit 0 of `Imm2` is `E`, bit 1 is `R`; `Mod1`
+/// 10 is `EI|RI`, as tt-metal's boot sequence uses.
+fn cc_mask(on: bool) -> Result<Instruction, tt_isa::isa::EncodeError> {
+    encode::sfpencc(if on { 3 } else { 2 }, 0, 10)
 }
 
 fn semaphore(index: u8) -> Result<Semaphore, Error> {
@@ -344,20 +351,28 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Vec<Instruction>) -> Res
     }
     let bad_isa = |e: tt_isa::isa::EncodeError| bad(e, op);
     match *op {
-        MirOp::Sfpload { lreg, row } => {
+        MirOp::Sfpload { lreg, row, int } => {
             let i = encode::sfpload(
                 u32::from(lreg),
-                tt_isa::sfpu::mod0_fmt::FP32,
+                if int {
+                    tt_isa::sfpu::mod0_fmt::INT32
+                } else {
+                    tt_isa::sfpu::mod0_fmt::FP32
+                },
                 0,
                 row + row_delta,
             )
             .map_err(bad_isa)?;
             out.push(i);
         }
-        MirOp::Sfpstore { lreg, row } => {
+        MirOp::Sfpstore { lreg, row, int } => {
             let i = encode::sfpstore(
                 u32::from(lreg),
-                tt_isa::sfpu::mod0_fmt::FP32,
+                if int {
+                    tt_isa::sfpu::mod0_fmt::INT32
+                } else {
+                    tt_isa::sfpu::mod0_fmt::FP32
+                },
                 0,
                 row + row_delta,
             )
@@ -414,6 +429,52 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Vec<Instruction>) -> Res
             );
         }
         MirOp::Sfp { .. } => return Err(Error(format!("{op:?} has no encoding yet"))),
+        MirOp::Compare { op: cmp, a, b, d } => {
+            let set_vd = 8u32;
+            let (first, second) = match cmp {
+                CmpOp::Lt => (b, a),
+                CmpOp::Gt => (a, b),
+                CmpOp::Ge => (b, a),
+            };
+            out.push(encode::sfpmov(u32::from(first), u32::from(d), 0).map_err(bad_isa)?);
+            let i = match cmp {
+                CmpOp::Lt | CmpOp::Gt => {
+                    encode::sfpgt(u32::from(second), u32::from(d), set_vd).map_err(bad_isa)?
+                }
+                CmpOp::Ge => {
+                    encode::sfple(u32::from(second), u32::from(d), set_vd).map_err(bad_isa)?
+                }
+            };
+            out.push(i);
+        }
+        MirOp::Select { cond, t, f, d } => {
+            // `d = f` in every lane, then `d = t` only where the condition's
+            // lane is true. `SFPGT` sets the lane flags from the condition
+            // (true means the sign-magnitude `0 > cond`, which is exactly a
+            // bool stored as `-1`), and `SFPMOV` is predicated on them.
+            out.push(encode::sfpmov(u32::from(f), u32::from(d), 0).map_err(bad_isa)?);
+            out.push(cc_mask(true).map_err(bad_isa)?);
+            out.push(
+                encode::sfpgt(
+                    u32::from(cond),
+                    tt_isa::sfpu::LREG_ZERO,
+                    1, // SFPGT_MOD1_SET_CC
+                )
+                .map_err(bad_isa)?,
+            );
+            out.push(encode::sfpmov(u32::from(t), u32::from(d), 0).map_err(bad_isa)?);
+            out.push(cc_mask(false).map_err(bad_isa)?);
+        }
+        MirOp::Max { a, b, d } => {
+            out.push(encode::sfpmov(u32::from(b), u32::from(d), 0).map_err(bad_isa)?);
+            out.push(cc_mask(true).map_err(bad_isa)?);
+            out.push(
+                encode::sfpgt(u32::from(b), u32::from(a), 1) // flags = a > b
+                    .map_err(bad_isa)?,
+            );
+            out.push(encode::sfpmov(u32::from(a), u32::from(d), 0).map_err(bad_isa)?);
+            out.push(cc_mask(false).map_err(bad_isa)?);
+        }
         MirOp::SemPost { sem } => {
             let s = semaphore(sem)?;
             out.extend(sync::post_after(sync::Unit::Sfpu, s));

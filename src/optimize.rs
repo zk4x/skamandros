@@ -68,7 +68,11 @@ fn same_shifted(body: &[MirOp; 3], following: &[MirOp; 3]) -> bool {
     match (body, following) {
         (
             [
-                MirOp::Sfpload { lreg: la, row: ra },
+                MirOp::Sfpload {
+                    lreg: la,
+                    row: ra,
+                    int: ia,
+                },
                 MirOp::Sfp {
                     op: oa,
                     a: aa,
@@ -78,10 +82,15 @@ fn same_shifted(body: &[MirOp; 3], following: &[MirOp; 3]) -> bool {
                 MirOp::Sfpstore {
                     lreg: sa,
                     row: sa_row,
+                    int: isa,
                 },
             ],
             [
-                MirOp::Sfpload { lreg: lb, row: rb },
+                MirOp::Sfpload {
+                    lreg: lb,
+                    row: rb,
+                    int: ib,
+                },
                 MirOp::Sfp {
                     op: ob,
                     a: ab,
@@ -91,11 +100,14 @@ fn same_shifted(body: &[MirOp; 3], following: &[MirOp; 3]) -> bool {
                 MirOp::Sfpstore {
                     lreg: sb,
                     row: sb_row,
+                    int: isb,
                 },
             ],
         ) => {
             la == lb
                 && sa == sb
+                && ia == ib
+                && isa == isb
                 && oa == ob
                 && aa == ab
                 && ba == bb
@@ -114,7 +126,7 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
         let mut at = 0usize;
         while at < ops.len() {
             match ops[at] {
-                MirOp::Sfpload { lreg, row } | MirOp::Sfpstore { lreg, row } => {
+                MirOp::Sfpload { lreg, row, .. } | MirOp::Sfpstore { lreg, row, .. } => {
                     if lreg >= crate::alloc::LREGS {
                         return Err(Error(format!(
                             "{name}[{at}]: lane register L{lreg} does not exist"
@@ -160,6 +172,33 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                         return Err(Error(format!(
                             "{name}[{at}]: repeat body runs past the program"
                         )));
+                    }
+                }
+                MirOp::Compare { a, b, d, .. } => {
+                    for lreg in [a, b, d] {
+                        if lreg >= crate::alloc::LREGS {
+                            return Err(Error(format!(
+                                "{name}[{at}]: lane register L{lreg} does not exist"
+                            )));
+                        }
+                    }
+                }
+                MirOp::Select { cond, t, f, d } => {
+                    for lreg in [cond, t, f, d] {
+                        if lreg >= crate::alloc::LREGS {
+                            return Err(Error(format!(
+                                "{name}[{at}]: lane register L{lreg} does not exist"
+                            )));
+                        }
+                    }
+                }
+                MirOp::Max { a, b, d } => {
+                    for lreg in [a, b, d] {
+                        if lreg >= crate::alloc::LREGS {
+                            return Err(Error(format!(
+                                "{name}[{at}]: lane register L{lreg} does not exist"
+                            )));
+                        }
                     }
                 }
                 MirOp::Unpacr { .. }
@@ -210,7 +249,14 @@ copy_to %out from %b0 [0]
         // One repeat marker plus the body, around the two hand-offs.
         assert_eq!(m.t1.len(), 6, "got {:?}", m.t1);
         assert!(matches!(m.t1[1], MirOp::Repeat { len: 3, count: 32 }));
-        assert!(matches!(m.t1[2], MirOp::Sfpload { lreg: 0, row: 0 }));
+        assert!(matches!(
+            m.t1[2],
+            MirOp::Sfpload {
+                lreg: 0,
+                row: 0,
+                int: false
+            }
+        ));
         assert_eq!(m.t1.len(), before - (32 - 1) * 3 + 1);
     }
 
@@ -256,7 +302,11 @@ copy_to %out from %b0 [0]
     #[test]
     fn a_bad_lane_register_is_refused() {
         let mut m = machine();
-        m.t1.push(MirOp::Sfpload { lreg: 9, row: 0 });
+        m.t1.push(MirOp::Sfpload {
+            lreg: 9,
+            row: 0,
+            int: false,
+        });
         assert!(verify(&m).is_err());
     }
 
@@ -266,6 +316,7 @@ copy_to %out from %b0 [0]
         m.t1.push(MirOp::Sfpstore {
             lreg: 0,
             row: 8 * DST_ROWS,
+            int: false,
         });
         assert!(verify(&m).is_err());
     }

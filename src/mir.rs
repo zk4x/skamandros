@@ -13,13 +13,23 @@ pub enum SfpOp {
     Mul,
 }
 
+/// The comparison a [`MirOp::Compare`] performs; the result is `-1` for true
+/// and `0` for false, lanewise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmpOp {
+    Lt,
+    Gt,
+    Ge,
+}
+
 /// One instruction of a compute core's program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MirOp {
-    /// `SFPLOAD`: `Dst` row into a lane register.
-    Sfpload { lreg: u8, row: u32 },
+    /// `SFPLOAD`: `Dst` row into a lane register. `int` selects the `INT32`
+    /// format instead of `FP32`, which is what a `bool` or `i32` value needs.
+    Sfpload { lreg: u8, row: u32, int: bool },
     /// `SFPSTORE`: lane register into a `Dst` row.
-    Sfpstore { lreg: u8, row: u32 },
+    Sfpstore { lreg: u8, row: u32, int: bool },
     /// One SFPU arithmetic instruction; `b` is `None` for a unary op.
     Sfp {
         op: SfpOp,
@@ -27,6 +37,12 @@ pub enum MirOp {
         b: Option<u8>,
         d: u8,
     },
+    /// A lanewise comparison, `-1`/`0` into `d`.
+    Compare { op: CmpOp, a: u8, b: u8, d: u8 },
+    /// `cond ? t : f`, lanewise, through the SFPU lane flags.
+    Select { cond: u8, t: u8, f: u8, d: u8 },
+    /// The lanewise maximum, through the SFPU lane flags.
+    Max { a: u8, b: u8, d: u8 },
     /// `UNPACR`: the tile image at L1 `src` into unpacker `unit`'s destination.
     Unpacr { src: u32, unit: u8, count: u32 },
     /// `SETADCZW`: which face the unpacker reads next.

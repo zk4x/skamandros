@@ -78,6 +78,7 @@ pub fn allocate(k: &Kernel, types: &Types) -> Result<Alloc, Error> {
                 | Op::Cast { .. }
                 | Op::Unary { .. }
                 | Op::Binary { .. }
+                | Op::Select { .. }
                 | Op::Matmul { .. }
         ) {
             continue;
