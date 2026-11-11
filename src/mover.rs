@@ -1,13 +1,19 @@
 // Copyright (C) 2025 zk4x
 // SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
 
-//! The mover programs: DRAM <-> L1 on RISCV B (reads) and NC (writes).
+//! The boundary programs: DRAM <-> L1 over the NoC.
 //!
 //! Each copy in the IR becomes one NOC request: the ten initiator registers are
 //! written in `tt_isa`'s order, `CMD_CTRL` triggers it, and the program waits on
 //! that word and then on the transaction ID's outstanding counter before the
-//! next copy. The target address is the parameter's launch argument plus the
-//! copy's offset; the local address is the planned L1 buffer.
+//! next copy. The parameter's address is its launch argument plus the copy's
+//! offset; the local address is the planned L1 buffer.
+//!
+//! `TARG_ADDR` is the request's source and `RET_ADDR` its destination, so a
+//! read names the parameter as target and L1 as return, and a write the other
+//! way round. Both programs are core-agnostic RISC-V; the runtime stages them on
+//! RISCV B through the `exec_b` trampoline, the reader first (the program's own
+//! order for a kernel with no compute).
 
 use crate::ir::{Error, Kernel, Op};
 use crate::planner::Plan;
@@ -90,8 +96,9 @@ fn emit_copy(a: &mut Asm, at: usize, param: u32, offset: u32, l1: u32, bytes: u3
         a.word(rv::add(reg::T1, reg::T1, reg::T4));
     }
     a.word(rv::lw(reg::T2, reg::A0, hi_arg));
-    // Local side: the L1 buffer for a read, the L1 buffer for a write, and
-    // this tile's high word for whichever side is local.
+    // `TARG_ADDR` is the request's source and `RET_ADDR` its destination: a
+    // read has the parameter as source and L1 as destination, a write the
+    // other way round.
     a.li(reg::T4, l1);
     if read {
         store_reg(a, initiator::TARG_ADDR_LO, reg::T1);
@@ -101,12 +108,12 @@ fn emit_copy(a: &mut Asm, at: usize, param: u32, offset: u32, l1: u32, bytes: u3
         store_zero(a, initiator::RET_ADDR_MID);
         store_reg(a, initiator::RET_ADDR_HI, reg::T3);
     } else {
-        store_reg(a, initiator::TARG_ADDR_LO, reg::T1);
+        store_reg(a, initiator::TARG_ADDR_LO, reg::T4);
         store_zero(a, initiator::TARG_ADDR_MID);
-        store_reg(a, initiator::TARG_ADDR_HI, reg::T2);
-        store_reg(a, initiator::RET_ADDR_LO, reg::T4);
+        store_reg(a, initiator::TARG_ADDR_HI, reg::T3);
+        store_reg(a, initiator::RET_ADDR_LO, reg::T1);
         store_zero(a, initiator::RET_ADDR_MID);
-        store_reg(a, initiator::RET_ADDR_HI, reg::T3);
+        store_reg(a, initiator::RET_ADDR_HI, reg::T2);
     }
     a.li(reg::T4, (TXN.index() as u32) << 10);
     store_reg(a, initiator::PACKET_TAG, reg::T4);

@@ -12,6 +12,7 @@ use std::ffi::{c_char, c_int};
 
 use crate::compile;
 use crate::ir::Kernel;
+use crate::runtime;
 
 /// Success.
 pub const TT_OK: c_int = 0;
@@ -19,6 +20,8 @@ pub const TT_OK: c_int = 0;
 pub const TT_INVALID: c_int = 1;
 /// A null pointer or a zero length where one is required.
 pub const TT_ARGUMENT: c_int = 2;
+/// The device could not do what was asked; the error buffer says why.
+pub const TT_DEVICE: c_int = 3;
 
 /// The ABI version this library implements.
 pub const ABI_VERSION: u32 = 1;
@@ -183,7 +186,184 @@ pub unsafe extern "C" fn tt_module_program(
     TT_OK
 }
 
+/// Open the device.
+///
+/// Idempotent. The simulator is initialized once per process, from
+/// `$TT_TTSIM_LIB` or `libttsim_bh.so` in the current directory. On failure the
+/// code is non-zero and `*err`/`*err_len` carry a message.
+///
+/// # Safety
+///
+/// `err` and `err_len` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ttInit(err: *mut *mut c_char, err_len: *mut usize) -> c_int {
+    if err.is_null() || err_len.is_null() {
+        return TT_ARGUMENT;
+    }
+    unsafe {
+        *err = std::ptr::null_mut();
+        *err_len = 0;
+    }
+    match runtime::init() {
+        Ok(()) => TT_OK,
+        Err(e) => fail(TT_DEVICE, &e.to_string(), err, err_len),
+    }
+}
+
+/// Close the device. DRAM allocations from it are gone; a later `ttInit` opens
+/// a fresh device over the same simulator.
+#[unsafe(no_mangle)]
+pub extern "C" fn ttRelease() -> c_int {
+    match runtime::release() {
+        Ok(()) => TT_OK,
+        Err(e) => fail(TT_DEVICE, &e.to_string(), std::ptr::null_mut(), std::ptr::null_mut()),
+    }
+}
+
+/// Reserve `bytes` of DRAM and write its address to `*addr`.
+///
+/// The address is opaque to the caller: pass it back to `ttMemcpyH2D`,
+/// `ttMemcpyD2H` and `ttLaunch`. Allocations are 64-byte aligned.
+///
+/// # Safety
+///
+/// `addr`, `err` and `err_len` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ttMemAlloc(
+    bytes: usize,
+    addr: *mut u64,
+    err: *mut *mut c_char,
+    err_len: *mut usize,
+) -> c_int {
+    if addr.is_null() || err.is_null() || err_len.is_null() {
+        return TT_ARGUMENT;
+    }
+    unsafe {
+        *addr = 0;
+        *err = std::ptr::null_mut();
+        *err_len = 0;
+    }
+    match runtime::alloc(bytes) {
+        Ok(at) => {
+            unsafe { *addr = at };
+            TT_OK
+        }
+        Err(e) => fail(TT_DEVICE, &e.to_string(), err, err_len),
+    }
+}
+
+/// Copy `len` host bytes into DRAM at `dst`.
+///
+/// # Safety
+///
+/// `src` must be readable for `len` bytes; `err` and `err_len` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ttMemcpyH2D(
+    dst: u64,
+    src: *const u8,
+    len: usize,
+    err: *mut *mut c_char,
+    err_len: *mut usize,
+) -> c_int {
+    if src.is_null() || len == 0 || err.is_null() || err_len.is_null() {
+        return TT_ARGUMENT;
+    }
+    unsafe {
+        *err = std::ptr::null_mut();
+        *err_len = 0;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(src, len) };
+    match runtime::h2d(dst, bytes) {
+        Ok(()) => TT_OK,
+        Err(e) => fail(TT_DEVICE, &e.to_string(), err, err_len),
+    }
+}
+
+/// Copy `len` DRAM bytes at `src` into host memory at `dst`.
+///
+/// # Safety
+///
+/// `dst` must be writable for `len` bytes; `err` and `err_len` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ttMemcpyD2H(
+    dst: *mut u8,
+    src: u64,
+    len: usize,
+    err: *mut *mut c_char,
+    err_len: *mut usize,
+) -> c_int {
+    if dst.is_null() || len == 0 || err.is_null() || err_len.is_null() {
+        return TT_ARGUMENT;
+    }
+    unsafe {
+        *err = std::ptr::null_mut();
+        *err_len = 0;
+    }
+    let out = unsafe { std::slice::from_raw_parts_mut(dst, len) };
+    match runtime::d2h(src, out) {
+        Ok(()) => TT_OK,
+        Err(e) => fail(TT_DEVICE, &e.to_string(), err, err_len),
+    }
+}
+
+/// Run a module over its grid. `params` holds one DRAM address per kernel
+/// parameter, in program order; `nparams` must equal the module's count.
+///
+/// The launch is synchronous: every program has finished when this returns.
+///
+/// # Safety
+///
+/// `module`/`len` must be a module the library returned; `params` readable for
+/// `nparams` addresses; `err` and `err_len` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ttLaunch(
+    module: *const u8,
+    len: usize,
+    params: *const u64,
+    nparams: usize,
+    err: *mut *mut c_char,
+    err_len: *mut usize,
+) -> c_int {
+    if module.is_null() || len == 0 || err.is_null() || err_len.is_null() {
+        return TT_ARGUMENT;
+    }
+    if params.is_null() && nparams != 0 {
+        return TT_ARGUMENT;
+    }
+    unsafe {
+        *err = std::ptr::null_mut();
+        *err_len = 0;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(module, len) };
+    let m = match compile::Module::from_bytes(bytes) {
+        Ok(m) => m,
+        Err(e) => return fail(TT_INVALID, &e.to_string(), err, err_len),
+    };
+    let addresses = if nparams == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(params, nparams) }
+    };
+    match runtime::launch(&m, addresses) {
+        Ok(()) => TT_OK,
+        Err(e) => fail(TT_DEVICE, &e.to_string(), err, err_len),
+    }
+}
+
+/// Wait for a launch. A launch is synchronous, so this only reports whether a
+/// device is open.
+#[unsafe(no_mangle)]
+pub extern "C" fn ttSynchronize() -> c_int {
+    match runtime::synchronize() {
+        Ok(()) => TT_OK,
+        Err(e) => fail(TT_DEVICE, &e.to_string(), std::ptr::null_mut(), std::ptr::null_mut()),
+    }
+}
+
 fn fail(code: c_int, message: &str, err: *mut *mut c_char, err_len: *mut usize) -> c_int {
+    if err.is_null() || err_len.is_null() {
+        return code;
+    }
     let mut bytes = message.as_bytes().to_vec();
     bytes.push(0);
     let len = bytes.len();

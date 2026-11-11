@@ -72,11 +72,34 @@ void tt_free(uint8_t *ptr, size_t len);
 ```
 
 `ir` is the text form, or the byte form if it starts with `TTIR`. On success
-`out` is a module: magic `TTMD`, version, grid, then the reader, writer and
-T0/T1/T2 programs, each a word count and its words. On failure the code is
-non-zero, `out` is null, and `err` carries a message.
+`out` is a module: magic `TTMD`, version, grid, parameter count, then the
+reader, writer and T0/T1/T2 programs, each a word count and its words. On
+failure the code is non-zero, `out` is null, and `err` carries a message.
 
-The runtime calls — `ttInit`, `ttMemAlloc`, `ttLaunch` — are not there yet.
+The runtime:
+
+```c
+int ttInit(char **err, size_t *err_len);
+int ttRelease(void);
+
+int ttMemAlloc(size_t bytes, uint64_t *addr, char **err, size_t *err_len);
+int ttMemcpyH2D(uint64_t dst, const void *src, size_t len, char **err, size_t *err_len);
+int ttMemcpyD2H(void *dst, uint64_t src, size_t len, char **err, size_t *err_len);
+
+int ttLaunch(const uint8_t *module, size_t len,
+             const uint64_t *params, size_t nparams,
+             char **err, size_t *err_len);
+int ttSynchronize(void);
+```
+
+A buffer address is opaque: what `ttMemAlloc` hands back is what `ttMemcpy*`
+and `ttLaunch` take. A launch is synchronous — every program has finished when
+it returns — so `ttSynchronize` has nothing to wait for and only reports that a
+device is open. `ttRelease` closes the device; the simulator stays initialized,
+so a later `ttInit` opens a fresh device over it.
+
+The device is `libttsim` through `dlopen`: `$TT_TTSIM_LIB`, or
+`libttsim_bh.so` in the current directory. Nothing links it.
 
 ## Building and testing
 
@@ -107,16 +130,23 @@ the measure.
 | `mover` | the reader/writer RISC-V programs |
 | `riscv` | RV32IM encoders and the branch assembler |
 | `compile` | the pipeline, and the module bytes |
+| `device` | the simulator, the TLB window, DRAM/L1 access, core start |
+| `runtime` | the open device, allocations, transfers and the launch |
 | `abi` | the `extern "C"` surface |
 | `images` | the firmware images the build produced |
-
-`runtime` — the device, staging and dispatch — follows.
 
 ## Status
 
 - Program format, verifier, L1 placement, allocation, lowering, fusion, the math
-  encoder and the mover programs: in the tree.
-- `libTT.so` compiles a program and returns a module; the end-to-end test proves
-  it through `dlopen`.
-- The unpack and pack encoders are refused with a message, not guessed.
-- Nothing executes on a device yet: there is no launch.
+  encoder and the boundary programs: in the tree.
+- `libTT.so` compiles a program, allocates DRAM, moves host bytes in and out,
+  and runs a module on the simulator. A copy kernel — DRAM into L1 and back —
+  runs end to end through the C ABI, and the bytes come back equal.
+- A launch runs the reader and then the writer on RISCV B through the embedded
+  `exec_b` trampoline, which is the program's own order for a kernel with no
+  compute. A module with compute programs is refused rather than run half-way.
+- A launch is one Tensix tile: a module whose grid is larger than 1x1 is
+  refused.
+- The unpack and pack encoders are refused with a message, not guessed. Until
+  they exist no module has a compute program, so nothing is lost by the
+  refusal; the three compute cores get their launch after them.

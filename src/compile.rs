@@ -18,13 +18,16 @@ use crate::mover;
 use crate::optimize;
 use crate::planner::place;
 
-/// One compiled kernel: five programs and the grid they run over.
+/// One compiled kernel: five programs, the grid they run over, and how many
+/// launch arguments they take.
 #[derive(Debug, Clone, Default)]
 pub struct Module {
     pub grid: [u32; 2],
+    /// Kernel parameters the launch supplies an address for, in program order.
+    pub params: u32,
     /// The reader program (RISCV B), words.
     pub reader: Vec<u32>,
-    /// The writer program (RISCV NC), words.
+    /// The writer program (RISCV B), words.
     pub writer: Vec<u32>,
     /// The three compute programs, T0/T1/T2, words.
     pub cores: [Vec<u32>; 3],
@@ -33,17 +36,18 @@ pub struct Module {
 /// The byte form's magic.
 pub const MAGIC: [u8; 4] = *b"TTMD";
 /// The byte form's version.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 impl Module {
-    /// The module bytes: `TTMD`, version, grid, then the five programs
-    /// (reader, writer, T0, T1, T2), each a word count and its words.
+    /// The module bytes: `TTMD`, version, grid, parameter count, then the five
+    /// programs (reader, writer, T0, T1, T2), each a word count and its words.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&MAGIC);
         b.extend_from_slice(&VERSION.to_le_bytes());
         b.extend_from_slice(&self.grid[0].to_le_bytes());
         b.extend_from_slice(&self.grid[1].to_le_bytes());
+        b.extend_from_slice(&self.params.to_le_bytes());
         for words in [&self.reader, &self.writer, &self.cores[0], &self.cores[1], &self.cores[2]] {
             b.extend_from_slice(&(words.len() as u32).to_le_bytes());
             for w in words {
@@ -55,7 +59,7 @@ impl Module {
 
     /// Read the module bytes back. A wrong magic or version is refused.
     pub fn from_bytes(bytes: &[u8]) -> Result<Module, Error> {
-        if bytes.len() < 16 || bytes[..4] != MAGIC {
+        if bytes.len() < 20 || bytes[..4] != MAGIC {
             return Err(Error("not a TTMD module".into()));
         }
         let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
@@ -63,8 +67,8 @@ impl Module {
         if version != VERSION {
             return Err(Error(format!("module version {version} is not {VERSION}")));
         }
-        let mut m = Module { grid: [u32_at(8), u32_at(12)], ..Module::default() };
-        let mut at = 16usize;
+        let mut m = Module { grid: [u32_at(8), u32_at(12)], params: u32_at(16), ..Module::default() };
+        let mut at = 20usize;
         for slot in 0..5 {
             let n = u32_at(at) as usize;
             at += 4;
@@ -102,6 +106,7 @@ pub fn compile(k: &Kernel) -> Result<Module, Error> {
     let words = encode::encode(&machine)?;
     Ok(Module {
         grid: k.grid,
+        params: k.params.len() as u32,
         reader: mover::reader(k, &plan)?,
         writer: mover::writer(k, &plan)?,
         cores: words.words(),

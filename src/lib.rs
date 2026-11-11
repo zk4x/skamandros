@@ -18,6 +18,7 @@
 pub mod abi;
 pub mod alloc;
 pub mod compile;
+pub mod device;
 pub mod encode;
 pub mod images;
 pub mod ir;
@@ -27,5 +28,6 @@ pub mod mir;
 pub mod mover;
 pub mod planner;
 pub mod riscv;
+pub mod runtime;
 
 pub use ir::{Buf, BufKind, DType, Kernel, Op, Param, ParamKind, SfpuKind, ValueId};
