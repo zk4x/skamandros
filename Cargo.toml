@@ -11,6 +11,12 @@ description = "Tenstorrent kernel IR, allocator and driver. Builds libTT.so."
 name = "TT"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# The backend is the crate: on by default. The name is kept because the
+# firmware build script (copied from zyx) gates on it.
+default = ["tenstorrent"]
+tenstorrent = []
+
 [dependencies]
 tt-isa = { path = "../tt-isa" }
 libloading = "0.8"

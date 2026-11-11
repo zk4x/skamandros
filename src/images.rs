@@ -1,0 +1,56 @@
+// Copyright (C) 2025 zk4x
+// SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
+
+//! The firmware images, built from `firmware/tt-firmware` by `build.rs`.
+//!
+//! Each image is linked for one core and loaded at that core's reset PC (`link.x`,
+//! or its own slot for the three role images). `build.rs` also disassembles every
+//! image and refuses any instruction Blackhole does not implement, so an image
+//! here is known to be executable before anything runs it.
+//!
+//! This is what makes `libTT.so` self-contained: the consumer's build needs
+//! neither the RISC-V target nor llvm-objcopy, only this crate's build did.
+
+use tt_isa::tensix::Core;
+
+/// One image: the core it runs on, its bytes, and where it is loaded in L1.
+pub type Image = (Core, &'static [u8], u64);
+
+/// Where `link.x` places an image: RISCV T0's default reset PC, which every image
+/// but the role images and the per-core probes uses.
+pub const LOAD_ADDRESS: u64 = Core::T0.default_reset_pc() as u64;
+
+/// The three role images -- unpack on T0, math on T1, pack on T2 -- each linked
+/// at its own slot (`tt_isa::l1::roles`), so all three fit in one tile's L1 at
+/// once and each starts through its reset-PC override.
+pub const ROLES: [Image; 3] = [
+    (Core::T0, include_bytes!(env!("FIRMWARE_ROLE_T0")), tt_isa::l1::roles::BASE[0]),
+    (Core::T1, include_bytes!(env!("FIRMWARE_ROLE_T1")), tt_isa::l1::roles::BASE[1]),
+    (Core::T2, include_bytes!(env!("FIRMWARE_ROLE_T2")), tt_isa::l1::roles::BASE[2]),
+];
+
+/// The program executor: reads a staged program's address, length and arguments
+/// from the mailbox, invalidates the I-cache and calls it.
+pub const EXEC_B: &[u8] = include_bytes!(env!("FIRMWARE_EXEC_B"));
+
+/// RISCV NC's mover image (`tt_isa::dm::nc`), reached through the stub at NC's
+/// reset PC.
+pub const DM_NC: &[u8] = include_bytes!(env!("FIRMWARE_DM_NC"));
+
+/// RISCV B's data mover (`tt_isa::dm`), loaded at L1 offset 0.
+pub const DM_B: &[u8] = include_bytes!(env!("FIRMWARE_DM_B"));
+
+/// Every image this build produced, by name, with its load address.
+///
+/// The list exists so a test can name every image the build gate judged, rather
+/// than trusting that the one it embeds was among them.
+pub fn all() -> Vec<(&'static str, &'static [u8])> {
+    vec![
+        ("exec_b", EXEC_B),
+        ("dm_nc", DM_NC),
+        ("dm_b", DM_B),
+        ("role_t0", ROLES[0].1),
+        ("role_t1", ROLES[1].1),
+        ("role_t2", ROLES[2].1),
+    ]
+}

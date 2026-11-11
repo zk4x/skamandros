@@ -16,6 +16,7 @@
 //! bytes, and versioned ([`ir::VERSION`]).
 
 pub mod alloc;
+pub mod images;
 pub mod ir;
 pub mod mover;
 pub mod planner;
