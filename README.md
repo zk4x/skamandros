@@ -150,6 +150,12 @@ Every code has one meaning:
 | `TT_ERROR_MODULE` | the handle is not one this library handed out, or was already unloaded; nothing was done |
 | `TT_ERROR_UNSUPPORTED` | the program compiled, but this build cannot run it; nothing was done |
 | `TT_ERROR_DEVICE` | the device, a transfer or the launch failed; the only state that can be left unknown |
+| `TT_ERROR_PARSE` … | the concrete failure, one variant each: parse, version, not-`TTIR`, trailing input, buffer shape/zero dimension, undefined/out-of-scope/duplicate name, grid, implicit cast, offset, `endloop` without `loop`, `sel` condition, and the `TT_TODO_*` variants for the unimplemented lowering features |
+
+The enum in `src/status.rs` is the only error type: `ir::Error` is an alias for
+it, the variants are integers, and the ABI returns the variant. The
+`char **err` out-parameter carries the variant's name for a human; it is not the
+error channel.
 
 An error message is a NUL-terminated string the caller frees with `ttFree`; a
 null pointer there is a no-op.

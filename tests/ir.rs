@@ -71,7 +71,7 @@ fn a_buffer_shape_that_is_not_one_or_a_multiple_of_32_is_refused() {
     for shape in ["33,32", "32,33", "16,32"] {
         let text = format!("version 4\n%x = buffer f32 {shape}\ngrid 1,1\n");
         let err = Kernel::parse(&text).expect_err(shape);
-        assert!(err.to_string().contains("multiple of 32"), "{err}");
+        assert_eq!(err, TT::status::ttStatus::TT_ERROR_BUFFER_SHAPE, "{shape}");
     }
     // A buffer is always two-dimensional and always constant.
     for shape in ["32", "32,%d"] {
@@ -87,7 +87,7 @@ fn a_buffer_shape_that_is_not_one_or_a_multiple_of_32_is_refused() {
 fn a_zero_dimension_is_not_the_way_to_write_a_tensor() {
     let text = "version 4\n%p = param f32 0,32\ngrid 1,1\n";
     let err = Kernel::parse(text).expect_err("a zero in a dimension list");
-    assert!(err.to_string().contains("zero"), "{err}");
+    assert_eq!(err, TT::status::ttStatus::TT_ERROR_ZERO_DIMENSION);
 }
 
 #[test]
@@ -100,14 +100,14 @@ version 4
 grid 1,1
 ";
     let err = Kernel::parse(text).expect_err("mixed dtypes");
-    assert!(err.to_string().contains("no implicit cast"), "{err}");
+    assert_eq!(err, TT::status::ttStatus::TT_ERROR_NO_IMPLICIT_CAST);
 }
 
 #[test]
 fn a_use_before_its_definition_is_refused() {
     let text = "version 4\n%x = add %a %b\n%a = const i32 1\n%b = const i32 2\ngrid 1,1\n";
     let err = Kernel::parse(text).expect_err("undefined value");
-    assert!(err.to_string().contains("unknown value"), "{err}");
+    assert_eq!(err, TT::status::ttStatus::TT_ERROR_PARSE);
 }
 
 #[test]
@@ -122,21 +122,21 @@ endloop
 grid 1,1
 ";
     let err = Kernel::parse(text).expect_err("out of scope");
-    assert!(err.to_string().contains("out of scope"), "{err}");
+    assert_eq!(err, TT::status::ttStatus::TT_ERROR_VALUE_OUT_OF_SCOPE);
 }
 
 #[test]
 fn a_program_needs_exactly_one_grid() {
     let err = Kernel::parse("version 4\n%x = const i32 1\n").expect_err("no grid");
-    assert!(err.to_string().contains("no grid"), "{err}");
+    assert_eq!(err, TT::status::ttStatus::TT_ERROR_GRID);
     let err = Kernel::parse("version 4\ngrid 1,1\ngrid 2,2\n").expect_err("two grids");
-    assert!(err.to_string().contains("more than one grid"), "{err}");
+    assert_eq!(err, TT::status::ttStatus::TT_ERROR_GRID);
 }
 
 #[test]
 fn an_unknown_version_is_refused_in_both_forms() {
     let err = Kernel::parse("version 1\ngrid 1,1\n").expect_err("version 1");
-    assert!(err.to_string().contains("version 1"), "{err}");
+    assert_eq!(err, TT::status::ttStatus::TT_ERROR_VERSION);
 
     let mut bytes = Kernel::parse("version 4\ngrid 1,1\n%x = const i32 1\n")
         .unwrap()
@@ -144,16 +144,20 @@ fn an_unknown_version_is_refused_in_both_forms() {
     assert_eq!(&bytes[..4], b"TTIR");
     bytes[4] = 1;
     let err = Kernel::from_bytes(&bytes).expect_err("byte version 1");
-    assert!(err.to_string().contains("version"), "{err}");
+    assert_eq!(err, TT::status::ttStatus::TT_ERROR_VERSION);
     bytes[4] = 2;
     bytes[0] = b'X';
-    assert!(Kernel::from_bytes(&bytes).is_err(), "a wrong magic");
+    assert_eq!(
+        Kernel::from_bytes(&bytes),
+        Err(TT::status::ttStatus::TT_ERROR_NOT_TTIR),
+        "a wrong magic"
+    );
     let mut bytes = Kernel::parse("version 4\ngrid 1,1\n%x = const i32 1\n")
         .unwrap()
         .to_bytes();
     bytes.push(0);
     let err = Kernel::from_bytes(&bytes).expect_err("trailing byte");
-    assert!(err.to_string().contains("trailing"), "{err}");
+    assert_eq!(err, TT::status::ttStatus::TT_ERROR_TRAILING_INPUT);
 }
 
 /// A copy kernel over a two-page buffer: the compiler derives the mover
@@ -329,7 +333,7 @@ grid 1,1
 ";
     let k = Kernel::parse(DYNAMIC).expect("the dynamic loop parses");
     let err = TT::compile::compile(&k).expect_err("a dynamic loop is not lowered");
-    assert!(err.to_string().contains("loops are not lowered"), "{err}");
+    assert_eq!(err, TT::status::ttStatus::TT_TODO_LOOP);
 }
 
 /// Comparisons produce a `bool`, `sel` takes one, and `relu` is not an op:
@@ -354,9 +358,9 @@ grid 1,1
     // A bool condition is required, and a value with no bool is not one.
     let bad = "version 4\n%x = const i32 3\n%m = sel %x %x %x\ngrid 1,1\n";
     let err = Kernel::parse(bad).expect_err("an i32 condition is refused");
-    assert!(err.to_string().contains("not bool"), "{err}");
+    assert_eq!(err, TT::status::ttStatus::TT_ERROR_CONDITION_NOT_BOOL);
 
     let err = Kernel::parse("version 4\n%x = const i32 3\n%y = relu %x\ngrid 1,1\n")
         .expect_err("relu is not an op");
-    assert!(err.to_string().contains("relu"), "{err}");
+    assert_eq!(err, TT::status::ttStatus::TT_ERROR_PARSE);
 }

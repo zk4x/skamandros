@@ -29,6 +29,7 @@ pub mod optimize;
 pub mod planner;
 pub mod riscv;
 pub mod runtime;
+pub mod status;
 pub mod unroll;
 
 pub use ir::{DType, Dim, Kernel, Op, RegShape, Types, ValueId};

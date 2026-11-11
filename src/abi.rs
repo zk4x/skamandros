@@ -34,28 +34,10 @@ use std::sync::{Mutex, MutexGuard};
 use crate::compile::{self, Module};
 use crate::ir::Kernel;
 use crate::runtime;
+pub use crate::status::ttStatus;
 
 /// The ABI version this library implements.
 pub const ABI_VERSION: u32 = 2;
-
-/// What every call returns.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ttStatus {
-    /// Success. `*err` is null.
-    TT_OK = 0,
-    /// A caller mistake: a null required pointer, a zero length, a wrong
-    /// parameter count. Nothing was read or written.
-    TT_ERROR_ARGUMENT = 1,
-    /// The text or bytes were not a program this compiler accepts.
-    TT_ERROR_PROGRAM = 2,
-    /// The handle is not one this library handed out, or was already unloaded.
-    TT_ERROR_MODULE = 3,
-    /// The program compiled, but this build cannot run it yet.
-    TT_ERROR_UNSUPPORTED = 4,
-    /// The device, a transfer or the launch failed.
-    TT_ERROR_DEVICE = 5,
-}
 
 /// A compiled module. Opaque: the pointer is the handle, and its contents are
 /// the library's.
@@ -131,11 +113,11 @@ pub unsafe extern "C" fn ttCompile(
     };
     let kernel = match Kernel::parse(source) {
         Ok(k) => k,
-        Err(e) => return fail(ttStatus::TT_ERROR_PROGRAM, e.to_string(), err),
+        Err(e) => return fail(e, e.name().to_string(), err),
     };
     let module = match compile::compile(&kernel) {
         Ok(m) => m,
-        Err(e) => return fail(ttStatus::TT_ERROR_PROGRAM, e.to_string(), err),
+        Err(e) => return fail(e, e.name().to_string(), err),
     };
     unsafe { *out = add_module(module) };
     ttStatus::TT_OK
@@ -174,11 +156,11 @@ pub unsafe extern "C" fn ttModuleLoad(
     let bytes = unsafe { std::slice::from_raw_parts(bytes, len) };
     let kernel = match Kernel::from_bytes(bytes) {
         Ok(k) => k,
-        Err(e) => return fail(ttStatus::TT_ERROR_PROGRAM, e.to_string(), err),
+        Err(e) => return fail(e, e.name().to_string(), err),
     };
     let module = match compile::compile(&kernel) {
         Ok(m) => m,
-        Err(e) => return fail(ttStatus::TT_ERROR_PROGRAM, e.to_string(), err),
+        Err(e) => return fail(e, e.name().to_string(), err),
     };
     unsafe { *out = add_module(module) };
     ttStatus::TT_OK

@@ -49,9 +49,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             | Op::Grid { .. }
             | Op::CopyTo { .. } => {}
             Op::Loop { .. } | Op::EndLoop => {
-                return Err(Error(format!(
-                    "op {at}: loops are not lowered yet; the parser and verifier accept them"
-                )));
+                let _ = at;
+                return Err(Error::TT_TODO_LOOP);
             }
             Op::Load {
                 value,

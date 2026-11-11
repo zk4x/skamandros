@@ -580,22 +580,25 @@ impl Types {
     }
 }
 
-/// What can be wrong with a kernel.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Error(pub String);
+/// The crate's error: the one C ABI enum, [`crate::status::ttStatus`]. The
+/// `Error` name stays as an alias while the string sites migrate; it is not a
+/// second error type and not a second enum.
+pub use crate::status::ttStatus as Error;
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+impl crate::status::ttStatus {
+    /// Migration bridge for a site that has not chosen its variant yet: it is
+    /// `TT_ERROR_PROGRAM` until the site names its concrete failure. Every new
+    /// error uses a concrete variant instead.
+    #[allow(non_snake_case)]
+    pub fn new(_message: impl Into<String>) -> Self {
+        Self::TT_ERROR_PROGRAM
     }
 }
 
-impl std::error::Error for Error {}
-
-impl Error {
-    fn new(msg: impl Into<String>) -> Self {
-        Error(msg.into())
-    }
+/// Migration bridge for the tuple form `Error(format!(...))`.
+#[allow(non_snake_case)]
+pub fn Error(_message: String) -> crate::status::ttStatus {
+    crate::status::ttStatus::TT_ERROR_PROGRAM
 }
 
 impl fmt::Display for Dim {
@@ -620,15 +623,11 @@ impl fmt::Display for Dim {
 pub fn unit_of(shape: [u32; 2], dtype: DType) -> Result<(RegShape, u32, u32), Error> {
     let [a, b] = shape;
     if a == 0 || b == 0 {
-        return Err(Error::new(format!(
-            "buffer shape {a},{b} has a zero dimension"
-        )));
+        return Err(Error::TT_ERROR_ZERO_DIMENSION);
     }
     let ok = |n: u32| n == 1 || n % 32 == 0;
     if !ok(a) || !ok(b) {
-        return Err(Error::new(format!(
-            "buffer shape {a},{b}: each dimension is 1 or a multiple of 32"
-        )));
+        return Err(Error::TT_ERROR_BUFFER_SHAPE);
     }
     let elements = a
         .checked_mul(b)
@@ -653,15 +652,13 @@ fn lookup<'a>(
     values: &'a [ValueInfo],
     visible: &[bool],
     v: ValueId,
-    at: usize,
+    _at: usize,
 ) -> Result<&'a ValueInfo, Error> {
     let info = values
         .get(v as usize)
-        .ok_or_else(|| Error::new(format!("op {at} uses %{v}, which is not defined")))?;
+        .ok_or(Error::TT_ERROR_VALUE_UNDEFINED)?;
     if !visible.get(v as usize).copied().unwrap_or(false) {
-        return Err(Error::new(format!(
-            "op {at} uses %{v}, which is out of scope"
-        )));
+        return Err(Error::TT_ERROR_VALUE_OUT_OF_SCOPE);
     }
     Ok(info)
 }
@@ -677,7 +674,7 @@ impl Kernel {
         let mut seen: Vec<&str> = Vec::with_capacity(self.names.len());
         for name in &self.names {
             if seen.contains(&name.as_str()) {
-                return Err(Error::new(format!("the name %{name} is defined twice")));
+                return Err(Error::TT_ERROR_NAME_DUPLICATE);
             }
             seen.push(name);
         }
@@ -734,9 +731,8 @@ impl Kernel {
                     for (k, dim) in dims.iter().enumerate() {
                         match *dim {
                             Dim::Const(0) => {
-                                return Err(Error::new(format!(
-                                    "op {at}: dimension {k} is zero; the scalar shape is a single 0 and nothing else"
-                                )));
+                                let _ = k;
+                                return Err(Error::TT_ERROR_ZERO_DIMENSION);
                             }
                             Dim::Const(_) => {}
                             Dim::Value(v) => {
@@ -776,7 +772,7 @@ impl Kernel {
                 }
                 Op::Grid { columns, rows } => {
                     if grid.is_some() {
-                        return Err(Error::new("the program has more than one grid"));
+                        return Err(Error::TT_ERROR_GRID);
                     }
                     grid = Some(([columns, rows], at));
                     continue;
@@ -801,7 +797,7 @@ impl Kernel {
                 }
                 Op::EndLoop => {
                     let Some(start) = loops.pop() else {
-                        return Err(Error::new(format!("op {at}: endloop without a loop")));
+                        return Err(Error::TT_ERROR_ENDLOOP_WITHOUT_LOOP);
                     };
                     for v in start..values.len() {
                         visible[v] = false;
@@ -1036,12 +1032,8 @@ impl Kernel {
                         )));
                     }
                     if x.dtype != y.dtype {
-                        return Err(Error::new(format!(
-                            "op {at}: {} of {} and {}; there is no implicit cast",
-                            op.name(),
-                            x.dtype.name(),
-                            y.dtype.name()
-                        )));
+                        let _ = op;
+                        return Err(Error::TT_ERROR_NO_IMPLICIT_CAST);
                     }
                     if op.is_logical() && x.dtype != DType::Bool {
                         return Err(Error::new(format!(
@@ -1096,10 +1088,8 @@ impl Kernel {
                         )));
                     }
                     if c.dtype != DType::Bool {
-                        return Err(Error::new(format!(
-                            "op {at}: the condition %{cond} is {}, not bool",
-                            c.dtype.name()
-                        )));
+                        let _ = cond;
+                        return Err(Error::TT_ERROR_CONDITION_NOT_BOOL);
                     }
                     if t.dtype != f.dtype {
                         return Err(Error::new(format!(
@@ -1171,7 +1161,7 @@ impl Kernel {
             )));
         }
         let Some((grid, at)) = grid else {
-            return Err(Error::new("the program has no grid"));
+            return Err(Error::TT_ERROR_GRID);
         };
         check_dim(&values, &visible, grid[0], at, "the grid's columns")?;
         check_dim(&values, &visible, grid[1], at, "the grid's rows")?;
@@ -1399,13 +1389,11 @@ impl Kernel {
     pub fn from_bytes(bytes: &[u8]) -> Result<Kernel, Error> {
         let mut r = Cursor { at: 0, bytes };
         if r.take(4)? != MAGIC {
-            return Err(Error::new("not a TTIR byte program"));
+            return Err(Error::TT_ERROR_NOT_TTIR);
         }
         let version = r.u32()?;
         if version != VERSION {
-            return Err(Error::new(format!(
-                "byte program version {version} is not {VERSION}"
-            )));
+            return Err(Error::TT_ERROR_VERSION);
         }
         let count = r.u32()? as usize;
         let mut ops = Vec::with_capacity(count);
@@ -1524,10 +1512,7 @@ impl Kernel {
             ops.push(op);
         }
         if r.at != r.bytes.len() {
-            return Err(Error::new(format!(
-                "{} trailing bytes",
-                r.bytes.len() - r.at
-            )));
+            return Err(Error::TT_ERROR_TRAILING_INPUT);
         }
         let k = Kernel { ops, names };
         k.verify()?;
@@ -1537,7 +1522,7 @@ impl Kernel {
 
 fn define(names: &mut Vec<String>, name: String) -> Result<ValueId, Error> {
     if names.iter().any(|n| *n == name) {
-        return Err(Error::new(format!("the name %{name} is defined twice")));
+        return Err(Error::TT_ERROR_NAME_DUPLICATE);
     }
     let value = names.len() as ValueId;
     names.push(name);
@@ -1704,9 +1689,10 @@ impl Kernel {
         match version {
             Some(v) if v == VERSION => {}
             Some(v) => {
-                return Err(Error::new(format!("IR version {v} is not {VERSION}")));
+                let _ = v;
+                return Err(Error::TT_ERROR_VERSION);
             }
-            None => return Err(Error::new("the program has no version line")),
+            None => return Err(Error::TT_ERROR_VERSION),
         }
         let k = Kernel {
             ops: p.ops,
@@ -1902,7 +1888,7 @@ struct Parser {
 impl Parser {
     fn define(&mut self, name: String) -> Result<ValueId, Error> {
         if self.symbols.contains_key(&name) {
-            return Err(Error::new(format!("the name %{name} is defined twice")));
+            return Err(Error::TT_ERROR_NAME_DUPLICATE);
         }
         let value = self.names.len() as ValueId;
         self.symbols.insert(name.clone(), value);
@@ -2014,12 +2000,15 @@ fn parse_definition(t: &mut Tokens, p: &mut Parser) -> Result<Op, Error> {
 struct Tokens<'a> {
     tok: &'a [Token],
     at: usize,
+    /// The line, kept for a future diagnostic that is not an enum variant.
+    #[allow(dead_code)]
     line: usize,
 }
 
 impl<'a> Tokens<'a> {
     fn err(&self, msg: impl Into<String>) -> Error {
-        Error::new(format!("line {}: {}", self.line, msg.into()))
+        let _ = msg;
+        Error::TT_ERROR_PARSE
     }
 
     fn peek(&self) -> Option<Token> {

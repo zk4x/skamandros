@@ -188,10 +188,8 @@ pub fn check_roles(k: &Kernel, types: &Types) -> Result<(), Error> {
             None => slot[buffer as usize] = Some(role),
             Some(previous) if previous == role => {}
             Some(previous) => {
-                return Err(Error(format!(
-                    "op {at}: buffer %{buffer} already has {previous} as its {}; a circular buffer has one producer and one consumer",
-                    if publishes { "producer" } else { "consumer" }
-                )));
+                let _ = (at, previous, role, publishes);
+                return Err(Error::TT_TODO_MULTI_PRODUCER_OR_CONSUMER);
             }
         }
     }
@@ -206,15 +204,9 @@ pub fn check_roles(k: &Kernel, types: &Types) -> Result<(), Error> {
             // A pure transfer (DRAM to DRAM through one page) has no compute:
             // the reader publishes and the writer drains the same buffer.
             | (Some("the reader"), Some("the writer")) => {}
-            (Some(p), Some(c)) => {
-                return Err(Error(format!(
-                    "buffer %{value} is published by {p} and consumed by {c}; a circular buffer is reader/unpacker, packer/writer or a pure reader/writer transfer"
-                )));
-            }
             _ => {
-                return Err(Error(format!(
-                    "buffer %{value} needs one producer and one consumer (a copy in and a load, or a store and a copy out)"
-                )));
+                let _ = (value, pair);
+                return Err(Error::TT_TODO_CIRCULAR_BUFFER_ROLE);
             }
         }
     }
