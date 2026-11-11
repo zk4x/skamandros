@@ -10,7 +10,7 @@
 //! buffer fed by two copies with different residues is refused rather than
 //! silently misaligned.
 
-use crate::ir::{BufKind, Error, Kernel, Op};
+use crate::ir::{BufKind, Error, Kernel, Layout, Op};
 
 /// Where each declared buffer lives in L1.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,11 +67,32 @@ pub fn place(k: &Kernel) -> Result<Plan, Error> {
                 "circular buffer {id}: a page move needs a {ALIGN}-byte read offset"
             )));
         }
+        if let Layout::TileMajor = b.layout {
+            // A tile-major buffer holds the datum blocks of whole tiles, and a
+            // tile image's datums start 16 bytes into its DRAM page: every copy
+            // that touches it must name that offset, so the two sides stay
+            // congruent.
+            for (at, op) in k.ops.iter().enumerate() {
+                let offset = match *op {
+                    Op::CopyIn { buf, offset, .. } | Op::CopyOut { buf, offset, .. } if buf == id as u32 => offset,
+                    _ => continue,
+                };
+                if offset % ALIGN != tt_isa::dm::TILE_DATA as u32 % ALIGN {
+                    return Err(Error(format!(
+                        "op {at}: a tile-major buffer is copied from a datum block (offset ≡ {TILE_DATA} mod {ALIGN}), not {offset}",
+                        TILE_DATA = tt_isa::dm::TILE_DATA,
+                    )));
+                }
+            }
+        }
     }
     let mut at = tt_isa::l1::DATA.base as u32;
     let mut buf = Vec::with_capacity(k.bufs.len());
     for (id, b) in k.bufs.iter().enumerate() {
-        let want = read64[id].or(write16[id]).unwrap_or(0);
+        let want = match b.layout {
+            Layout::TileMajor => tt_isa::dm::TILE_DATA as u32 % ALIGN,
+            Layout::RowMajor => read64[id].or(write16[id]).unwrap_or(0),
+        };
         let base = at.div_ceil(ALIGN) * ALIGN + want;
         let end = base
             .checked_add(b.bytes)
@@ -98,8 +119,8 @@ mod tests {
 version 1
 grid 1 1
 param in f32 8192
-buf 0 4096 plain
-buf 1 4096 plain
+buf 0 4096 plain rm
+buf 1 4096 plain rm
 copy_in param 0 offset 64 len 4096 buf 0
 copy_in param 0 offset 96 len 4096 buf 1
 ";
@@ -116,7 +137,7 @@ copy_in param 0 offset 96 len 4096 buf 1
 version 1
 grid 1 1
 param in f32 8192
-buf 0 4096 plain
+buf 0 4096 plain rm
 copy_in param 0 offset 0 len 4096 buf 0
 copy_in param 0 offset 64 len 4096 buf 0
 ";
@@ -127,7 +148,7 @@ copy_in param 0 offset 64 len 4096 buf 0
 version 1
 grid 1 1
 param in f32 8192
-buf 0 4096 plain
+buf 0 4096 plain rm
 copy_in param 0 offset 0 len 4096 buf 0
 copy_in param 0 offset 32 len 4096 buf 0
 ";
@@ -136,9 +157,50 @@ copy_in param 0 offset 32 len 4096 buf 0
     }
 
     #[test]
+    fn a_tile_major_buffer_is_placed_at_the_datum_offset() {
+        let text = "\
+version 1
+grid 1 1
+param in f32 8192
+buf 0 4096 plain tile
+copy_in param 0 offset 16 len 4096 buf 0
+";
+        let k = Kernel::parse(text).unwrap();
+        let plan = place(&k).unwrap();
+        assert_eq!(plan.buf[0] % 64, tt_isa::dm::TILE_DATA as u32 % 64);
+    }
+
+    #[test]
+    fn a_tile_major_buffer_copied_from_a_tile_header_is_refused() {
+        let text = "\
+version 1
+grid 1 1
+param in f32 8192
+buf 0 4096 plain tile
+copy_in param 0 offset 0 len 4096 buf 0
+";
+        let k = Kernel::parse(text).unwrap();
+        let err = place(&k).expect_err("header offset");
+        assert!(err.to_string().contains("datum block"), "{err}");
+    }
+
+    #[test]
+    fn a_tile_major_buffer_of_partial_tiles_is_refused() {
+        let text = "\
+version 1
+grid 1 1
+param in f32 8192
+buf 0 4000 plain tile
+copy_in param 0 offset 16 len 4000 buf 0
+";
+        let err = Kernel::parse(text).expect_err("partial tile");
+        assert!(err.to_string().contains("whole 4096-byte tiles"), "{err}");
+    }
+
+    #[test]
     fn the_arena_end_is_enforced() {
         let mut text = String::from("version 1\ngrid 1 1\nparam in f32 100000000\n");
-        text.push_str("buf 0 100000000 plain\ncopy_in param 0 offset 0 len 4096 buf 0\n");
+        text.push_str("buf 0 100000000 plain rm\ncopy_in param 0 offset 0 len 4096 buf 0\n");
         let k = Kernel::parse(&text).unwrap();
         let err = place(&k).expect_err("does not fit");
         assert!(err.to_string().contains("data arena"), "{err}");

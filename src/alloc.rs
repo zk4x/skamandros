@@ -200,8 +200,8 @@ version 1
 grid 1 1
 param in f32 4096
 param out f32 4096
-buf 0 4096 plain
-buf 1 4096 plain
+buf 0 4096 plain rm
+buf 1 4096 plain rm
 copy_in param 0 offset 0 len 4096 buf 0
 %0 = unpack buf 0
 %1 = sfpu neg %0
@@ -236,9 +236,9 @@ copy_out buf 1 param 1 offset 0 len 4096
 version 1
 grid 1 1
 param in f32 8192
-buf 0 4096 plain
-buf 1 4096 plain
-buf 2 4096 plain
+buf 0 4096 plain rm
+buf 1 4096 plain rm
+buf 2 4096 plain rm
 copy_in param 0 offset 0 len 4096 buf 0
 copy_in param 0 offset 4096 len 4096 buf 1
 %0 = unpack buf 0
@@ -257,9 +257,9 @@ pack %2 buf 2
     fn nine_live_dst_values_are_refused() {
         let mut text = String::from("version 1\ngrid 1 1\nparam in f32 4096\nparam out f32 4096\n");
         for b in 0..9 {
-            text.push_str(&format!("buf {b} 4096 plain\n"));
+            text.push_str(&format!("buf {b} 4096 plain rm\n"));
         }
-        text.push_str("buf 9 4096 plain\n");
+        text.push_str("buf 9 4096 plain rm\n");
         for b in 0..9 {
             text.push_str(&format!("copy_in param 0 offset 0 len 4096 buf {b}\n"));
         }
@@ -284,8 +284,8 @@ pack %2 buf 2
 version 1
 grid 1 1
 param in f32 4096
-buf 0 4096 plain
-buf 1 4096 plain
+buf 0 4096 plain rm
+buf 1 4096 plain rm
 copy_in param 0 offset 0 len 4096 buf 0
 %0 = unpack buf 0
 %1 = matmul %0 %0

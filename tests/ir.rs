@@ -11,8 +11,8 @@ version 1
 grid 1 1
 param in f32 4096
 param out f32 4096
-buf 0 4096 plain
-buf 1 4096 plain
+buf 0 4096 plain rm
+buf 1 4096 plain rm
 copy_in param 0 offset 0 len 4096 buf 0
 %0 = unpack buf 0
 %1 = sfpu neg %0
@@ -44,7 +44,7 @@ version 1
 grid 2 3
 param in f32 8192
 param out f32 8192
-buf 0 4096 circ 2
+buf 0 4096 circ 2 rm
 copy_in param 0 offset 0 len 4096 buf 0
 reserve 0 1
 push 0 1
@@ -59,7 +59,7 @@ pop 0 1
 
 #[test]
 fn a_use_before_its_definition_is_refused() {
-    let text = "version 1\ngrid 1 1\nparam out f32 4096\nbuf 0 4096 plain\n%0 = sfpu neg %1\n";
+    let text = "version 1\ngrid 1 1\nparam out f32 4096\nbuf 0 4096 plain rm\n%0 = sfpu neg %1\n";
     let err = Kernel::parse(text).expect_err("undefined value");
     assert!(err.to_string().contains("%1"), "{err}");
 }
@@ -93,7 +93,7 @@ fn a_copy_past_its_parameter_is_refused() {
 version 1
 grid 1 1
 param in f32 4096
-buf 0 4096 plain
+buf 0 4096 plain rm
 copy_in param 0 offset 4096 len 4096 buf 0
 ";
     let err = Kernel::parse(text).expect_err("copy past param");
@@ -102,14 +102,14 @@ copy_in param 0 offset 4096 len 4096 buf 0
 
 #[test]
 fn sync_on_a_plain_buffer_is_refused() {
-    let text = "version 1\ngrid 1 1\nparam in f32 4096\nbuf 0 4096 plain\nreserve 0 1\n";
+    let text = "version 1\ngrid 1 1\nparam in f32 4096\nbuf 0 4096 plain rm\nreserve 0 1\n";
     let err = Kernel::parse(text).expect_err("reserve on plain");
     assert!(err.to_string().contains("not a circular"), "{err}");
 }
 
 #[test]
 fn more_pages_than_the_buffer_holds_is_refused() {
-    let text = "version 1\ngrid 1 1\nparam in f32 8192\nbuf 0 8192 circ 2\npush 0 3\n";
+    let text = "version 1\ngrid 1 1\nparam in f32 8192\nbuf 0 8192 circ 2 rm\npush 0 3\n";
     let err = Kernel::parse(text).expect_err("overfill");
     assert!(err.to_string().contains("3 pages"), "{err}");
 }

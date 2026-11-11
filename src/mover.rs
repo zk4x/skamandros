@@ -152,8 +152,8 @@ version 1
 grid 1 1
 param in f32 8192
 param out f32 8192
-buf 0 4096 plain
-buf 1 4096 plain
+buf 0 4096 plain rm
+buf 1 4096 plain rm
 copy_in param 0 offset 0 len 4096 buf 0
 copy_out buf 1 param 1 offset 64 len 4096
 ";

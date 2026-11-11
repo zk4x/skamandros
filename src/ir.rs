@@ -79,11 +79,39 @@ pub enum BufKind {
     Circular { pages: u8 },
 }
 
+/// How the datums of an L1 buffer are laid out.
+///
+/// A row-major buffer is a contiguous run of datums. A tile-major buffer is a
+/// sequence of 32x32 tile images: 4096 bytes of datums per tile, the four 16x16
+/// faces in face order (`TILE_SLOT`'s body, without the DRAM header). The
+/// unpacker's descriptor and the packer's address generator are configured from
+/// this, so it is part of the program, not of the driver's policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// Datums in row order, no tiling.
+    RowMajor,
+    /// A sequence of 32x32 tile images, faces in face order.
+    TileMajor,
+}
+
+impl Layout {
+    fn name(self) -> &'static str {
+        match self {
+            Layout::RowMajor => "rm",
+            Layout::TileMajor => "tile",
+        }
+    }
+}
+
+/// Bytes of one tile-major tile's datums (`16*16*4` per face, four faces).
+pub const TILE_BYTES: u32 = 4096;
+
 /// One declared L1 buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Buf {
     pub bytes: u32,
     pub kind: BufKind,
+    pub layout: Layout,
 }
 
 /// The elementwise operations the IR names.
@@ -260,6 +288,16 @@ impl Kernel {
                 Op::Sfpu { .. } | Op::Matmul { .. } => {}
             }
         }
+        for (id, b) in self.bufs.iter().enumerate() {
+            if let Layout::TileMajor = b.layout {
+                if b.bytes == 0 || b.bytes % TILE_BYTES != 0 {
+                    return Err(Error::new(format!(
+                        "buffer {id}: a tile-major buffer holds whole {TILE_BYTES}-byte tiles, not {} bytes",
+                        b.bytes
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -318,6 +356,10 @@ impl Kernel {
                     b.push(pages);
                 }
             }
+            b.push(match buf.layout {
+                Layout::RowMajor => 0,
+                Layout::TileMajor => 1,
+            });
         }
         put_u32(&mut b, self.ops.len() as u32);
         for op in &self.ops {
@@ -427,7 +469,12 @@ impl Kernel {
                 1 => BufKind::Circular { pages },
                 other => return Err(Error::new(format!("buffer kind {other}"))),
             };
-            k.bufs.push(Buf { bytes, kind });
+            let layout = match r.u8()? {
+                0 => Layout::RowMajor,
+                1 => Layout::TileMajor,
+                other => return Err(Error::new(format!("buffer layout {other}"))),
+            };
+            k.bufs.push(Buf { bytes, kind, layout });
         }
         for _ in 0..r.u32()? {
             let op = match r.u8()? {
@@ -596,7 +643,12 @@ impl Kernel {
                         "circ" => BufKind::Circular { pages: num(&mut it, at)? },
                         other => return Err(Error::new(format!("line {at}: unknown buffer kind `{other}`"))),
                     };
-                    k.bufs.push(Buf { bytes, kind });
+                    let layout = match it.next().ok_or_else(|| Error::new(format!("line {at}: missing buffer layout")))? {
+                        "rm" => Layout::RowMajor,
+                        "tile" => Layout::TileMajor,
+                        other => return Err(Error::new(format!("line {at}: unknown buffer layout `{other}`"))),
+                    };
+                    k.bufs.push(Buf { bytes, kind, layout });
                 }
                 "copy_in" => {
                     expect(&mut it, "param", at)?;
@@ -658,10 +710,11 @@ impl Kernel {
             s.push_str(&format!("param {} {} {}\n", p.kind.name(), p.dtype.name(), p.bytes));
         }
         for (id, b) in self.bufs.iter().enumerate() {
-            match b.kind {
-                BufKind::Plain => s.push_str(&format!("buf {id} {} plain\n", b.bytes)),
-                BufKind::Circular { pages } => s.push_str(&format!("buf {id} {} circ {pages}\n", b.bytes)),
-            }
+            let kind = match b.kind {
+                BufKind::Plain => "plain".to_string(),
+                BufKind::Circular { pages } => format!("circ {pages}"),
+            };
+            s.push_str(&format!("buf {id} {} {kind} {}\n", b.bytes, b.layout.name()));
         }
         for op in &self.ops {
             match *op {

@@ -144,8 +144,8 @@ version 1
 grid 1 1
 param in f32 4096
 param out f32 4096
-buf 0 4096 plain
-buf 1 4096 plain
+buf 0 4096 plain rm
+buf 1 4096 plain rm
 copy_in param 0 offset 0 len 4096 buf 0
 %0 = unpack buf 0
 %1 = sfpu neg %0
