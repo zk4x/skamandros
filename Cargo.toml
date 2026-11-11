@@ -12,6 +12,6 @@ name = "TT"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-tt-isa = { git = "https://github.com/zk4x/tt-isa" }
+tt-isa = { path = "../tt-isa" }
 libloading = "0.8"
 libc = "0.2"

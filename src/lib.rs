@@ -1,6 +1,9 @@
 // Copyright (C) 2025 zk4x
 // SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
 
+// The artifact is `libTT.so`, so the crate is `TT`.
+#![allow(non_snake_case)]
+
 //! The Tenstorrent kernel compiler and driver.
 //!
 //! One semantic SSA program in ([`ir`]), a set of role programs and a launch
@@ -13,5 +16,8 @@
 //! bytes, and versioned ([`ir::VERSION`]).
 
 pub mod ir;
+pub mod mover;
+pub mod planner;
+pub mod riscv;
 
 pub use ir::{Buf, BufKind, DType, Kernel, Op, Param, ParamKind, SfpuKind, ValueId};
