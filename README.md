@@ -85,6 +85,10 @@ cargo build          # target/debug/libTT.so
 cargo test           # unit tests and the end-to-end suite
 ```
 
+The end-to-end suite loads `target/<profile>/libTT.so`, so build the library
+before running it (`cargo build && cargo test`); `cargo test` alone does not
+rebuild the `cdylib` if only its Rust sources changed.
+
 The measure is the end-to-end suite (`tests/e2e.rs`): it `dlopen`s the built
 `libTT.so` with `libloading` — nothing links the Rust library — and drives the C
 ABI exactly as a consumer would. Unit tests exist under the modules; they are not

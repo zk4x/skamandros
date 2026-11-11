@@ -70,6 +70,46 @@ fn the_so_compiles_a_program_through_the_c_abi() {
 }
 
 #[test]
+fn a_module_can_be_decoded_through_the_c_abi() {
+    let path = library_path();
+    let lib = unsafe { Library::new(&path) }.unwrap_or_else(|e| panic!("dlopen {}: {e}", path.display()));
+    let compile: Symbol<Compile> = unsafe { lib.get(b"tt_compile\0") }.expect("tt_compile");
+    let free: Symbol<Free> = unsafe { lib.get(b"tt_free\0") }.expect("tt_free");
+    let grid: Symbol<unsafe extern "C" fn(*const u8, usize, *mut u32, *mut u32) -> c_int> =
+        unsafe { lib.get(b"tt_module_grid\0") }.expect("tt_module_grid");
+    let program: Symbol<unsafe extern "C" fn(*const u8, usize, u32, *mut u32, usize, *mut usize) -> c_int> =
+        unsafe { lib.get(b"tt_module_program\0") }.expect("tt_module_program");
+
+    let (mut out, mut out_len) = (std::ptr::null_mut(), 0usize);
+    let (mut err, mut err_len) = (std::ptr::null_mut(), 0usize);
+    let code = unsafe { compile(COPY.as_ptr(), COPY.len(), &mut out, &mut out_len, &mut err, &mut err_len) };
+    assert_eq!(code, 0, "the copy kernel compiles");
+
+    let (mut gx, mut gy) = (0u32, 0u32);
+    assert_eq!(unsafe { grid(out, out_len, &mut gx, &mut gy) }, 0);
+    assert_eq!((gx, gy), (1, 1), "the grid a module launches over");
+
+    // Query the reader program's length, then fetch it into a caller buffer.
+    let mut len = 0usize;
+    assert_eq!(unsafe { program(out, out_len, 0, std::ptr::null_mut(), 0, &mut len) }, 0);
+    assert!(len > 0, "the reader program has words");
+    let mut words = vec![0u32; len];
+    assert_eq!(unsafe { program(out, out_len, 0, words.as_mut_ptr(), words.len(), &mut len) }, 0);
+    assert_eq!(len, words.len());
+    assert_eq!(*words.last().unwrap(), 0x0000_8067, "the reader ends in ret");
+
+    // A core with no program reports length 0, and a sixth core is refused.
+    let mut empty = 0usize;
+    assert_eq!(unsafe { program(out, out_len, 2, std::ptr::null_mut(), 0, &mut empty) }, 0);
+    assert_eq!(empty, 0, "a copy kernel has no T0 program");
+    assert_ne!(unsafe { program(out, out_len, 5, std::ptr::null_mut(), 0, &mut empty) }, 0);
+    // A buffer too small is an error, not a truncation.
+    assert_ne!(unsafe { program(out, out_len, 0, words.as_mut_ptr(), words.len() - 1, &mut len) }, 0);
+
+    unsafe { free(out, out_len) };
+}
+
+#[test]
 fn a_refused_program_comes_back_as_an_error_not_a_crash() {
     let path = library_path();
     let lib = unsafe { Library::new(&path) }.unwrap_or_else(|e| panic!("dlopen {}: {e}", path.display()));

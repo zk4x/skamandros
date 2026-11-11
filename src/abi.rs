@@ -107,6 +107,82 @@ pub unsafe extern "C" fn tt_free(ptr: *mut u8, len: usize) {
     }
 }
 
+/// The grid a module launches over.
+///
+/// # Safety
+///
+/// `module`/`len` must be a module the library returned, and the two out
+/// pointers writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tt_module_grid(
+    module: *const u8,
+    len: usize,
+    x: *mut u32,
+    y: *mut u32,
+) -> c_int {
+    if module.is_null() || len == 0 || x.is_null() || y.is_null() {
+        return TT_ARGUMENT;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(module, len) };
+    match compile::Module::from_bytes(bytes) {
+        Ok(m) => {
+            unsafe {
+                *x = m.grid[0];
+                *y = m.grid[1];
+            }
+            TT_OK
+        }
+        Err(_) => TT_INVALID,
+    }
+}
+
+/// Copy one of a module's five programs into the caller's buffer.
+///
+/// `core` is `0` reader, `1` writer, `2` T0, `3` T1, `4` T2. The words are copied
+/// into `out` (at most `cap` of them) and the program's true length is written to
+/// `out_len`; a shorter buffer is an error, never a truncation.
+///
+/// # Safety
+///
+/// `module`/`len` must be a module the library returned; `out` must be writable
+/// for `cap` words; `out_len` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tt_module_program(
+    module: *const u8,
+    len: usize,
+    core: u32,
+    out: *mut u32,
+    cap: usize,
+    out_len: *mut usize,
+) -> c_int {
+    if module.is_null() || len == 0 || out_len.is_null() {
+        return TT_ARGUMENT;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(module, len) };
+    let m = match compile::Module::from_bytes(bytes) {
+        Ok(m) => m,
+        Err(_) => return TT_INVALID,
+    };
+    let words: &[u32] = match core {
+        0 => &m.reader,
+        1 => &m.writer,
+        2..=4 => &m.cores[core as usize - 2],
+        _ => return TT_ARGUMENT,
+    };
+    unsafe { *out_len = words.len() };
+    // A null `out` is a length query.
+    if out.is_null() {
+        return TT_OK;
+    }
+    if words.len() > cap {
+        return TT_ARGUMENT;
+    }
+    if !words.is_empty() {
+        unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), out, words.len()) };
+    }
+    TT_OK
+}
+
 fn fail(code: c_int, message: &str, err: *mut *mut c_char, err_len: *mut usize) -> c_int {
     let mut bytes = message.as_bytes().to_vec();
     bytes.push(0);
