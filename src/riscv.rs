@@ -247,7 +247,7 @@ pub mod cb {
         a.li(t, n);
         a.word(lhu(u, p, COUNTERS + 2));
         a.word(add(u, u, t));
-        a.word(sh(p, u, COUNTERS + 2));
+        a.word(sh(u, p, COUNTERS + 2));
         advance(a, p, WR_PTR, t, v);
     }
 
@@ -258,7 +258,7 @@ pub mod cb {
         a.li(t, n);
         a.word(lhu(u, p, COUNTERS));
         a.word(add(u, u, t));
-        a.word(sh(p, u, COUNTERS));
+        a.word(sh(u, p, COUNTERS));
         advance(a, p, RD_PTR, t, v);
     }
 
@@ -269,13 +269,13 @@ pub mod cb {
         a.word(mul(scratch, scratch, n));
         a.word(lw(n, p, ptr));
         a.word(add(n, n, scratch));
-        a.word(sw(p, n, ptr));
+        a.word(sw(n, p, ptr));
         a.word(lw(scratch, p, LIMIT));
         let done = a.fresh_label();
         a.bne_label(n, scratch, done.clone());
         a.word(lw(scratch, p, SIZE));
         a.word(sub(n, n, scratch));
-        a.word(sw(p, n, ptr));
+        a.word(sw(n, p, ptr));
         a.label(done);
     }
 

@@ -15,9 +15,11 @@
 
 use crate::ir::Error;
 use crate::mir::{CmpOp, Machine, MirOp, SfpOp};
+use crate::riscv::{self as rv, Asm, reg};
 use tt_isa::backend::{
     self, Before, ConfigWords, ThreadConfigEntry, block, cond, wait_for_packer, wait_for_unpacker0,
 };
+use tt_isa::cfg::ConfigBank;
 use tt_isa::cfg::generated::{alu, global, pack0, thcon, thread, unpack1};
 use tt_isa::isa::Instruction;
 use tt_isa::isa::generated::{defs, encode};
@@ -31,37 +33,86 @@ pub const DST_ROW_BYTES: u32 = 16 * 4;
 /// The `AddrMod` entry that steps the packer's input Y by four rows.
 pub const PACK_ADDR_MOD_NEXT_GROUP: u32 = 1;
 
+/// One entry of a role program: a Tensix instruction (emitted as `.ttinsn`) or
+/// a RISC-V instruction (emitted as itself).
+///
+/// A role is RISC-V code with the Tensix words inline, so a program that has to
+/// read a ring pointer or run a CB sync mixes the two in one stream.
+#[derive(Debug, Clone, Copy)]
+enum Elem {
+    Tensix(Instruction),
+    Riscv(u32),
+}
+
+/// A role's program under construction.
+#[derive(Debug, Clone, Default)]
+pub struct Stream {
+    elems: Vec<Elem>,
+}
+
+impl Stream {
+    fn push(&mut self, instruction: Instruction) {
+        self.elems.push(Elem::Tensix(instruction));
+    }
+
+    fn extend(&mut self, instructions: impl IntoIterator<Item = Instruction>) {
+        for instruction in instructions {
+            self.push(instruction);
+        }
+    }
+
+    /// Append one already-encoded RISC-V word.
+    fn rv(&mut self, word: u32) {
+        self.elems.push(Elem::Riscv(word));
+    }
+
+    /// Append an assembled RISC-V sequence.
+    fn asm(&mut self, build: impl FnOnce(&mut Asm)) -> Result<(), Error> {
+        let mut a = Asm::new();
+        build(&mut a);
+        for word in a.finish().map_err(|_| Error::TT_ERROR_MOVER_PROGRAM)? {
+            self.rv(word);
+        }
+        Ok(())
+    }
+
+    /// The encoded words, ending in `ret`. An empty program stays empty: it is
+    /// not started, and a lone `ret` would make it look non-empty.
+    fn words(&self) -> Result<Vec<u32>, Error> {
+        if self.elems.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(self.elems.len() + 1);
+        for elem in &self.elems {
+            out.push(match *elem {
+                Elem::Tensix(i) => i.ttinsn_word().ok_or_else(|| {
+                    let _ = i;
+                    Error::TT_ERROR_INSTRUCTION_NOT_INLINE
+                })?,
+                Elem::Riscv(w) => w,
+            });
+        }
+        out.push(crate::riscv::ret());
+        Ok(out)
+    }
+}
+
 /// One instruction stream per compute core.
 #[derive(Debug, Clone, Default)]
 pub struct Words {
-    pub t0: Vec<Instruction>,
-    pub t1: Vec<Instruction>,
-    pub t2: Vec<Instruction>,
+    t0: Stream,
+    t1: Vec<Instruction>,
+    t2: Stream,
 }
 
 impl Words {
     /// The encoded words, as the program slot takes them.
-    ///
-    /// A role's program is RISC-V code with the Tensix words inline, so each
-    /// Tensix word goes in as the `.ttinsn` operand form (rotated left two) and
-    /// a non-empty program ends in `ret`; an empty one is not started, and gets
-    /// no `ret` that would make it look non-empty.
     pub fn words(&self) -> Result<[Vec<u32>; 3], Error> {
-        let one = |program: &[Instruction]| {
-            if program.is_empty() {
-                return Ok(Vec::new());
-            }
-            let mut out = Vec::with_capacity(program.len() + 1);
-            for instruction in program {
-                out.push(instruction.ttinsn_word().ok_or_else(|| {
-                    let _ = instruction;
-                    Error::TT_ERROR_INSTRUCTION_NOT_INLINE
-                })?);
-            }
-            out.push(crate::riscv::ret());
-            Ok(out)
-        };
-        Ok([one(&self.t0)?, one(&self.t1)?, one(&self.t2)?])
+        let mut t1 = Stream::default();
+        for instruction in &self.t1 {
+            t1.push(*instruction);
+        }
+        Ok([self.t0.words()?, t1.words()?, self.t2.words()?])
     }
 }
 
@@ -157,10 +208,19 @@ struct UnpackState {
     x0: u32,
     x1: u32,
     face: u32,
-    started: bool,
 }
 
-fn encode_unpack(ops: &[MirOp], out: &mut Vec<Instruction>) -> Result<(), Error> {
+fn encode_unpack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
+    if ops.is_empty() {
+        return Ok(());
+    }
+    // The `ThreadConfig` entries come first, as at the start of every tt-metal
+    // kernel: `CFG_STATE_ID` decides which `Config` bank later writes land in, so
+    // no config store may race with them.
+    thread_config(out);
+    // Every role is called with `a0` = the launch arguments; word 2 is the CB
+    // interface table (`tt-metal`'s `ARG_IFACE`).
+    out.rv(rv::lw(reg::A6, reg::A0, crate::mover::ARG_IFACE as i32 * 4));
     let mut state = UnpackState::default();
     for op in ops {
         match *op {
@@ -173,20 +233,18 @@ fn encode_unpack(ops: &[MirOp], out: &mut Vec<Instruction>) -> Result<(), Error>
                 state.x1 = first + count - 1;
             }
             MirOp::Setadczw { face, .. } => state.face = face,
-            MirOp::Unpacr {
-                src, count, int, ..
-            } => {
-                if !state.started {
-                    thread_config(out);
-                    state.started = true;
-                }
+            MirOp::Unpacr { cb, count, int, .. } => {
                 if count == 0 {
                     return Err(Error::TT_ERROR_UNPACK_ZERO_DATUMS);
                 }
                 state.x0 = 0;
                 state.x1 = count - 1;
+                // The page is at the ring's read pointer, not a compile-time L1
+                // address: write that pointer into the unpacker's base register
+                // after draining the previous unpack.
+                cb_base_unpack(out, cb)?;
                 let mut words = ConfigWords::new();
-                unpack_config(&mut words, src, count, state.dst_row, int);
+                unpack_config(&mut words, count, state.dst_row, int);
                 out.extend(config_program(&words));
                 out.push(stallwait(
                     block::UNPACKER | block::CONFIG,
@@ -197,6 +255,19 @@ fn encode_unpack(ops: &[MirOp], out: &mut Vec<Instruction>) -> Result<(), Error>
                     out.push(set_adc_z_unpack(state.face)?);
                 }
                 out.push(unpack_instruction()?);
+            }
+            MirOp::CbWait { cb } => {
+                out.asm(|a| rv::cb::wait_front(a, reg::A6, cb, 1, [reg::T0, reg::T1, reg::T2]))?;
+            }
+            MirOp::CbPop { cb } => {
+                // The page is only free once the unpacker has read it.
+                out.push(
+                    wait_for_unpacker0(Before::EVERYTHING)
+                        .map_err(|_| Error::TT_ERROR_STALLWAIT)?,
+                );
+                out.asm(|a| {
+                    rv::cb::pop_front(a, reg::A6, cb, 1, [reg::T0, reg::T1, reg::T2, reg::T6])
+                })?;
             }
             MirOp::SemPost { sem } => {
                 out.extend(sync::post_after(sync::Unit::Unpacker0, semaphore(sem)?));
@@ -213,9 +284,60 @@ fn encode_unpack(ops: &[MirOp], out: &mut Vec<Instruction>) -> Result<(), Error>
     Ok(())
 }
 
+/// The unpacker's read base: the ring's read pointer in 16-byte units, minus the
+/// header unit the unpacker adds (`UNPACR_Regular.md`: `InAddr = (Base_address +
+/// 1 + DigestSize) * 16`).
+fn cb_base_unpack(out: &mut Stream, cb: u32) -> Result<(), Error> {
+    out.push(wait_for_unpacker0(Before::EVERYTHING).map_err(|_| Error::TT_ERROR_STALLWAIT)?);
+    cb_base(
+        out,
+        cb,
+        rv::cb::RD_PTR,
+        thcon::THCON_SEC0_REG3_Base_address.riscv_address(ConfigBank::Bank0),
+        block::UNPACKER,
+    )
+}
+
+/// The packer's output base: the ring's write pointer, same 16-byte conversion.
+fn cb_base_pack(out: &mut Stream, cb: u32) -> Result<(), Error> {
+    out.push(wait_for_packer(Before::EVERYTHING).map_err(|_| Error::TT_ERROR_STALLWAIT)?);
+    cb_base(
+        out,
+        cb,
+        rv::cb::WR_PTR,
+        thcon::THCON_SEC0_REG1_L1_Dest_addr.riscv_address(ConfigBank::Bank0),
+        block::PACKER,
+    )
+}
+
+/// `unit` is the block that must not run until the base store has landed: tt-metal
+/// stalls `STALL_UNPACK`/`STALL_PACK` with `TRISC_CFG`, not the Configuration
+/// Unit, because `STALLWAIT`'s block mask names the *following* instructions to
+/// hold back.
+fn cb_base(out: &mut Stream, cb: u32, field: i32, config: u64, unit: u32) -> Result<(), Error> {
+    out.asm(|a| {
+        a.word(rv::lw(
+            reg::T0,
+            reg::A6,
+            (cb * rv::cb::STRIDE) as i32 + field,
+        ));
+        a.word(rv::srli(reg::T0, reg::T0, 4));
+        a.word(rv::addi(reg::T0, reg::T0, -1));
+        a.li(reg::T1, config as u32);
+        a.word(rv::sw(reg::T0, reg::T1, 0));
+    })?;
+    // The Configuration Unit processes RISC-V writes asynchronously; the next
+    // `UNPACR`/`PACR` must not run until the store has landed.
+    out.push(
+        backend::stallwait(unit | block::CONFIG, cond::RISCV_REQUEST_PENDING)
+            .map_err(|_| Error::TT_ERROR_STALLWAIT)?,
+    );
+    Ok(())
+}
+
 /// `SETC16.md`: the first `ThreadConfig` writes any thread must make. Emitted
 /// once per role program, before anything reads the configuration bank.
-fn thread_config(out: &mut Vec<Instruction>) {
+fn thread_config(out: &mut Stream) {
     for (field, value) in [
         (thread::CFG_STATE_ID_StateID, 0),
         (thread::SRCA_SET_SetOvrdWithAddr, 0),
@@ -253,7 +375,7 @@ fn stallwait(block_mask: u32, condition: u32) -> Result<Instruction, Error> {
 /// The unpacker's `Config` for one unit: base, destination, X dimension, FP32
 /// in and out. The base is `base/16 - 1` because L1 holds the datum block with
 /// no 16-byte tile header, while the unpacker adds one unconditionally.
-fn unpack_config(words: &mut ConfigWords, src: u32, datums: u32, dst_row: u32, int: bool) {
+fn unpack_config(words: &mut ConfigWords, datums: u32, dst_row: u32, int: bool) {
     // The datum is opaque 32 bits at this layer: `Int32` in the packer's
     // `Out_data_format` requires the `Dst` access format to match it, and the
     // role descriptor's is 32-bit. The `int` flag instead selects the
@@ -261,10 +383,7 @@ fn unpack_config(words: &mut ConfigWords, src: u32, datums: u32, dst_row: u32, i
     // converted.
     let _ = int;
     let fmt = L1Format::Fp32;
-    let base = src / 16 - 1;
     words
-        .set(thcon::THCON_SEC0_REG3_Base_address, base)
-        .unwrap()
         .set(thcon::THCON_SEC0_REG7_Offset_address, 0)
         .unwrap()
         .set(thcon::THCON_SEC0_REG5_Tile_x_dim_cntx0, datums)
@@ -588,8 +707,16 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Vec<Instruction>) -> Res
 // The pack core (T2)
 // ---------------------------------------------------------------------------
 
-fn encode_pack(ops: &[MirOp], out: &mut Vec<Instruction>) -> Result<(), Error> {
-    let mut started = false;
+fn encode_pack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
+    if ops.is_empty() {
+        return Ok(());
+    }
+    // The `ThreadConfig` entries come first, as at the start of every tt-metal
+    // kernel: `CFG_STATE_ID` decides which `Config` bank later writes land in, so
+    // no config store may race with them.
+    thread_config(out);
+    // `a0` = the launch arguments; word 2 is the CB interface table.
+    out.rv(rv::lw(reg::A6, reg::A0, crate::mover::ARG_IFACE as i32 * 4));
     for op in ops {
         match *op {
             MirOp::SemWait { sem, .. } => {
@@ -607,21 +734,31 @@ fn encode_pack(ops: &[MirOp], out: &mut Vec<Instruction>) -> Result<(), Error> {
             MirOp::SemPost { sem } => {
                 out.extend(sync::post_after(sync::Unit::Packer, semaphore(sem)?));
             }
+            MirOp::CbReserve { cb } => {
+                out.asm(|a| rv::cb::reserve_back(a, reg::A6, cb, 1, [reg::T0, reg::T1, reg::T2]))?;
+            }
+            MirOp::CbPush { cb } => {
+                // The page is only visible to the writer once the pack has
+                // written it.
+                out.push(wait_for_packer(Before::EVERYTHING).expect("named bits"));
+                out.asm(|a| {
+                    rv::cb::push_back(a, reg::A6, cb, 1, [reg::T0, reg::T1, reg::T2, reg::T6])
+                })?;
+            }
             MirOp::Pack {
-                dst,
+                cb,
                 rows,
                 last,
                 int,
             } => {
-                if !started {
-                    thread_config(out);
-                    started = true;
-                }
                 if rows == 0 {
                     return Err(Error::TT_ERROR_PACK_ZERO_ROWS);
                 }
+                // The destination is the ring's write pointer, converted to
+                // 16-byte units minus the header unit the packer adds.
+                cb_base_pack(out, cb)?;
                 let mut words = ConfigWords::new();
-                pack_config(&mut words, dst, int);
+                pack_config(&mut words, int);
                 out.extend(config_program(&words));
                 out.push(stallwait(block::PACKER | block::CONFIG, cond::CONFIG_BUSY)?);
                 pack_rows(out, rows, last)?;
@@ -635,10 +772,11 @@ fn encode_pack(ops: &[MirOp], out: &mut Vec<Instruction>) -> Result<(), Error> {
     Ok(())
 }
 
-/// The packer's `Config` for one unit: read `Dst` as 32-bit, write FP32 to
-/// `dst`. The output address is in 16-byte units and the generator always adds
-/// the one 16-byte tile header unit it never writes; `dst/16 - 1` compensates.
-fn pack_config(words: &mut ConfigWords, dst: u32, int: bool) {
+/// The packer's `Config` for one unit: read `Dst` as 32-bit, write FP32 to the
+/// ring's page. The output address is in 16-byte units and the generator always
+/// adds the one 16-byte tile header unit it never writes; the base store takes
+/// the same `- 1`.
+fn pack_config(words: &mut ConfigWords, int: bool) {
     // The datum is opaque 32 bits at this layer: `Int32` in the packer's
     // `Out_data_format` requires the `Dst` access format to match it, and the
     // role descriptor's is 32-bit. The `int` flag instead selects the
@@ -647,8 +785,6 @@ fn pack_config(words: &mut ConfigWords, dst: u32, int: bool) {
     let _ = int;
     let fmt = L1Format::Fp32;
     words
-        .set(thcon::THCON_SEC0_REG1_L1_Dest_addr, dst / 16 - 1)
-        .unwrap()
         .set(thcon::THCON_SEC0_REG1_In_data_format, fmt.code().unwrap())
         .unwrap()
         .set(thcon::THCON_SEC0_REG1_Out_data_format, fmt.code().unwrap())
@@ -708,7 +844,7 @@ fn pack_config(words: &mut ConfigWords, dst: u32, int: bool) {
 }
 
 /// Pack `rows` rows of FP32 `Dst`, from row 0, to the run `pack_config` set up.
-fn pack_rows(out: &mut Vec<Instruction>, rows: u32, last: bool) -> Result<(), Error> {
+fn pack_rows(out: &mut Stream, rows: u32, last: bool) -> Result<(), Error> {
     out.push(thread_entry(thread::ADDR_MOD_PACK_SEC0_YsrcIncr, 0));
     out.push(thread_entry(thread::ADDR_MOD_PACK_SEC1_YsrcIncr, 4));
     out.push(

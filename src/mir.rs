@@ -47,10 +47,11 @@ pub enum MirOp {
     Select { cond: u8, t: u8, f: u8, d: u8 },
     /// The lanewise maximum, through the SFPU lane flags.
     Max { a: u8, b: u8, d: u8 },
-    /// `UNPACR`: the tile image at L1 `src` into unpacker `unit`'s destination.
-    /// `int` selects the `Int32` L1 format instead of `Fp32`.
+    /// `UNPACR`: the page at the head of `cb`'s ring into unpacker `unit`'s
+    /// destination. `int` selects the `Int32` L1 format instead of `Fp32`.
+    /// The base is read from the ring's read pointer at run time.
     Unpacr {
-        src: u32,
+        cb: u32,
         unit: u8,
         count: u32,
         int: bool,
@@ -61,13 +62,24 @@ pub enum MirOp {
     Setadcx { unit: u8, first: u32, count: u32 },
     /// The base `Dst` row an unpack writes to.
     Setdst { row: u32 },
-    /// The L1 address the packer drains to, and how many rows.
+    /// The packer drains into the page at the tail of `cb`'s ring. The base is
+    /// read from the ring's write pointer at run time.
     Pack {
-        dst: u32,
+        cb: u32,
         rows: u32,
         last: bool,
         int: bool,
     },
+    /// `cb_wait_front`: wait for a page to be published on this ring.
+    CbWait { cb: u32 },
+    /// `cb_pop_front`: release the page [`MirOp::CbWait`] waited for, after the
+    /// unpacker has drained it.
+    CbPop { cb: u32 },
+    /// `cb_reserve_back`: wait for a free page on this ring.
+    CbReserve { cb: u32 },
+    /// `cb_push_back`: publish the page [`MirOp::CbReserve`] reserved, after the
+    /// packer has drained `Dst`.
+    CbPush { cb: u32 },
     /// `SEMPOST` on this core.
     SemPost { sem: u8 },
     /// `SEMWAIT` on this core, holding `before`'s blocks.

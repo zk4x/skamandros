@@ -16,7 +16,7 @@
 //! way round. Which copies belong to the inbound program and which to the
 //! outbound one is decided here from the operands, not by the caller.
 
-use crate::ir::{Dim, Error, Kernel, Op, Types, ValueId, unit_of};
+use crate::ir::{Dim, Error, Kernel, Op, Types, ValueId};
 use crate::planner::Plan;
 use crate::riscv::{self as rv, Asm, reg};
 use tt_isa::noc::niu::{
@@ -26,6 +26,10 @@ use tt_isa::noc::niu::{
 /// Words of launch arguments before the per-parameter pairs: grid x, grid y,
 /// reserved, this tile's NOC high word.
 pub const ARG_HEAD: usize = 4;
+
+/// The launch argument word with the CB interface table (tt-metal's
+/// `ARG_IFACE`); word 2 is the slot that used to be reserved.
+pub const ARG_IFACE: usize = 2;
 
 /// Transaction ID every request uses. The programs issue in order and drain
 /// after each copy, so one ID is enough.
@@ -44,9 +48,10 @@ pub const fn param_arg(param: u32) -> (i32, i32) {
 /// One copy, resolved against the plan.
 struct Copy {
     param: u32,
-    /// Byte offset into the parameter, and into the buffer.
+    /// Byte offset into the parameter.
     offset: u32,
-    l1: u32,
+    /// The CB whose ring holds the L1 side of the copy.
+    cb: u32,
     bytes: u32,
 }
 
@@ -354,16 +359,23 @@ fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
     }
     let mut a = Asm::new();
     prologue(&mut a);
+    // The sync scratch leaves `t3` (this tile's high word), `t5` (the NOC
+    // initiator) and `a6` (the interface) alone.
+    let sync3 = [reg::T0, reg::T1, reg::T2];
+    let sync4 = [reg::T0, reg::T1, reg::T2, reg::T6];
     for (at, copy) in copies.iter().enumerate() {
-        emit_copy(
-            &mut a,
-            at,
-            copy.param,
-            copy.offset,
-            copy.l1,
-            copy.bytes,
-            inbound,
-        )?;
+        let cb = copy.cb;
+        if inbound {
+            rv::cb::reserve_back(&mut a, reg::A6, cb, 1, sync3);
+        } else {
+            rv::cb::wait_front(&mut a, reg::A6, cb, 1, sync3);
+        }
+        emit_copy(&mut a, at, copy.param, copy.offset, cb, copy.bytes, inbound)?;
+        if inbound {
+            rv::cb::push_back(&mut a, reg::A6, cb, 1, sync4);
+        } else {
+            rv::cb::pop_front(&mut a, reg::A6, cb, 1, sync4);
+        }
     }
     a.word(rv::ret());
     a.finish().map_err(|_| Error::TT_ERROR_MOVER_PROGRAM)
@@ -412,10 +424,9 @@ fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
                     return Err(Error::TT_ERROR_COPY_ENDS);
                 }
             };
-        let Op::Buffer { shape, dtype, .. } = k.ops[def[buffer as usize].expect("defined")] else {
+        let Op::Buffer { dtype, .. } = k.ops[def[buffer as usize].expect("defined")] else {
             unreachable!("the type says it is a buffer");
         };
-        let (_, _, unit_bytes) = unit_of(shape, dtype)?;
         let literal = |offset: Dim, what: &str| match offset {
             Dim::Const(n) => Ok(n),
             Dim::Value(v) => {
@@ -425,7 +436,7 @@ fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
         };
         let param_offset = literal(param_offset, "parameter")?;
         let buffer_offset = literal(buffer_offset, "buffer")?;
-        let base = plan.buf[buffer as usize].ok_or_else(|| {
+        let cb = plan.cb[buffer as usize].ok_or_else(|| {
             let _ = (at, buffer);
             Error::TT_ERROR_BUFFER_NOT_PLACED
         })?;
@@ -437,24 +448,27 @@ fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
             let _ = (at, buffer_offset);
             Error::TT_ERROR_BUFFER_OFFSET_OVERFLOW
         })?;
+        // The ring position, not the literal offset, is the L1 address: a page is
+        // one unit and the pointers advance in program order. The offset is still
+        // checked (it must be a literal that fits) but it names the parameter's
+        // side only.
+        let _ = buffer_bytes;
         copies.push(Copy {
             param: param_index[param as usize].expect("a parameter has an index"),
             offset: param_bytes,
-            l1: base.checked_add(buffer_bytes).ok_or_else(|| {
-                let _ = (at, base, buffer_bytes);
-                Error::TT_ERROR_BUFFER_ADDRESS_OVERFLOW
-            })?,
-            bytes: unit_bytes,
+            cb,
+            bytes: plan.cbs[cb as usize].page,
         });
     }
     Ok(copies)
 }
 
 /// `t5` = this NIU's base, `t3` = this tile's NOC high word (the launch's third
-/// argument pair, read from `a0`).
+/// argument pair, read from `a0`), `a6` = the CB interface table (argument 2).
 fn prologue(a: &mut Asm) {
     a.li(reg::T5, Niu::Noc0.base() as u32);
     a.word(rv::lw(reg::T3, reg::A0, 12));
+    a.word(rv::lw(reg::A6, reg::A0, ARG_IFACE as i32 * 4));
 }
 
 fn emit_copy(
@@ -462,7 +476,7 @@ fn emit_copy(
     at: usize,
     param: u32,
     offset: u32,
-    l1: u32,
+    cb: u32,
     bytes: u32,
     read: bool,
 ) -> Result<(), Error> {
@@ -478,10 +492,18 @@ fn emit_copy(
         a.word(rv::add(reg::T1, reg::T1, reg::T4));
     }
     a.word(rv::lw(reg::T2, reg::A0, hi_arg));
+    // The local side is the ring's write pointer for a publish and its read
+    // pointer for a drain: `reserve_back` made the page the writer's,
+    // `wait_front` made it the reader's.
+    let field = if read { rv::cb::WR_PTR } else { rv::cb::RD_PTR };
+    a.word(rv::lw(
+        reg::T4,
+        reg::A6,
+        (cb * rv::cb::STRIDE) as i32 + field,
+    ));
     // `TARG_ADDR` is the request's source and `RET_ADDR` its destination: a
     // read has the parameter as source and L1 as destination, a write the
     // other way round.
-    a.li(reg::T4, l1);
     if read {
         store_reg(a, initiator::TARG_ADDR_LO, reg::T1);
         store_zero(a, initiator::TARG_ADDR_MID);

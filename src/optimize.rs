@@ -193,10 +193,15 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                         }
                     }
                 }
-                MirOp::Unpacr { .. }
-                | MirOp::Setadczw { .. }
-                | MirOp::Setadcx { .. }
-                | MirOp::Pack { .. } => {}
+                MirOp::Unpacr { cb, .. }
+                | MirOp::Pack { cb, .. }
+                | MirOp::CbWait { cb }
+                | MirOp::CbPop { cb }
+                | MirOp::CbReserve { cb }
+                | MirOp::CbPush { cb } => {
+                    let _ = cb;
+                }
+                MirOp::Setadczw { .. } | MirOp::Setadcx { .. } => {}
             }
             at += 1;
         }

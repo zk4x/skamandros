@@ -16,7 +16,7 @@
 //! named none of them.
 
 use crate::alloc::Alloc;
-use crate::ir::{BinOp, Dim, Error, Kernel, Op, RegShape, Types, UnOp, unit_of};
+use crate::ir::{BinOp, Error, Kernel, Op, RegShape, Types, UnOp, unit_of};
 use crate::mir::{CmpOp, Machine, MirOp, SfpOp};
 use crate::planner::Plan;
 
@@ -73,22 +73,22 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 };
                 let (unit_shape, _, _) = unit_of(shape, dtype)?;
                 let rows = rows_of(unit_shape, at)?;
-                let offset = const_offset(offset, at)?;
-                let base = plan.buf[buffer as usize].ok_or_else(|| {
+                let cb = plan.cb[buffer as usize].ok_or_else(|| {
                     let _ = buffer;
                     Error::TT_ERROR_BUFFER_NOT_PLACED
                 })?;
-                let src = base + offset * dtype.bytes();
                 let row = match alloc.place_of(value) {
                     crate::alloc::Place::Dst(slot) => u32::from(slot) * DST_ROWS,
                 };
                 // The unpacker writes `Dst`: it waits for a slot the packer has
                 // given back, so the first unit's result cannot be overwritten
-                // before it has been packed.
+                // before it has been packed. The page itself comes from the ring:
+                // wait for the producer's push, unpack, then release the page.
                 m.t0.push(MirOp::SemWait {
                     sem: SEM_SLOT,
                     before: 0,
                 });
+                m.t0.push(MirOp::CbWait { cb });
                 m.t0.push(MirOp::Setdst { row });
                 m.t0.push(MirOp::Setadczw { unit: 0, face: 0 });
                 m.t0.push(MirOp::Setadcx {
@@ -97,11 +97,12 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     count: unit_shape.datums(),
                 });
                 m.t0.push(MirOp::Unpacr {
-                    src,
+                    cb,
                     unit: 0,
                     count: unit_shape.datums(),
                     int,
                 });
+                m.t0.push(MirOp::CbPop { cb });
                 m.t0.push(MirOp::SemPost { sem: SEM_UNPACKED });
                 m.t1.push(MirOp::SemWait {
                     sem: SEM_UNPACKED,
@@ -109,6 +110,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 });
                 let _ = info;
                 let _ = rows;
+                let _ = offset;
             }
             Op::StoreTo {
                 value,
@@ -130,27 +132,30 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 };
                 let (unit_shape, _, _) = unit_of(shape, dtype)?;
                 let rows = rows_of(unit_shape, at)?;
-                let offset = const_offset(offset, at)?;
-                let base = plan.buf[buffer as usize].ok_or_else(|| {
+                let cb = plan.cb[buffer as usize].ok_or_else(|| {
                     let _ = buffer;
                     Error::TT_ERROR_BUFFER_NOT_PLACED
                 })?;
-                let dst = base + offset * dtype.bytes();
                 m.t1.push(MirOp::SemPost { sem: SEM_READY });
                 // The packer claims the unit, packs it, and only then releases
                 // the semaphore — so the math core cannot overwrite `Dst` until
                 // the pack has actually read it (`_llk_pack_dest_section_done_`).
                 m.t2.push(MirOp::SemWaitData { sem: SEM_READY });
+                // The page comes from the ring: reserve a free one, pack into
+                // it, then publish it to the writer.
+                m.t2.push(MirOp::CbReserve { cb });
                 m.t2.push(MirOp::Pack {
-                    dst,
+                    cb,
                     rows,
                     last: true,
                     int,
                 });
                 m.t2.push(MirOp::SemGet { sem: SEM_READY });
+                m.t2.push(MirOp::CbPush { cb });
                 // The pack has retired, so the `Dst` slot is free again.
                 m.t2.push(MirOp::SemPost { sem: SEM_SLOT });
                 let _ = value;
+                let _ = offset;
             }
             Op::Cast { .. } => {
                 let _ = at;
@@ -331,16 +336,6 @@ fn rows_of(shape: RegShape, at: usize) -> Result<u32, Error> {
 fn dst_row(alloc: &Alloc, value: crate::ir::ValueId) -> u32 {
     match alloc.place_of(value) {
         crate::alloc::Place::Dst(slot) => u32::from(slot) * DST_ROWS,
-    }
-}
-
-fn const_offset(dim: Dim, at: usize) -> Result<u32, Error> {
-    match dim {
-        Dim::Const(n) => Ok(n),
-        Dim::Value(v) => {
-            let _ = (at, v);
-            Err(Error::TT_TODO_SYMBOLIC_OFFSET)
-        }
     }
 }
 
