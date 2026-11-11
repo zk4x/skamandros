@@ -13,45 +13,55 @@ name only appears in `Cargo.toml`, the docs and the repo.
 
 One semantic program in, a set of machine programs out.
 
-The caller writes SSA tiles and the L1 traffic it wants, and names no processor,
-no `Dst` slot, no `Src` bank, no lane register, no semaphore, and no Tensix word:
+The caller writes one SSA program over DRAM parameters, L1 buffers and register
+values. It names no processor, no `Dst` slot, no `Src` bank, no lane register,
+no semaphore, no unpacker, no packer and no Tensix word:
 
 ```
-version 1
-grid 1 1
-param in f32 4096
-param out f32 4096
-buf 0 4096 plain tile          # a 32x32 tile image
-buf 1 4096 plain rm            # a contiguous datum run
-copy_in param 0 offset 16 len 4096 buf 0
-%0 = unpack buf 0
-%1 = sfpu neg %0
-pack %1 buf 1
-copy_out buf 1 param 1 offset 0 len 4096
+version 2
+grid 1,1
+%in  = param f32 1024,128
+%out = param f32 1024,128
+%b0  = buffer f32 32,64          # two 32x32 units, double buffered
+%n   = const i32 2
+%i   = loop %n
+%o   = mul %i %n
+copy_to %b0 from %in [%o]
+%x = load %b0 [%o]
+%y = neg %x
+store_to %b0 from %y [%o]
+copy_to %out from %b0 [%o]
+endloop
 ```
 
-The crate decides which of the five programs each instruction belongs to, where
-each value lives, which lane registers its body uses, and which semaphores pace
-the three compute cores. Both forms are accepted and versioned: the text form
-above, and a byte form (`TTIR`).
+Parameters and buffers are mutable, not SSA. A shape is a comma-separated list of
+terms, and a term is a literal or an `i32` value; a product is built by an op
+first. A parameter may be arbitrary-dimensional and symbolic, a scalar parameter
+is the shape `0`, and a buffer is two constant dimensions, each `1` or a multiple
+of 32. There is no implicit dtype conversion: `cast %x to bf16` is the only one.
+
+The crate decides which machine programs each instruction belongs to, where each
+register value lives, which lane registers its body uses, how a buffer is read
+into a register and written back, and which semaphores pace the three compute
+cores. Both forms are accepted and versioned: the text form above, and a byte
+form (`TTIR`).
 
 ## Design
 
-- **Semantic in, machine out.** The device is not one program: the movers run
-  RISC-V, and the three compute cores run Tensix instructions. One semantic
-  program becomes `reader`, `writer`, `T0`, `T1`, `T2`, handled internally.
-- **SSA values get resources automatically.** A value consumed by a matrix op
-  lives in `SrcA`/`SrcB`, everything else in a `Dst` slot; slots and banks are
-  assigned by liveness, lane registers are each body's temporaries, and the
-  cross-core hand-offs are one semaphore per producer/consumer seam. A value
-  needed on both `Src` sides is refused rather than copied.
-- **L1 stays manual.** Which buffer, how many bytes, which offset, and every
-  `reserve`/`push`/`wait`/`pop` is the caller's program. The driver places the
-  buffers in L1 and nothing else. A buffer declares its layout — `rm` (contiguous
-  datums) or `tile` (4096-byte tile images, four faces) — because the unpacker's
-  descriptor and the packer's address generator are configured from it.
-- **L1 holds datum bytes only.** A `tile` buffer is the 4096-byte tile body, no
-  16-byte DRAM header; the unpack/pack base compensates the fixed header step.
+- **One program, machine programs out.** There is no reader/compute/writer split
+  in the IR: an instruction is classified by its operands, and the compiler emits
+  only the programs that end up non-empty — the inbound mover, the outbound
+  mover, and T0/T1/T2.
+- **Unpack and pack are internal.** The IR has `copy_to` between DRAM and L1,
+  `load` from L1 into a register and `store_to` back. The unpacker descriptor,
+  the packer address generator, the tile order, the base compensation for the
+  header the hardware assumes, and the ADCs are all the compiler's.
+- **Register values get resources automatically.** A value's `Dst` slot follows
+  from liveness, lane registers are each body's temporaries, and the cross-core
+  hand-offs are one semaphore per producer/consumer seam.
+- **L1 is declared, not managed.** The program declares every buffer and its
+  shape; the compiler places it and may not change its size. The shape is the
+  footprint, so a `32,64` buffer is two pages and the program chooses it.
 - **The firmware ships inside the library.** `exec_b`, the NC mover and the three
   role images are built from `firmware/tt-firmware` and embedded, so a consumer
   needs neither the RISC-V target nor `llvm-objcopy`. This is what makes the
@@ -157,16 +167,22 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
 
 ## Status
 
-- Program format, verifier, L1 placement, allocation, lowering, fusion, the math
-  encoder and the boundary programs: in the tree.
+- The unified IR, the verifier, L1 placement, allocation, lowering, fusion, the
+  unpack and pack encoders and the mover programs: in the tree.
 - `libTT.so` compiles a program, allocates DRAM, moves host bytes in and out,
   and runs a module on the simulator. A copy kernel — DRAM into L1 and back —
   runs end to end through the C ABI, and the bytes come back equal.
-- A launch runs the reader and then the writer on RISCV B through the embedded
-  `exec_b` trampoline, which is the program's own order for a kernel with no
-  compute. A module with compute programs is refused rather than run half-way.
+- An elementwise kernel runs the whole datapath through the C ABI: the inbound
+  mover on RISCV B, the three compute cores (unpack on T0, math on T1, pack on
+  T2) released together, and the outbound mover. A 32x32 FP32 tile of inputs
+  comes back negated, every datum.
+- The three compute programs are paced by two semaphores. Thread 0 runs the
+  setup program (`SEMINIT` each semaphore to value 0, max 1, as tt-metal's boot
+  sequence does) to completion before the three roles are released, so no role
+  depends on another role's initialisation having already run.
 - A launch is one Tensix tile: a module whose grid is larger than 1x1 is
-  refused.
-- The unpack and pack encoders are refused with a message, not guessed. Until
-  they exist no module has a compute program, so nothing is lost by the
-  refusal; the three compute cores get their launch after them.
+  refused. A symbolic grid parses and verifies but is not lowered.
+- The register datapath lowered today is FP32, straight-line, with literal
+  offsets, and `neg`/`abs` plus `add`/`sub`/`mul` on equal shapes. Loops,
+  symbolic offsets, `cast`, broadcast, `matmul` and `relu` are accepted by the
+  format and verifier and refused loudly by lowering, not guessed at.

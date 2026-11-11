@@ -23,11 +23,11 @@ pub mod encode;
 pub mod images;
 pub mod ir;
 pub mod lower;
-pub mod optimize;
 pub mod mir;
 pub mod mover;
+pub mod optimize;
 pub mod planner;
 pub mod riscv;
 pub mod runtime;
 
-pub use ir::{Buf, BufKind, DType, Kernel, Op, Param, ParamKind, SfpuKind, ValueId};
+pub use ir::{DType, Dim, Kernel, Op, RegShape, Types, ValueId};

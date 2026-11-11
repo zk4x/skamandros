@@ -67,8 +67,32 @@ fn triple(ops: &[MirOp], at: usize) -> Option<[MirOp; 3]> {
 fn same_shifted(body: &[MirOp; 3], following: &[MirOp; 3]) -> bool {
     match (body, following) {
         (
-            [MirOp::Sfpload { lreg: la, row: ra }, MirOp::Sfp { op: oa, a: aa, b: ba, d: da }, MirOp::Sfpstore { lreg: sa, row: sa_row }],
-            [MirOp::Sfpload { lreg: lb, row: rb }, MirOp::Sfp { op: ob, a: ab, b: bb, d: db }, MirOp::Sfpstore { lreg: sb, row: sb_row }],
+            [
+                MirOp::Sfpload { lreg: la, row: ra },
+                MirOp::Sfp {
+                    op: oa,
+                    a: aa,
+                    b: ba,
+                    d: da,
+                },
+                MirOp::Sfpstore {
+                    lreg: sa,
+                    row: sa_row,
+                },
+            ],
+            [
+                MirOp::Sfpload { lreg: lb, row: rb },
+                MirOp::Sfp {
+                    op: ob,
+                    a: ab,
+                    b: bb,
+                    d: db,
+                },
+                MirOp::Sfpstore {
+                    lreg: sb,
+                    row: sb_row,
+                },
+            ],
         ) => {
             la == lb
                 && sa == sb
@@ -92,27 +116,37 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
             match ops[at] {
                 MirOp::Sfpload { lreg, row } | MirOp::Sfpstore { lreg, row } => {
                     if lreg >= crate::alloc::LREGS {
-                        return Err(Error(format!("{name}[{at}]: lane register L{lreg} does not exist")));
+                        return Err(Error(format!(
+                            "{name}[{at}]: lane register L{lreg} does not exist"
+                        )));
                     }
                     if row >= u32::from(DST_SLOTS) * DST_ROWS {
-                        return Err(Error(format!("{name}[{at}]: Dst row {row} is past the last tile")));
+                        return Err(Error(format!(
+                            "{name}[{at}]: Dst row {row} is past the last tile"
+                        )));
                     }
                 }
                 MirOp::Sfp { a, b, d, .. } => {
                     for lreg in [Some(a), b, Some(d)].into_iter().flatten() {
                         if lreg >= crate::alloc::LREGS {
-                            return Err(Error(format!("{name}[{at}]: lane register L{lreg} does not exist")));
+                            return Err(Error(format!(
+                                "{name}[{at}]: lane register L{lreg} does not exist"
+                            )));
                         }
                     }
                 }
                 MirOp::Setdst { row } => {
                     if row >= u32::from(DST_SLOTS) * DST_ROWS {
-                        return Err(Error(format!("{name}[{at}]: Dst row {row} is past the last tile")));
+                        return Err(Error(format!(
+                            "{name}[{at}]: Dst row {row} is past the last tile"
+                        )));
                     }
                 }
                 MirOp::SemPost { sem } | MirOp::SemWait { sem, .. } => {
                     if sem >= tt_isa::sync::Semaphore::COUNT {
-                        return Err(Error(format!("{name}[{at}]: semaphore {sem} does not exist")));
+                        return Err(Error(format!(
+                            "{name}[{at}]: semaphore {sem} does not exist"
+                        )));
                     }
                 }
                 MirOp::Repeat { len, count } => {
@@ -120,10 +154,15 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                         return Err(Error(format!("{name}[{at}]: empty repeat")));
                     }
                     if at + 1 + len as usize > ops.len() {
-                        return Err(Error(format!("{name}[{at}]: repeat body runs past the program")));
+                        return Err(Error(format!(
+                            "{name}[{at}]: repeat body runs past the program"
+                        )));
                     }
                 }
-                MirOp::Unpacr { .. } | MirOp::Setadczw { .. } | MirOp::Setadcx { .. } | MirOp::Pack { .. } => {}
+                MirOp::Unpacr { .. }
+                | MirOp::Setadczw { .. }
+                | MirOp::Setadcx { .. }
+                | MirOp::Pack { .. } => {}
             }
             at += 1;
         }
@@ -140,24 +179,24 @@ mod tests {
     use crate::planner::place;
 
     const NEG: &str = "\
-version 1
-grid 1 1
-param in f32 4096
-param out f32 4096
-buf 0 4096 plain rm
-buf 1 4096 plain rm
-copy_in param 0 offset 0 len 4096 buf 0
-%0 = unpack buf 0
-%1 = sfpu neg %0
-pack %1 buf 1
-copy_out buf 1 param 1 offset 0 len 4096
+version 2
+grid 1,1
+%in = param f32 4096
+%out = param f32 4096
+%b0 = buffer f32 32,32
+copy_to %b0 from %in [0]
+%x = load %b0 [0]
+%y = neg %x
+store_to %b0 from %y [0]
+copy_to %out from %b0 [0]
 ";
 
     fn machine() -> Machine {
         let k = Kernel::parse(NEG).unwrap();
-        let plan = place(&k).unwrap();
-        let alloc = allocate(&k).unwrap();
-        lower(&k, &plan, &alloc).unwrap()
+        let types = k.verify().unwrap();
+        let plan = place(&k, &types).unwrap();
+        let alloc = allocate(&k, &types).unwrap();
+        lower(&k, &types, &plan, &alloc).unwrap()
     }
 
     #[test]
@@ -178,7 +217,10 @@ copy_out buf 1 param 1 offset 0 len 4096
         // Cut the body: a semaphore in the middle must stop fusion across it.
         m.t1.insert(3 * 16, MirOp::SemPost { sem: 7 });
         fuse(&mut m);
-        let repeats = m.t1.iter().filter(|op| matches!(op, MirOp::Repeat { .. })).count();
+        let repeats =
+            m.t1.iter()
+                .filter(|op| matches!(op, MirOp::Repeat { .. }))
+                .count();
         assert_eq!(repeats, 2, "one repeat on each side of the hand-off");
     }
 
@@ -190,14 +232,13 @@ copy_out buf 1 param 1 offset 0 len 4096
             *d = 5;
         }
         fuse(&mut m);
-        let repeats: Vec<u16> = m
-            .t1
-            .iter()
-            .filter_map(|op| match op {
-                MirOp::Repeat { count, .. } => Some(*count),
-                _ => None,
-            })
-            .collect();
+        let repeats: Vec<u16> =
+            m.t1.iter()
+                .filter_map(|op| match op {
+                    MirOp::Repeat { count, .. } => Some(*count),
+                    _ => None,
+                })
+                .collect();
         assert_eq!(repeats, vec![30], "the changed row splits the run");
     }
 
@@ -219,7 +260,10 @@ copy_out buf 1 param 1 offset 0 len 4096
     #[test]
     fn a_dst_row_past_the_last_tile_is_refused() {
         let mut m = machine();
-        m.t1.push(MirOp::Sfpstore { lreg: 0, row: 8 * DST_ROWS });
+        m.t1.push(MirOp::Sfpstore {
+            lreg: 0,
+            row: 8 * DST_ROWS,
+        });
         assert!(verify(&m).is_err());
     }
 

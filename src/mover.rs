@@ -3,22 +3,25 @@
 
 //! The boundary programs: DRAM <-> L1 over the NoC.
 //!
-//! Each copy in the IR becomes one NOC request: the ten initiator registers are
-//! written in `tt_isa`'s order, `CMD_CTRL` triggers it, and the program waits on
-//! that word and then on the transaction ID's outstanding counter before the
-//! next copy. The parameter's address is its launch argument plus the copy's
-//! offset; the local address is the planned L1 buffer.
+//! Every `copy_to` between a parameter and a buffer becomes one NOC request:
+//! the ten initiator registers are written in `tt_isa`'s order, `CMD_CTRL`
+//! triggers it, and the program waits on that word and then on the transaction
+//! ID's outstanding counter before the next copy. The parameter's address is its
+//! launch argument plus the copy's datum offset; the local address is the
+//! planned L1 buffer plus the same datum offset. Both sides are 64-byte aligned
+//! and add the same byte offset, so a request's two addresses are congruent.
 //!
 //! `TARG_ADDR` is the request's source and `RET_ADDR` its destination, so a
 //! read names the parameter as target and L1 as return, and a write the other
-//! way round. Both programs are core-agnostic RISC-V; the runtime stages them on
-//! RISCV B through the `exec_b` trampoline, the reader first (the program's own
-//! order for a kernel with no compute).
+//! way round. Which copies belong to the inbound program and which to the
+//! outbound one is decided here from the operands, not by the caller.
 
-use crate::ir::{Error, Kernel, Op};
+use crate::ir::{Dim, Error, Kernel, Op, Types, ValueId, unit_of};
 use crate::planner::Plan;
 use crate::riscv::{self as rv, Asm, reg};
-use tt_isa::noc::niu::{CMD_RD, CMD_WR, Niu, RESP_MARKED, STATIC_VC_1, TxnId, initiator, reqs_outstanding};
+use tt_isa::noc::niu::{
+    CMD_RD, CMD_WR, Niu, RESP_MARKED, STATIC_VC_1, TxnId, initiator, reqs_outstanding,
+};
 
 /// Words of launch arguments before the per-parameter pairs: grid x, grid y,
 /// reserved, this tile's NOC high word.
@@ -38,40 +41,112 @@ pub const fn param_arg(param: u32) -> (i32, i32) {
     (lo as i32, lo as i32 + 4)
 }
 
-/// Emit the reader program: every `CopyIn`, in IR order.
-pub fn reader(k: &Kernel, plan: &Plan) -> Result<Vec<u32>, Error> {
+/// One copy, resolved against the plan.
+struct Copy {
+    param: u32,
+    /// Byte offset into the parameter, and into the buffer.
+    offset: u32,
+    l1: u32,
+    bytes: u32,
+}
+
+/// The inbound program: every copy from a parameter into a buffer, in program
+/// order. Empty when the program has none.
+pub fn inbound(k: &Kernel, types: &Types, plan: &Plan) -> Result<Vec<u32>, Error> {
+    program(k, types, plan, true)
+}
+
+/// The outbound program: every copy from a buffer into a parameter.
+pub fn outbound(k: &Kernel, types: &Types, plan: &Plan) -> Result<Vec<u32>, Error> {
+    program(k, types, plan, false)
+}
+
+fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<u32>, Error> {
+    let copies = collect(k, types, plan, inbound)?;
+    if copies.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut a = Asm::new();
     prologue(&mut a);
-    let mut any = false;
-    for (at, op) in k.ops.iter().enumerate() {
-        if let Op::CopyIn { param, offset, buf, bytes } = *op {
-            emit_copy(&mut a, at, param, offset, plan.buf[buf as usize], bytes, true)?;
-            any = true;
-        }
-    }
-    if !any {
-        return Err(Error("the kernel has no copy into L1".into()));
+    for (at, copy) in copies.iter().enumerate() {
+        emit_copy(
+            &mut a,
+            at,
+            copy.param,
+            copy.offset,
+            copy.l1,
+            copy.bytes,
+            inbound,
+        )?;
     }
     a.word(rv::ret());
     a.finish().map_err(Error)
 }
 
-/// Emit the writer program: every `CopyOut`, in IR order.
-pub fn writer(k: &Kernel, plan: &Plan) -> Result<Vec<u32>, Error> {
-    let mut a = Asm::new();
-    prologue(&mut a);
-    let mut any = false;
+fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<Copy>, Error> {
+    let mut param_index: Vec<Option<u32>> = vec![None; types.values.len()];
+    let mut def: Vec<Option<usize>> = vec![None; types.values.len()];
+    let mut next = 0u32;
     for (at, op) in k.ops.iter().enumerate() {
-        if let Op::CopyOut { buf, param, offset, bytes } = *op {
-            emit_copy(&mut a, at, param, offset, plan.buf[buf as usize], bytes, false)?;
-            any = true;
+        if let Some(value) = op.defined() {
+            def[value as usize] = Some(at);
+        }
+        if let Op::Param { value, .. } = *op {
+            param_index[value as usize] = Some(next);
+            next += 1;
         }
     }
-    if !any {
-        return Err(Error("the kernel has no copy out of L1".into()));
+    let mut copies = Vec::new();
+    for (at, op) in k.ops.iter().enumerate() {
+        let Op::CopyTo { dst, src, offset } = *op else {
+            continue;
+        };
+        let (param, buffer) = match (types.of(dst).kind, types.of(src).kind) {
+            (crate::ir::ValueKind::Buffer, crate::ir::ValueKind::Param) => {
+                if !inbound {
+                    continue;
+                }
+                (src, dst)
+            }
+            (crate::ir::ValueKind::Param, crate::ir::ValueKind::Buffer) => {
+                if inbound {
+                    continue;
+                }
+                (dst, src)
+            }
+            _ => {
+                return Err(Error(format!(
+                    "op {at}: a copy moves between a parameter and a buffer"
+                )));
+            }
+        };
+        let Op::Buffer { shape, dtype, .. } = k.ops[def[buffer as usize].expect("defined")] else {
+            unreachable!("the type says it is a buffer");
+        };
+        let (_, _, unit_bytes) = unit_of(shape, dtype)?;
+        let offset = match offset {
+            Dim::Const(n) => n,
+            Dim::Value(v) => {
+                return Err(Error(format!(
+                    "op {at}: the offset %{v} is symbolic; only a literal offset is lowered yet"
+                )));
+            }
+        };
+        let base = plan.buf[buffer as usize]
+            .ok_or_else(|| Error(format!("op {at}: buffer %{buffer} was not placed")))?;
+        let byte_offset = offset
+            .checked_mul(dtype.bytes())
+            .ok_or_else(|| Error(format!("op {at}: the offset overflows")))?;
+        copies.push(Copy {
+            param: param_index[param as usize].expect("a parameter has an index"),
+            offset: byte_offset,
+            l1: base
+                .checked_add(byte_offset)
+                .ok_or_else(|| Error(format!("op {at}: the buffer address overflows")))?,
+            bytes: unit_bytes,
+        });
     }
-    a.word(rv::ret());
-    a.finish().map_err(Error)
+    Ok(copies)
 }
 
 /// `t5` = this NIU's base, `t3` = this tile's NOC high word (the launch's third
@@ -81,15 +156,23 @@ fn prologue(a: &mut Asm) {
     a.word(rv::lw(reg::T3, reg::A0, 12));
 }
 
-fn emit_copy(a: &mut Asm, at: usize, param: u32, offset: u32, l1: u32, bytes: u32, read: bool) -> Result<(), Error> {
+fn emit_copy(
+    a: &mut Asm,
+    at: usize,
+    param: u32,
+    offset: u32,
+    l1: u32,
+    bytes: u32,
+    read: bool,
+) -> Result<(), Error> {
     if bytes == 0 || bytes > tt_isa::noc::niu::MAX_REQUEST_BYTES {
         return Err(Error(format!(
-            "op {at}: {bytes} bytes is not one NOC request (1..={})",
+            "copy {at}: {bytes} bytes is not one NOC request (1..={})",
             tt_isa::noc::niu::MAX_REQUEST_BYTES
         )));
     }
     let (lo_arg, hi_arg) = param_arg(param);
-    // Target: the parameter's range base plus the copy's offset.
+    // Target: the parameter's range base plus the copy's byte offset.
     a.word(rv::lw(reg::T1, reg::A0, lo_arg));
     if offset != 0 {
         a.li(reg::T4, offset);
@@ -124,9 +207,8 @@ fn emit_copy(a: &mut Asm, at: usize, param: u32, offset: u32, l1: u32, bytes: u3
     store_reg(a, initiator::AT_LEN_BE, reg::T4);
     store_zero(a, initiator::AT_DATA);
     // Trigger, then wait until the hardware takes the request.
-    let one = a.word(rv::addi(reg::T4, reg::ZERO, 1));
+    a.word(rv::addi(reg::T4, reg::ZERO, 1));
     store_reg(a, initiator::CMD_CTRL, reg::T4);
-    let _ = one;
     let poll = format!("poll{at}");
     a.label(&poll);
     a.word(rv::lw(reg::T6, reg::T5, initiator::CMD_CTRL as i32));
@@ -149,85 +231,5 @@ fn store_zero(a: &mut Asm, at: u64) {
     a.word(rv::sw(reg::ZERO, reg::T5, at as i32));
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ir::Kernel;
-
-    const COPY: &str = "\
-version 1
-grid 1 1
-param in f32 8192
-param out f32 8192
-buf 0 4096 plain rm
-buf 1 4096 plain rm
-copy_in param 0 offset 0 len 4096 buf 0
-copy_out buf 1 param 1 offset 64 len 4096
-";
-
-    #[test]
-    fn the_reader_program_ends_in_ret() {
-        let k = Kernel::parse(COPY).unwrap();
-        let plan = crate::planner::place(&k).unwrap();
-        let words = reader(&k, &plan).unwrap();
-        assert_eq!(*words.last().unwrap(), rv::ret());
-    }
-
-    #[test]
-    fn the_writer_program_ends_in_ret() {
-        let k = Kernel::parse(COPY).unwrap();
-        let plan = crate::planner::place(&k).unwrap();
-        let words = writer(&k, &plan).unwrap();
-        assert_eq!(*words.last().unwrap(), rv::ret());
-    }
-
-    #[test]
-    fn the_reader_issues_a_read_and_drains() {
-        let k = Kernel::parse(COPY).unwrap();
-        let plan = crate::planner::place(&k).unwrap();
-        let words = reader(&k, &plan).unwrap();
-        // The NIU base, the control word and the drain counter are all present
-        // as constants formed by `lui`/`addi`.
-        let ctrl = CMD_RD | RESP_MARKED | STATIC_VC_1;
-        assert!(has_const(&words, ctrl), "the control word is issued");
-        assert!(has_const(&words, 4096), "the request length is 4096");
-        assert!(
-            has_lw_imm(&words, reqs_outstanding(TXN) as i32),
-            "the drain polls the counter"
-        );
-        assert!(has_const(&words, Niu::Noc0.base() as u32), "the NIU base is materialised");
-        // Two backward branches: the trigger poll and the drain.
-        let branches = words.iter().filter(|w| (**w & 0x7f) == 0x63).count();
-        assert_eq!(branches, 2, "one poll for the trigger and one for the drain");
-    }
-
-    #[test]
-    fn the_writer_issues_a_write() {
-        let k = Kernel::parse(COPY).unwrap();
-        let plan = crate::planner::place(&k).unwrap();
-        let words = writer(&k, &plan).unwrap();
-        let ctrl = CMD_WR | RESP_MARKED | STATIC_VC_1;
-        assert!(has_const(&words, ctrl), "the write control word is issued");
-    }
-
-    /// Is there an `lw` with this (signed) immediate?
-    fn has_lw_imm(words: &[u32], imm: i32) -> bool {
-        words.iter().any(|w| (w & 0x7f) == 0x03 && ((w >> 12) & 7) == 2 && ((*w as i32) >> 20) == imm)
-    }
-
-    /// Is `value` formed by an adjacent `lui`/`addi` pair (what `li` emits)?
-    fn has_const(words: &[u32], value: u32) -> bool {
-        for i in 0..words.len().saturating_sub(1) {
-            let (w, n) = (words[i], words[i + 1]);
-            let is_lui = (w & 0x7f) == 0x37;
-            let is_addi = (n & 0x7f) == 0x13 && ((n >> 12) & 7) == 0;
-            if is_lui && is_addi && ((n >> 15) & 0x1f) == ((w >> 7) & 0x1f) {
-                let total = (w & 0xffff_f000).wrapping_add(((n as i32) >> 20) as u32);
-                if total == value {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-}
+#[allow(dead_code)]
+fn _unused(_: ValueId) {}

@@ -2,18 +2,6 @@
 // SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
 
 //! The machine IR: what each of the three compute cores executes.
-//!
-//! This is the form the optimization passes work on -- no SSA, no buffer ids,
-//! physical `Dst` rows, lane registers and L1 addresses. It is still an enum, not
-//! encoded words: [`crate::encode`] is the only thing that turns it into Tensix
-//! instructions, so a pass can inspect and rewrite it.
-//!
-//! The device is not one program: the mover cores run their own RISC-V and the
-//! three compute cores run one program each. [`Machine`] holds them separately,
-//! which is what lets a single semantic program become several programs without
-//! the caller ever naming a core.
-
-use crate::ir::SfpuKind;
 
 /// One SFPU instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,16 +9,9 @@ pub enum SfpOp {
     Neg,
     Abs,
     Relu,
-}
-
-impl From<SfpuKind> for SfpOp {
-    fn from(kind: SfpuKind) -> Self {
-        match kind {
-            SfpuKind::Neg => SfpOp::Neg,
-            SfpuKind::Abs => SfpOp::Abs,
-            SfpuKind::Relu => SfpOp::Relu,
-        }
-    }
+    Add,
+    Sub,
+    Mul,
 }
 
 /// One instruction of a compute core's program.
@@ -41,7 +22,12 @@ pub enum MirOp {
     /// `SFPSTORE`: lane register into a `Dst` row.
     Sfpstore { lreg: u8, row: u32 },
     /// One SFPU arithmetic instruction; `b` is `None` for a unary op.
-    Sfp { op: SfpOp, a: u8, b: Option<u8>, d: u8 },
+    Sfp {
+        op: SfpOp,
+        a: u8,
+        b: Option<u8>,
+        d: u8,
+    },
     /// `UNPACR`: the tile image at L1 `src` into unpacker `unit`'s destination.
     Unpacr { src: u32, unit: u8, count: u32 },
     /// `SETADCZW`: which face the unpacker reads next.

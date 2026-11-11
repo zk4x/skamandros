@@ -3,17 +3,17 @@
 
 //! The runtime: a device, DRAM buffers, host transfers, and a launch.
 //!
-//! A launch is synchronous. The three compute programs are not started yet, so
-//! every module that can be compiled today is a boundary program or a pair of
-//! them; such a module runs on RISCV B through [`Device::run_program`], the
-//! reader first and then the writer, which is the program's own order. A module
-//! with non-empty compute programs is refused rather than run half-way.
+//! A launch is synchronous: the inbound mover runs on RISCV B to completion, then
+//! the three compute cores are staged and released together, then the outbound
+//! mover runs on RISCV B. A module without compute programs skips the middle
+//! step, and a module with neither mover runs only the compute cores.
 
 use std::sync::Mutex;
 
 use crate::compile::Module;
 use crate::device::Device;
 use crate::ir::Error;
+use tt_isa::mailbox::{self, status};
 use tt_isa::noc::{Noc0, NocCoord};
 
 /// The one open device, if [`init`] has been called.
@@ -83,13 +83,13 @@ pub fn launch(module: &Module, params: &[u64]) -> Result<(), LaunchError> {
             module.grid[0], module.grid[1]
         )));
     }
-    if module.cores.iter().any(|program| !program.is_empty()) {
+    if module.reader.is_empty()
+        && module.writer.is_empty()
+        && module.cores.iter().all(Vec::is_empty)
+    {
         return Err(LaunchError::Unsupported(
-            "this module has compute programs; the three compute cores are not launched yet".into(),
+            "the module has no program to run".into(),
         ));
-    }
-    if module.reader.is_empty() && module.writer.is_empty() {
-        return Err(LaunchError::Unsupported("the module has no program to run".into()));
     }
     with_device(|device| run(device, module, params)).map_err(LaunchError::Device)
 }
@@ -124,13 +124,85 @@ fn run(device: &mut Device, module: &Module, params: &[u64]) -> Result<(), Error
     }
 
     device.start_executor()?;
-    for (name, words) in [("reader", &module.reader), ("writer", &module.writer)] {
+    if !module.reader.is_empty() {
+        device
+            .run_program(program_at, args_at, &module.reader, &args)
+            .map_err(|e| Error(format!("the reader program: {e}")))?;
+    }
+    if module.cores.iter().any(|words| !words.is_empty()) {
+        run_compute(device, module).map_err(|e| Error(format!("the compute cores: {e}")))?;
+    }
+    if !module.writer.is_empty() {
+        device
+            .run_program(program_at, args_at, &module.writer, &args)
+            .map_err(|e| Error(format!("the writer program: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Stage the three compute programs in their role slots, release T0/T1/T2
+/// together, and wait for every started role to finish.
+///
+/// The backend is released first, while the cores are still held: no Tensix
+/// instruction may be pushed into a held backend. Then thread 0 runs the setup
+/// program (the semaphore initialisation) to completion, and only after that are
+/// the three roles released together — the order tt-metal uses, where BRISC
+/// initialises the semaphores before it releases the TRISCs.
+fn run_compute(device: &mut Device, module: &Module) -> Result<(), Error> {
+    device.release_tensix_backend()?;
+    let setup = crate::encode::setup()?;
+    stage_role(device, 0, &setup)?;
+    let (core, image, at) = crate::images::ROLES[0];
+    device.load_and_start(core, image, at)?;
+    device
+        .wait_for(mailbox::role::Mailbox::of(0).status(), |s| {
+            s == status::DONE
+        })
+        .map_err(|e| Error(format!("the setup run on thread 0: {e}")))?;
+
+    let mut images = Vec::new();
+    for (thread, words) in module.cores.iter().enumerate() {
         if words.is_empty() {
             continue;
         }
+        stage_role(device, thread, words)?;
+        images.push(crate::images::ROLES[thread]);
+    }
+    device.load_and_start_together(&images)?;
+    for (thread, words) in module.cores.iter().enumerate() {
+        if words.is_empty() {
+            continue;
+        }
+        let mb = mailbox::role::Mailbox::of(thread as u32);
         device
-            .run_program(program_at, args_at, words, &args)
-            .map_err(|e| Error(format!("the {name} program: {e}")))?;
+            .wait_for(mb.status(), |s| s == status::DONE)
+            .map_err(|e| Error(format!("thread {thread}: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Stage `words` in `thread`'s role slot and write its descriptor.
+fn stage_role(device: &mut Device, thread: usize, words: &[u32]) -> Result<(), Error> {
+    if words.len() as u32 > mailbox::PROGRAM_MAX {
+        return Err(Error(format!(
+            "the thread-{thread} program ({} words) is longer than the {} a slot holds",
+            words.len(),
+            mailbox::PROGRAM_MAX
+        )));
+    }
+    let mb = mailbox::role::Mailbox::of(thread as u32);
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    device.l1_write(mb.program(), &code)?;
+    device.write32(mb.status(), 0)?;
+    let descriptor = mailbox::Descriptor {
+        thread_index: thread as u32,
+        dst_access_fmt: 0,
+        program_len: words.len() as u32,
+        push_window: mailbox::SIM_PUSH_WINDOW,
+        ..Default::default()
+    };
+    for (at, value) in descriptor.writes(mb) {
+        device.write32(at, value)?;
     }
     Ok(())
 }

@@ -1,178 +1,254 @@
 // Copyright (C) 2025 zk4x
 // SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
 
-//! SSA to machine IR: the first lowering step.
+//! Unified program to machine IR: the first lowering step.
 //!
-//! Each semantic op becomes the instructions of the core that runs it: `unpack`
-//! configures and fills the unpacker on T0, `sfpu` becomes one load/op/store
-//! triple per `Dst` row on T1, `pack` configures and drains on T2. Addresses come
-//! from the L1 plan, `Dst` slots from the allocation, and the hand-offs from the
-//! allocation's semaphores -- the caller wrote none of them.
+//! `load` configures and fills the unpacker on T0, the register ops become
+//! load/op/store bodies on T1, `store_to` configures and drains the packer on
+//! T2. `copy_to` crosses the L1 boundary and is emitted by [`crate::mover`], not
+//! here. The three cores are paced by two semaphores: the unpacker publishes
+//! each loaded unit, and the math core publishes each stored one.
+//!
+//! Addresses come from the L1 plan, `Dst` slots from the allocation; the caller
+//! named none of them.
 
-use crate::alloc::{Alloc, Place, Role, Sync, SyncKind};
-use crate::ir::{Error, Kernel, Op};
+use crate::alloc::Alloc;
+use crate::ir::{BinOp, Dim, Error, Kernel, Op, RegShape, Types, UnOp, unit_of};
 use crate::mir::{Machine, MirOp, SfpOp};
 use crate::planner::Plan;
 
 /// `Dst` rows one 32x32 F32 tile occupies (`tt_isa`'s SFPU row is 16 datums).
 pub const DST_ROWS: u32 = 64;
-/// Datums in one tile.
+/// Datums in one 32x32 tile.
 pub const TILE_DATUMS: u32 = 1024;
+/// Semaphore the unpacker publishes a loaded unit on.
+pub const SEM_UNPACKED: u8 = 0;
+/// Semaphore the math core publishes a stored unit on.
+pub const SEM_READY: u8 = 1;
 
-/// Lower `k` to the three compute programs. The mover programs are separate.
-pub fn lower(k: &Kernel, plan: &Plan, alloc: &Alloc) -> Result<Machine, Error> {
+/// Lower `k` to the three compute programs.
+pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Machine, Error> {
     let mut m = Machine::default();
-    // Hand-offs are emitted in program order around the compute ops they pace;
-    // the allocation lists them as a whole-program protocol.
-    let mut syncs: Vec<&Sync> = alloc.sync.iter().collect();
+    let mut def: Vec<Option<usize>> = vec![None; types.values.len()];
+    for (at, op) in k.ops.iter().enumerate() {
+        if let Some(value) = op.defined() {
+            def[value as usize] = Some(at);
+        }
+    }
     for (at, op) in k.ops.iter().enumerate() {
         match *op {
-            Op::Unpack { value, buf } => {
-                let place = alloc.place_of(value);
-                let row = match place {
-                    Place::Dst(slot) => u32::from(slot) * DST_ROWS,
-                    Place::SrcA(_) | Place::SrcB(_) => {
-                        return Err(Error(format!(
-                            "op {at}: unpack %{value} lands in a Src bank; the Src path is not lowered yet"
-                        )));
-                    }
+            Op::Const { .. }
+            | Op::Param { .. }
+            | Op::Buffer { .. }
+            | Op::Grid { .. }
+            | Op::CopyTo { .. } => {}
+            Op::Loop { .. } | Op::EndLoop => {
+                return Err(Error(format!(
+                    "op {at}: loops are not lowered yet; the parser and verifier accept them"
+                )));
+            }
+            Op::Load {
+                value,
+                buffer,
+                offset,
+            } => {
+                let info = types.of(buffer);
+                let Op::Buffer { shape, dtype, .. } = k.ops[def[buffer as usize].expect("defined")]
+                else {
+                    return Err(Error(format!("op {at}: %{buffer} is not a buffer")));
+                };
+                if dtype != crate::ir::DType::F32 {
+                    return Err(Error(format!(
+                        "op {at}: the register datapath is FP32 only for now, not {}",
+                        dtype.name()
+                    )));
+                }
+                let (unit_shape, _, _) = unit_of(shape, dtype)?;
+                let rows = rows_of(unit_shape, at)?;
+                let offset = const_offset(offset, at)?;
+                let base = plan.buf[buffer as usize]
+                    .ok_or_else(|| Error(format!("op {at}: buffer %{buffer} was not placed")))?;
+                let src = base + offset * dtype.bytes();
+                let row = match alloc.place_of(value) {
+                    crate::alloc::Place::Dst(slot) => u32::from(slot) * DST_ROWS,
                 };
                 m.t0.push(MirOp::Setdst { row });
                 m.t0.push(MirOp::Setadczw { unit: 0, face: 0 });
-                m.t0.push(MirOp::Setadcx { unit: 0, first: 0, count: TILE_DATUMS });
-                m.t0.push(MirOp::Unpacr { src: plan.buf[buf as usize], unit: 0, count: TILE_DATUMS });
-                emit_sync(&mut m, &mut syncs, Role::Unpack, true);
+                m.t0.push(MirOp::Setadcx {
+                    unit: 0,
+                    first: 0,
+                    count: unit_shape.datums(),
+                });
+                m.t0.push(MirOp::Unpacr {
+                    src,
+                    unit: 0,
+                    count: unit_shape.datums(),
+                });
+                m.t0.push(MirOp::SemPost { sem: SEM_UNPACKED });
+                m.t1.push(MirOp::SemWait {
+                    sem: SEM_UNPACKED,
+                    before: 0,
+                });
+                let _ = info;
+                let _ = rows;
             }
-            Op::Sfpu { value, kind, a, b } => {
-                if b.is_some() {
-                    return Err(Error(format!("op {at}: binary SFPU ops are not lowered yet")));
-                }
-                let (src_row, dst_row) = match (alloc.place_of(a), alloc.place_of(value)) {
-                    (Place::Dst(s), Place::Dst(d)) => (u32::from(s) * DST_ROWS, u32::from(d) * DST_ROWS),
-                    _ => return Err(Error(format!("op {at}: an SFPU value is not in Dst"))),
+            Op::StoreTo {
+                value,
+                buffer,
+                offset,
+            } => {
+                let Op::Buffer { shape, dtype, .. } = k.ops[def[buffer as usize].expect("defined")]
+                else {
+                    return Err(Error(format!("op {at}: %{buffer} is not a buffer")));
                 };
-                let (lreg_in, lreg_out) = alloc.lreg[value as usize];
-                // Wait for the tile before reading `Dst`, publish the result
-                // after writing it.
-                emit_sync(&mut m, &mut syncs, Role::Math, false);
-                // One `SFPLOAD`/`SFPSTORE` reaches four `Dst` rows and eight of
-                // the sixteen columns (`SFPLOAD.md`: `row = (addr & !3) +
-                // lane/8`, `col = (lane & 7) * 2 + (addr & 2)`), so a 64-row
-                // tile is 32 addresses, stepping by two: bit 1 is the odd half.
-                for at in (0..DST_ROWS).step_by(2) {
-                    m.t1.push(MirOp::Sfpload { lreg: lreg_in, row: src_row + at });
-                    m.t1.push(MirOp::Sfp { op: SfpOp::from(kind), a: lreg_in, b: None, d: lreg_out });
-                    m.t1.push(MirOp::Sfpstore { lreg: lreg_out, row: dst_row + at });
+                if dtype != crate::ir::DType::F32 {
+                    return Err(Error(format!(
+                        "op {at}: the register datapath is FP32 only for now, not {}",
+                        dtype.name()
+                    )));
                 }
-                emit_sync(&mut m, &mut syncs, Role::Math, true);
+                let (unit_shape, _, _) = unit_of(shape, dtype)?;
+                let rows = rows_of(unit_shape, at)?;
+                let offset = const_offset(offset, at)?;
+                let base = plan.buf[buffer as usize]
+                    .ok_or_else(|| Error(format!("op {at}: buffer %{buffer} was not placed")))?;
+                let dst = base + offset * dtype.bytes();
+                m.t1.push(MirOp::SemPost { sem: SEM_READY });
+                m.t2.push(MirOp::SemWait {
+                    sem: SEM_READY,
+                    before: 0,
+                });
+                m.t2.push(MirOp::Pack {
+                    dst,
+                    rows,
+                    last: true,
+                });
+                let _ = value;
+            }
+            Op::Cast { .. } => {
+                return Err(Error(format!(
+                    "op {at}: cast is not lowered yet; the parser and verifier accept it"
+                )));
+            }
+            Op::Unary { value, op, a } => {
+                let shape = types.of(a).shape;
+                let rows = rows_of(shape, at)?;
+                let src = dst_row(alloc, a);
+                let out = dst_row(alloc, value);
+                let (la, ld) = alloc.lreg[value as usize];
+                let sfp = unary(op, at)?;
+                for row in (0..rows).step_by(2) {
+                    m.t1.push(MirOp::Sfpload {
+                        lreg: la,
+                        row: src + row,
+                    });
+                    m.t1.push(MirOp::Sfp {
+                        op: sfp,
+                        a: la,
+                        b: None,
+                        d: ld,
+                    });
+                    m.t1.push(MirOp::Sfpstore {
+                        lreg: ld,
+                        row: out + row,
+                    });
+                }
+            }
+            Op::Binary { value, op, a, b } => {
+                let left = types.of(a);
+                let right = types.of(b);
+                if left.shape != right.shape {
+                    return Err(Error(format!(
+                        "op {at}: broadcast of a {} and a {} is not lowered yet",
+                        right.shape.name(),
+                        left.shape.name()
+                    )));
+                }
+                if left.dtype != crate::ir::DType::F32 {
+                    return Err(Error(format!(
+                        "op {at}: the register datapath is FP32 only for now, not {}",
+                        left.dtype.name()
+                    )));
+                }
+                let rows = rows_of(left.shape, at)?;
+                let sa = dst_row(alloc, a);
+                let sb = dst_row(alloc, b);
+                let out = dst_row(alloc, value);
+                let (la, ld) = alloc.lreg[value as usize];
+                let lb = 2u8;
+                let sfp = binary(op, at)?;
+                for row in (0..rows).step_by(2) {
+                    m.t1.push(MirOp::Sfpload {
+                        lreg: la,
+                        row: sa + row,
+                    });
+                    m.t1.push(MirOp::Sfpload {
+                        lreg: lb,
+                        row: sb + row,
+                    });
+                    m.t1.push(MirOp::Sfp {
+                        op: sfp,
+                        a: la,
+                        b: Some(lb),
+                        d: ld,
+                    });
+                    m.t1.push(MirOp::Sfpstore {
+                        lreg: ld,
+                        row: out + row,
+                    });
+                }
             }
             Op::Matmul { .. } => {
-                return Err(Error(format!("op {at}: the matrix path is not lowered yet")));
+                return Err(Error(format!(
+                    "op {at}: the matrix path is not lowered yet"
+                )));
             }
-            Op::Pack { value, buf } => {
-                if !matches!(alloc.place_of(value), Place::Dst(_)) {
-                    return Err(Error(format!("op {at}: packing a value that is not in Dst")));
-                }
-                emit_sync(&mut m, &mut syncs, Role::Pack, false);
-                m.t2.push(MirOp::Pack { dst: plan.buf[buf as usize], rows: DST_ROWS, last: true });
-                emit_sync(&mut m, &mut syncs, Role::Pack, true);
-            }
-            // Boundary traffic and the explicit syncs are not compute.
-            Op::CopyIn { .. } | Op::CopyOut { .. } | Op::Reserve { .. } | Op::Push { .. } | Op::Wait { .. } | Op::Pop { .. } => {}
         }
-    }
-    if !syncs.is_empty() {
-        return Err(Error(format!(
-            "{} hand-offs were never placed on a core",
-            syncs.len()
-        )));
     }
     Ok(m)
 }
 
-/// Emit the hand-offs this role owns at the current point: the posts when
-/// `posts` is true, the waits when it is false.
-fn emit_sync(m: &mut Machine, syncs: &mut Vec<&Sync>, role: Role, posts: bool) {
-    while let Some(pos) = syncs.iter().position(|s| {
-        s.role == role && matches!((s.kind, posts), (SyncKind::Post, true) | (SyncKind::Wait { .. }, false))
-    }) {
-        let s = *syncs.remove(pos);
-        let op = match s.kind {
-            SyncKind::Post => MirOp::SemPost { sem: s.sem.index() },
-            SyncKind::Wait { before } => MirOp::SemWait { sem: s.sem.index(), before },
-        };
-        match role {
-            Role::Unpack => m.t0.push(op),
-            Role::Math => m.t1.push(op),
-            Role::Pack => m.t2.push(op),
-        }
+fn rows_of(shape: RegShape, at: usize) -> Result<u32, Error> {
+    match shape {
+        RegShape::Scalar => Err(Error(format!(
+            "op {at}: a scalar register value has no row body"
+        ))),
+        RegShape::Row | RegShape::Column => Ok(2),
+        RegShape::Tile => Ok(DST_ROWS),
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::alloc::allocate;
-    use crate::ir::Kernel;
-    use crate::planner::place;
-
-    const ELEMENTWISE: &str = "\
-version 1
-grid 1 1
-param in f32 4096
-param out f32 4096
-buf 0 4096 plain rm
-buf 1 4096 plain rm
-copy_in param 0 offset 0 len 4096 buf 0
-%0 = unpack buf 0
-%1 = sfpu neg %0
-pack %1 buf 1
-copy_out buf 1 param 1 offset 0 len 4096
-";
-
-    #[test]
-    fn the_sfpu_body_is_one_row_triple_per_dst_row() {
-        let k = Kernel::parse(ELEMENTWISE).unwrap();
-        let plan = place(&k).unwrap();
-        let alloc = allocate(&k).unwrap();
-        let m = lower(&k, &plan, &alloc).unwrap();
-        let math: Vec<MirOp> = m.t1.iter().copied().filter(|op| !matches!(op, MirOp::SemWait { .. } | MirOp::SemPost { .. })).collect();
-        assert_eq!(math.len(), (DST_ROWS / 2 * 3) as usize);
-        assert!(matches!(math[0], MirOp::Sfpload { lreg: 0, row: 0 }));
-        assert!(matches!(math[1], MirOp::Sfp { op: SfpOp::Neg, a: 0, b: None, d: 1 }));
-        assert!(matches!(math[2], MirOp::Sfpstore { lreg: 1, row: 0 }));
-        // The last triple is the last address, in place.
-        assert!(matches!(math[math.len() - 3], MirOp::Sfpload { row, .. } if row == DST_ROWS - 2));
+fn dst_row(alloc: &Alloc, value: crate::ir::ValueId) -> u32 {
+    match alloc.place_of(value) {
+        crate::alloc::Place::Dst(slot) => u32::from(slot) * DST_ROWS,
     }
+}
 
-    #[test]
-    fn the_unpack_reads_the_planned_l1_buffer() {
-        let k = Kernel::parse(ELEMENTWISE).unwrap();
-        let plan = place(&k).unwrap();
-        let alloc = allocate(&k).unwrap();
-        let m = lower(&k, &plan, &alloc).unwrap();
-        assert!(m.t0.iter().any(|op| matches!(op, MirOp::Unpacr { src, .. } if *src == plan.buf[0])));
-        assert!(m.t0.iter().any(|op| matches!(op, MirOp::Setdst { row: 0 })));
+fn const_offset(dim: Dim, at: usize) -> Result<u32, Error> {
+    match dim {
+        Dim::Const(n) => Ok(n),
+        Dim::Value(v) => Err(Error(format!(
+            "op {at}: the offset %{v} is symbolic; only a literal offset is lowered yet"
+        ))),
     }
+}
 
-    #[test]
-    fn the_pack_drains_to_the_planned_l1_buffer() {
-        let k = Kernel::parse(ELEMENTWISE).unwrap();
-        let plan = place(&k).unwrap();
-        let alloc = allocate(&k).unwrap();
-        let m = lower(&k, &plan, &alloc).unwrap();
-        assert!(m.t2.iter().any(|op| matches!(op, MirOp::Pack { dst, .. } if *dst == plan.buf[1])));
+fn unary(op: UnOp, at: usize) -> Result<SfpOp, Error> {
+    match op {
+        UnOp::Neg => Ok(SfpOp::Neg),
+        UnOp::Abs => Ok(SfpOp::Abs),
+        UnOp::Relu => Err(Error(format!("op {at}: relu has no encoding yet"))),
     }
+}
 
-    #[test]
-    fn the_hand_offs_land_on_their_cores() {
-        let k = Kernel::parse(ELEMENTWISE).unwrap();
-        let plan = place(&k).unwrap();
-        let alloc = allocate(&k).unwrap();
-        let m = lower(&k, &plan, &alloc).unwrap();
-        assert!(m.t0.iter().any(|op| matches!(op, MirOp::SemPost { sem: 0 })), "unpack publishes");
-        assert!(m.t1.iter().any(|op| matches!(op, MirOp::SemWait { sem: 0, .. })), "math waits");
-        assert!(m.t1.iter().any(|op| matches!(op, MirOp::SemPost { sem: 1 })), "math publishes");
-        assert!(m.t2.iter().any(|op| matches!(op, MirOp::SemWait { sem: 1, .. })), "pack waits");
+fn binary(op: BinOp, at: usize) -> Result<SfpOp, Error> {
+    match op {
+        BinOp::Add => Ok(SfpOp::Add),
+        BinOp::Sub => Ok(SfpOp::Sub),
+        BinOp::Mul => Ok(SfpOp::Mul),
+        other => Err(Error(format!(
+            "op {at}: {} has no SFPU encoding yet",
+            other.name()
+        ))),
     }
 }

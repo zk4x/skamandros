@@ -1,197 +1,438 @@
 // Copyright (C) 2025 zk4x
 // SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
 
-//! The semantic kernel IR: one SSA program, machine programs out.
+//! The semantic kernel IR: one unified SSA program, machine programs out.
 //!
-//! What the caller writes is what the kernel *means*: L1 buffers, the manual
-//! DRAM <-> L1 copies, the circular-buffer sync instructions, and SSA values
-//! produced by unpack / SFPU / matrix ops and consumed by pack or another
-//! compute op. Nothing here names a lane register, a `Dst` slot, a `SrcA`/`SrcB`
-//! bank, a Tensix word or a core: [`crate::alloc`] decides those, and
-//! [`crate::emit`] turns the result into the role programs.
+//! What the caller writes is what the kernel *means*. There are no reader,
+//! compute and writer segments: a DRAM parameter, an L1 buffer, a register
+//! value and the operations on them are all named in one list, and the compiler
+//! classifies each instruction by the operands it touches. There is no
+//! `unpack`/`pack` and no buffer layout: how L1 becomes a register and how a
+//! register becomes L1 is the compiler's business.
 //!
-//! Both forms are canonical: the text form ([`Kernel::parse`],
-//! [`Kernel::to_text`]) and the byte form ([`Kernel::from_bytes`],
-//! [`Kernel::to_bytes`]). They are checked against each other by a round-trip
-//! test, as `llvm-as`/`llvm-dis` are.
+//! Parameters and buffers are mutable, not SSA: `copy_to` (in either direction),
+//! `load` and `store_to` all name the same parameter or buffer. SSA covers the
+//! register values produced by `const`, `cast`, the arithmetic ops, `load` and
+//! `matmul`.
+//!
+//! A shape is a comma-separated list of terms, and a term is a literal or a
+//! value of the fixed index dtype. There is no inline arithmetic: a product is
+//! built by an op first. A parameter may be arbitrary-dimensional and may use
+//! symbolic terms; a scalar parameter is the shape `0`. A buffer is always
+//! two-dimensional, always constant, and each dimension is `1` or a multiple
+//! of 32. The grid is a shape of exactly two terms and may be symbolic too.
+//!
+//! Both forms are canonical: the text form and the byte form ([`MAGIC`],
+//! [`VERSION`]). Each refuses the other's version.
 
 use core::fmt;
+use std::collections::BTreeMap;
 
-/// Identifier of an SSA value.
+/// Identifier of an SSA value. Equals the definition order.
 pub type ValueId = u32;
 
-/// Identifier of an L1 buffer.
-pub type BufId = u32;
+/// The fixed dtype of every index, shape and bracket term.
+pub const INDEX: DType = DType::I32;
 
-/// Element type of a tile.
+/// Element type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DType {
     F32,
+    Bf16,
+    I32,
 }
 
 impl DType {
     /// Bytes of one datum.
     pub const fn bytes(self) -> u32 {
         match self {
-            DType::F32 => 4,
+            DType::F32 | DType::I32 => 4,
+            DType::Bf16 => 2,
         }
     }
 
-    fn name(self) -> &'static str {
+    pub const fn is_float(self) -> bool {
+        matches!(self, DType::F32 | DType::Bf16)
+    }
+
+    pub fn name(self) -> &'static str {
         match self {
             DType::F32 => "f32",
+            DType::Bf16 => "bf16",
+            DType::I32 => "i32",
         }
     }
-}
 
-/// A kernel argument: read-only or written by the kernel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ParamKind {
-    In,
-    Out,
-}
-
-impl ParamKind {
-    fn name(self) -> &'static str {
+    fn tag(self) -> u8 {
         match self {
-            ParamKind::In => "in",
-            ParamKind::Out => "out",
+            DType::F32 => 0,
+            DType::Bf16 => 1,
+            DType::I32 => 2,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Option<DType> {
+        match tag {
+            0 => Some(DType::F32),
+            1 => Some(DType::Bf16),
+            2 => Some(DType::I32),
+            _ => None,
         }
     }
 }
 
-/// One kernel argument.
+/// One term of a shape, a grid or a bracket: a literal or an SSA value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Param {
-    pub kind: ParamKind,
-    pub dtype: DType,
-    /// Bytes the argument occupies.
-    pub bytes: u32,
+pub enum Dim {
+    Const(u32),
+    Value(ValueId),
 }
 
-/// How an L1 buffer is used.
+/// The shape of a register value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BufKind {
-    /// A plain span of L1: written by a copy or a pack, read by an unpack.
-    Plain,
-    /// A circular buffer: `pages` pages of `bytes / pages` bytes, driven by the
-    /// explicit reserve / push / wait / pop instructions.
-    Circular { pages: u8 },
+pub enum RegShape {
+    /// One datum.
+    Scalar,
+    /// 32 datums in a column.
+    Column,
+    /// 32 datums in a row.
+    Row,
+    /// A 32x32 tile.
+    Tile,
 }
 
-/// How the datums of an L1 buffer are laid out.
+impl RegShape {
+    /// Datums in one value of this shape.
+    pub const fn datums(self) -> u32 {
+        match self {
+            RegShape::Scalar => 1,
+            RegShape::Column | RegShape::Row => 32,
+            RegShape::Tile => 32 * 32,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            RegShape::Scalar => "scalar",
+            RegShape::Column => "column",
+            RegShape::Row => "row",
+            RegShape::Tile => "tile",
+        }
+    }
+}
+
+/// What a value names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueKind {
+    /// A DRAM parameter. Mutable, not SSA.
+    Param,
+    /// An L1 buffer. Mutable, not SSA.
+    Buffer,
+    /// A literal.
+    Const,
+    /// A loop's induction value.
+    Induction,
+    /// A register value.
+    Register,
+}
+
+/// Everything the compiler knows about one value.
 ///
-/// A row-major buffer is a contiguous run of datums. A tile-major buffer is a
-/// sequence of 32x32 tile images: 4096 bytes of datums per tile, the four 16x16
-/// faces in face order (`TILE_SLOT`'s body, without the DRAM header). The
-/// unpacker's descriptor and the packer's address generator are configured from
-/// this, so it is part of the program, not of the driver's policy.
+/// A scalar parameter has [`RegShape::Scalar`]; any other parameter has
+/// [`RegShape::Tile`], and the `Param` op carries its logical shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Layout {
-    /// Datums in row order, no tiling.
-    RowMajor,
-    /// A sequence of 32x32 tile images, faces in face order.
-    TileMajor,
+pub struct ValueInfo {
+    pub kind: ValueKind,
+    pub dtype: DType,
+    pub shape: RegShape,
 }
 
-impl Layout {
-    fn name(self) -> &'static str {
+/// The arithmetic a binary op names. Index math is `i32`; float math is `f32`
+/// or `bf16`; shifts and bitwise ops are `i32` only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Shr,
+    Shl,
+    And,
+    Or,
+    Xor,
+}
+
+impl BinOp {
+    pub fn name(self) -> &'static str {
         match self {
-            Layout::RowMajor => "rm",
-            Layout::TileMajor => "tile",
+            BinOp::Add => "add",
+            BinOp::Sub => "sub",
+            BinOp::Mul => "mul",
+            BinOp::Div => "div",
+            BinOp::Rem => "rem",
+            BinOp::Shr => "shr",
+            BinOp::Shl => "shl",
+            BinOp::And => "and",
+            BinOp::Or => "or",
+            BinOp::Xor => "xor",
         }
+    }
+
+    fn from_name(name: &str) -> Option<BinOp> {
+        Some(match name {
+            "add" => BinOp::Add,
+            "sub" => BinOp::Sub,
+            "mul" => BinOp::Mul,
+            "div" => BinOp::Div,
+            "rem" => BinOp::Rem,
+            "shr" => BinOp::Shr,
+            "shl" => BinOp::Shl,
+            "and" => BinOp::And,
+            "or" => BinOp::Or,
+            "xor" => BinOp::Xor,
+            _ => return None,
+        })
+    }
+
+    fn tag(self) -> u8 {
+        match self {
+            BinOp::Add => 0,
+            BinOp::Sub => 1,
+            BinOp::Mul => 2,
+            BinOp::Div => 3,
+            BinOp::Rem => 4,
+            BinOp::Shr => 5,
+            BinOp::Shl => 6,
+            BinOp::And => 7,
+            BinOp::Or => 8,
+            BinOp::Xor => 9,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Option<BinOp> {
+        Some(match tag {
+            0 => BinOp::Add,
+            1 => BinOp::Sub,
+            2 => BinOp::Mul,
+            3 => BinOp::Div,
+            4 => BinOp::Rem,
+            5 => BinOp::Shr,
+            6 => BinOp::Shl,
+            7 => BinOp::And,
+            8 => BinOp::Or,
+            9 => BinOp::Xor,
+            _ => return None,
+        })
+    }
+
+    /// The ops that only make sense on the index dtype.
+    pub const fn is_integer_only(self) -> bool {
+        matches!(
+            self,
+            BinOp::Rem | BinOp::Shr | BinOp::Shl | BinOp::And | BinOp::Or | BinOp::Xor
+        )
     }
 }
 
-/// Bytes of one tile-major tile's datums (`16*16*4` per face, four faces).
-pub const TILE_BYTES: u32 = 4096;
-
-/// One declared L1 buffer.
+/// A unary register op.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Buf {
-    pub bytes: u32,
-    pub kind: BufKind,
-    pub layout: Layout,
-}
-
-/// The elementwise operations the IR names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SfpuKind {
+pub enum UnOp {
     Neg,
     Abs,
     Relu,
 }
 
-impl SfpuKind {
-    fn name(self) -> &'static str {
+impl UnOp {
+    pub fn name(self) -> &'static str {
         match self {
-            SfpuKind::Neg => "neg",
-            SfpuKind::Abs => "abs",
-            SfpuKind::Relu => "relu",
+            UnOp::Neg => "neg",
+            UnOp::Abs => "abs",
+            UnOp::Relu => "relu",
         }
+    }
+
+    fn from_name(name: &str) -> Option<UnOp> {
+        Some(match name {
+            "neg" => UnOp::Neg,
+            "abs" => UnOp::Abs,
+            "relu" => UnOp::Relu,
+            _ => return None,
+        })
+    }
+
+    fn tag(self) -> u8 {
+        match self {
+            UnOp::Neg => 0,
+            UnOp::Abs => 1,
+            UnOp::Relu => 2,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Option<UnOp> {
+        Some(match tag {
+            0 => UnOp::Neg,
+            1 => UnOp::Abs,
+            2 => UnOp::Relu,
+            _ => return None,
+        })
     }
 }
 
-/// One instruction of the semantic program.
+/// One instruction of the unified program.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
-    /// Move `bytes` from `param` at byte `offset` into L1 `buf`. Runs on the
-    /// reader core; L1 is the caller's choice.
-    CopyIn { param: u32, offset: u32, buf: BufId, bytes: u32 },
-    /// Move L1 `buf` into `param` at byte `offset`. Runs on the writer core.
-    CopyOut { buf: BufId, param: u32, offset: u32, bytes: u32 },
-    /// `reserve_back`: open `pages` back pages of a circular buffer.
-    Reserve { buf: BufId, pages: u8 },
-    /// `push_back`: publish `pages` written pages.
-    Push { buf: BufId, pages: u8 },
-    /// `wait_front`: block until `pages` front pages hold data.
-    Wait { buf: BufId, pages: u8 },
-    /// `pop_front`: release `pages` consumed pages.
-    Pop { buf: BufId, pages: u8 },
-    /// L1 `buf` becomes an SSA value: the unpacker moves the tile into `Dst`
-    /// or a `Src` bank, chosen by [`crate::alloc`] from the value's uses.
-    Unpack { value: ValueId, buf: BufId },
-    /// Elementwise SFPU: `b` is `None` for a unary op. Result is an SSA value.
-    Sfpu { value: ValueId, kind: SfpuKind, a: ValueId, b: Option<ValueId> },
-    /// Matrix multiply: `a x b` accumulates into a `Dst` value.
-    Matmul { value: ValueId, a: ValueId, b: ValueId },
-    /// The value's tile is packed into L1 `buf`.
-    Pack { value: ValueId, buf: BufId },
+    /// A literal. `bits` holds the two's-complement `i32` or the `f32` bits.
+    Const {
+        value: ValueId,
+        dtype: DType,
+        bits: u32,
+    },
+    /// A DRAM parameter. Empty `dims` is the scalar shape `0`.
+    Param {
+        value: ValueId,
+        dtype: DType,
+        dims: Vec<Dim>,
+    },
+    /// An L1 buffer: two constant dimensions.
+    Buffer {
+        value: ValueId,
+        dtype: DType,
+        shape: [u32; 2],
+    },
+    /// The launch grid, as a shape of two terms.
+    Grid { columns: Dim, rows: Dim },
+    /// `%i = loop %bound`.
+    Loop { value: ValueId, bound: Dim },
+    /// `endloop`.
+    EndLoop,
+    /// DRAM into L1, or L1 into DRAM: exactly one side is a parameter, the other
+    /// a buffer. `offset` is in datums and indexes both sides.
+    CopyTo {
+        dst: ValueId,
+        src: ValueId,
+        offset: Dim,
+    },
+    /// L1 buffer into a register value.
+    Load {
+        value: ValueId,
+        buffer: ValueId,
+        offset: Dim,
+    },
+    /// A register value into an L1 buffer.
+    StoreTo {
+        value: ValueId,
+        buffer: ValueId,
+        offset: Dim,
+    },
+    /// The only conversion.
+    Cast {
+        value: ValueId,
+        src: ValueId,
+        dtype: DType,
+    },
+    /// One unary register op.
+    Unary {
+        value: ValueId,
+        op: UnOp,
+        a: ValueId,
+    },
+    /// One binary register op, with implicit broadcast.
+    Binary {
+        value: ValueId,
+        op: BinOp,
+        a: ValueId,
+        b: ValueId,
+    },
+    /// `a x b` accumulating into a tile.
+    Matmul {
+        value: ValueId,
+        a: ValueId,
+        b: ValueId,
+    },
 }
 
 impl Op {
     /// The value this op defines, if any.
     pub fn defined(&self) -> Option<ValueId> {
         match *self {
-            Op::Unpack { value, .. } | Op::Sfpu { value, .. } | Op::Matmul { value, .. } => Some(value),
-            _ => None,
+            Op::Const { value, .. }
+            | Op::Param { value, .. }
+            | Op::Buffer { value, .. }
+            | Op::Loop { value, .. }
+            | Op::Load { value, .. }
+            | Op::Cast { value, .. }
+            | Op::Unary { value, .. }
+            | Op::Binary { value, .. }
+            | Op::Matmul { value, .. } => Some(value),
+            Op::Grid { .. } | Op::EndLoop | Op::CopyTo { .. } | Op::StoreTo { .. } => None,
         }
     }
 
-    /// Values this op reads.
+    /// The values this op reads.
     pub fn used(&self) -> Vec<ValueId> {
-        match *self {
-            Op::Sfpu { a, b, .. } => b.map_or_else(|| vec![a], |b| vec![a, b]),
-            Op::Matmul { a, b, .. } => vec![a, b],
-            Op::Pack { value, .. } => vec![value],
-            _ => Vec::new(),
+        fn dim(d: &Dim) -> Option<ValueId> {
+            match *d {
+                Dim::Value(v) => Some(v),
+                Dim::Const(_) => None,
+            }
+        }
+        match self {
+            Op::CopyTo { dst, src, offset } => {
+                let mut v = vec![*dst, *src];
+                v.extend(dim(offset));
+                v
+            }
+            Op::Load { buffer, offset, .. } => {
+                let mut v = vec![*buffer];
+                v.extend(dim(offset));
+                v
+            }
+            Op::StoreTo {
+                value,
+                buffer,
+                offset,
+            } => {
+                let mut v = vec![*value, *buffer];
+                v.extend(dim(offset));
+                v
+            }
+            Op::Cast { src, .. } => vec![*src],
+            Op::Unary { a, .. } => vec![*a],
+            Op::Binary { a, b, .. } => vec![*a, *b],
+            Op::Matmul { a, b, .. } => vec![*a, *b],
+            Op::Loop { bound, .. } => dim(bound).into_iter().collect(),
+            Op::Grid { columns, rows } => dim(columns).into_iter().chain(dim(rows)).collect(),
+            Op::Param { dims, .. } => dims.iter().filter_map(dim).collect(),
+            Op::Const { .. } | Op::Buffer { .. } | Op::EndLoop => Vec::new(),
         }
     }
 }
 
-/// A parsed, verified-by-construction kernel. Call [`Kernel::verify`] before
-/// handing it to the allocator.
+/// A parsed kernel. [`Kernel::verify`] is the only thing that fills in what a
+/// value means; a program that fails it must never reach the compiler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Kernel {
-    /// Launch grid: (columns, rows) of points, each a Tensix tile.
-    pub grid: [u32; 2],
-    pub params: Vec<Param>,
-    pub bufs: Vec<Buf>,
     pub ops: Vec<Op>,
+    /// The name of every value, by id.
+    pub names: Vec<String>,
 }
 
-/// What can be wrong with a kernel. Every check reports the line (text form) or
-/// the op index (byte form) that failed.
+/// The meaning of every value, by id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Types {
+    pub values: Vec<ValueInfo>,
+    /// The grid terms. A program must have them.
+    pub grid: [Dim; 2],
+}
+
+impl Types {
+    pub fn of(&self, value: ValueId) -> &ValueInfo {
+        &self.values[value as usize]
+    }
+}
+
+/// What can be wrong with a kernel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error(pub String);
 
@@ -209,235 +450,624 @@ impl Error {
     }
 }
 
-impl Kernel {
-    /// Check the SSA form and every reference. A kernel that fails this must
-    /// never reach the allocator.
-    pub fn verify(&self) -> Result<(), Error> {
-        if self.grid[0] == 0 || self.grid[1] == 0 {
-            return Err(Error::new("grid must be at least 1x1"));
+impl fmt::Display for Dim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Dim::Const(n) => write!(f, "{n}"),
+            Dim::Value(v) => write!(f, "%{v}"),
         }
-        let mut defined: Vec<bool> = Vec::new();
-        let mut next_value: ValueId = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shapes
+// ---------------------------------------------------------------------------
+
+/// The register shape of one buffer unit, how many units the buffer holds, and
+/// its byte size.
+///
+/// A `1,N` buffer is a row vector and a `N,1` buffer a column; otherwise both
+/// dimensions are multiples of 32 and each 32x32 block is a tile. The extra
+/// units are the pages of a deeper buffer (double or triple buffering).
+pub fn unit_of(shape: [u32; 2], dtype: DType) -> Result<(RegShape, u32, u32), Error> {
+    let [a, b] = shape;
+    if a == 0 || b == 0 {
+        return Err(Error::new(format!(
+            "buffer shape {a},{b} has a zero dimension"
+        )));
+    }
+    let ok = |n: u32| n == 1 || n % 32 == 0;
+    if !ok(a) || !ok(b) {
+        return Err(Error::new(format!(
+            "buffer shape {a},{b}: each dimension is 1 or a multiple of 32"
+        )));
+    }
+    let elements = a
+        .checked_mul(b)
+        .ok_or_else(|| Error::new(format!("buffer shape {a},{b} overflows")))?;
+    let bytes = elements
+        .checked_mul(dtype.bytes())
+        .ok_or_else(|| Error::new(format!("buffer shape {a},{b} overflows in bytes")))?;
+    let (unit, datums) = match (a, b) {
+        (1, 1) => (RegShape::Scalar, 1),
+        (1, _) => (RegShape::Row, 32),
+        (_, 1) => (RegShape::Column, 32),
+        _ => (RegShape::Tile, 1024),
+    };
+    Ok((unit, elements / datums, bytes))
+}
+
+// ---------------------------------------------------------------------------
+// Verification
+// ---------------------------------------------------------------------------
+
+fn lookup<'a>(
+    values: &'a [ValueInfo],
+    visible: &[bool],
+    v: ValueId,
+    at: usize,
+) -> Result<&'a ValueInfo, Error> {
+    let info = values
+        .get(v as usize)
+        .ok_or_else(|| Error::new(format!("op {at} uses %{v}, which is not defined")))?;
+    if !visible.get(v as usize).copied().unwrap_or(false) {
+        return Err(Error::new(format!(
+            "op {at} uses %{v}, which is out of scope"
+        )));
+    }
+    Ok(info)
+}
+
+impl Kernel {
+    /// Check every reference, dtype, shape and scope, and return what each
+    /// value means.
+    pub fn verify(&self) -> Result<Types, Error> {
+        let mut values: Vec<ValueInfo> = Vec::with_capacity(self.names.len());
+        let mut visible: Vec<bool> = Vec::with_capacity(self.names.len());
+        let mut loops: Vec<usize> = Vec::new();
+        let mut grid: Option<([Dim; 2], usize)> = None;
+        let mut seen: Vec<&str> = Vec::with_capacity(self.names.len());
+        for name in &self.names {
+            if seen.contains(&name.as_str()) {
+                return Err(Error::new(format!("the name %{name} is defined twice")));
+            }
+            seen.push(name);
+        }
+        // The op that defines each value. Value ids are definition order, not op
+        // indices: a `grid`, a `copy_to` or an `endloop` takes an op slot and
+        // defines nothing.
+        let mut def: Vec<usize> = vec![usize::MAX; self.names.len()];
+        for (at, op) in self.ops.iter().enumerate() {
+            if let Some(value) = op.defined() {
+                def[value as usize] = at;
+            }
+        }
+
         for (at, op) in self.ops.iter().enumerate() {
             for v in op.used() {
-                match defined.get(v as usize) {
-                    Some(true) => {}
-                    _ => {
-                        return Err(Error::new(format!(
-                            "op {at} uses value %{v}, which is not defined before it"
-                        )));
-                    }
-                }
+                lookup(&values, &visible, v, at)?;
             }
-            if let Some(v) = op.defined() {
-                if v != next_value {
+            if let Some(value) = op.defined() {
+                if value as usize != values.len() {
                     return Err(Error::new(format!(
-                        "op {at} defines %{v} but the next SSA value is %{next_value}"
+                        "op {at} defines %{value} but the next value is %{}",
+                        values.len()
                     )));
                 }
-                defined.push(true);
-                next_value += 1;
+                if self.names.get(value as usize).is_none() {
+                    return Err(Error::new(format!("op {at}: value %{value} has no name")));
+                }
             }
-            match *op {
-                Op::CopyIn { param, offset, buf, bytes } => {
-                    self.param_bytes(param, at)?;
-                    self.buf_bytes(buf, at)?;
-                    if bytes == 0 {
-                        return Err(Error::new(format!("op {at}: copy length is zero")));
+            let info = match *op {
+                Op::Const { dtype, bits, .. } => {
+                    if dtype == DType::Bf16 {
+                        return Err(Error::new(format!(
+                            "op {at}: a bf16 constant is not exact; write it as f32 and cast"
+                        )));
                     }
-                    if u64::from(offset) + u64::from(bytes) > u64::from(self.params[param as usize].bytes) {
-                        return Err(Error::new(format!("op {at}: copy runs past param {param}")));
-                    }
-                    if bytes > self.bufs[buf as usize].bytes {
-                        return Err(Error::new(format!("op {at}: copy is larger than buffer {buf}")));
-                    }
-                }
-                Op::CopyOut { buf, param, offset, bytes } => {
-                    self.param_bytes(param, at)?;
-                    self.buf_bytes(buf, at)?;
-                    if bytes == 0 {
-                        return Err(Error::new(format!("op {at}: copy length is zero")));
-                    }
-                    if u64::from(offset) + u64::from(bytes) > u64::from(self.params[param as usize].bytes) {
-                        return Err(Error::new(format!("op {at}: copy runs past param {param}")));
-                    }
-                    if bytes > self.bufs[buf as usize].bytes {
-                        return Err(Error::new(format!("op {at}: copy is larger than buffer {buf}")));
+                    let _ = bits;
+                    ValueInfo {
+                        kind: ValueKind::Const,
+                        dtype,
+                        shape: RegShape::Scalar,
                     }
                 }
-                Op::Reserve { buf, pages } | Op::Push { buf, pages } | Op::Wait { buf, pages } | Op::Pop { buf, pages } => {
-                    let b = self.bufs.get(buf as usize).ok_or_else(|| Error::new(format!("op {at}: no buffer {buf}")))?;
-                    let BufKind::Circular { pages: capacity } = b.kind else {
-                        return Err(Error::new(format!("op {at}: buffer {buf} is not a circular buffer")));
+                Op::Param {
+                    dtype, ref dims, ..
+                } => {
+                    for (k, dim) in dims.iter().enumerate() {
+                        match *dim {
+                            Dim::Const(0) => {
+                                return Err(Error::new(format!(
+                                    "op {at}: dimension {k} is zero; the scalar shape is a single 0 and nothing else"
+                                )));
+                            }
+                            Dim::Const(_) => {}
+                            Dim::Value(v) => {
+                                let i = lookup(&values, &visible, v, at)?;
+                                if i.dtype != INDEX || i.shape != RegShape::Scalar {
+                                    return Err(Error::new(format!(
+                                        "op {at}: dimension {k} is %{v}, a {} {}; a dimension needs an i32 scalar",
+                                        i.dtype.name(),
+                                        i.shape.name()
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    ValueInfo {
+                        kind: ValueKind::Param,
+                        dtype,
+                        // A tensor parameter's logical shape lives in the op;
+                        // only the scalar/tensor distinction matters here.
+                        shape: if dims.is_empty() {
+                            RegShape::Scalar
+                        } else {
+                            RegShape::Tile
+                        },
+                    }
+                }
+                Op::Buffer { dtype, shape, .. } => {
+                    unit_of(shape, dtype)?;
+                    ValueInfo {
+                        kind: ValueKind::Buffer,
+                        dtype,
+                        shape: RegShape::Tile,
+                    }
+                }
+                Op::Grid { columns, rows } => {
+                    if grid.is_some() {
+                        return Err(Error::new("the program has more than one grid"));
+                    }
+                    grid = Some(([columns, rows], at));
+                    continue;
+                }
+                Op::Loop { bound, .. } => {
+                    if let Dim::Value(v) = bound {
+                        let i = lookup(&values, &visible, v, at)?;
+                        if i.dtype != INDEX || i.shape != RegShape::Scalar {
+                            return Err(Error::new(format!(
+                                "op {at}: the loop bound %{v} is not an i32 scalar"
+                            )));
+                        }
+                    }
+                    loops.push(values.len());
+                    values.push(ValueInfo {
+                        kind: ValueKind::Induction,
+                        dtype: INDEX,
+                        shape: RegShape::Scalar,
+                    });
+                    visible.push(true);
+                    continue;
+                }
+                Op::EndLoop => {
+                    let Some(start) = loops.pop() else {
+                        return Err(Error::new(format!("op {at}: endloop without a loop")));
                     };
-                    if pages == 0 {
-                        return Err(Error::new(format!("op {at}: zero pages")));
+                    for v in start..values.len() {
+                        visible[v] = false;
                     }
-                    if pages > capacity {
+                    continue;
+                }
+                Op::CopyTo { dst, src, offset } => {
+                    let d = *lookup(&values, &visible, dst, at)?;
+                    let s = *lookup(&values, &visible, src, at)?;
+                    let (buffer, param) = match (d.kind, s.kind) {
+                        (ValueKind::Buffer, ValueKind::Param) => (dst, src),
+                        (ValueKind::Param, ValueKind::Buffer) => (src, dst),
+                        _ => {
+                            return Err(Error::new(format!(
+                                "op {at}: a copy moves between a parameter and a buffer, not a {} and a {}",
+                                kind_name(d.kind),
+                                kind_name(s.kind)
+                            )));
+                        }
+                    };
+                    let b = *lookup(&values, &visible, buffer, at)?;
+                    let p = *lookup(&values, &visible, param, at)?;
+                    if p.shape == RegShape::Scalar {
                         return Err(Error::new(format!(
-                            "op {at}: {pages} pages of a {capacity}-page circular buffer"
+                            "op {at}: %{param} is a scalar parameter; it cannot hold a buffer unit"
                         )));
                     }
+                    if b.dtype != p.dtype {
+                        return Err(Error::new(format!(
+                            "op {at}: the buffer is {} and the parameter {}; there is no implicit cast",
+                            b.dtype.name(),
+                            p.dtype.name()
+                        )));
+                    }
+                    check_dim(&values, &visible, offset, at, "the copy offset")?;
+                    let Op::Buffer { shape, .. } = self.ops[def[buffer as usize]] else {
+                        return Err(Error::new(format!("op {at}: %{buffer} is not a buffer")));
+                    };
+                    let (unit_shape, _, _) = unit_of(shape, b.dtype)?;
+                    let total = shape[0] * shape[1];
+                    check_offset(offset, total, unit_shape.datums(), at, "buffer")?;
+                    if let Some(count) = param_elements(self, &def, param) {
+                        check_offset(offset, count, unit_shape.datums(), at, "parameter")?;
+                    }
+                    continue;
                 }
-                Op::Unpack { buf, .. } => {
-                    self.buf_bytes(buf, at)?;
+                Op::Load {
+                    buffer,
+                    offset,
+                    value,
+                } => {
+                    let b = *lookup(&values, &visible, buffer, at)?;
+                    if b.kind != ValueKind::Buffer {
+                        return Err(Error::new(format!("op {at}: %{buffer} is not a buffer")));
+                    }
+                    check_dim(&values, &visible, offset, at, "the load offset")?;
+                    let Op::Buffer { shape, .. } = self.ops[def[buffer as usize]] else {
+                        return Err(Error::new(format!("op {at}: %{buffer} is not a buffer")));
+                    };
+                    let (unit_shape, _, _) = unit_of(shape, b.dtype)?;
+                    let total = shape[0] * shape[1];
+                    check_offset(offset, total, unit_shape.datums(), at, "buffer")?;
+                    let _ = value;
+                    ValueInfo {
+                        kind: ValueKind::Register,
+                        dtype: b.dtype,
+                        shape: unit_shape,
+                    }
                 }
-                Op::Pack { buf, .. } => {
-                    self.buf_bytes(buf, at)?;
+                Op::StoreTo {
+                    value,
+                    buffer,
+                    offset,
+                } => {
+                    let v = *lookup(&values, &visible, value, at)?;
+                    let b = *lookup(&values, &visible, buffer, at)?;
+                    if v.kind != ValueKind::Register {
+                        return Err(Error::new(format!(
+                            "op {at}: %{value} is not a register value"
+                        )));
+                    }
+                    if b.kind != ValueKind::Buffer {
+                        return Err(Error::new(format!("op {at}: %{buffer} is not a buffer")));
+                    }
+                    if v.dtype != b.dtype {
+                        return Err(Error::new(format!(
+                            "op {at}: the value is {} and the buffer {}; there is no implicit cast",
+                            v.dtype.name(),
+                            b.dtype.name()
+                        )));
+                    }
+                    let Op::Buffer { shape, .. } = self.ops[def[buffer as usize]] else {
+                        return Err(Error::new(format!("op {at}: %{buffer} is not a buffer")));
+                    };
+                    let (unit_shape, _, _) = unit_of(shape, b.dtype)?;
+                    if v.shape != unit_shape {
+                        return Err(Error::new(format!(
+                            "op {at}: the buffer holds a {}, the value is a {}",
+                            unit_shape.name(),
+                            v.shape.name()
+                        )));
+                    }
+                    check_dim(&values, &visible, offset, at, "the store offset")?;
+                    let total = shape[0] * shape[1];
+                    check_offset(offset, total, unit_shape.datums(), at, "buffer")?;
+                    continue;
                 }
-                Op::Sfpu { .. } | Op::Matmul { .. } => {}
-            }
+                Op::Cast { src, dtype, .. } => {
+                    let s = *lookup(&values, &visible, src, at)?;
+                    if !is_value(s.kind) {
+                        return Err(Error::new(format!(
+                            "op {at}: %{src} is not a register value"
+                        )));
+                    }
+                    ValueInfo {
+                        kind: ValueKind::Register,
+                        dtype,
+                        shape: s.shape,
+                    }
+                }
+                Op::Unary { op, a, .. } => {
+                    let x = *lookup(&values, &visible, a, at)?;
+                    if !is_value(x.kind) {
+                        return Err(Error::new(format!("op {at}: %{a} is not a register value")));
+                    }
+                    if !x.dtype.is_float() {
+                        return Err(Error::new(format!(
+                            "op {at}: {} needs a float value, not {}",
+                            op.name(),
+                            x.dtype.name()
+                        )));
+                    }
+                    ValueInfo {
+                        kind: ValueKind::Register,
+                        dtype: x.dtype,
+                        shape: x.shape,
+                    }
+                }
+                Op::Binary { op, a, b, .. } => {
+                    let x = *lookup(&values, &visible, a, at)?;
+                    let y = *lookup(&values, &visible, b, at)?;
+                    if !is_value(x.kind) || !is_value(y.kind) {
+                        return Err(Error::new(format!(
+                            "op {at}: {} needs two register values",
+                            op.name()
+                        )));
+                    }
+                    if x.dtype != y.dtype {
+                        return Err(Error::new(format!(
+                            "op {at}: {} of {} and {}; there is no implicit cast",
+                            op.name(),
+                            x.dtype.name(),
+                            y.dtype.name()
+                        )));
+                    }
+                    if op.is_integer_only() && x.dtype != INDEX {
+                        return Err(Error::new(format!(
+                            "op {at}: {} is index math (i32), not {}",
+                            op.name(),
+                            x.dtype.name()
+                        )));
+                    }
+                    let shape = broadcast(x.shape, y.shape).ok_or_else(|| {
+                        Error::new(format!(
+                            "op {at}: cannot broadcast a {} and a {}",
+                            x.shape.name(),
+                            y.shape.name()
+                        ))
+                    })?;
+                    ValueInfo {
+                        kind: ValueKind::Register,
+                        dtype: x.dtype,
+                        shape,
+                    }
+                }
+                Op::Matmul { a, b, .. } => {
+                    let x = *lookup(&values, &visible, a, at)?;
+                    let y = *lookup(&values, &visible, b, at)?;
+                    if !is_value(x.kind) || !is_value(y.kind) {
+                        return Err(Error::new(format!(
+                            "op {at}: matmul needs two register values"
+                        )));
+                    }
+                    if x.shape != RegShape::Tile || y.shape != RegShape::Tile {
+                        return Err(Error::new(format!(
+                            "op {at}: matmul needs two tiles, not a {} and a {}",
+                            x.shape.name(),
+                            y.shape.name()
+                        )));
+                    }
+                    if x.dtype != y.dtype {
+                        return Err(Error::new(format!(
+                            "op {at}: matmul of {} and {}; there is no implicit cast",
+                            x.dtype.name(),
+                            y.dtype.name()
+                        )));
+                    }
+                    ValueInfo {
+                        kind: ValueKind::Register,
+                        dtype: x.dtype,
+                        shape: RegShape::Tile,
+                    }
+                }
+            };
+            values.push(info);
+            visible.push(true);
         }
-        for (id, b) in self.bufs.iter().enumerate() {
-            if let Layout::TileMajor = b.layout {
-                if b.bytes == 0 || b.bytes % TILE_BYTES != 0 {
-                    return Err(Error::new(format!(
-                        "buffer {id}: a tile-major buffer holds whole {TILE_BYTES}-byte tiles, not {} bytes",
-                        b.bytes
-                    )));
-                }
-            }
+        if !loops.is_empty() {
+            return Err(Error::new("the program ends inside a loop"));
         }
-        Ok(())
+        if values.len() != self.names.len() {
+            return Err(Error::new(format!(
+                "the program defines {} values but names {}",
+                values.len(),
+                self.names.len()
+            )));
+        }
+        let Some((grid, at)) = grid else {
+            return Err(Error::new("the program has no grid"));
+        };
+        check_dim(&values, &visible, grid[0], at, "the grid's columns")?;
+        check_dim(&values, &visible, grid[1], at, "the grid's rows")?;
+        Ok(Types { values, grid })
     }
+}
 
-    fn param_bytes(&self, param: u32, at: usize) -> Result<(), Error> {
-        if self.params.get(param as usize).is_none() {
-            return Err(Error::new(format!("op {at}: no param {param}")));
-        }
-        Ok(())
-    }
+/// A value an arithmetic op can read: a computed register value, a literal or a
+/// loop induction value. Parameters and buffers are memory, not operands.
+fn is_value(kind: ValueKind) -> bool {
+    matches!(
+        kind,
+        ValueKind::Register | ValueKind::Const | ValueKind::Induction
+    )
+}
 
-    fn buf_bytes(&self, buf: BufId, at: usize) -> Result<(), Error> {
-        if self.bufs.get(buf as usize).is_none() {
-            return Err(Error::new(format!("op {at}: no buffer {buf}")));
-        }
-        Ok(())
+fn kind_name(kind: ValueKind) -> &'static str {
+    match kind {
+        ValueKind::Param => "parameter",
+        ValueKind::Buffer => "buffer",
+        ValueKind::Const => "constant",
+        ValueKind::Induction => "induction value",
+        ValueKind::Register => "register value",
     }
+}
+
+fn broadcast(a: RegShape, b: RegShape) -> Option<RegShape> {
+    use RegShape::*;
+    Some(match (a, b) {
+        (x, y) if x == y => x,
+        (Scalar, y) => y,
+        (x, Scalar) => x,
+        (Tile, Row | Column) => Tile,
+        (Row | Column, Tile) => Tile,
+        _ => return None,
+    })
+}
+
+/// A shape term that must name an i32 scalar: a literal, or a visible value.
+fn check_dim(
+    values: &[ValueInfo],
+    visible: &[bool],
+    dim: Dim,
+    at: usize,
+    what: &str,
+) -> Result<(), Error> {
+    if let Dim::Value(v) = dim {
+        let i = lookup(values, visible, v, at)?;
+        if i.dtype != INDEX || i.shape != RegShape::Scalar {
+            return Err(Error::new(format!(
+                "op {at}: {what} is %{v}, a {} {}; it must be an i32 scalar",
+                i.dtype.name(),
+                i.shape.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A bracket must leave room for one unit. A symbolic offset cannot be checked
+/// here; it is checked at run time.
+fn check_offset(offset: Dim, total: u32, unit: u32, at: usize, what: &str) -> Result<(), Error> {
+    if let Dim::Const(n) = offset {
+        if n.checked_add(unit).is_none_or(|end| end > total) {
+            return Err(Error::new(format!(
+                "op {at}: {n} + {unit} datums runs past the {what} ({total} datums)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A parameter's element count when every dimension is a literal.
+fn param_elements(k: &Kernel, def: &[usize], param: ValueId) -> Option<u32> {
+    let Op::Param { dims, .. } = &k.ops[def[param as usize]] else {
+        return None;
+    };
+    if dims.is_empty() {
+        return None;
+    }
+    dims.iter().try_fold(1u32, |acc, d| match *d {
+        Dim::Const(n) => acc.checked_mul(n),
+        Dim::Value(_) => None,
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Byte form
 // ---------------------------------------------------------------------------
 
-const MAGIC: [u8; 4] = *b"TTIR";
+/// The byte form's magic.
+pub const MAGIC: [u8; 4] = *b"TTIR";
+/// The IR version this build reads and writes.
+pub const VERSION: u32 = 2;
 
 impl Kernel {
-    /// The byte form: the same program as [`Kernel::to_text`], length-prefixed
-    /// and little-endian. This is the form a driver ships; the text form is the
-    /// form it reads.
+    /// The byte form: the same program as [`Kernel::to_text`], little-endian and
+    /// length-prefixed. Values are referenced by id; every definition carries
+    /// its name.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&MAGIC);
         put_u32(&mut b, VERSION);
-        put_u32(&mut b, self.grid[0]);
-        put_u32(&mut b, self.grid[1]);
-        put_u32(&mut b, self.params.len() as u32);
-        for p in &self.params {
-            b.push(match p.kind {
-                ParamKind::In => 0,
-                ParamKind::Out => 1,
-            });
-            b.push(match p.dtype {
-                DType::F32 => 0,
-            });
-            put_u32(&mut b, p.bytes);
-        }
-        put_u32(&mut b, self.bufs.len() as u32);
-        for buf in &self.bufs {
-            put_u32(&mut b, buf.bytes);
-            match buf.kind {
-                BufKind::Plain => {
-                    b.push(0);
-                    b.push(0);
-                }
-                BufKind::Circular { pages } => {
-                    b.push(1);
-                    b.push(pages);
-                }
-            }
-            b.push(match buf.layout {
-                Layout::RowMajor => 0,
-                Layout::TileMajor => 1,
-            });
-        }
         put_u32(&mut b, self.ops.len() as u32);
         for op in &self.ops {
-            match *op {
-                Op::CopyIn { param, offset, buf, bytes } => {
+            match op {
+                Op::Const { value, dtype, bits } => {
                     b.push(0);
-                    put_u32(&mut b, param);
-                    put_u32(&mut b, offset);
-                    put_u32(&mut b, buf);
-                    put_u32(&mut b, bytes);
+                    put_name(&mut b, &self.names[*value as usize]);
+                    b.push(dtype.tag());
+                    put_u32(&mut b, *bits);
                 }
-                Op::CopyOut { buf, param, offset, bytes } => {
+                Op::Param { value, dtype, dims } => {
                     b.push(1);
-                    put_u32(&mut b, buf);
-                    put_u32(&mut b, param);
-                    put_u32(&mut b, offset);
-                    put_u32(&mut b, bytes);
-                }
-                Op::Reserve { buf, pages } => {
-                    b.push(2);
-                    put_u32(&mut b, buf);
-                    b.push(pages);
-                }
-                Op::Push { buf, pages } => {
-                    b.push(3);
-                    put_u32(&mut b, buf);
-                    b.push(pages);
-                }
-                Op::Wait { buf, pages } => {
-                    b.push(4);
-                    put_u32(&mut b, buf);
-                    b.push(pages);
-                }
-                Op::Pop { buf, pages } => {
-                    b.push(5);
-                    put_u32(&mut b, buf);
-                    b.push(pages);
-                }
-                Op::Unpack { value, buf } => {
-                    b.push(6);
-                    put_u32(&mut b, value);
-                    put_u32(&mut b, buf);
-                }
-                Op::Sfpu { value, kind, a, b: second } => {
-                    b.push(7);
-                    put_u32(&mut b, value);
-                    b.push(match kind {
-                        SfpuKind::Neg => 0,
-                        SfpuKind::Abs => 1,
-                        SfpuKind::Relu => 2,
-                    });
-                    put_u32(&mut b, a);
-                    match second {
-                        Some(v) => {
-                            b.push(1);
-                            put_u32(&mut b, v);
-                        }
-                        None => b.push(0),
+                    put_name(&mut b, &self.names[*value as usize]);
+                    b.push(dtype.tag());
+                    put_u32(&mut b, dims.len() as u32);
+                    for d in dims {
+                        put_dim(&mut b, *d);
                     }
                 }
-                Op::Matmul { value, a, b: second } => {
-                    b.push(8);
-                    put_u32(&mut b, value);
-                    put_u32(&mut b, a);
-                    put_u32(&mut b, second);
+                Op::Buffer {
+                    value,
+                    dtype,
+                    shape,
+                } => {
+                    b.push(2);
+                    put_name(&mut b, &self.names[*value as usize]);
+                    b.push(dtype.tag());
+                    put_u32(&mut b, shape[0]);
+                    put_u32(&mut b, shape[1]);
                 }
-                Op::Pack { value, buf } => {
+                Op::Grid { columns, rows } => {
+                    b.push(3);
+                    put_dim(&mut b, *columns);
+                    put_dim(&mut b, *rows);
+                }
+                Op::Loop { value, bound } => {
+                    b.push(4);
+                    put_name(&mut b, &self.names[*value as usize]);
+                    put_dim(&mut b, *bound);
+                }
+                Op::EndLoop => b.push(5),
+                Op::CopyTo { dst, src, offset } => {
+                    b.push(6);
+                    put_u32(&mut b, *dst);
+                    put_u32(&mut b, *src);
+                    put_dim(&mut b, *offset);
+                }
+                Op::Load {
+                    value,
+                    buffer,
+                    offset,
+                } => {
+                    b.push(7);
+                    put_name(&mut b, &self.names[*value as usize]);
+                    put_u32(&mut b, *buffer);
+                    put_dim(&mut b, *offset);
+                }
+                Op::StoreTo {
+                    value,
+                    buffer,
+                    offset,
+                } => {
+                    b.push(8);
+                    put_u32(&mut b, *buffer);
+                    put_u32(&mut b, *value);
+                    put_dim(&mut b, *offset);
+                }
+                Op::Cast { value, src, dtype } => {
                     b.push(9);
-                    put_u32(&mut b, value);
-                    put_u32(&mut b, buf);
+                    put_name(&mut b, &self.names[*value as usize]);
+                    put_u32(&mut b, *src);
+                    b.push(dtype.tag());
+                }
+                Op::Unary { value, op, a } => {
+                    b.push(10);
+                    put_name(&mut b, &self.names[*value as usize]);
+                    b.push(op.tag());
+                    put_u32(&mut b, *a);
+                }
+                Op::Binary {
+                    value,
+                    op,
+                    a,
+                    b: rhs,
+                } => {
+                    b.push(11);
+                    put_name(&mut b, &self.names[*value as usize]);
+                    b.push(op.tag());
+                    put_u32(&mut b, *a);
+                    put_u32(&mut b, *rhs);
+                }
+                Op::Matmul { value, a, b: rhs } => {
+                    b.push(12);
+                    put_name(&mut b, &self.names[*value as usize]);
+                    put_u32(&mut b, *a);
+                    put_u32(&mut b, *rhs);
                 }
             }
         }
         b
     }
 
-    /// Read the byte form. A wrong magic or an unknown version is refused, not
-    /// guessed at.
+    /// Read the byte form. A wrong magic, an unknown version or a truncated
+    /// record is refused, never guessed at.
     pub fn from_bytes(bytes: &[u8]) -> Result<Kernel, Error> {
         let mut r = Cursor { at: 0, bytes };
         if r.take(4)? != MAGIC {
@@ -445,78 +1075,153 @@ impl Kernel {
         }
         let version = r.u32()?;
         if version != VERSION {
-            return Err(Error::new(format!("byte program version {version} is not {VERSION}")));
+            return Err(Error::new(format!(
+                "byte program version {version} is not {VERSION}"
+            )));
         }
-        let mut k = Kernel { grid: [r.u32()?, r.u32()?], params: Vec::new(), bufs: Vec::new(), ops: Vec::new() };
-        for _ in 0..r.u32()? {
-            let kind = match r.u8()? {
-                0 => ParamKind::In,
-                1 => ParamKind::Out,
-                other => return Err(Error::new(format!("param kind {other}"))),
-            };
-            let dtype = match r.u8()? {
-                0 => DType::F32,
-                other => return Err(Error::new(format!("dtype {other}"))),
-            };
-            k.params.push(Param { kind, dtype, bytes: r.u32()? });
-        }
-        for _ in 0..r.u32()? {
-            let bytes = r.u32()?;
+        let count = r.u32()? as usize;
+        let mut ops = Vec::with_capacity(count);
+        let mut names: Vec<String> = Vec::new();
+        for _ in 0..count {
             let tag = r.u8()?;
-            let pages = r.u8()?;
-            let kind = match tag {
-                0 => BufKind::Plain,
-                1 => BufKind::Circular { pages },
-                other => return Err(Error::new(format!("buffer kind {other}"))),
-            };
-            let layout = match r.u8()? {
-                0 => Layout::RowMajor,
-                1 => Layout::TileMajor,
-                other => return Err(Error::new(format!("buffer layout {other}"))),
-            };
-            k.bufs.push(Buf { bytes, kind, layout });
-        }
-        for _ in 0..r.u32()? {
-            let op = match r.u8()? {
-                0 => Op::CopyIn { param: r.u32()?, offset: r.u32()?, buf: r.u32()?, bytes: r.u32()? },
-                1 => Op::CopyOut { buf: r.u32()?, param: r.u32()?, offset: r.u32()?, bytes: r.u32()? },
-                2 => Op::Reserve { buf: r.u32()?, pages: r.u8()? },
-                3 => Op::Push { buf: r.u32()?, pages: r.u8()? },
-                4 => Op::Wait { buf: r.u32()?, pages: r.u8()? },
-                5 => Op::Pop { buf: r.u32()?, pages: r.u8()? },
-                6 => Op::Unpack { value: r.u32()?, buf: r.u32()? },
-                7 => {
-                    let value = r.u32()?;
-                    let kind = match r.u8()? {
-                        0 => SfpuKind::Neg,
-                        1 => SfpuKind::Abs,
-                        2 => SfpuKind::Relu,
-                        other => return Err(Error::new(format!("sfpu kind {other}"))),
-                    };
-                    let a = r.u32()?;
-                    let b = match r.u8()? {
-                        0 => None,
-                        1 => Some(r.u32()?),
-                        other => return Err(Error::new(format!("sfpu operand flag {other}"))),
-                    };
-                    Op::Sfpu { value, kind, a, b }
+            let op = match tag {
+                0 => {
+                    let name = r.name()?;
+                    let dtype = r.dtype()?;
+                    let bits = r.u32()?;
+                    let value = define(&mut names, name)?;
+                    Op::Const { value, dtype, bits }
                 }
-                8 => Op::Matmul { value: r.u32()?, a: r.u32()?, b: r.u32()? },
-                9 => Op::Pack { value: r.u32()?, buf: r.u32()? },
-                other => return Err(Error::new(format!("op tag {other}"))),
+                1 => {
+                    let name = r.name()?;
+                    let dtype = r.dtype()?;
+                    let n = r.u32()? as usize;
+                    let mut dims = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        dims.push(r.dim()?);
+                    }
+                    let value = define(&mut names, name)?;
+                    Op::Param { value, dtype, dims }
+                }
+                2 => {
+                    let name = r.name()?;
+                    let dtype = r.dtype()?;
+                    let shape = [r.u32()?, r.u32()?];
+                    let value = define(&mut names, name)?;
+                    Op::Buffer {
+                        value,
+                        dtype,
+                        shape,
+                    }
+                }
+                3 => Op::Grid {
+                    columns: r.dim()?,
+                    rows: r.dim()?,
+                },
+                4 => {
+                    let name = r.name()?;
+                    let bound = r.dim()?;
+                    let value = define(&mut names, name)?;
+                    Op::Loop { value, bound }
+                }
+                5 => Op::EndLoop,
+                6 => Op::CopyTo {
+                    dst: r.u32()?,
+                    src: r.u32()?,
+                    offset: r.dim()?,
+                },
+                7 => {
+                    let name = r.name()?;
+                    let buffer = r.u32()?;
+                    let offset = r.dim()?;
+                    let value = define(&mut names, name)?;
+                    Op::Load {
+                        value,
+                        buffer,
+                        offset,
+                    }
+                }
+                8 => Op::StoreTo {
+                    buffer: r.u32()?,
+                    value: r.u32()?,
+                    offset: r.dim()?,
+                },
+                9 => {
+                    let name = r.name()?;
+                    let src = r.u32()?;
+                    let dtype = r.dtype()?;
+                    let value = define(&mut names, name)?;
+                    Op::Cast { value, src, dtype }
+                }
+                10 => {
+                    let name = r.name()?;
+                    let op = UnOp::from_tag(r.u8()?)
+                        .ok_or_else(|| Error::new("unknown unary op tag"))?;
+                    let a = r.u32()?;
+                    let value = define(&mut names, name)?;
+                    Op::Unary { value, op, a }
+                }
+                11 => {
+                    let name = r.name()?;
+                    let op = BinOp::from_tag(r.u8()?)
+                        .ok_or_else(|| Error::new("unknown binary op tag"))?;
+                    let a = r.u32()?;
+                    let b = r.u32()?;
+                    let value = define(&mut names, name)?;
+                    Op::Binary { value, op, a, b }
+                }
+                12 => {
+                    let name = r.name()?;
+                    let a = r.u32()?;
+                    let b = r.u32()?;
+                    let value = define(&mut names, name)?;
+                    Op::Matmul { value, a, b }
+                }
+                other => return Err(Error::new(format!("unknown instruction tag {other}"))),
             };
-            k.ops.push(op);
+            ops.push(op);
         }
         if r.at != r.bytes.len() {
-            return Err(Error::new(format!("{} trailing bytes", r.bytes.len() - r.at)));
+            return Err(Error::new(format!(
+                "{} trailing bytes",
+                r.bytes.len() - r.at
+            )));
         }
+        let k = Kernel { ops, names };
         k.verify()?;
         Ok(k)
     }
 }
 
+fn define(names: &mut Vec<String>, name: String) -> Result<ValueId, Error> {
+    if names.iter().any(|n| *n == name) {
+        return Err(Error::new(format!("the name %{name} is defined twice")));
+    }
+    let value = names.len() as ValueId;
+    names.push(name);
+    Ok(value)
+}
+
 fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_name(out: &mut Vec<u8>, name: &str) {
+    put_u32(out, name.len() as u32);
+    out.extend_from_slice(name.as_bytes());
+}
+
+fn put_dim(out: &mut Vec<u8>, dim: Dim) {
+    match dim {
+        Dim::Const(n) => {
+            out.push(0);
+            put_u32(out, n);
+        }
+        Dim::Value(v) => {
+            out.push(1);
+            put_u32(out, v);
+        }
+    }
 }
 
 struct Cursor<'a> {
@@ -542,224 +1247,633 @@ impl Cursor<'_> {
     fn u32(&mut self) -> Result<u32, Error> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
-}
 
+    fn dtype(&mut self) -> Result<DType, Error> {
+        let tag = self.u8()?;
+        DType::from_tag(tag).ok_or_else(|| Error::new(format!("unknown dtype tag {tag}")))
+    }
+
+    fn name(&mut self) -> Result<String, Error> {
+        let n = self.u32()? as usize;
+        let bytes = self.take(n)?;
+        String::from_utf8(bytes.to_vec()).map_err(|_| Error::new("a name is not UTF-8"))
+    }
+
+    fn dim(&mut self) -> Result<Dim, Error> {
+        match self.u8()? {
+            0 => Ok(Dim::Const(self.u32()?)),
+            1 => Ok(Dim::Value(self.u32()?)),
+            other => Err(Error::new(format!("unknown shape-term tag {other}"))),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Text form
 // ---------------------------------------------------------------------------
 
-/// The IR's version, shared by both forms. A kernel whose version this build
-/// does not know is refused, never read best-effort.
-pub const VERSION: u32 = 1;
-
 impl Kernel {
-    /// Parse the text form. Line-oriented, `#` starts a comment; every value is
-    /// `%N`, and a value-producing op is written `%N = ...`.
+    /// Parse the text form. Line-oriented; `//` starts a comment.
     pub fn parse(text: &str) -> Result<Kernel, Error> {
-        let mut k = Kernel { grid: [1, 1], params: Vec::new(), bufs: Vec::new(), ops: Vec::new() };
+        let mut p = Parser::default();
         let mut version: Option<u32> = None;
-        let mut next_value: ValueId = 0;
         for (line_no, raw) in text.lines().enumerate() {
             let at = line_no + 1;
-            let line = raw.split('#').next().unwrap_or("").trim();
+            let line = match raw.find("//") {
+                Some(i) => &raw[..i],
+                None => raw,
+            }
+            .trim();
             if line.is_empty() {
                 continue;
             }
-            let mut it = line.split_whitespace().peekable();
-            let head = it.next().unwrap();
-            // `%N = <op> ...`
-            if let Some(name) = head.strip_prefix('%') {
-                let value: ValueId = name.parse().map_err(|_| Error::new(format!("line {at}: bad value `{head}`")))?;
-                if it.next() != Some("=") {
-                    return Err(Error::new(format!("line {at}: expected `=` after {head}")));
-                }
-                let op = it.next().ok_or_else(|| Error::new(format!("line {at}: missing op after `=`")))?;
-                if value != next_value {
-                    return Err(Error::new(format!("line {at}: defines %{value}, expected %{next_value}")));
-                }
-                let parsed = match op {
-                    "unpack" => {
-                        expect(&mut it, "buf", at)?;
-                        Op::Unpack { value, buf: num(&mut it, at)? }
-                    }
-                    "sfpu" => {
-                        let kind = match it.next().ok_or_else(|| Error::new(format!("line {at}: missing sfpu kind")))? {
-                            "neg" => SfpuKind::Neg,
-                            "abs" => SfpuKind::Abs,
-                            "relu" => SfpuKind::Relu,
-                            other => return Err(Error::new(format!("line {at}: unknown sfpu kind `{other}`"))),
-                        };
-                        let a = value_ref(it.next(), at)?;
-                        let b = it.next().map(|s| value_ref(Some(s), at)).transpose()?;
-                        Op::Sfpu { value, kind, a, b }
-                    }
-                    "matmul" => {
-                        let a = value_ref(it.next(), at)?;
-                        let b = value_ref(it.next(), at)?;
-                        Op::Matmul { value, a, b }
-                    }
-                    other => return Err(Error::new(format!("line {at}: unknown value op `{other}`"))),
-                };
-                if it.next().is_some() {
-                    return Err(Error::new(format!("line {at}: trailing input")));
-                }
-                k.ops.push(parsed);
-                next_value += 1;
+            let tokens = tokenize(line).map_err(|e| Error::new(format!("line {at}: {e}")))?;
+            let mut t = Tokens {
+                tok: &tokens,
+                at: 0,
+                line: at,
+            };
+            if matches!(t.peek(), Some(Token::Name(_))) {
+                let op = parse_definition(&mut t, &mut p)?;
+                p.ops.push(op);
                 continue;
             }
-            match head {
-                "version" => {
-                    let v: u32 = num(&mut it, at)?;
-                    if v != VERSION {
-                        return Err(Error::new(format!("line {at}: IR version {v} is not {VERSION}")));
-                    }
-                    version = Some(v);
+            let first = t.ident()?;
+            if first == "version" {
+                if version.is_some() {
+                    return Err(t.err("more than one version line"));
                 }
-                "grid" => {
-                    k.grid = [num(&mut it, at)?, num(&mut it, at)?];
-                }
-                "param" => {
-                    let kind = match it.next().ok_or_else(|| Error::new(format!("line {at}: missing kind")))? {
-                        "in" => ParamKind::In,
-                        "out" => ParamKind::Out,
-                        other => return Err(Error::new(format!("line {at}: unknown param kind `{other}`"))),
-                    };
-                    let dtype = match it.next().ok_or_else(|| Error::new(format!("line {at}: missing dtype")))? {
-                        "f32" => DType::F32,
-                        other => return Err(Error::new(format!("line {at}: unknown dtype `{other}`"))),
-                    };
-                    let bytes: u32 = num(&mut it, at)?;
-                    k.params.push(Param { kind, dtype, bytes });
-                }
-                "buf" => {
-                    let id: u32 = num(&mut it, at)?;
-                    if id as usize != k.bufs.len() {
-                        return Err(Error::new(format!("line {at}: buffer {id} out of order")));
-                    }
-                    let bytes: u32 = num(&mut it, at)?;
-                    let kind = match it.next().ok_or_else(|| Error::new(format!("line {at}: missing buffer kind")))? {
-                        "plain" => BufKind::Plain,
-                        "circ" => BufKind::Circular { pages: num(&mut it, at)? },
-                        other => return Err(Error::new(format!("line {at}: unknown buffer kind `{other}`"))),
-                    };
-                    let layout = match it.next().ok_or_else(|| Error::new(format!("line {at}: missing buffer layout")))? {
-                        "rm" => Layout::RowMajor,
-                        "tile" => Layout::TileMajor,
-                        other => return Err(Error::new(format!("line {at}: unknown buffer layout `{other}`"))),
-                    };
-                    k.bufs.push(Buf { bytes, kind, layout });
-                }
-                "copy_in" => {
-                    expect(&mut it, "param", at)?;
-                    let param: u32 = num(&mut it, at)?;
-                    expect(&mut it, "offset", at)?;
-                    let offset: u32 = num(&mut it, at)?;
-                    expect(&mut it, "len", at)?;
-                    let bytes: u32 = num(&mut it, at)?;
-                    expect(&mut it, "buf", at)?;
-                    let buf: BufId = num(&mut it, at)?;
-                    k.ops.push(Op::CopyIn { param, offset, buf, bytes });
-                }
-                "copy_out" => {
-                    expect(&mut it, "buf", at)?;
-                    let buf: BufId = num(&mut it, at)?;
-                    expect(&mut it, "param", at)?;
-                    let param: u32 = num(&mut it, at)?;
-                    expect(&mut it, "offset", at)?;
-                    let offset: u32 = num(&mut it, at)?;
-                    expect(&mut it, "len", at)?;
-                    let bytes: u32 = num(&mut it, at)?;
-                    k.ops.push(Op::CopyOut { buf, param, offset, bytes });
-                }
-                "pack" => {
-                    let value = value_ref(it.next(), at)?;
-                    expect(&mut it, "buf", at)?;
-                    let buf: BufId = num(&mut it, at)?;
-                    k.ops.push(Op::Pack { value, buf });
-                }
-                "reserve" | "push" | "wait" | "pop" => {
-                    let buf: BufId = num(&mut it, at)?;
-                    let pages: u8 = num(&mut it, at)?;
-                    k.ops.push(match head {
-                        "reserve" => Op::Reserve { buf, pages },
-                        "push" => Op::Push { buf, pages },
-                        "wait" => Op::Wait { buf, pages },
-                        _ => Op::Pop { buf, pages },
-                    });
-                }
-                other => return Err(Error::new(format!("line {at}: unknown directive `{other}`"))),
+                version = Some(t.number_u32()?);
+                t.end()?;
+                continue;
             }
-            if it.next().is_some() {
-                return Err(Error::new(format!("line {at}: trailing input")));
+            if version.is_none() {
+                return Err(t.err("the version line comes first"));
             }
+            if first == "grid" {
+                let columns = t.term(&p.symbols)?;
+                t.comma()?;
+                let rows = t.term(&p.symbols)?;
+                t.end()?;
+                p.ops.push(Op::Grid { columns, rows });
+                continue;
+            }
+            if first == "copy_to" {
+                let dst = t.value(&p.symbols)?;
+                t.expect("from")?;
+                let src = t.value(&p.symbols)?;
+                let offset = t.bracket(&p.symbols)?;
+                t.end()?;
+                p.ops.push(Op::CopyTo { dst, src, offset });
+                continue;
+            }
+            if first == "store_to" {
+                let buffer = t.value(&p.symbols)?;
+                t.expect("from")?;
+                let value = t.value(&p.symbols)?;
+                let offset = t.bracket(&p.symbols)?;
+                t.end()?;
+                p.ops.push(Op::StoreTo {
+                    value,
+                    buffer,
+                    offset,
+                });
+                continue;
+            }
+            if first == "endloop" {
+                t.end()?;
+                p.ops.push(Op::EndLoop);
+                continue;
+            }
+            return Err(t.err(format!("no instruction starts with `{first}`")));
         }
-        if version.is_none() {
-            return Err(Error::new("missing `version`"));
+        match version {
+            Some(v) if v == VERSION => {}
+            Some(v) => {
+                return Err(Error::new(format!("IR version {v} is not {VERSION}")));
+            }
+            None => return Err(Error::new("the program has no version line")),
         }
+        let k = Kernel {
+            ops: p.ops,
+            names: p.names,
+        };
         k.verify()?;
         Ok(k)
     }
 
-    /// Print the text form. `parse(to_text(k)) == k` for every verified kernel.
+    /// The canonical text form.
     pub fn to_text(&self) -> String {
         let mut s = String::new();
         s.push_str(&format!("version {VERSION}\n"));
-        s.push_str(&format!("grid {} {}\n", self.grid[0], self.grid[1]));
-        for p in &self.params {
-            s.push_str(&format!("param {} {} {}\n", p.kind.name(), p.dtype.name(), p.bytes));
-        }
-        for (id, b) in self.bufs.iter().enumerate() {
-            let kind = match b.kind {
-                BufKind::Plain => "plain".to_string(),
-                BufKind::Circular { pages } => format!("circ {pages}"),
-            };
-            s.push_str(&format!("buf {id} {} {kind} {}\n", b.bytes, b.layout.name()));
-        }
         for op in &self.ops {
-            match *op {
-                Op::CopyIn { param, offset, buf, bytes } => {
-                    s.push_str(&format!("copy_in param {param} offset {offset} len {bytes} buf {buf}\n"));
+            let name = |v: ValueId| self.names[v as usize].as_str();
+            match op {
+                Op::Const { value, dtype, bits } => {
+                    s.push_str(&format!(
+                        "%{} = const {} {}\n",
+                        name(*value),
+                        dtype.name(),
+                        literal(*dtype, *bits)
+                    ));
                 }
-                Op::CopyOut { buf, param, offset, bytes } => {
-                    s.push_str(&format!("copy_out buf {buf} param {param} offset {offset} len {bytes}\n"));
+                Op::Param { value, dtype, dims } => {
+                    let shape = if dims.is_empty() {
+                        "0".to_string()
+                    } else {
+                        dims.iter()
+                            .map(|d| self.dim_text(*d))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    };
+                    s.push_str(&format!(
+                        "%{} = param {} {shape}\n",
+                        name(*value),
+                        dtype.name()
+                    ));
                 }
-                Op::Reserve { buf, pages } => s.push_str(&format!("reserve {buf} {pages}\n")),
-                Op::Push { buf, pages } => s.push_str(&format!("push {buf} {pages}\n")),
-                Op::Wait { buf, pages } => s.push_str(&format!("wait {buf} {pages}\n")),
-                Op::Pop { buf, pages } => s.push_str(&format!("pop {buf} {pages}\n")),
-                Op::Unpack { value, buf } => s.push_str(&format!("%{value} = unpack buf {buf}\n")),
-                Op::Sfpu { value, kind, a, b } => match b {
-                    Some(b) => s.push_str(&format!("%{value} = sfpu {} %{a} %{b}\n", kind.name())),
-                    None => s.push_str(&format!("%{value} = sfpu {} %{a}\n", kind.name())),
-                },
+                Op::Buffer {
+                    value,
+                    dtype,
+                    shape,
+                } => {
+                    s.push_str(&format!(
+                        "%{} = buffer {} {},{}\n",
+                        name(*value),
+                        dtype.name(),
+                        shape[0],
+                        shape[1]
+                    ));
+                }
+                Op::Grid { columns, rows } => {
+                    s.push_str(&format!(
+                        "grid {},{}\n",
+                        self.dim_text(*columns),
+                        self.dim_text(*rows)
+                    ));
+                }
+                Op::Loop { value, bound } => {
+                    s.push_str(&format!(
+                        "%{} = loop {}\n",
+                        name(*value),
+                        self.dim_text(*bound)
+                    ));
+                }
+                Op::EndLoop => s.push_str("endloop\n"),
+                Op::CopyTo { dst, src, offset } => {
+                    s.push_str(&format!(
+                        "copy_to %{} from %{} [{}]\n",
+                        name(*dst),
+                        name(*src),
+                        self.dim_text(*offset)
+                    ));
+                }
+                Op::Load {
+                    value,
+                    buffer,
+                    offset,
+                } => {
+                    s.push_str(&format!(
+                        "%{} = load %{} [{}]\n",
+                        name(*value),
+                        name(*buffer),
+                        self.dim_text(*offset)
+                    ));
+                }
+                Op::StoreTo {
+                    value,
+                    buffer,
+                    offset,
+                } => {
+                    s.push_str(&format!(
+                        "store_to %{} from %{} [{}]\n",
+                        name(*buffer),
+                        name(*value),
+                        self.dim_text(*offset)
+                    ));
+                }
+                Op::Cast { value, src, dtype } => {
+                    s.push_str(&format!(
+                        "%{} = cast %{} to {}\n",
+                        name(*value),
+                        name(*src),
+                        dtype.name()
+                    ));
+                }
+                Op::Unary { value, op, a } => {
+                    s.push_str(&format!(
+                        "%{} = {} %{}\n",
+                        name(*value),
+                        op.name(),
+                        name(*a)
+                    ));
+                }
+                Op::Binary { value, op, a, b } => {
+                    s.push_str(&format!(
+                        "%{} = {} %{} %{}\n",
+                        name(*value),
+                        op.name(),
+                        name(*a),
+                        name(*b)
+                    ));
+                }
                 Op::Matmul { value, a, b } => {
-                    s.push_str(&format!("%{value} = matmul %{a} %{b}\n"));
+                    s.push_str(&format!(
+                        "%{} = matmul %{} %{}\n",
+                        name(*value),
+                        name(*a),
+                        name(*b)
+                    ));
                 }
-                Op::Pack { value, buf } => s.push_str(&format!("pack %{value} buf {buf}\n")),
             }
         }
         s
     }
-}
 
-fn num<'a, T: core::str::FromStr>(it: &mut impl Iterator<Item = &'a str>, at: usize) -> Result<T, Error> {
-    let s = it.next().ok_or_else(|| Error::new(format!("line {at}: missing number")))?;
-    s.parse().map_err(|_| Error::new(format!("line {at}: bad number `{s}`")))
-}
-
-fn expect<'a>(it: &mut impl Iterator<Item = &'a str>, word: &str, at: usize) -> Result<(), Error> {
-    match it.next() {
-        Some(got) if got == word => Ok(()),
-        Some(got) => Err(Error::new(format!("line {at}: expected `{word}`, got `{got}`"))),
-        None => Err(Error::new(format!("line {at}: expected `{word}`"))),
+    fn dim_text(&self, dim: Dim) -> String {
+        match dim {
+            Dim::Const(n) => n.to_string(),
+            Dim::Value(v) => format!("%{}", self.names[v as usize]),
+        }
     }
 }
 
-fn value_ref(token: Option<&str>, at: usize) -> Result<ValueId, Error> {
-    let token = token.ok_or_else(|| Error::new(format!("line {at}: missing value")))?;
-    let digits = token
-        .strip_prefix('%')
-        .ok_or_else(|| Error::new(format!("line {at}: `{token}` is not a value")))?;
-    digits.parse().map_err(|_| Error::new(format!("line {at}: bad value `{token}`")))
+fn literal(dtype: DType, bits: u32) -> String {
+    match dtype {
+        DType::I32 => (bits as i32).to_string(),
+        DType::F32 => {
+            let v = f32::from_bits(bits);
+            if v.fract() == 0.0 {
+                format!("{v:.1}")
+            } else {
+                format!("{v}")
+            }
+        }
+        DType::Bf16 => unreachable!("bf16 constants are refused"),
+    }
+}
+
+/// The parser state that spans lines: the program and the names defined so far.
+#[derive(Default)]
+struct Parser {
+    ops: Vec<Op>,
+    names: Vec<String>,
+    symbols: BTreeMap<String, ValueId>,
+}
+
+impl Parser {
+    fn define(&mut self, name: String) -> Result<ValueId, Error> {
+        if self.symbols.contains_key(&name) {
+            return Err(Error::new(format!("the name %{name} is defined twice")));
+        }
+        let value = self.names.len() as ValueId;
+        self.symbols.insert(name.clone(), value);
+        self.names.push(name);
+        Ok(value)
+    }
+}
+
+/// `%name = ...`: the only lines that define a value.
+fn parse_definition(t: &mut Tokens, p: &mut Parser) -> Result<Op, Error> {
+    let name = t.name()?;
+    t.expect_eq()?;
+    let keyword = t.ident()?;
+    let value = p.define(name)?;
+    let op = match keyword.as_str() {
+        "const" => {
+            let dtype = t.dtype()?;
+            let bits = t.literal(dtype)?;
+            t.end()?;
+            Op::Const { value, dtype, bits }
+        }
+        "param" => {
+            let dtype = t.dtype()?;
+            // The scalar shape is a single `0` and nothing else.
+            let dims = if matches!(t.peek(), Some(Token::Int(0))) && t.tok.len() == t.at + 1 {
+                t.at += 1;
+                Vec::new()
+            } else {
+                let mut dims = vec![t.term(&p.symbols)?];
+                while matches!(t.peek(), Some(Token::Comma)) {
+                    t.comma()?;
+                    dims.push(t.term(&p.symbols)?);
+                }
+                dims
+            };
+            t.end()?;
+            Op::Param { value, dtype, dims }
+        }
+        "buffer" => {
+            let dtype = t.dtype()?;
+            let a = t.number_u32()?;
+            t.comma()?;
+            let b = t.number_u32()?;
+            t.end()?;
+            Op::Buffer {
+                value,
+                dtype,
+                shape: [a, b],
+            }
+        }
+        "loop" => {
+            let bound = t.term(&p.symbols)?;
+            t.end()?;
+            Op::Loop { value, bound }
+        }
+        "load" => {
+            let buffer = t.value(&p.symbols)?;
+            let offset = t.bracket(&p.symbols)?;
+            t.end()?;
+            Op::Load {
+                value,
+                buffer,
+                offset,
+            }
+        }
+        "cast" => {
+            let src = t.value(&p.symbols)?;
+            t.expect("to")?;
+            let dtype = t.dtype()?;
+            t.end()?;
+            Op::Cast { value, src, dtype }
+        }
+        "matmul" => {
+            let a = t.value(&p.symbols)?;
+            let b = t.value(&p.symbols)?;
+            t.end()?;
+            Op::Matmul { value, a, b }
+        }
+        word if BinOp::from_name(word).is_some() => {
+            let op = BinOp::from_name(word).expect("checked");
+            let a = t.value(&p.symbols)?;
+            let b = t.value(&p.symbols)?;
+            t.end()?;
+            Op::Binary { value, op, a, b }
+        }
+        word if UnOp::from_name(word).is_some() => {
+            let op = UnOp::from_name(word).expect("checked");
+            let a = t.value(&p.symbols)?;
+            t.end()?;
+            Op::Unary { value, op, a }
+        }
+        other => return Err(t.err(format!("no definition starts with `{other}`"))),
+    };
+    Ok(op)
+}
+
+struct Tokens<'a> {
+    tok: &'a [Token],
+    at: usize,
+    line: usize,
+}
+
+impl<'a> Tokens<'a> {
+    fn err(&self, msg: impl Into<String>) -> Error {
+        Error::new(format!("line {}: {}", self.line, msg.into()))
+    }
+
+    fn peek(&self) -> Option<Token> {
+        self.tok.get(self.at).cloned()
+    }
+
+    fn next(&mut self) -> Result<Token, Error> {
+        let t = self
+            .tok
+            .get(self.at)
+            .cloned()
+            .ok_or_else(|| self.err("the line ends early"))?;
+        self.at += 1;
+        Ok(t)
+    }
+
+    fn end(&self) -> Result<(), Error> {
+        match self.peek() {
+            None => Ok(()),
+            Some(t) => Err(self.err(format!("unexpected `{}`", t.text()))),
+        }
+    }
+
+    fn ident(&mut self) -> Result<String, Error> {
+        match self.next()? {
+            Token::Ident(s) => Ok(s),
+            t => Err(self.err(format!("expected a word, found `{}`", t.text()))),
+        }
+    }
+
+    fn expect(&mut self, word: &str) -> Result<(), Error> {
+        let got = self.ident()?;
+        if got == word {
+            Ok(())
+        } else {
+            Err(self.err(format!("expected `{word}`, found `{got}`")))
+        }
+    }
+
+    fn value(&mut self, symbols: &BTreeMap<String, ValueId>) -> Result<ValueId, Error> {
+        let name = self.name()?;
+        symbols
+            .get(&name)
+            .copied()
+            .ok_or_else(|| self.err(format!("unknown value %{name}")))
+    }
+
+    fn name(&mut self) -> Result<String, Error> {
+        match self.next()? {
+            Token::Name(s) => Ok(s),
+            t => Err(self.err(format!("expected a %value, found `{}`", t.text()))),
+        }
+    }
+
+    fn comma(&mut self) -> Result<(), Error> {
+        match self.next()? {
+            Token::Comma => Ok(()),
+            t => Err(self.err(format!("expected `,`, found `{}`", t.text()))),
+        }
+    }
+
+    fn bracket(&mut self, symbols: &BTreeMap<String, ValueId>) -> Result<Dim, Error> {
+        match self.next()? {
+            Token::LBracket => {}
+            t => {
+                return Err(self.err(format!("expected `[`, found `{}`", t.text())));
+            }
+        }
+        let dim = self.term(symbols)?;
+        match self.next()? {
+            Token::RBracket => Ok(dim),
+            t => Err(self.err(format!("expected `]`, found `{}`", t.text()))),
+        }
+    }
+
+    fn term(&mut self, symbols: &BTreeMap<String, ValueId>) -> Result<Dim, Error> {
+        match self.next()? {
+            Token::Name(s) => Ok(Dim::Value(
+                *symbols
+                    .get(&s)
+                    .ok_or_else(|| self.err(format!("unknown value %{s}")))?,
+            )),
+            Token::Int(n) => u32::try_from(n)
+                .map(Dim::Const)
+                .map_err(|_| self.err(format!("{n} is not a non-negative index"))),
+            t => Err(self.err(format!(
+                "expected a literal or a %value, found `{}`",
+                t.text()
+            ))),
+        }
+    }
+
+    fn number_u32(&mut self) -> Result<u32, Error> {
+        match self.next()? {
+            Token::Int(n) => u32::try_from(n).map_err(|_| self.err(format!("{n} is not a u32"))),
+            t => Err(self.err(format!("expected a number, found `{}`", t.text()))),
+        }
+    }
+
+    fn dtype(&mut self) -> Result<DType, Error> {
+        let name = self.ident()?;
+        match name.as_str() {
+            "f32" => Ok(DType::F32),
+            "bf16" => Ok(DType::Bf16),
+            "i32" => Ok(DType::I32),
+            other => Err(self.err(format!("unknown dtype `{other}`"))),
+        }
+    }
+
+    fn expect_eq(&mut self) -> Result<(), Error> {
+        match self.next()? {
+            Token::Eq => Ok(()),
+            t => Err(self.err(format!("expected `=`, found `{}`", t.text()))),
+        }
+    }
+
+    /// A constant's bits, in its dtype.
+    fn literal(&mut self, dtype: DType) -> Result<u32, Error> {
+        if dtype == DType::Bf16 {
+            return Err(self.err("a bf16 constant is not exact; write it as f32 and cast"));
+        }
+        match self.next()? {
+            Token::Int(n) if dtype == DType::I32 => {
+                Ok(u32::try_from(n).map_err(|_| self.err(format!("{n} is not an i32")))?)
+            }
+            Token::Int(n) if dtype == DType::F32 => Ok((n as f32).to_bits()),
+            Token::Float(bits) if dtype == DType::F32 => Ok(bits),
+            t => Err(self.err(format!(
+                "expected a {} literal, found `{}`",
+                dtype.name(),
+                t.text()
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum Token {
+    Name(String),
+    Ident(String),
+    Int(i64),
+    Float(u32),
+    Comma,
+    LBracket,
+    RBracket,
+    Eq,
+}
+
+impl Token {
+    fn text(&self) -> String {
+        match self {
+            Token::Name(n) => format!("%{n}"),
+            Token::Ident(s) => s.clone(),
+            Token::Int(n) => n.to_string(),
+            Token::Float(bits) => literal(DType::F32, *bits),
+            Token::Comma => ",".to_string(),
+            Token::LBracket => "[".to_string(),
+            Token::RBracket => "]".to_string(),
+            Token::Eq => "=".to_string(),
+        }
+    }
+}
+
+fn tokenize(line: &str) -> Result<Vec<Token>, String> {
+    let mut out = Vec::new();
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        match c {
+            ',' => {
+                out.push(Token::Comma);
+                i += 1;
+            }
+            '[' => {
+                out.push(Token::LBracket);
+                i += 1;
+            }
+            ']' => {
+                out.push(Token::RBracket);
+                i += 1;
+            }
+            '=' => {
+                out.push(Token::Eq);
+                i += 1;
+            }
+            '%' => {
+                let start = i + 1;
+                i += 1;
+                let mut end = i;
+                while end < bytes.len()
+                    && ((bytes[end] as char).is_ascii_alphanumeric() || bytes[end] == b'_')
+                {
+                    end += 1;
+                }
+                if end == start {
+                    return Err("a `%` must be followed by a name".into());
+                }
+                out.push(Token::Name(line[start..end].to_string()));
+                i = end;
+            }
+            c if c.is_ascii_digit() || c == '-' => {
+                let start = i;
+                i += 1;
+                let mut float = false;
+                while i < bytes.len() {
+                    let d = bytes[i] as char;
+                    if d.is_ascii_digit() {
+                        i += 1;
+                    } else if d == '.' {
+                        float = true;
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let text = &line[start..i];
+                if float {
+                    let v: f32 = text
+                        .parse()
+                        .map_err(|_| format!("`{text}` is not a number"))?;
+                    out.push(Token::Float(v.to_bits()));
+                } else {
+                    let v: i64 = text
+                        .parse()
+                        .map_err(|_| format!("`{text}` is not an integer"))?;
+                    out.push(Token::Int(v));
+                }
+            }
+            c if c.is_ascii_alphabetic() || c == '_' => {
+                let start = i;
+                while i < bytes.len()
+                    && ((bytes[i] as char).is_ascii_alphanumeric() || bytes[i] == b'_')
+                {
+                    i += 1;
+                }
+                out.push(Token::Ident(line[start..i].to_string()));
+            }
+            other => return Err(format!("unexpected `{other}`")),
+        }
+    }
+    Ok(out)
 }

@@ -332,6 +332,16 @@ impl Device {
 
     /// Load `image` into L1 and start `core` on it.
     pub fn load_and_start(&mut self, core: Core, image: &[u8], at: u64) -> Result<(), Error> {
+        self.load_held(core, image, at)?;
+        self.set_core_reset(core, false)
+    }
+
+    /// Load `image` at `at` and leave `core` held in reset.
+    ///
+    /// Everything [`Device::load_and_start`] does except the release: the image,
+    /// the reset PC and a cleared status word are in place, so one later write to
+    /// `SOFT_RESET_0` starts this core and every other held one at once.
+    fn load_held(&mut self, core: Core, image: &[u8], at: u64) -> Result<(), Error> {
         self.set_core_reset(core, true)?;
         self.l1_write(at, image)?;
         // A stale status word would satisfy the wait before the image runs.
@@ -353,7 +363,29 @@ impl Device {
                 )));
             }
         }
-        self.set_core_reset(core, false)
+        Ok(())
+    }
+
+    /// Load every image and release all their cores with **one** write to
+    /// `SOFT_RESET_0`, so cores meant to run alongside each other do.
+    pub fn load_and_start_together(
+        &mut self,
+        images: &[crate::images::Image],
+    ) -> Result<(), Error> {
+        let mut release = 0u32;
+        for &(core, image, at) in images {
+            self.load_held(core, image, at)?;
+            release |= core.soft_reset_mask();
+        }
+        let current = self.read32(tensix::SOFT_RESET_0)?;
+        self.write32(tensix::SOFT_RESET_0, current & !release)
+    }
+
+    /// Release the Tensix backend — unpackers, packers, Matrix Unit, Vector Unit
+    /// and the rest — from soft reset, leaving the five RISC-V cores alone.
+    pub fn release_tensix_backend(&mut self) -> Result<(), Error> {
+        let current = self.read32(tensix::SOFT_RESET_0)?;
+        self.write32(tensix::SOFT_RESET_0, current & !tensix::BACKEND_RESET_MASK)
     }
 
     /// Wait until `predicate` accepts the word at `address`.
