@@ -29,5 +29,18 @@ library out.
 
 ## Status
 
-The IR, both forms and the verifier are in place (`tests/ir.rs`). The planner,
-allocator, emitter and runtime follow.
+What a consumer sees is `libTT.so` and its C ABI, tested end to end by loading
+the built library with `dlopen` and calling it (`tests/e2e.rs`). Unit tests exist
+under the modules, but they are not the measure: the measure is the `.so`.
+
+```c
+uint32_t tt_abi_version(void);
+int tt_compile(const uint8_t *ir, size_t ir_len,
+               uint8_t **out, size_t *out_len,
+               char **err, size_t *err_len);
+void tt_free(uint8_t *ptr, size_t len);
+```
+
+`ir` is the text form (or the byte form if it starts with `TTIR`); `out` is a
+module (magic `TTMD`, the grid, then the reader, writer and T0/T1/T2 programs).
+The runtime calls that take a module and run it are not there yet.

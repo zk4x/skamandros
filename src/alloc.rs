@@ -85,10 +85,6 @@ const SEM_RESULT: Semaphore = match Semaphore::new(1) {
     Some(s) => s,
     None => panic!("semaphore 1 exists"),
 };
-const SEM_FREE: Semaphore = match Semaphore::new(2) {
-    Some(s) => s,
-    None => panic!("semaphore 2 exists"),
-};
 
 /// Allocate homes and hand-offs for `k`.
 pub fn allocate(k: &Kernel) -> Result<Alloc, Error> {
