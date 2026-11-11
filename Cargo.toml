@@ -1,0 +1,17 @@
+[package]
+name = "tt-driver"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/zk4x/tt-driver"
+description = "Tenstorrent kernel IR, allocator and driver. Builds libTT.so."
+
+[lib]
+name = "TT"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+tt-isa = { git = "https://github.com/zk4x/tt-isa" }
+libloading = "0.8"
+libc = "0.2"

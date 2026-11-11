@@ -1,0 +1,17 @@
+// Copyright (C) 2025 zk4x
+// SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
+
+//! The Tenstorrent kernel compiler and driver.
+//!
+//! One semantic SSA program in ([`ir`]), a set of role programs and a launch
+//! out: the reader/writer RISC-V programs and the T0/T1/T2 Tensix programs are
+//! produced by `emit` from the allocation `alloc` makes, and `runtime` loads and
+//! runs them. The C ABI in `abi` is the only stable surface; every other item is
+//! free to move.
+//!
+//! The IR is a *program format*, not a Rust API: it is accepted as text or as
+//! bytes, and versioned ([`ir::VERSION`]).
+
+pub mod ir;
+
+pub use ir::{Buf, BufKind, DType, Kernel, Op, Param, ParamKind, SfpuKind, ValueId};
