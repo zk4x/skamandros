@@ -202,3 +202,8 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   `eq`/`noteq`, the remaining unary and binary ops, the `bool` datapath in a
   parameter or buffer, and the reduce op are accepted by the format and verifier
   and refused loudly by lowering, not guessed at.
+- Transcendentals are the caller's to unfold. zyx rewrites `Exp2`/`Log2`/`Sin`/
+  `Cos` (and `Pow` as `exp2(y * log2 x)`) into primitive arithmetic in
+  `tt_unfold`, before the backend sees them, and skamandros does the same by
+  refusing them: the compiler takes the low-level arithmetic, not the
+  approximation tables.
