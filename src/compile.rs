@@ -30,6 +30,9 @@ pub struct Module {
     pub writer: Vec<u32>,
     /// The three compute programs, T0/T1/T2, words.
     pub cores: [Vec<u32>; 3],
+    /// The setup program thread 0 runs before the three roles are released: the
+    /// semaphore initialisation, sized to the `Dst` slots this kernel uses.
+    pub setup: Vec<u32>,
 }
 
 /// Compile one program. Every refusal is an error, never a partial module.
@@ -52,6 +55,7 @@ pub fn compile(k: &Kernel) -> Result<Module, Error> {
     optimize::fuse(&mut machine);
     optimize::verify(&machine)?;
     let words = encode::encode(&machine)?;
+    let setup = encode::setup(alloc.dst_peak.max(1))?;
     let reader = mover::inbound(k, &types, &plan)?;
     let writer = mover::outbound(k, &types, &plan)?;
     let params = k
@@ -66,6 +70,7 @@ pub fn compile(k: &Kernel) -> Result<Module, Error> {
         reader,
         writer,
         cores: words.words(),
+        setup,
     };
     if module.reader.is_empty()
         && module.writer.is_empty()

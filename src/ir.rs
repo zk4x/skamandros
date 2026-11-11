@@ -35,11 +35,16 @@ pub type ValueId = u32;
 pub const INDEX: DType = DType::I32;
 
 /// Element type.
+///
+/// `Bool` is what a comparison and a logical op produce, and what `sel` takes.
+/// A parameter or a buffer may name it in the format, but neither is lowered
+/// yet (the verifier says so loudly).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DType {
     F32,
     Bf16,
     I32,
+    Bool,
 }
 
 impl DType {
@@ -47,7 +52,7 @@ impl DType {
     pub const fn bytes(self) -> u32 {
         match self {
             DType::F32 | DType::I32 => 4,
-            DType::Bf16 => 2,
+            DType::Bf16 | DType::Bool => 2,
         }
     }
 
@@ -60,6 +65,7 @@ impl DType {
             DType::F32 => "f32",
             DType::Bf16 => "bf16",
             DType::I32 => "i32",
+            DType::Bool => "bool",
         }
     }
 
@@ -68,6 +74,7 @@ impl DType {
             DType::F32 => 0,
             DType::Bf16 => 1,
             DType::I32 => 2,
+            DType::Bool => 3,
         }
     }
 
@@ -76,6 +83,7 @@ impl DType {
             0 => Some(DType::F32),
             1 => Some(DType::Bf16),
             2 => Some(DType::I32),
+            3 => Some(DType::Bool),
             _ => None,
         }
     }
@@ -147,20 +155,32 @@ pub struct ValueInfo {
     pub shape: RegShape,
 }
 
-/// The arithmetic a binary op names. Index math is `i32`; float math is `f32`
-/// or `bf16`; shifts and bitwise ops are `i32` only.
+/// The binary operations the unified program has, the same set as zyx's `BOp`.
+///
+/// Comparisons produce a `bool`; `Or`/`And` are logical (bool operands and
+/// result); `BitOr`/`BitAnd`/`BitXor`/`BitShiftLeft`/`BitShiftRight`/`Mod` are
+/// integer (`i32`); the rest operate on two values of the same dtype.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add,
     Sub,
     Mul,
     Div,
-    Rem,
-    Shr,
-    Shl,
-    And,
+    Pow,
+    Mod,
+    Cmplt,
+    Cmpgt,
+    Cmpge,
+    Max,
     Or,
-    Xor,
+    And,
+    BitXor,
+    BitOr,
+    BitAnd,
+    BitShiftLeft,
+    BitShiftRight,
+    NotEq,
+    Eq,
 }
 
 impl BinOp {
@@ -170,12 +190,21 @@ impl BinOp {
             BinOp::Sub => "sub",
             BinOp::Mul => "mul",
             BinOp::Div => "div",
-            BinOp::Rem => "rem",
-            BinOp::Shr => "shr",
-            BinOp::Shl => "shl",
-            BinOp::And => "and",
+            BinOp::Pow => "pow",
+            BinOp::Mod => "mod",
+            BinOp::Cmplt => "cmplt",
+            BinOp::Cmpgt => "cmpgt",
+            BinOp::Cmpge => "cmpge",
+            BinOp::Max => "max",
             BinOp::Or => "or",
-            BinOp::Xor => "xor",
+            BinOp::And => "and",
+            BinOp::BitXor => "bitxor",
+            BinOp::BitOr => "bitor",
+            BinOp::BitAnd => "bitand",
+            BinOp::BitShiftLeft => "bitshiftleft",
+            BinOp::BitShiftRight => "bitshiftright",
+            BinOp::NotEq => "noteq",
+            BinOp::Eq => "eq",
         }
     }
 
@@ -185,12 +214,21 @@ impl BinOp {
             "sub" => BinOp::Sub,
             "mul" => BinOp::Mul,
             "div" => BinOp::Div,
-            "rem" => BinOp::Rem,
-            "shr" => BinOp::Shr,
-            "shl" => BinOp::Shl,
-            "and" => BinOp::And,
+            "pow" => BinOp::Pow,
+            "mod" => BinOp::Mod,
+            "cmplt" => BinOp::Cmplt,
+            "cmpgt" => BinOp::Cmpgt,
+            "cmpge" => BinOp::Cmpge,
+            "max" => BinOp::Max,
             "or" => BinOp::Or,
-            "xor" => BinOp::Xor,
+            "and" => BinOp::And,
+            "bitxor" => BinOp::BitXor,
+            "bitor" => BinOp::BitOr,
+            "bitand" => BinOp::BitAnd,
+            "bitshiftleft" => BinOp::BitShiftLeft,
+            "bitshiftright" => BinOp::BitShiftRight,
+            "noteq" => BinOp::NotEq,
+            "eq" => BinOp::Eq,
             _ => return None,
         })
     }
@@ -201,12 +239,21 @@ impl BinOp {
             BinOp::Sub => 1,
             BinOp::Mul => 2,
             BinOp::Div => 3,
-            BinOp::Rem => 4,
-            BinOp::Shr => 5,
-            BinOp::Shl => 6,
-            BinOp::And => 7,
-            BinOp::Or => 8,
-            BinOp::Xor => 9,
+            BinOp::Pow => 4,
+            BinOp::Mod => 5,
+            BinOp::Cmplt => 6,
+            BinOp::Cmpgt => 7,
+            BinOp::Cmpge => 8,
+            BinOp::Max => 9,
+            BinOp::Or => 10,
+            BinOp::And => 11,
+            BinOp::BitXor => 12,
+            BinOp::BitOr => 13,
+            BinOp::BitAnd => 14,
+            BinOp::BitShiftLeft => 15,
+            BinOp::BitShiftRight => 16,
+            BinOp::NotEq => 17,
+            BinOp::Eq => 18,
         }
     }
 
@@ -216,47 +263,104 @@ impl BinOp {
             1 => BinOp::Sub,
             2 => BinOp::Mul,
             3 => BinOp::Div,
-            4 => BinOp::Rem,
-            5 => BinOp::Shr,
-            6 => BinOp::Shl,
-            7 => BinOp::And,
-            8 => BinOp::Or,
-            9 => BinOp::Xor,
+            4 => BinOp::Pow,
+            5 => BinOp::Mod,
+            6 => BinOp::Cmplt,
+            7 => BinOp::Cmpgt,
+            8 => BinOp::Cmpge,
+            9 => BinOp::Max,
+            10 => BinOp::Or,
+            11 => BinOp::And,
+            12 => BinOp::BitXor,
+            13 => BinOp::BitOr,
+            14 => BinOp::BitAnd,
+            15 => BinOp::BitShiftLeft,
+            16 => BinOp::BitShiftRight,
+            17 => BinOp::NotEq,
+            18 => BinOp::Eq,
             _ => return None,
         })
     }
 
-    /// The ops that only make sense on the index dtype.
+    /// A comparison: the result is a `bool`.
+    pub const fn returns_bool(self) -> bool {
+        matches!(
+            self,
+            BinOp::Cmplt | BinOp::Cmpgt | BinOp::Cmpge | BinOp::NotEq | BinOp::Eq
+        )
+    }
+
+    /// The ops that only make sense on an integer dtype.
     pub const fn is_integer_only(self) -> bool {
         matches!(
             self,
-            BinOp::Rem | BinOp::Shr | BinOp::Shl | BinOp::And | BinOp::Or | BinOp::Xor
+            BinOp::Mod
+                | BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::BitShiftLeft
+                | BinOp::BitShiftRight
         )
+    }
+
+    /// The logical ops take and return a `bool`.
+    pub const fn is_logical(self) -> bool {
+        matches!(self, BinOp::Or | BinOp::And)
     }
 }
 
-/// A unary register op.
+/// A unary register op, the same set as zyx's `UOp`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnOp {
     Neg,
+    Not,
+    BitNot,
+    Exp2,
+    Log2,
+    Reciprocal,
+    Sqrt,
+    Rsqrt,
+    Sin,
+    Cos,
+    Floor,
+    Trunc,
     Abs,
-    Relu,
 }
 
 impl UnOp {
     pub fn name(self) -> &'static str {
         match self {
             UnOp::Neg => "neg",
+            UnOp::Not => "not",
+            UnOp::BitNot => "bitnot",
+            UnOp::Exp2 => "exp2",
+            UnOp::Log2 => "log2",
+            UnOp::Reciprocal => "reciprocal",
+            UnOp::Sqrt => "sqrt",
+            UnOp::Rsqrt => "rsqrt",
+            UnOp::Sin => "sin",
+            UnOp::Cos => "cos",
+            UnOp::Floor => "floor",
+            UnOp::Trunc => "trunc",
             UnOp::Abs => "abs",
-            UnOp::Relu => "relu",
         }
     }
 
     fn from_name(name: &str) -> Option<UnOp> {
         Some(match name {
             "neg" => UnOp::Neg,
+            "not" => UnOp::Not,
+            "bitnot" => UnOp::BitNot,
+            "exp2" => UnOp::Exp2,
+            "log2" => UnOp::Log2,
+            "reciprocal" => UnOp::Reciprocal,
+            "sqrt" => UnOp::Sqrt,
+            "rsqrt" => UnOp::Rsqrt,
+            "sin" => UnOp::Sin,
+            "cos" => UnOp::Cos,
+            "floor" => UnOp::Floor,
+            "trunc" => UnOp::Trunc,
             "abs" => UnOp::Abs,
-            "relu" => UnOp::Relu,
             _ => return None,
         })
     }
@@ -264,16 +368,36 @@ impl UnOp {
     fn tag(self) -> u8 {
         match self {
             UnOp::Neg => 0,
-            UnOp::Abs => 1,
-            UnOp::Relu => 2,
+            UnOp::Not => 1,
+            UnOp::BitNot => 2,
+            UnOp::Exp2 => 3,
+            UnOp::Log2 => 4,
+            UnOp::Reciprocal => 5,
+            UnOp::Sqrt => 6,
+            UnOp::Rsqrt => 7,
+            UnOp::Sin => 8,
+            UnOp::Cos => 9,
+            UnOp::Floor => 10,
+            UnOp::Trunc => 11,
+            UnOp::Abs => 12,
         }
     }
 
     fn from_tag(tag: u8) -> Option<UnOp> {
         Some(match tag {
             0 => UnOp::Neg,
-            1 => UnOp::Abs,
-            2 => UnOp::Relu,
+            1 => UnOp::Not,
+            2 => UnOp::BitNot,
+            3 => UnOp::Exp2,
+            4 => UnOp::Log2,
+            5 => UnOp::Reciprocal,
+            6 => UnOp::Sqrt,
+            7 => UnOp::Rsqrt,
+            8 => UnOp::Sin,
+            9 => UnOp::Cos,
+            10 => UnOp::Floor,
+            11 => UnOp::Trunc,
+            12 => UnOp::Abs,
             _ => return None,
         })
     }
@@ -344,6 +468,14 @@ pub enum Op {
         a: ValueId,
         b: ValueId,
     },
+    /// Branchless select: `cond ? if_true : if_false`. `cond` is a `bool`; the
+    /// two values have the same dtype and the result has their shape.
+    Select {
+        value: ValueId,
+        cond: ValueId,
+        if_true: ValueId,
+        if_false: ValueId,
+    },
     /// `a x b` accumulating into a tile.
     Matmul {
         value: ValueId,
@@ -364,6 +496,7 @@ impl Op {
             | Op::Cast { value, .. }
             | Op::Unary { value, .. }
             | Op::Binary { value, .. }
+            | Op::Select { value, .. }
             | Op::Matmul { value, .. } => Some(value),
             Op::Grid { .. } | Op::EndLoop | Op::CopyTo { .. } | Op::StoreTo { .. } => None,
         }
@@ -400,6 +533,12 @@ impl Op {
             Op::Cast { src, .. } => vec![*src],
             Op::Unary { a, .. } => vec![*a],
             Op::Binary { a, b, .. } => vec![*a, *b],
+            Op::Select {
+                cond,
+                if_true,
+                if_false,
+                ..
+            } => vec![*cond, *if_true, *if_false],
             Op::Matmul { a, b, .. } => vec![*a, *b],
             Op::Loop { bound, .. } => dim(bound).into_iter().collect(),
             Op::Grid { columns, rows } => dim(columns).into_iter().chain(dim(rows)).collect(),
@@ -565,6 +704,11 @@ impl Kernel {
                             "op {at}: a bf16 constant is not exact; write it as f32 and cast"
                         )));
                     }
+                    if dtype == DType::Bool {
+                        return Err(Error::new(format!(
+                            "op {at}: a bool constant is not a datum; write a comparison"
+                        )));
+                    }
                     let _ = bits;
                     ValueInfo {
                         kind: ValueKind::Const,
@@ -575,6 +719,9 @@ impl Kernel {
                 Op::Param {
                     dtype, ref dims, ..
                 } => {
+                    if dtype == DType::Bool {
+                        todo!("op {at}: a bool parameter is not implemented");
+                    }
                     for (k, dim) in dims.iter().enumerate() {
                         match *dim {
                             Dim::Const(0) => {
@@ -608,6 +755,9 @@ impl Kernel {
                     }
                 }
                 Op::Buffer { dtype, shape, .. } => {
+                    if dtype == DType::Bool {
+                        todo!("op {at}: a bool buffer is not implemented");
+                    }
                     unit_of(shape, dtype)?;
                     ValueInfo {
                         kind: ValueKind::Buffer,
@@ -757,6 +907,9 @@ impl Kernel {
                             "op {at}: %{src} is not a register value"
                         )));
                     }
+                    if s.dtype == DType::Bool || dtype == DType::Bool {
+                        todo!("op {at}: a cast to or from bool is not implemented");
+                    }
                     ValueInfo {
                         kind: ValueKind::Register,
                         dtype,
@@ -768,16 +921,39 @@ impl Kernel {
                     if !is_value(x.kind) {
                         return Err(Error::new(format!("op {at}: %{a} is not a register value")));
                     }
-                    if !x.dtype.is_float() {
-                        return Err(Error::new(format!(
-                            "op {at}: {} needs a float value, not {}",
-                            op.name(),
-                            x.dtype.name()
-                        )));
-                    }
+                    let dtype = match op {
+                        UnOp::Not => {
+                            if x.dtype != DType::Bool {
+                                return Err(Error::new(format!(
+                                    "op {at}: not needs a bool, not {}",
+                                    x.dtype.name()
+                                )));
+                            }
+                            DType::Bool
+                        }
+                        UnOp::BitNot => {
+                            if x.dtype != DType::I32 {
+                                return Err(Error::new(format!(
+                                    "op {at}: bitnot is integer (i32), not {}",
+                                    x.dtype.name()
+                                )));
+                            }
+                            DType::I32
+                        }
+                        _ => {
+                            if !x.dtype.is_float() {
+                                return Err(Error::new(format!(
+                                    "op {at}: {} needs a float value, not {}",
+                                    op.name(),
+                                    x.dtype.name()
+                                )));
+                            }
+                            x.dtype
+                        }
+                    };
                     ValueInfo {
                         kind: ValueKind::Register,
-                        dtype: x.dtype,
+                        dtype,
                         shape: x.shape,
                     }
                 }
@@ -798,11 +974,24 @@ impl Kernel {
                             y.dtype.name()
                         )));
                     }
-                    if op.is_integer_only() && x.dtype != INDEX {
+                    if op.is_logical() && x.dtype != DType::Bool {
                         return Err(Error::new(format!(
-                            "op {at}: {} is index math (i32), not {}",
+                            "op {at}: {} is logical (bool), not {}",
                             op.name(),
                             x.dtype.name()
+                        )));
+                    }
+                    if op.is_integer_only() && x.dtype != INDEX {
+                        return Err(Error::new(format!(
+                            "op {at}: {} is integer math (i32), not {}",
+                            op.name(),
+                            x.dtype.name()
+                        )));
+                    }
+                    if !op.is_logical() && x.dtype == DType::Bool {
+                        return Err(Error::new(format!(
+                            "op {at}: {} is not a bool operation",
+                            op.name()
                         )));
                     }
                     let shape = broadcast(x.shape, y.shape).ok_or_else(|| {
@@ -812,9 +1001,61 @@ impl Kernel {
                             y.shape.name()
                         ))
                     })?;
+                    let dtype = if op.returns_bool() {
+                        DType::Bool
+                    } else {
+                        x.dtype
+                    };
                     ValueInfo {
                         kind: ValueKind::Register,
-                        dtype: x.dtype,
+                        dtype,
+                        shape,
+                    }
+                }
+                Op::Select {
+                    cond,
+                    if_true,
+                    if_false,
+                    ..
+                } => {
+                    let c = *lookup(&values, &visible, cond, at)?;
+                    let t = *lookup(&values, &visible, if_true, at)?;
+                    let f = *lookup(&values, &visible, if_false, at)?;
+                    if !is_value(c.kind) || !is_value(t.kind) || !is_value(f.kind) {
+                        return Err(Error::new(format!(
+                            "op {at}: sel needs three register values"
+                        )));
+                    }
+                    if c.dtype != DType::Bool {
+                        return Err(Error::new(format!(
+                            "op {at}: the condition %{cond} is {}, not bool",
+                            c.dtype.name()
+                        )));
+                    }
+                    if t.dtype != f.dtype {
+                        return Err(Error::new(format!(
+                            "op {at}: sel of {} and {}; there is no implicit cast",
+                            t.dtype.name(),
+                            f.dtype.name()
+                        )));
+                    }
+                    let shape = broadcast(t.shape, f.shape).ok_or_else(|| {
+                        Error::new(format!(
+                            "op {at}: cannot broadcast a {} and a {}",
+                            t.shape.name(),
+                            f.shape.name()
+                        ))
+                    })?;
+                    let shape = broadcast(shape, c.shape).ok_or_else(|| {
+                        Error::new(format!(
+                            "op {at}: cannot broadcast the condition's {} with the values' {}",
+                            c.shape.name(),
+                            shape.name()
+                        ))
+                    })?;
+                    ValueInfo {
+                        kind: ValueKind::Register,
+                        dtype: t.dtype,
                         shape,
                     }
                 }
@@ -955,7 +1196,7 @@ fn param_elements(k: &Kernel, def: &[usize], param: ValueId) -> Option<u32> {
 /// The byte form's magic.
 pub const MAGIC: [u8; 4] = *b"TTIR";
 /// The IR version this build reads and writes.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 impl Kernel {
     /// The byte form: the same program as [`Kernel::to_text`], little-endian and
@@ -1054,6 +1295,18 @@ impl Kernel {
                     b.push(op.tag());
                     put_u32(&mut b, *a);
                     put_u32(&mut b, *rhs);
+                }
+                Op::Select {
+                    value,
+                    cond,
+                    if_true,
+                    if_false,
+                } => {
+                    b.push(13);
+                    put_name(&mut b, &self.names[*value as usize]);
+                    put_u32(&mut b, *cond);
+                    put_u32(&mut b, *if_true);
+                    put_u32(&mut b, *if_false);
                 }
                 Op::Matmul { value, a, b: rhs } => {
                     b.push(12);
@@ -1176,6 +1429,19 @@ impl Kernel {
                     let b = r.u32()?;
                     let value = define(&mut names, name)?;
                     Op::Matmul { value, a, b }
+                }
+                13 => {
+                    let name = r.name()?;
+                    let cond = r.u32()?;
+                    let if_true = r.u32()?;
+                    let if_false = r.u32()?;
+                    let value = define(&mut names, name)?;
+                    Op::Select {
+                        value,
+                        cond,
+                        if_true,
+                        if_false,
+                    }
                 }
                 other => return Err(Error::new(format!("unknown instruction tag {other}"))),
             };
@@ -1477,6 +1743,20 @@ impl Kernel {
                         name(*b)
                     ));
                 }
+                Op::Select {
+                    value,
+                    cond,
+                    if_true,
+                    if_false,
+                } => {
+                    s.push_str(&format!(
+                        "%{} = sel %{} %{} %{}\n",
+                        name(*value),
+                        name(*cond),
+                        name(*if_true),
+                        name(*if_false)
+                    ));
+                }
                 Op::Matmul { value, a, b } => {
                     s.push_str(&format!(
                         "%{} = matmul %{} %{}\n",
@@ -1510,6 +1790,7 @@ fn literal(dtype: DType, bits: u32) -> String {
             }
         }
         DType::Bf16 => unreachable!("bf16 constants are refused"),
+        DType::Bool => unreachable!("bool constants are refused"),
     }
 }
 
@@ -1602,6 +1883,18 @@ fn parse_definition(t: &mut Tokens, p: &mut Parser) -> Result<Op, Error> {
             let b = t.value(&p.symbols)?;
             t.end()?;
             Op::Matmul { value, a, b }
+        }
+        "sel" => {
+            let cond = t.value(&p.symbols)?;
+            let if_true = t.value(&p.symbols)?;
+            let if_false = t.value(&p.symbols)?;
+            t.end()?;
+            Op::Select {
+                value,
+                cond,
+                if_true,
+                if_false,
+            }
         }
         word if BinOp::from_name(word).is_some() => {
             let op = BinOp::from_name(word).expect("checked");

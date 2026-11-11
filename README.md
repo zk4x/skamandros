@@ -18,7 +18,7 @@ values. It names no processor, no `Dst` slot, no `Src` bank, no lane register,
 no semaphore, no unpacker, no packer and no Tensix word:
 
 ```
-version 2
+version 3
 grid 1,1
 %in  = param f32 1024,128
 %out = param f32 1024,128
@@ -39,6 +39,14 @@ terms, and a term is a literal or an `i32` value; a product is built by an op
 first. A parameter may be arbitrary-dimensional and symbolic, a scalar parameter
 is the shape `0`, and a buffer is two constant dimensions, each `1` or a multiple
 of 32. There is no implicit dtype conversion: `cast %x to bf16` is the only one.
+
+The op set is the low-level one and nothing more: zyx's `UOp`
+(`neg`, `not`, `bitnot`, `exp2`, `log2`, `reciprocal`, `sqrt`, `rsqrt`, `sin`,
+`cos`, `floor`, `trunc`, `abs`), zyx's `BOp` (`add`, `sub`, `mul`, `div`, `pow`,
+`mod`, `cmplt`, `cmpgt`, `cmpge`, `max`, `or`, `and`, `bitxor`, `bitor`, `bitand`,
+`bitshiftleft`, `bitshiftright`, `noteq`, `eq`), `sel` (`cond ? if_true :
+if_false`, the branchless `v_if`), and the matrix multiply. A comparison produces
+a `bool`, and `sel` takes one. There is no `relu`/`elu`/`sigmoid` op.
 
 The crate decides which machine programs each instruction belongs to, where each
 register value lives, which lane registers its body uses, how a buffer is read
@@ -185,9 +193,11 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
 - A launch is one Tensix tile: a module whose grid is larger than 1x1 is
   refused. A symbolic grid parses and verifies but is not lowered.
 - The register datapath lowered today is FP32, straight-line, with literal
-  offsets, and `neg`/`abs` plus `add`/`sub`/`mul` on equal shapes. A loop with a
-  constant bound is unrolled before lowering, and constant index arithmetic
-  (including the offset of each iteration) folds to a literal. A loop with a
-  symbolic bound, symbolic offsets, `cast`, broadcast, `matmul` and `relu` are
-  accepted by the format and verifier and refused loudly by lowering, not
-  guessed at.
+  offsets, and `neg`/`abs` plus `add`/`sub`/`mul` on equal shapes; all four run
+  end to end through the C ABI, `add`/`sub`/`mul` on two loaded tiles. A loop
+  with a constant bound is unrolled before lowering, and constant index
+  arithmetic (including the offset of each iteration) folds to a literal.
+- A loop with a symbolic bound, symbolic offsets, `cast`, broadcast, `matmul`,
+  `sel`, the remaining unary and binary ops, the `bool` datapath in a parameter
+  or buffer, and the reduce op are accepted by the format and verifier and
+  refused loudly by lowering, not guessed at.

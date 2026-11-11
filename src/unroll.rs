@@ -219,6 +219,20 @@ impl Unroller<'_> {
                     }
                 }
             }
+            Op::Select {
+                value,
+                cond,
+                if_true,
+                if_false,
+            } => {
+                let id = self.redefine(value)?;
+                Op::Select {
+                    value: id,
+                    cond: self.map(cond, subs)?,
+                    if_true: self.map(if_true, subs)?,
+                    if_false: self.map(if_false, subs)?,
+                }
+            }
             Op::Matmul { value, a, b: rhs } => {
                 let id = self.redefine(value)?;
                 Op::Matmul {
@@ -244,12 +258,23 @@ impl Unroller<'_> {
             BinOp::Sub => a.wrapping_sub(b),
             BinOp::Mul => a.wrapping_mul(b),
             BinOp::Div => a.checked_div(b)?,
-            BinOp::Rem => a.checked_rem(b)?,
-            BinOp::Shr => a.checked_shr(u32::try_from(b).ok()?)?,
-            BinOp::Shl => a.checked_shl(u32::try_from(b).ok()?)?,
-            BinOp::And => a & b,
-            BinOp::Or => a | b,
-            BinOp::Xor => a ^ b,
+            BinOp::Mod => a.checked_rem(b)?,
+            BinOp::Pow => a.checked_pow(u32::try_from(b).ok()?)?,
+            BinOp::Max => a.max(b),
+            BinOp::BitAnd => a & b,
+            BinOp::BitOr => a | b,
+            BinOp::BitXor => a ^ b,
+            BinOp::BitShiftLeft => a.checked_shl(u32::try_from(b).ok()?)?,
+            BinOp::BitShiftRight => a.checked_shr(u32::try_from(b).ok()?)?,
+            // A comparison makes a bool and a logical op takes one; neither is
+            // an `i32` constant to fold into an index.
+            BinOp::Cmplt
+            | BinOp::Cmpgt
+            | BinOp::Cmpge
+            | BinOp::Eq
+            | BinOp::NotEq
+            | BinOp::Or
+            | BinOp::And => return None,
         };
         Some(value)
     }

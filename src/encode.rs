@@ -76,22 +76,30 @@ pub fn encode(m: &Machine) -> Result<Words, Error> {
 /// makes it race-free; a `SEMINIT` issued by a role itself could reset a value
 /// another role has already posted. The semaphore that counts free `Dst` slots
 /// starts at one instead of zero, because the first load has a slot to fill.
-pub fn setup() -> Result<Vec<u32>, Error> {
-    Ok(semaphore_init()?.into_iter().map(|i| i.word()).collect())
+pub fn setup(slots: u8) -> Result<Vec<u32>, Error> {
+    Ok(semaphore_init(slots)?
+        .into_iter()
+        .map(|i| i.word())
+        .collect())
 }
 
 /// `SEMINIT` each semaphore with max 1 — the boot sequence's shape.
-fn semaphore_init() -> Result<Vec<Instruction>, Error> {
+fn semaphore_init(slots: u8) -> Result<Vec<Instruction>, Error> {
     let mut out = Vec::new();
+    let max = sync::MAX_VALUE;
     for (index, value) in [
         (crate::lower::SEM_UNPACKED, 0),
         (crate::lower::SEM_READY, 0),
-        // One `Dst` slot is free at the start; the packer hands each back.
-        (crate::lower::SEM_SLOT, 1),
+        // Every `Dst` slot this kernel uses is free at the start; the packer
+        // hands each back. The count is the allocation's peak liveness, not the
+        // whole bank: with more tokens than the program can have live units, the
+        // unpacker would run a second unit into a slot the packer is still
+        // reading.
+        (crate::lower::SEM_SLOT, slots),
     ] {
         let sem = semaphore(index)?;
         out.push(
-            sync::init(sem, value, 1)
+            sync::init(sem, value, max)
                 .map_err(|e| Error(format!("SEMINIT on semaphore {index}: {e}")))?,
         );
     }

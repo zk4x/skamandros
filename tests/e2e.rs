@@ -73,7 +73,7 @@ fn library() -> &'static Library {
 }
 
 const COPY: &str = "\
-version 2
+version 3
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -157,7 +157,7 @@ fn a_refused_program_comes_back_as_an_error_not_a_crash() {
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
 
-    let bad = "version 2\ngrid 1,1\n%out = param f32 1024\n%x = neg %y\n";
+    let bad = "version 3\ngrid 1,1\n%out = param f32 1024\n%x = neg %y\n";
     let mut module: *mut c_void = std::ptr::null_mut();
     let mut err: *mut c_char = std::ptr::null_mut();
     let code = unsafe { compile(bad.as_ptr().cast(), bad.len(), &mut module, &mut err) };
@@ -237,7 +237,7 @@ fn the_error_codes_are_the_documented_ones() {
 /// A copy kernel over a two-page buffer: DRAM into L1, and the same L1 buffer
 /// back into DRAM, in 32x32 units.
 const COPY_8K: &str = "\
-version 2
+version 3
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
@@ -251,7 +251,7 @@ copy_to %out from %b0 [1024]
 /// One 32x32 tile through the datapath: DRAM into L1, unpack, negate, pack,
 /// L1 into DRAM. The program names no core, no `Dst` slot and no unpacker.
 const NEG_TILE: &str = "\
-version 2
+version 3
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -267,7 +267,7 @@ copy_to %out from %b0 [0]
 /// the step are constants, so the loop is unrolled and each iteration's offset
 /// becomes a literal.
 const NEG_TWO_TILES: &str = "\
-version 2
+version 3
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
@@ -597,6 +597,172 @@ fn an_unrolled_loop_runs_on_the_simulator() {
         "unload: {}",
         take_error(&free, err)
     );
+    assert_eq!(
+        unsafe { release(&mut err) },
+        TT_OK,
+        "ttRelease: {}",
+        take_error(&free, err)
+    );
+}
+
+/// The unary and binary ops the SFPU has an encoding for, run through the C ABI:
+/// `abs` on one loaded tile, and `add`/`sub`/`mul` on two.
+#[test]
+fn arithmetic_ops_run_on_the_simulator() {
+    const TWO_LOAD: &str = "\
+version 3
+grid 1,1
+%in = param f32 2048
+%out = param f32 2048
+%b0 = buffer f32 32,64
+copy_to %b0 from %in [0]
+copy_to %b0 from %in [1024]
+%x = load %b0 [0]
+%y = load %b0 [1024]
+%r = OP %x %y
+store_to %b0 from %r [0]
+copy_to %out from %b0 [0]
+";
+    const ONE_LOAD: &str = "\
+version 3
+grid 1,1
+%in = param f32 1024
+%out = param f32 1024
+%b0 = buffer f32 32,32
+copy_to %b0 from %in [0]
+%x = load %b0 [0]
+%r = abs %x
+store_to %b0 from %r [0]
+copy_to %out from %b0 [0]
+";
+
+    let _device = device();
+    let sim = simulator_path();
+    // SAFETY: no other thread reads the environment concurrently; the library
+    // reads it when it opens the device.
+    unsafe { std::env::set_var("TT_TTSIM_LIB", &sim) };
+
+    let lib = library();
+    let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
+    let unload: Symbol<ModuleUnload> =
+        unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
+    let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
+    let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
+    let release: Symbol<Release> = unsafe { lib.get(b"ttRelease\0") }.expect("ttRelease");
+    let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
+    let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
+    let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
+    let launch: Symbol<Launch> = unsafe { lib.get(b"ttLaunch\0") }.expect("ttLaunch");
+
+    let mut err: *mut c_char = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { init(&mut err) },
+        TT_OK,
+        "ttInit: {}",
+        take_error(&free, err)
+    );
+
+    let (mut input, mut output) = (0u64, 0u64);
+    assert_eq!(
+        unsafe { alloc(8192, &mut input, &mut err) },
+        TT_OK,
+        "input: {}",
+        take_error(&free, err)
+    );
+    assert_eq!(
+        unsafe { alloc(8192, &mut output, &mut err) },
+        TT_OK,
+        "output: {}",
+        take_error(&free, err)
+    );
+
+    let host: Vec<f32> = (0..2048)
+        .map(|i| {
+            let v = (i as f32 - 1024.0) * 0.125;
+            if i % 3 == 0 { -v } else { v }
+        })
+        .collect();
+    let host_bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+    assert_eq!(
+        unsafe { h2d(input, host_bytes.as_ptr(), host_bytes.len(), &mut err) },
+        TT_OK,
+        "upload: {}",
+        take_error(&free, err)
+    );
+
+    let mut run = |program: &str, expected: &dyn Fn(&[f32]) -> Vec<f32>, out_bytes: usize| {
+        let mut module: *mut c_void = std::ptr::null_mut();
+        let code = unsafe {
+            compile(
+                program.as_ptr().cast(),
+                program.len(),
+                &mut module,
+                &mut err,
+            )
+        };
+        assert_eq!(code, TT_OK, "compile: {}", take_error(&free, err));
+        let params = [input, output];
+        let code = unsafe { launch(module, params.as_ptr(), params.len(), &mut err) };
+        assert_eq!(code, TT_OK, "ttLaunch: {}", take_error(&free, err));
+        let mut back = vec![0u8; out_bytes];
+        assert_eq!(
+            unsafe { d2h(back.as_mut_ptr(), output, back.len(), &mut err) },
+            TT_OK,
+            "download: {}",
+            take_error(&free, err)
+        );
+        let got: Vec<f32> = back
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let want = expected(&host);
+        assert_eq!(got.len(), want.len());
+        for (i, (x, y)) in want.iter().zip(&got).enumerate() {
+            assert_eq!(*y, *x, "{program}: datum {i}: got {y}, want {x}");
+        }
+        assert_eq!(
+            unsafe { unload(module, &mut err) },
+            TT_OK,
+            "unload: {}",
+            take_error(&free, err)
+        );
+    };
+
+    run(
+        &ONE_LOAD.replace("OP", ""),
+        &|h| h[..1024].iter().map(|v| v.abs()).collect(),
+        4096,
+    );
+    for (op, f) in [
+        (
+            "add",
+            (&|h: &[f32]| {
+                h[..1024]
+                    .iter()
+                    .zip(&h[1024..])
+                    .map(|(a, b)| a + b)
+                    .collect()
+            }) as &dyn Fn(&[f32]) -> Vec<f32>,
+        ),
+        ("sub", &|h: &[f32]| {
+            h[..1024]
+                .iter()
+                .zip(&h[1024..])
+                .map(|(a, b)| a - b)
+                .collect()
+        }),
+        ("mul", &|h: &[f32]| {
+            h[..1024]
+                .iter()
+                .zip(&h[1024..])
+                .map(|(a, b)| a * b)
+                .collect()
+        }),
+    ] {
+        let program = TWO_LOAD.replace("OP", op);
+        run(&program, f, 4096);
+    }
+
     assert_eq!(
         unsafe { release(&mut err) },
         TT_OK,

@@ -41,25 +41,6 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             def[value as usize] = Some(at);
         }
     }
-    // The hand-off gives the unpacker one `Dst` slot until the packer returns
-    // it. A program that wants a second unit loaded before the first is stored
-    // would wait for a slot that never comes, so it is refused here rather than
-    // deadlocking on the device.
-    let mut outstanding = 0usize;
-    for (at, op) in k.ops.iter().enumerate() {
-        match op {
-            Op::Load { .. } => {
-                outstanding += 1;
-                if outstanding > 1 {
-                    return Err(Error(format!(
-                        "op {at}: {outstanding} loaded units are in flight; the `Dst` hand-off gives one slot"
-                    )));
-                }
-            }
-            Op::StoreTo { .. } => outstanding = outstanding.saturating_sub(1),
-            _ => {}
-        }
-    }
     for (at, op) in k.ops.iter().enumerate() {
         match *op {
             Op::Const { .. }
@@ -233,6 +214,11 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     });
                 }
             }
+            Op::Select { .. } => {
+                return Err(Error(format!(
+                    "op {at}: sel is not lowered yet; the SFPU condition-code sequence is not in the tree"
+                )));
+            }
             Op::Matmul { .. } => {
                 return Err(Error(format!(
                     "op {at}: the matrix path is not lowered yet"
@@ -272,7 +258,10 @@ fn unary(op: UnOp, at: usize) -> Result<SfpOp, Error> {
     match op {
         UnOp::Neg => Ok(SfpOp::Neg),
         UnOp::Abs => Ok(SfpOp::Abs),
-        UnOp::Relu => Err(Error(format!("op {at}: relu has no encoding yet"))),
+        other => Err(Error(format!(
+            "op {at}: {} has no SFPU encoding yet",
+            other.name()
+        ))),
     }
 }
 

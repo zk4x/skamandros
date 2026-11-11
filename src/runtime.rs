@@ -150,8 +150,7 @@ fn run(device: &mut Device, module: &Module, params: &[u64]) -> Result<(), Error
 /// initialises the semaphores before it releases the TRISCs.
 fn run_compute(device: &mut Device, module: &Module) -> Result<(), Error> {
     device.release_tensix_backend()?;
-    let setup = crate::encode::setup()?;
-    stage_role(device, 0, &setup)?;
+    stage_role(device, 0, &module.setup)?;
     let (core, image, at) = crate::images::ROLES[0];
     device.load_and_start(core, image, at)?;
     device

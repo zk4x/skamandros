@@ -8,7 +8,6 @@
 pub enum SfpOp {
     Neg,
     Abs,
-    Relu,
     Add,
     Sub,
     Mul,
