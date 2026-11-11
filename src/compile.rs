@@ -33,6 +33,10 @@ pub struct Module {
     /// The setup program thread 0 runs before the three roles are released: the
     /// semaphore initialisation, sized to the `Dst` slots this kernel uses.
     pub setup: Vec<u32>,
+    /// The CB interface table the host writes before the launch.
+    pub iface: u32,
+    /// The rings the table describes, in cb-id order.
+    pub cbs: Vec<crate::planner::Cb>,
 }
 
 /// Compile one program. Every refusal is an error, never a partial module.
@@ -74,6 +78,8 @@ pub fn compile(k: &Kernel) -> Result<Module, Error> {
         writer,
         cores: words.words()?,
         setup,
+        iface: plan.iface,
+        cbs: plan.cbs.clone(),
     };
     if module.reader.is_empty()
         && module.writer.is_empty()

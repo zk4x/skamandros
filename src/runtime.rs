@@ -96,7 +96,7 @@ pub fn launch(module: &Module, params: &[u64]) -> Result<(), LaunchError> {
 
 fn run(device: &mut Device, module: &Module, params: &[u64]) -> Result<(), Error> {
     let tile: NocCoord<Noc0> = device.tile();
-    let mut args: Vec<u32> = vec![module.grid[0], module.grid[1], 0, me_hi(tile)];
+    let mut args: Vec<u32> = vec![module.grid[0], module.grid[1], module.iface, me_hi(tile)];
     let hi = device.dram_hi();
     for &address in params {
         let low = u32::try_from(address).map_err(|_| {
@@ -121,6 +121,23 @@ fn run(device: &mut Device, module: &Module, params: &[u64]) -> Result<(), Error
     }
 
     device.start_executor()?;
+    // The CB interface is host state: tt-metal's `setup_local_cb_read_write_interfaces`
+    // writes each `LocalCBInterface` before the roles start, and every mover and
+    // compute role reads its ring pointers from there. Bytes, not tt-metal's
+    // 16-byte units (`riscv::cb`).
+    if !module.cbs.is_empty() {
+        let mut words = Vec::with_capacity(module.cbs.len() * 8);
+        for ring in &module.cbs {
+            words.extend_from_slice(&crate::riscv::cb::interface(
+                ring.base,
+                ring.page * ring.pages,
+                ring.page,
+                ring.pages,
+            ));
+        }
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        device.l1_write(u64::from(module.iface), &bytes)?;
+    }
     // Every core of the launch reads the same arguments array; write it before
     // the first core starts, not only as a side effect of a mover run.
     let arg_bytes: Vec<u8> = args.iter().flat_map(|w| w.to_le_bytes()).collect();

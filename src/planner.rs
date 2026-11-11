@@ -16,17 +16,42 @@
 
 use crate::ir::{Error, Kernel, Op, Types, unit_of};
 
-/// Where each declared buffer lives in L1, by value id.
+/// One circular buffer's L1 ring: where it starts, how big a page is, and how
+/// many pages fit. tt-metal's `CB` is described the same three ways; the ring
+/// depth is the whole declared buffer, so a second copy before a pop has a page
+/// to land in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cb {
+    /// Byte address of the first page.
+    pub base: u32,
+    /// Bytes in one page: one `load`/`store_to` unit.
+    pub page: u32,
+    /// Pages in the ring: `size / page`.
+    pub pages: u32,
+}
+
+/// Where each declared buffer lives in L1, by value id, and the CB interface
+/// table the host writes before the launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     pub buf: Vec<Option<u32>>,
+    /// The CB id of each buffer value, by value id.
+    pub cb: Vec<Option<u32>>,
+    /// The rings, in cb-id order.
+    pub cbs: Vec<Cb>,
+    /// Byte address of the `LocalCBInterface` table (`riscv::cb::COUNT` entries,
+    /// 32 bytes each).
+    pub iface: u32,
 }
 
 const ALIGN: u32 = 64;
 
-/// Place every buffer in `tt_isa::l1::DATA`, in declaration order.
+/// Place every buffer in `tt_isa::l1::DATA`, in declaration order, and the CB
+/// interface table after them.
 pub fn place(k: &Kernel, types: &Types) -> Result<Plan, Error> {
     let mut buf = vec![None; types.values.len()];
+    let mut cb = vec![None; types.values.len()];
+    let mut cbs: Vec<Cb> = Vec::new();
     let mut at = tt_isa::l1::DATA.base as u32;
     for (op_at, op) in k.ops.iter().enumerate() {
         let Op::Buffer {
@@ -38,7 +63,7 @@ pub fn place(k: &Kernel, types: &Types) -> Result<Plan, Error> {
         else {
             continue;
         };
-        let (_, _, bytes) = unit_of(shape, dtype)?;
+        let (unit, units, bytes) = unit_of(shape, dtype)?;
         let base = at.div_ceil(ALIGN) * ALIGN;
         let end = base.checked_add(bytes).ok_or_else(|| {
             let _ = (op_at, value);
@@ -48,8 +73,74 @@ pub fn place(k: &Kernel, types: &Types) -> Result<Plan, Error> {
             let _ = (op_at, value, base, end);
             return Err(Error::TT_ERROR_L1_ARENA);
         }
+        let page = unit
+            .datums()
+            .checked_mul(dtype.bytes())
+            .ok_or(Error::TT_ERROR_L1_OVERFLOW)?;
         buf[value as usize] = Some(base);
+        cb[value as usize] = Some(cbs.len() as u32);
+        cbs.push(Cb {
+            base,
+            page,
+            pages: units,
+        });
         at = end;
     }
-    Ok(Plan { buf })
+    // The interface table follows the buffers: one `LocalCBInterface` per CB, as
+    // many entries as tt-metal's table has, and only `cbs.len()` of them used.
+    let iface = at.div_ceil(ALIGN) * ALIGN;
+    let table = crate::riscv::cb::COUNT
+        .checked_mul(crate::riscv::cb::STRIDE)
+        .ok_or(Error::TT_ERROR_L1_OVERFLOW)?;
+    let end = iface
+        .checked_add(table)
+        .ok_or(Error::TT_ERROR_L1_OVERFLOW)?;
+    if u64::from(end) > tt_isa::l1::DATA.end {
+        let _ = (iface, end);
+        return Err(Error::TT_ERROR_L1_ARENA);
+    }
+    Ok(Plan {
+        buf,
+        cb,
+        cbs,
+        iface,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::Kernel;
+
+    const TWO: &str = "\
+version 4
+%in = param f32 2048
+%out = param f32 2048
+%bi = buffer f32 32,64
+%bo = buffer f32 32,32
+copy_to %bi from %in [0]
+copy_to %out from %bo [0]
+grid 1,1
+";
+
+    /// A buffer is a ring of whole units: `32,64` is two 4 KiB pages, `32,32`
+    /// one; the interface table follows the last buffer, 64-byte aligned, and
+    /// every buffer value has a cb id.
+    #[test]
+    fn buffers_become_rings_and_the_table_follows_them() {
+        let k = Kernel::parse(TWO).expect("the program parses");
+        let types = k.verify().expect("it verifies");
+        let plan = place(&k, &types).expect("it places");
+        assert_eq!(plan.cbs.len(), 2);
+        assert_eq!(plan.cbs[0].page, 4096);
+        assert_eq!(plan.cbs[0].pages, 2);
+        assert_eq!(plan.cbs[1].page, 4096);
+        assert_eq!(plan.cbs[1].pages, 1);
+        assert_eq!(plan.cbs[0].base + 2 * 4096, plan.cbs[1].base);
+        assert_eq!(plan.iface, plan.cbs[1].base + 4096);
+        assert_eq!(plan.iface % 64, 0);
+        // `%bi` is value 2, `%bo` value 3 in declaration order.
+        assert_eq!(plan.cb[2], Some(0));
+        assert_eq!(plan.cb[3], Some(1));
+    }
 }
