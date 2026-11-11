@@ -146,7 +146,9 @@ fn encode_unpack(ops: &[MirOp], out: &mut Vec<Instruction>) -> Result<(), Error>
                 state.x1 = first + count - 1;
             }
             MirOp::Setadczw { face, .. } => state.face = face,
-            MirOp::Unpacr { src, count, .. } => {
+            MirOp::Unpacr {
+                src, count, int, ..
+            } => {
                 if !state.started {
                     thread_config(out);
                     state.started = true;
@@ -157,7 +159,7 @@ fn encode_unpack(ops: &[MirOp], out: &mut Vec<Instruction>) -> Result<(), Error>
                 state.x0 = 0;
                 state.x1 = count - 1;
                 let mut words = ConfigWords::new();
-                unpack_config(&mut words, src, count, state.dst_row);
+                unpack_config(&mut words, src, count, state.dst_row, int);
                 out.extend(config_program(&words));
                 out.push(stallwait(
                     block::UNPACKER | block::CONFIG,
@@ -218,7 +220,14 @@ fn stallwait(block_mask: u32, condition: u32) -> Result<Instruction, Error> {
 /// The unpacker's `Config` for one unit: base, destination, X dimension, FP32
 /// in and out. The base is `base/16 - 1` because L1 holds the datum block with
 /// no 16-byte tile header, while the unpacker adds one unconditionally.
-fn unpack_config(words: &mut ConfigWords, src: u32, datums: u32, dst_row: u32) {
+fn unpack_config(words: &mut ConfigWords, src: u32, datums: u32, dst_row: u32, int: bool) {
+    // The datum is opaque 32 bits at this layer: `Int32` in the packer's
+    // `Out_data_format` requires the `Dst` access format to match it, and the
+    // role descriptor's is 32-bit. The `int` flag instead selects the
+    // `SFPLOAD`/`SFPSTORE` format, which is what decides whether the lane is
+    // converted.
+    let _ = int;
+    let fmt = L1Format::Fp32;
     let base = src / 16 - 1;
     words
         .set(thcon::THCON_SEC0_REG3_Base_address, base)
@@ -227,10 +236,7 @@ fn unpack_config(words: &mut ConfigWords, src: u32, datums: u32, dst_row: u32) {
         .unwrap()
         .set(thcon::THCON_SEC0_REG5_Tile_x_dim_cntx0, datums)
         .unwrap()
-        .set(
-            thcon::THCON_SEC0_REG2_Out_data_format,
-            L1Format::Fp32.code().unwrap(),
-        )
+        .set(thcon::THCON_SEC0_REG2_Out_data_format, fmt.code().unwrap())
         .unwrap()
         .set(thcon::THCON_SEC0_REG2_Ovrd_data_format, 0)
         .unwrap()
@@ -267,7 +273,7 @@ fn unpack_config(words: &mut ConfigWords, src: u32, datums: u32, dst_row: u32) {
         .with_z_dim(0)
         .with_w_dim(0)
         .with_is_uncompressed(true)
-        .with_in_data_format_raw(L1Format::Fp32.code().unwrap());
+        .with_in_data_format_raw(fmt.code().unwrap());
     // Words 0 and 1 always; 2 and 3 only when they carry something (ttsim
     // refuses a write of the all-zero tail).
     for (i, word) in descriptor.words().iter().enumerate() {
@@ -428,6 +434,39 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Vec<Instruction>) -> Res
                     .map_err(|e| bad(e, op))?,
             );
         }
+        MirOp::Sfp {
+            op: SfpOp::BitAnd,
+            a,
+            b: Some(b),
+            d,
+        } => {
+            out.push(encode::sfpand(u32::from(b), u32::from(a), u32::from(d), 1).map_err(bad_isa)?);
+        }
+        MirOp::Sfp {
+            op: SfpOp::BitOr,
+            a,
+            b: Some(b),
+            d,
+        } => {
+            out.push(encode::sfpor(u32::from(b), u32::from(a), u32::from(d), 1).map_err(bad_isa)?);
+        }
+        MirOp::Sfp {
+            op: SfpOp::BitXor,
+            a,
+            b: Some(b),
+            d,
+        } => {
+            out.push(encode::sfpmov(u32::from(a), u32::from(d), 0).map_err(bad_isa)?);
+            out.push(encode::sfpxor(u32::from(b), u32::from(d)).map_err(bad_isa)?);
+        }
+        MirOp::Sfp {
+            op: SfpOp::BitNot,
+            a,
+            b: None,
+            d,
+        } => {
+            out.push(encode::sfpnot(u32::from(a), u32::from(d)).map_err(bad_isa)?);
+        }
         MirOp::Sfp { .. } => return Err(Error(format!("{op:?} has no encoding yet"))),
         MirOp::Compare { op: cmp, a, b, d } => {
             let set_vd = 8u32;
@@ -518,7 +557,12 @@ fn encode_pack(ops: &[MirOp], out: &mut Vec<Instruction>) -> Result<(), Error> {
             MirOp::SemPost { sem } => {
                 out.extend(sync::post_after(sync::Unit::Packer, semaphore(sem)?));
             }
-            MirOp::Pack { dst, rows, last } => {
+            MirOp::Pack {
+                dst,
+                rows,
+                last,
+                int,
+            } => {
                 if !started {
                     thread_config(out);
                     started = true;
@@ -527,7 +571,7 @@ fn encode_pack(ops: &[MirOp], out: &mut Vec<Instruction>) -> Result<(), Error> {
                     return Err(Error("a pack of zero rows".into()));
                 }
                 let mut words = ConfigWords::new();
-                pack_config(&mut words, dst);
+                pack_config(&mut words, dst, int);
                 out.extend(config_program(&words));
                 out.push(stallwait(block::PACKER | block::CONFIG, cond::CONFIG_BUSY)?);
                 pack_rows(out, rows, last)?;
@@ -541,19 +585,20 @@ fn encode_pack(ops: &[MirOp], out: &mut Vec<Instruction>) -> Result<(), Error> {
 /// The packer's `Config` for one unit: read `Dst` as 32-bit, write FP32 to
 /// `dst`. The output address is in 16-byte units and the generator always adds
 /// the one 16-byte tile header unit it never writes; `dst/16 - 1` compensates.
-fn pack_config(words: &mut ConfigWords, dst: u32) {
+fn pack_config(words: &mut ConfigWords, dst: u32, int: bool) {
+    // The datum is opaque 32 bits at this layer: `Int32` in the packer's
+    // `Out_data_format` requires the `Dst` access format to match it, and the
+    // role descriptor's is 32-bit. The `int` flag instead selects the
+    // `SFPLOAD`/`SFPSTORE` format, which is what decides whether the lane is
+    // converted.
+    let _ = int;
+    let fmt = L1Format::Fp32;
     words
         .set(thcon::THCON_SEC0_REG1_L1_Dest_addr, dst / 16 - 1)
         .unwrap()
-        .set(
-            thcon::THCON_SEC0_REG1_In_data_format,
-            L1Format::Fp32.code().unwrap(),
-        )
+        .set(thcon::THCON_SEC0_REG1_In_data_format, fmt.code().unwrap())
         .unwrap()
-        .set(
-            thcon::THCON_SEC0_REG1_Out_data_format,
-            L1Format::Fp32.code().unwrap(),
-        )
+        .set(thcon::THCON_SEC0_REG1_Out_data_format, fmt.code().unwrap())
         .unwrap()
         .set(thcon::THCON_SEC0_REG1_Source_interface_selection, 0)
         .unwrap()

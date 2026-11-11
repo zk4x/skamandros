@@ -192,9 +192,10 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   role's initialisation having already run.
 - A launch is one Tensix tile: a module whose grid is larger than 1x1 is
   refused. A symbolic grid parses and verifies but is not lowered.
-- The register datapath lowered today is FP32, straight-line, with literal
-  offsets: `neg`/`abs`, `add`/`sub`/`mul`/`max` on equal shapes, `cmplt`/`cmpgt`/
-  `cmpge` producing a `bool`, and `sel` consuming one. All of them run end to end
+- The register datapath lowered today is FP32 (and `i32` for the bitwise ops),
+  straight-line, with literal offsets: `neg`/`abs`, `add`/`sub`/`mul`/`max` on
+  equal shapes, `cmplt`/`cmpgt`/`cmpge` producing a `bool`, `sel` consuming one,
+  and `bitand`/`bitor`/`bitxor`/`bitnot` on `i32`. All of them run end to end
   through the C ABI. A loop with a constant bound is unrolled before lowering,
   and constant index arithmetic (including the offset of each iteration) folds
   to a literal.

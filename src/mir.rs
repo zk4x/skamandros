@@ -11,6 +11,10 @@ pub enum SfpOp {
     Add,
     Sub,
     Mul,
+    BitAnd,
+    BitOr,
+    BitXor,
+    BitNot,
 }
 
 /// The comparison a [`MirOp::Compare`] performs; the result is `-1` for true
@@ -44,7 +48,13 @@ pub enum MirOp {
     /// The lanewise maximum, through the SFPU lane flags.
     Max { a: u8, b: u8, d: u8 },
     /// `UNPACR`: the tile image at L1 `src` into unpacker `unit`'s destination.
-    Unpacr { src: u32, unit: u8, count: u32 },
+    /// `int` selects the `Int32` L1 format instead of `Fp32`.
+    Unpacr {
+        src: u32,
+        unit: u8,
+        count: u32,
+        int: bool,
+    },
     /// `SETADCZW`: which face the unpacker reads next.
     Setadczw { unit: u8, face: u32 },
     /// `SETADCX`: the datum run the unpacker walks.
@@ -52,7 +62,12 @@ pub enum MirOp {
     /// The base `Dst` row an unpack writes to.
     Setdst { row: u32 },
     /// The L1 address the packer drains to, and how many rows.
-    Pack { dst: u32, rows: u32, last: bool },
+    Pack {
+        dst: u32,
+        rows: u32,
+        last: bool,
+        int: bool,
+    },
     /// `SEMPOST` on this core.
     SemPost { sem: u8 },
     /// `SEMWAIT` on this core, holding `before`'s blocks.

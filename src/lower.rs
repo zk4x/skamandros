@@ -63,12 +63,16 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 else {
                     return Err(Error(format!("op {at}: %{buffer} is not a buffer")));
                 };
-                if dtype != crate::ir::DType::F32 {
-                    return Err(Error(format!(
-                        "op {at}: the register datapath is FP32 only for now, not {}",
-                        dtype.name()
-                    )));
-                }
+                let int = match dtype {
+                    crate::ir::DType::F32 => false,
+                    crate::ir::DType::I32 => true,
+                    other => {
+                        return Err(Error(format!(
+                            "op {at}: the register datapath is FP32 or I32, not {}",
+                            other.name()
+                        )));
+                    }
+                };
                 let (unit_shape, _, _) = unit_of(shape, dtype)?;
                 let rows = rows_of(unit_shape, at)?;
                 let offset = const_offset(offset, at)?;
@@ -96,6 +100,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     src,
                     unit: 0,
                     count: unit_shape.datums(),
+                    int,
                 });
                 m.t0.push(MirOp::SemPost { sem: SEM_UNPACKED });
                 m.t1.push(MirOp::SemWait {
@@ -114,12 +119,16 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 else {
                     return Err(Error(format!("op {at}: %{buffer} is not a buffer")));
                 };
-                if dtype != crate::ir::DType::F32 {
-                    return Err(Error(format!(
-                        "op {at}: the register datapath is FP32 only for now, not {}",
-                        dtype.name()
-                    )));
-                }
+                let int = match dtype {
+                    crate::ir::DType::F32 => false,
+                    crate::ir::DType::I32 => true,
+                    other => {
+                        return Err(Error(format!(
+                            "op {at}: the register datapath is FP32 or I32, not {}",
+                            other.name()
+                        )));
+                    }
+                };
                 let (unit_shape, _, _) = unit_of(shape, dtype)?;
                 let rows = rows_of(unit_shape, at)?;
                 let offset = const_offset(offset, at)?;
@@ -135,6 +144,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     dst,
                     rows,
                     last: true,
+                    int,
                 });
                 m.t2.push(MirOp::SemGet { sem: SEM_READY });
                 // The pack has retired, so the `Dst` slot is free again.
@@ -153,11 +163,12 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 let out = dst_row(alloc, value);
                 let (la, ld) = alloc.lreg[value as usize];
                 let sfp = unary(op, at)?;
+                let int = types.of(a).dtype == crate::ir::DType::I32;
                 for row in (0..rows).step_by(2) {
                     m.t1.push(MirOp::Sfpload {
                         lreg: la,
                         row: src + row,
-                        int: false,
+                        int,
                     });
                     m.t1.push(MirOp::Sfp {
                         op: sfp,
@@ -168,7 +179,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     m.t1.push(MirOp::Sfpstore {
                         lreg: ld,
                         row: out + row,
-                        int: false,
+                        int,
                     });
                 }
             }
@@ -182,12 +193,21 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         left.shape.name()
                     )));
                 }
-                if left.dtype != crate::ir::DType::F32 {
-                    return Err(Error(format!(
-                        "op {at}: the register datapath is FP32 only for now, not {}",
-                        left.dtype.name()
-                    )));
-                }
+                let int = match left.dtype {
+                    crate::ir::DType::F32 => false,
+                    crate::ir::DType::I32
+                        if matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor) =>
+                    {
+                        true
+                    }
+                    other => {
+                        return Err(Error(format!(
+                            "op {at}: {} on {other} is not lowered yet",
+                            op.name(),
+                            other = other.name()
+                        )));
+                    }
+                };
                 let rows = rows_of(left.shape, at)?;
                 let sa = dst_row(alloc, a);
                 let sb = dst_row(alloc, b);
@@ -196,17 +216,17 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 let lb = 2u8;
                 // A comparison writes `-1`/`0` lanes, so its result is stored in
                 // the integer format; everything else here is FP32.
-                let int_out = matches!(op, BinOp::Cmplt | BinOp::Cmpgt | BinOp::Cmpge);
+                let int_out = int || matches!(op, BinOp::Cmplt | BinOp::Cmpgt | BinOp::Cmpge);
                 for row in (0..rows).step_by(2) {
                     m.t1.push(MirOp::Sfpload {
                         lreg: la,
                         row: sa + row,
-                        int: false,
+                        int,
                     });
                     m.t1.push(MirOp::Sfpload {
                         lreg: lb,
                         row: sb + row,
-                        int: false,
+                        int,
                     });
                     match op {
                         BinOp::Cmplt | BinOp::Cmpgt | BinOp::Cmpge => {
@@ -328,6 +348,7 @@ fn unary(op: UnOp, at: usize) -> Result<SfpOp, Error> {
     match op {
         UnOp::Neg => Ok(SfpOp::Neg),
         UnOp::Abs => Ok(SfpOp::Abs),
+        UnOp::BitNot => Ok(SfpOp::BitNot),
         other => Err(Error(format!(
             "op {at}: {} has no SFPU encoding yet",
             other.name()
@@ -340,6 +361,9 @@ fn binary(op: BinOp, at: usize) -> Result<SfpOp, Error> {
         BinOp::Add => Ok(SfpOp::Add),
         BinOp::Sub => Ok(SfpOp::Sub),
         BinOp::Mul => Ok(SfpOp::Mul),
+        BinOp::BitAnd => Ok(SfpOp::BitAnd),
+        BinOp::BitOr => Ok(SfpOp::BitOr),
+        BinOp::BitXor => Ok(SfpOp::BitXor),
         other => Err(Error(format!(
             "op {at}: {} has no SFPU encoding yet",
             other.name()
