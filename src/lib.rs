@@ -15,6 +15,7 @@
 //! The IR is a *program format*, not a Rust API: it is accepted as text or as
 //! bytes, and versioned ([`ir::VERSION`]).
 
+pub mod alloc;
 pub mod ir;
 pub mod mover;
 pub mod planner;
