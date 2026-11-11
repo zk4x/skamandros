@@ -41,7 +41,7 @@ pub fn lower(k: &Kernel, plan: &Plan, alloc: &Alloc) -> Result<Machine, Error> {
                 m.t0.push(MirOp::Setadczw { unit: 0, face: 0 });
                 m.t0.push(MirOp::Setadcx { unit: 0, first: 0, count: TILE_DATUMS });
                 m.t0.push(MirOp::Unpacr { src: plan.buf[buf as usize], unit: 0, count: TILE_DATUMS });
-                emit_sync(&mut m, &mut syncs, Role::Unpack);
+                emit_sync(&mut m, &mut syncs, Role::Unpack, true);
             }
             Op::Sfpu { value, kind, a, b } => {
                 if b.is_some() {
@@ -52,6 +52,9 @@ pub fn lower(k: &Kernel, plan: &Plan, alloc: &Alloc) -> Result<Machine, Error> {
                     _ => return Err(Error(format!("op {at}: an SFPU value is not in Dst"))),
                 };
                 let (lreg_in, lreg_out) = alloc.lreg[value as usize];
+                // Wait for the tile before reading `Dst`, publish the result
+                // after writing it.
+                emit_sync(&mut m, &mut syncs, Role::Math, false);
                 // One `SFPLOAD`/`SFPSTORE` reaches four `Dst` rows and eight of
                 // the sixteen columns (`SFPLOAD.md`: `row = (addr & !3) +
                 // lane/8`, `col = (lane & 7) * 2 + (addr & 2)`), so a 64-row
@@ -61,7 +64,7 @@ pub fn lower(k: &Kernel, plan: &Plan, alloc: &Alloc) -> Result<Machine, Error> {
                     m.t1.push(MirOp::Sfp { op: SfpOp::from(kind), a: lreg_in, b: None, d: lreg_out });
                     m.t1.push(MirOp::Sfpstore { lreg: lreg_out, row: dst_row + at });
                 }
-                emit_sync(&mut m, &mut syncs, Role::Math);
+                emit_sync(&mut m, &mut syncs, Role::Math, true);
             }
             Op::Matmul { .. } => {
                 return Err(Error(format!("op {at}: the matrix path is not lowered yet")));
@@ -70,8 +73,9 @@ pub fn lower(k: &Kernel, plan: &Plan, alloc: &Alloc) -> Result<Machine, Error> {
                 if !matches!(alloc.place_of(value), Place::Dst(_)) {
                     return Err(Error(format!("op {at}: packing a value that is not in Dst")));
                 }
+                emit_sync(&mut m, &mut syncs, Role::Pack, false);
                 m.t2.push(MirOp::Pack { dst: plan.buf[buf as usize], rows: DST_ROWS, last: true });
-                emit_sync(&mut m, &mut syncs, Role::Pack);
+                emit_sync(&mut m, &mut syncs, Role::Pack, true);
             }
             // Boundary traffic and the explicit syncs are not compute.
             Op::CopyIn { .. } | Op::CopyOut { .. } | Op::Reserve { .. } | Op::Push { .. } | Op::Wait { .. } | Op::Pop { .. } => {}
@@ -86,9 +90,12 @@ pub fn lower(k: &Kernel, plan: &Plan, alloc: &Alloc) -> Result<Machine, Error> {
     Ok(m)
 }
 
-/// Emit every hand-off this role owns at the current op, in protocol order.
-fn emit_sync(m: &mut Machine, syncs: &mut Vec<&Sync>, role: Role) {
-    while let Some(pos) = syncs.iter().position(|s| s.role == role) {
+/// Emit the hand-offs this role owns at the current point: the posts when
+/// `posts` is true, the waits when it is false.
+fn emit_sync(m: &mut Machine, syncs: &mut Vec<&Sync>, role: Role, posts: bool) {
+    while let Some(pos) = syncs.iter().position(|s| {
+        s.role == role && matches!((s.kind, posts), (SyncKind::Post, true) | (SyncKind::Wait { .. }, false))
+    }) {
         let s = *syncs.remove(pos);
         let op = match s.kind {
             SyncKind::Post => MirOp::SemPost { sem: s.sem.index() },

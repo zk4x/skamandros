@@ -167,8 +167,8 @@ copy_out buf 1 param 1 offset 0 len 4096
         fuse(&mut m);
         // One repeat marker plus the body, around the two hand-offs.
         assert_eq!(m.t1.len(), 6, "got {:?}", m.t1);
-        assert!(matches!(m.t1[0], MirOp::Repeat { len: 3, count: 32 }));
-        assert!(matches!(m.t1[1], MirOp::Sfpload { lreg: 0, row: 0 }));
+        assert!(matches!(m.t1[1], MirOp::Repeat { len: 3, count: 32 }));
+        assert!(matches!(m.t1[2], MirOp::Sfpload { lreg: 0, row: 0 }));
         assert_eq!(m.t1.len(), before - (32 - 1) * 3 + 1);
     }
 
@@ -186,7 +186,7 @@ copy_out buf 1 param 1 offset 0 len 4096
     fn a_different_op_is_not_fused() {
         let mut m = machine();
         // Row 1 negated with a different lane register: not the same body.
-        if let MirOp::Sfp { d, .. } = &mut m.t1[4] {
+        if let MirOp::Sfp { d, .. } = &mut m.t1[5] {
             *d = 5;
         }
         fuse(&mut m);
