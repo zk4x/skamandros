@@ -205,6 +205,60 @@ grid 1,1
     );
 }
 
+/// A direct parameter access is the `tt_add_movers` boundary: the caller names
+/// `load %in` / `store_to %out`, and the compiler stages it through a buffer and
+/// emits the two copies.
+#[test]
+fn a_direct_parameter_access_gets_its_movers() {
+    const DIRECT: &str = "\
+version 3
+%in = param f32 4096
+%out = param f32 4096
+%x = load %in [0]
+%y = neg %x
+store_to %out from %y [0]
+grid 1,1
+";
+    let k = Kernel::parse(DIRECT).expect("the direct kernel parses");
+    let types = k.verify().expect("the direct form verifies");
+    let staged = TT::mover::add_movers(&k, &types).expect("the access is staged");
+    let buffers = staged
+        .ops
+        .iter()
+        .filter(|op| matches!(op, TT::Op::Buffer { .. }))
+        .count();
+    let copies = staged
+        .ops
+        .iter()
+        .filter(|op| matches!(op, TT::Op::CopyTo { .. }))
+        .count();
+    assert_eq!(buffers, 2, "one staged buffer per direct access");
+    assert_eq!(copies, 2, "one inbound and one outbound copy");
+    assert!(
+        staged
+            .ops
+            .iter()
+            .filter(|op| matches!(
+                op,
+                TT::Op::Load {
+                    offset: TT::Dim::Const(0),
+                    ..
+                }
+            ))
+            .count()
+            == 1,
+        "the staged load reads its buffer at zero"
+    );
+    // The same program still compiles to all five programs.
+    let m = TT::compile::compile(&k).expect("the direct kernel compiles");
+    assert!(!m.reader.is_empty(), "the staged inbound copy");
+    assert!(!m.writer.is_empty(), "the staged outbound copy");
+    assert!(
+        m.cores.iter().all(|c| !c.is_empty()),
+        "unpack, math and pack"
+    );
+}
+
 /// A loop with a constant bound is unrolled before anything reads the program,
 /// and `%o = mul %i %step` folds to the literal offset of each iteration.
 #[test]

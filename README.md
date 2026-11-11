@@ -64,6 +64,11 @@ form (`TTIR`).
   `load` from L1 into a register and `store_to` back. The unpacker descriptor,
   the packer address generator, the tile order, the base compensation for the
   header the hardware assumes, and the ADCs are all the compiler's.
+- **A parameter can be named directly.** `load %in [%o]` and `store_to %out from
+  %x [%o]` are the CUDA-like form: `mover::add_movers` (zyx's `tt_add_movers`)
+  stages the access through a one-unit L1 buffer and inserts the inbound or
+  outbound copy. `copy_to` is still accepted, but it is not required and names no
+  mover.
 - **Register values get resources automatically.** A value's `Dst` slot follows
   from liveness, lane registers are each body's temporaries, and the cross-core
   hand-offs are one semaphore per producer/consumer seam.

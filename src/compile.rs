@@ -41,6 +41,10 @@ pub fn compile(k: &Kernel) -> Result<Module, Error> {
     let k = crate::unroll::constant_loops(k)?;
     let k = &k;
     let types = k.verify()?;
+    // `tt_add_movers`: a direct parameter access gets its staging and copy.
+    let k = mover::add_movers(k, &types)?;
+    let k = &k;
+    let types = k.verify()?;
     let grid = match types.grid {
         [Dim::Const(columns), Dim::Const(rows)] => [columns, rows],
         _ => {

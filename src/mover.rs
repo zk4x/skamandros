@@ -61,6 +61,230 @@ pub fn outbound(k: &Kernel, types: &Types, plan: &Plan) -> Result<Vec<u32>, Erro
     program(k, types, plan, false)
 }
 
+/// The boundary `tt_add_movers` draws, on skamandros's IR: a `load` or
+/// `store_to` against a parameter is staged through a fresh one-unit L1 buffer,
+/// with the inbound/outbound copy emitted around it. The caller names the
+/// parameter and the offset; the compiler adds the traffic, exactly as zyx's
+/// `tt_add_movers` turns a `Load`/`Store` against a `Global` into a `Copy` into a
+/// circular buffer plus the register access.
+///
+/// One unit per access: the staged buffer is the access's own shape, so a tile
+/// load gets a `32,32` buffer and a scalar one a `1,1`. Every program after this
+/// pass sees only buffers and copies; nothing downstream knows the parameter was
+/// named directly.
+pub fn add_movers(k: &Kernel, types: &Types) -> Result<Kernel, Error> {
+    let direct = |op: &Op| match *op {
+        Op::Load { buffer, .. } | Op::StoreTo { buffer, .. } => {
+            types.of(buffer).kind == crate::ir::ValueKind::Param
+        }
+        _ => false,
+    };
+    if !k.ops.iter().any(direct) {
+        return Ok(k.clone());
+    }
+
+    let mut out = Kernel {
+        ops: Vec::with_capacity(k.ops.len()),
+        names: Vec::with_capacity(k.names.len()),
+    };
+    // Old value id -> new value id. Definitions are emitted in the same order,
+    // so a use only needs an already-emitted definition.
+    let mut map: Vec<ValueId> = vec![u32::MAX; k.names.len()];
+    let mut stage = 0usize;
+
+    for op in &k.ops {
+        match *op {
+            Op::Load {
+                value,
+                buffer,
+                offset,
+            } if types.of(buffer).kind == crate::ir::ValueKind::Param => {
+                let info = *types.of(buffer);
+                let shape = stage_shape(info.shape, buffer)?;
+                let staged = fresh(&mut out, &k.names, &mut stage);
+                out.ops.push(Op::Buffer {
+                    value: staged,
+                    dtype: info.dtype,
+                    shape,
+                });
+                out.ops.push(Op::CopyTo {
+                    dst: staged,
+                    src: map[buffer as usize],
+                    offset: remap_dim(offset, &map),
+                });
+                let value = define(&mut out, k, value, &mut map);
+                out.ops.push(Op::Load {
+                    value,
+                    buffer: staged,
+                    offset: Dim::Const(0),
+                });
+            }
+            Op::StoreTo {
+                value,
+                buffer,
+                offset,
+            } if types.of(buffer).kind == crate::ir::ValueKind::Param => {
+                let info = *types.of(buffer);
+                let shape = stage_shape(info.shape, buffer)?;
+                let staged = fresh(&mut out, &k.names, &mut stage);
+                out.ops.push(Op::Buffer {
+                    value: staged,
+                    dtype: info.dtype,
+                    shape,
+                });
+                out.ops.push(Op::StoreTo {
+                    value: map[value as usize],
+                    buffer: staged,
+                    offset: Dim::Const(0),
+                });
+                out.ops.push(Op::CopyTo {
+                    dst: map[buffer as usize],
+                    src: staged,
+                    offset: remap_dim(offset, &map),
+                });
+            }
+            _ => {
+                let value = op.defined().map(|_| out.names.len() as ValueId);
+                let new = remap(op, &map, value);
+                if let Some(old) = op.defined() {
+                    map[old as usize] = value.expect("a definition has a new id");
+                    out.names.push(k.names[old as usize].clone());
+                }
+                out.ops.push(new);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The staged buffer's shape for a direct parameter access. A tensor parameter
+/// is a tile; a scalar one would need the 64-byte span read, which the movers do
+/// not do yet.
+fn stage_shape(shape: crate::ir::RegShape, param: ValueId) -> Result<[u32; 2], Error> {
+    match shape {
+        crate::ir::RegShape::Tile => Ok([32, 32]),
+        other => Err(Error(format!(
+            "parameter %{param} is a {}; only a tile access can be staged yet",
+            other.name()
+        ))),
+    }
+}
+
+/// Define one fresh value with a name no existing value has.
+fn fresh(out: &mut Kernel, names: &[String], stage: &mut usize) -> ValueId {
+    let value = out.names.len() as ValueId;
+    loop {
+        let name = format!("stage{}", *stage);
+        *stage += 1;
+        if !names.contains(&name) && !out.names.contains(&name) {
+            out.names.push(name);
+            return value;
+        }
+    }
+}
+
+/// Give an existing definition its new id and copy its name.
+fn define(out: &mut Kernel, k: &Kernel, old: ValueId, map: &mut [ValueId]) -> ValueId {
+    let value = out.names.len() as ValueId;
+    map[old as usize] = value;
+    out.names.push(k.names[old as usize].clone());
+    value
+}
+
+fn remap_dim(dim: Dim, map: &[ValueId]) -> Dim {
+    match dim {
+        Dim::Const(n) => Dim::Const(n),
+        Dim::Value(v) => Dim::Value(map[v as usize]),
+    }
+}
+
+/// The same op with every value it reads renamed, and (for a definition) its
+/// own new id installed.
+fn remap(op: &Op, map: &[ValueId], value: Option<ValueId>) -> Op {
+    let v = |x: ValueId| map[x as usize];
+    let d = |x: Dim| remap_dim(x, map);
+    let own = || value.expect("a definition has a new id");
+    match *op {
+        Op::Const { dtype, bits, .. } => Op::Const {
+            value: own(),
+            dtype,
+            bits,
+        },
+        Op::Param {
+            dtype, ref dims, ..
+        } => Op::Param {
+            value: own(),
+            dtype,
+            dims: dims.iter().map(|x| d(*x)).collect(),
+        },
+        Op::Buffer { dtype, shape, .. } => Op::Buffer {
+            value: own(),
+            dtype,
+            shape,
+        },
+        Op::Grid { columns, rows } => Op::Grid {
+            columns: d(columns),
+            rows: d(rows),
+        },
+        Op::Loop { bound, .. } => Op::Loop {
+            value: own(),
+            bound: d(bound),
+        },
+        Op::EndLoop => Op::EndLoop,
+        Op::CopyTo { dst, src, offset } => Op::CopyTo {
+            dst: v(dst),
+            src: v(src),
+            offset: d(offset),
+        },
+        Op::Load { buffer, offset, .. } => Op::Load {
+            value: own(),
+            buffer: v(buffer),
+            offset: d(offset),
+        },
+        Op::StoreTo {
+            value: src,
+            buffer,
+            offset,
+        } => Op::StoreTo {
+            value: v(src),
+            buffer: v(buffer),
+            offset: d(offset),
+        },
+        Op::Cast { src, dtype, .. } => Op::Cast {
+            value: own(),
+            src: v(src),
+            dtype,
+        },
+        Op::Unary { op, a, .. } => Op::Unary {
+            value: own(),
+            op,
+            a: v(a),
+        },
+        Op::Binary { op, a, b, .. } => Op::Binary {
+            value: own(),
+            op,
+            a: v(a),
+            b: v(b),
+        },
+        Op::Select {
+            cond,
+            if_true,
+            if_false,
+            ..
+        } => Op::Select {
+            value: own(),
+            cond: v(cond),
+            if_true: v(if_true),
+            if_false: v(if_false),
+        },
+        Op::Matmul { a, b, .. } => Op::Matmul {
+            value: own(),
+            a: v(a),
+            b: v(b),
+        },
+    }
+}
+
 fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<u32>, Error> {
     let copies = collect(k, types, plan, inbound)?;
     if copies.is_empty() {

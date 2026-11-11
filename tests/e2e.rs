@@ -284,6 +284,19 @@ copy_to %out from %b0 [%o]
 endloop
 ";
 
+/// The same elementwise kernel with no buffer and no `copy_to`: the parameter is
+/// named directly and `mover::add_movers` supplies the staging and the traffic,
+/// as zyx's `tt_add_movers` does.
+const NEG_TILE_DIRECT: &str = "\
+version 3
+grid 1,1
+%in = param f32 1024
+%out = param f32 1024
+%x = load %in [0]
+%y = neg %x
+store_to %out from %y [0]
+";
+
 /// Where the simulator is. The library only reads `TT_TTSIM_LIB`, so the test
 /// supplies it: the simulator is not part of this repository.
 fn simulator_path() -> PathBuf {
@@ -467,6 +480,99 @@ fn an_elementwise_kernel_runs_on_the_simulator() {
     assert_eq!(code, TT_OK, "compile: {}", take_error(&free, err));
     assert!(!module.is_null());
 
+    let params = [input, output];
+    let code = unsafe { launch(module, params.as_ptr(), params.len(), &mut err) };
+    assert_eq!(code, TT_OK, "ttLaunch: {}", take_error(&free, err));
+
+    let mut back = vec![0u8; bytes];
+    assert_eq!(
+        unsafe { d2h(back.as_mut_ptr(), output, back.len(), &mut err) },
+        TT_OK,
+        "download: {}",
+        take_error(&free, err)
+    );
+    let got: Vec<f32> = back
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (i, (x, y)) in host.iter().zip(&got).enumerate() {
+        assert_eq!(*y, -*x, "datum {i}: {x} negated is {}", -*x);
+    }
+
+    assert_eq!(
+        unsafe { unload(module, &mut err) },
+        TT_OK,
+        "unload: {}",
+        take_error(&free, err)
+    );
+    assert_eq!(
+        unsafe { release(&mut err) },
+        TT_OK,
+        "ttRelease: {}",
+        take_error(&free, err)
+    );
+}
+
+/// The direct form: no buffer and no `copy_to` in the program, and the tile
+/// still comes back negated. `mover::add_movers` inserted the staging.
+#[test]
+fn a_direct_parameter_kernel_runs_on_the_simulator() {
+    let _device = device();
+    let sim = simulator_path();
+    // SAFETY: no other thread reads the environment concurrently; the library
+    // reads it when it opens the device.
+    unsafe { std::env::set_var("TT_TTSIM_LIB", &sim) };
+
+    let lib = library();
+    let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
+    let unload: Symbol<ModuleUnload> =
+        unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
+    let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
+    let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
+    let release: Symbol<Release> = unsafe { lib.get(b"ttRelease\0") }.expect("ttRelease");
+    let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
+    let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
+    let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
+    let launch: Symbol<Launch> = unsafe { lib.get(b"ttLaunch\0") }.expect("ttLaunch");
+
+    let mut err: *mut c_char = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { init(&mut err) },
+        TT_OK,
+        "ttInit: {}",
+        take_error(&free, err)
+    );
+
+    let bytes = 1024 * 4;
+    let (mut input, mut output) = (0u64, 0u64);
+    for (name, at) in [("input", &mut input), ("output", &mut output)] {
+        assert_eq!(
+            unsafe { alloc(bytes, at, &mut err) },
+            TT_OK,
+            "{name}: {}",
+            take_error(&free, err)
+        );
+    }
+
+    let host: Vec<f32> = (0..1024).map(|i| (i as f32 - 300.0) * 0.5).collect();
+    let host_bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+    assert_eq!(
+        unsafe { h2d(input, host_bytes.as_ptr(), host_bytes.len(), &mut err) },
+        TT_OK,
+        "upload: {}",
+        take_error(&free, err)
+    );
+
+    let mut module: *mut c_void = std::ptr::null_mut();
+    let code = unsafe {
+        compile(
+            NEG_TILE_DIRECT.as_ptr().cast(),
+            NEG_TILE_DIRECT.len(),
+            &mut module,
+            &mut err,
+        )
+    };
+    assert_eq!(code, TT_OK, "compile: {}", take_error(&free, err));
     let params = [input, output];
     let code = unsafe { launch(module, params.as_ptr(), params.len(), &mut err) };
     assert_eq!(code, TT_OK, "ttLaunch: {}", take_error(&free, err));

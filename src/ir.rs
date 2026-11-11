@@ -845,21 +845,42 @@ impl Kernel {
                     value,
                 } => {
                     let b = *lookup(&values, &visible, buffer, at)?;
-                    if b.kind != ValueKind::Buffer {
-                        return Err(Error::new(format!("op {at}: %{buffer} is not a buffer")));
-                    }
-                    check_dim(&values, &visible, offset, at, "the load offset")?;
-                    let Op::Buffer { shape, .. } = self.ops[def[buffer as usize]] else {
-                        return Err(Error::new(format!("op {at}: %{buffer} is not a buffer")));
-                    };
-                    let (unit_shape, _, _) = unit_of(shape, b.dtype)?;
-                    let total = shape[0] * shape[1];
-                    check_offset(offset, total, unit_shape.datums(), at, "buffer")?;
-                    let _ = value;
-                    ValueInfo {
-                        kind: ValueKind::Register,
-                        dtype: b.dtype,
-                        shape: unit_shape,
+                    if b.kind == ValueKind::Param {
+                        // A direct parameter access: one tile, which
+                        // `mover::add_movers` stages through a `32,32` buffer.
+                        if b.shape != RegShape::Tile {
+                            return Err(Error::new(format!(
+                                "op {at}: %{buffer} is a {} parameter; a load reads a tile",
+                                b.shape.name()
+                            )));
+                        }
+                        check_dim(&values, &visible, offset, at, "the load offset")?;
+                        if let Some(count) = param_elements(self, &def, buffer) {
+                            check_offset(offset, count, 1024, at, "parameter")?;
+                        }
+                        let _ = value;
+                        ValueInfo {
+                            kind: ValueKind::Register,
+                            dtype: b.dtype,
+                            shape: RegShape::Tile,
+                        }
+                    } else {
+                        if b.kind != ValueKind::Buffer {
+                            return Err(Error::new(format!("op {at}: %{buffer} is not a buffer")));
+                        }
+                        check_dim(&values, &visible, offset, at, "the load offset")?;
+                        let Op::Buffer { shape, .. } = self.ops[def[buffer as usize]] else {
+                            return Err(Error::new(format!("op {at}: %{buffer} is not a buffer")));
+                        };
+                        let (unit_shape, _, _) = unit_of(shape, b.dtype)?;
+                        let total = shape[0] * shape[1];
+                        check_offset(offset, total, unit_shape.datums(), at, "buffer")?;
+                        let _ = value;
+                        ValueInfo {
+                            kind: ValueKind::Register,
+                            dtype: b.dtype,
+                            shape: unit_shape,
+                        }
                     }
                 }
                 Op::StoreTo {
@@ -873,6 +894,33 @@ impl Kernel {
                         return Err(Error::new(format!(
                             "op {at}: %{value} is not a register value"
                         )));
+                    }
+                    if b.kind == ValueKind::Param {
+                        // The direct form; `mover::add_movers` stages it.
+                        if b.shape != RegShape::Tile {
+                            return Err(Error::new(format!(
+                                "op {at}: %{buffer} is a {} parameter; a store writes a tile",
+                                b.shape.name()
+                            )));
+                        }
+                        if v.dtype != b.dtype {
+                            return Err(Error::new(format!(
+                                "op {at}: the value is {} and the parameter {}; there is no implicit cast",
+                                v.dtype.name(),
+                                b.dtype.name()
+                            )));
+                        }
+                        if v.shape != RegShape::Tile {
+                            return Err(Error::new(format!(
+                                "op {at}: a parameter holds a tile, the value is a {}",
+                                v.shape.name()
+                            )));
+                        }
+                        check_dim(&values, &visible, offset, at, "the store offset")?;
+                        if let Some(count) = param_elements(self, &def, buffer) {
+                            check_offset(offset, count, 1024, at, "parameter")?;
+                        }
+                        continue;
                     }
                     if b.kind != ValueKind::Buffer {
                         return Err(Error::new(format!("op {at}: %{buffer} is not a buffer")));
