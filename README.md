@@ -1,4 +1,4 @@
-# tt-driver — libTT
+# skamandros — libTT
 
 A kernel compiler and driver for Tenstorrent, with a program format in and a
 library out.

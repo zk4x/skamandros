@@ -18,6 +18,8 @@
 pub mod alloc;
 pub mod images;
 pub mod ir;
+pub mod lower;
+pub mod mir;
 pub mod mover;
 pub mod planner;
 pub mod riscv;

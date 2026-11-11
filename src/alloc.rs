@@ -185,8 +185,6 @@ pub fn allocate(k: &Kernel) -> Result<Alloc, Error> {
     if k.ops.iter().any(|op| matches!(op, Op::Sfpu { .. } | Op::Matmul { .. })) {
         sync.push(Sync { role: Role::Math, sem: SEM_RESULT, kind: SyncKind::Post });
         sync.push(Sync { role: Role::Pack, sem: SEM_RESULT, kind: SyncKind::Wait { before: 0 } });
-        sync.push(Sync { role: Role::Pack, sem: SEM_FREE, kind: SyncKind::Post });
-        sync.push(Sync { role: Role::Unpack, sem: SEM_FREE, kind: SyncKind::Wait { before: 0 } });
     }
     Ok(Alloc { place, lreg, sync, dst_peak })
 }

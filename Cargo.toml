@@ -1,10 +1,10 @@
 [package]
-name = "tt-driver"
+name = "skamandros"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/zk4x/tt-driver"
+repository = "https://github.com/zk4x/skamandros"
 description = "Tenstorrent kernel IR, allocator and driver. Builds libTT.so."
 
 [lib]
