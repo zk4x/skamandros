@@ -115,11 +115,19 @@ pub unsafe extern "C" fn ttCompile(
     }
     unsafe { *out = std::ptr::null_mut() };
     if text.is_null() || len == 0 {
-        return fail(ttStatus::TT_ERROR_ARGUMENT, "ttCompile: the program is empty", err);
+        return fail(
+            ttStatus::TT_ERROR_ARGUMENT,
+            "ttCompile: the program is empty",
+            err,
+        );
     }
     let bytes = unsafe { std::slice::from_raw_parts(text as *const u8, len) };
     let Ok(source) = std::str::from_utf8(bytes) else {
-        return fail(ttStatus::TT_ERROR_PROGRAM, "ttCompile: the program is not UTF-8", err);
+        return fail(
+            ttStatus::TT_ERROR_PROGRAM,
+            "ttCompile: the program is not UTF-8",
+            err,
+        );
     };
     let kernel = match Kernel::parse(source) {
         Ok(k) => k,
@@ -149,11 +157,19 @@ pub unsafe extern "C" fn ttModuleLoad(
 ) -> ttStatus {
     clear(err);
     if out.is_null() {
-        return fail(ttStatus::TT_ERROR_ARGUMENT, "ttModuleLoad: out is null", err);
+        return fail(
+            ttStatus::TT_ERROR_ARGUMENT,
+            "ttModuleLoad: out is null",
+            err,
+        );
     }
     unsafe { *out = std::ptr::null_mut() };
     if bytes.is_null() || len == 0 {
-        return fail(ttStatus::TT_ERROR_ARGUMENT, "ttModuleLoad: the program is empty", err);
+        return fail(
+            ttStatus::TT_ERROR_ARGUMENT,
+            "ttModuleLoad: the program is empty",
+            err,
+        );
     }
     let bytes = unsafe { std::slice::from_raw_parts(bytes, len) };
     let kernel = match Kernel::from_bytes(bytes) {
@@ -178,11 +194,19 @@ pub unsafe extern "C" fn ttModuleLoad(
 pub unsafe extern "C" fn ttModuleUnload(module: *mut ttModule, err: *mut *mut c_char) -> ttStatus {
     clear(err);
     if module.is_null() {
-        return fail(ttStatus::TT_ERROR_ARGUMENT, "ttModuleUnload: the handle is null", err);
+        return fail(
+            ttStatus::TT_ERROR_ARGUMENT,
+            "ttModuleUnload: the handle is null",
+            err,
+        );
     }
     match modules().remove(&(module as usize)) {
         Some(_) => ttStatus::TT_OK,
-        None => fail(ttStatus::TT_ERROR_MODULE, "ttModuleUnload: not a live module handle", err),
+        None => fail(
+            ttStatus::TT_ERROR_MODULE,
+            "ttModuleUnload: not a live module handle",
+            err,
+        ),
     }
 }
 
@@ -227,7 +251,11 @@ pub unsafe extern "C" fn ttRelease(err: *mut *mut c_char) -> ttStatus {
 ///
 /// `addr` and `err` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ttMemAlloc(bytes: usize, addr: *mut u64, err: *mut *mut c_char) -> ttStatus {
+pub unsafe extern "C" fn ttMemAlloc(
+    bytes: usize,
+    addr: *mut u64,
+    err: *mut *mut c_char,
+) -> ttStatus {
     clear(err);
     if addr.is_null() {
         return fail(ttStatus::TT_ERROR_ARGUMENT, "ttMemAlloc: addr is null", err);
@@ -259,7 +287,11 @@ pub unsafe extern "C" fn ttMemcpyH2D(
 ) -> ttStatus {
     clear(err);
     if src.is_null() || len == 0 {
-        return fail(ttStatus::TT_ERROR_ARGUMENT, "ttMemcpyH2D: the source is empty", err);
+        return fail(
+            ttStatus::TT_ERROR_ARGUMENT,
+            "ttMemcpyH2D: the source is empty",
+            err,
+        );
     }
     let bytes = unsafe { std::slice::from_raw_parts(src, len) };
     match runtime::h2d(dst, bytes) {
@@ -282,7 +314,11 @@ pub unsafe extern "C" fn ttMemcpyD2H(
 ) -> ttStatus {
     clear(err);
     if dst.is_null() || len == 0 {
-        return fail(ttStatus::TT_ERROR_ARGUMENT, "ttMemcpyD2H: the destination is empty", err);
+        return fail(
+            ttStatus::TT_ERROR_ARGUMENT,
+            "ttMemcpyD2H: the destination is empty",
+            err,
+        );
     }
     let out = unsafe { std::slice::from_raw_parts_mut(dst, len) };
     match runtime::d2h(src, out) {
@@ -309,7 +345,11 @@ pub unsafe extern "C" fn ttLaunch(
 ) -> ttStatus {
     clear(err);
     if module.is_null() {
-        return fail(ttStatus::TT_ERROR_ARGUMENT, "ttLaunch: the handle is null", err);
+        return fail(
+            ttStatus::TT_ERROR_ARGUMENT,
+            "ttLaunch: the handle is null",
+            err,
+        );
     }
     if params.is_null() && nparams != 0 {
         return fail(ttStatus::TT_ERROR_ARGUMENT, "ttLaunch: params is null", err);
@@ -321,14 +361,22 @@ pub unsafe extern "C" fn ttLaunch(
     };
     let modules = modules();
     let Some(m) = lookup_module(&modules, module) else {
-        return fail(ttStatus::TT_ERROR_MODULE, "ttLaunch: not a live module handle", err);
+        return fail(
+            ttStatus::TT_ERROR_MODULE,
+            "ttLaunch: not a live module handle",
+            err,
+        );
     };
     // The count is the caller's contract, not the device's business: refuse it
     // before anything is touched.
     if m.params as usize != addresses.len() {
         return fail(
             ttStatus::TT_ERROR_ARGUMENT,
-            format!("ttLaunch: the module takes {} parameters, {} were given", m.params, addresses.len()),
+            format!(
+                "ttLaunch: the module takes {} parameters, {} were given",
+                m.params,
+                addresses.len()
+            ),
             err,
         );
     }

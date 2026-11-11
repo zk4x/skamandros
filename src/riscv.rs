@@ -28,7 +28,12 @@ pub mod reg {
 }
 
 fn r_type(funct7: u32, rs2: u8, rs1: u8, funct3: u32, rd: u8, opcode: u32) -> u32 {
-    (funct7 << 25) | (u32::from(rs2) << 20) | (u32::from(rs1) << 15) | (funct3 << 12) | (u32::from(rd) << 7) | opcode
+    (funct7 << 25)
+        | (u32::from(rs2) << 20)
+        | (u32::from(rs1) << 15)
+        | (funct3 << 12)
+        | (u32::from(rd) << 7)
+        | opcode
 }
 
 fn i_type(imm: i32, rs1: u8, funct3: u32, rd: u8, opcode: u32) -> u32 {
@@ -38,7 +43,12 @@ fn i_type(imm: i32, rs1: u8, funct3: u32, rd: u8, opcode: u32) -> u32 {
 
 fn s_type(imm: i32, rs2: u8, rs1: u8, funct3: u32, opcode: u32) -> u32 {
     let imm = imm as u32;
-    ((imm >> 5) & 0x7f) << 25 | (u32::from(rs2) << 20) | (u32::from(rs1) << 15) | (funct3 << 12) | ((imm & 0x1f) << 7) | opcode
+    ((imm >> 5) & 0x7f) << 25
+        | (u32::from(rs2) << 20)
+        | (u32::from(rs1) << 15)
+        | (funct3 << 12)
+        | ((imm & 0x1f) << 7)
+        | opcode
 }
 
 fn b_type(imm: i32, rs2: u8, rs1: u8, funct3: u32, opcode: u32) -> u32 {
@@ -198,12 +208,28 @@ impl Asm {
 
     pub fn bne_label(&mut self, rs1: u8, rs2: u8, label: impl Into<String>) {
         let at = self.word(0);
-        self.fixups.push((at, label.into(), Fixup::Branch { funct3: 1, rs1, rs2 }));
+        self.fixups.push((
+            at,
+            label.into(),
+            Fixup::Branch {
+                funct3: 1,
+                rs1,
+                rs2,
+            },
+        ));
     }
 
     pub fn beq_label(&mut self, rs1: u8, rs2: u8, label: impl Into<String>) {
         let at = self.word(0);
-        self.fixups.push((at, label.into(), Fixup::Branch { funct3: 0, rs1, rs2 }));
+        self.fixups.push((
+            at,
+            label.into(),
+            Fixup::Branch {
+                funct3: 0,
+                rs1,
+                rs2,
+            },
+        ));
     }
 
     pub fn j_label(&mut self, label: impl Into<String>) {
@@ -219,7 +245,8 @@ impl Asm {
                 return Err(format!("no label `{label}`"));
             };
             let delta = (target as i64 - at as i64) * 4;
-            let delta = i32::try_from(delta).map_err(|_| format!("branch to `{label}` is out of range"))?;
+            let delta =
+                i32::try_from(delta).map_err(|_| format!("branch to `{label}` is out of range"))?;
             self.words[at] = match kind {
                 Fixup::Branch { funct3, rs1, rs2 } => b_type(delta, rs2, rs1, funct3, 0x63),
                 Fixup::Jal { rd } => j_type(delta, rd, 0x6f),

@@ -24,9 +24,21 @@ pub const LOAD_ADDRESS: u64 = Core::T0.default_reset_pc() as u64;
 /// at its own slot (`tt_isa::l1::roles`), so all three fit in one tile's L1 at
 /// once and each starts through its reset-PC override.
 pub const ROLES: [Image; 3] = [
-    (Core::T0, include_bytes!(env!("FIRMWARE_ROLE_T0")), tt_isa::l1::roles::BASE[0]),
-    (Core::T1, include_bytes!(env!("FIRMWARE_ROLE_T1")), tt_isa::l1::roles::BASE[1]),
-    (Core::T2, include_bytes!(env!("FIRMWARE_ROLE_T2")), tt_isa::l1::roles::BASE[2]),
+    (
+        Core::T0,
+        include_bytes!(env!("FIRMWARE_ROLE_T0")),
+        tt_isa::l1::roles::BASE[0],
+    ),
+    (
+        Core::T1,
+        include_bytes!(env!("FIRMWARE_ROLE_T1")),
+        tt_isa::l1::roles::BASE[1],
+    ),
+    (
+        Core::T2,
+        include_bytes!(env!("FIRMWARE_ROLE_T2")),
+        tt_isa::l1::roles::BASE[2],
+    ),
 ];
 
 /// The program executor: reads a staged program's address, length and arguments

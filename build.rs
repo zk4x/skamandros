@@ -70,16 +70,25 @@ fn main() {
         // published crate.
         let build_dir = out_dir.join("firmware-src");
         copy_tree(&firmware_dir, &build_dir);
-        std::fs::copy(firmware_dir.join("Cargo.toml.in"), build_dir.join("Cargo.toml"))
-            .expect("could not write the firmware manifest");
-        println!("cargo:rerun-if-changed={}", firmware_dir.join("Cargo.toml.in").display());
+        std::fs::copy(
+            firmware_dir.join("Cargo.toml.in"),
+            build_dir.join("Cargo.toml"),
+        )
+        .expect("could not write the firmware manifest");
+        println!(
+            "cargo:rerun-if-changed={}",
+            firmware_dir.join("Cargo.toml.in").display()
+        );
 
         let target_dir = out_dir.join("firmware-target");
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
 
         let experiment = std::env::var_os("CARGO_FEATURE_TTINSN_EXPERIMENT").is_some();
         let mut cmd = Command::new(&cargo);
-        cmd.current_dir(&build_dir).args(["build", "--release", "--target", TARGET]).arg("--target-dir").arg(&target_dir);
+        cmd.current_dir(&build_dir)
+            .args(["build", "--release", "--target", TARGET])
+            .arg("--target-dir")
+            .arg(&target_dir);
         let mut features = Vec::new();
         if experiment {
             features.push("ttinsn-experiment");
@@ -102,33 +111,58 @@ fn main() {
         // mover change that fit a build overflowed clippy. Firmware is linted on
         // its own (`AGENTS.md`).
         for (key, _) in std::env::vars() {
-            if key.starts_with("CARGO_") || key == "RUSTFLAGS" || key == "RUSTC_WRAPPER" || key == "RUSTC_WORKSPACE_WRAPPER" {
+            if key.starts_with("CARGO_")
+                || key == "RUSTFLAGS"
+                || key == "RUSTC_WRAPPER"
+                || key == "RUSTC_WORKSPACE_WRAPPER"
+            {
                 cmd.env_remove(key);
             }
         }
-        let status = cmd.status().expect("could not run cargo for the firmware build");
+        let status = cmd
+            .status()
+            .expect("could not run cargo for the firmware build");
         assert!(status.success(), "firmware build failed");
 
         let objcopy = tool("llvm-objcopy");
         let objdump = tool("llvm-objdump");
 
-        let binaries = BINARIES.iter().copied().chain(experiment.then_some(TTINSN_IMAGE));
+        let binaries = BINARIES
+            .iter()
+            .copied()
+            .chain(experiment.then_some(TTINSN_IMAGE));
         for name in binaries {
             let elf = target_dir.join(TARGET).join("release").join(name);
-            assert!(elf.exists(), "firmware binary {name} was not produced at {}", elf.display());
+            assert!(
+                elf.exists(),
+                "firmware binary {name} was not produced at {}",
+                elf.display()
+            );
 
             let bin = out_dir.join(format!("{name}.bin"));
-            let status =
-                Command::new(&objcopy).args(["-O", "binary"]).arg(&elf).arg(&bin).status().expect("could not run llvm-objcopy");
+            let status = Command::new(&objcopy)
+                .args(["-O", "binary"])
+                .arg(&elf)
+                .arg(&bin)
+                .status()
+                .expect("could not run llvm-objcopy");
             assert!(status.success(), "objcopy failed for {name}");
 
             check_instruction_set(&objdump, &elf, name);
 
             // The entry point, so the crate can check each image against the core
             // it is loaded for instead of trusting a literal next to it.
-            println!("cargo:rustc-env=FIRMWARE_{}_ENTRY={}", name.to_uppercase(), elf_entry(&elf));
+            println!(
+                "cargo:rustc-env=FIRMWARE_{}_ENTRY={}",
+                name.to_uppercase(),
+                elf_entry(&elf)
+            );
 
-            println!("cargo:rustc-env=FIRMWARE_{}={}", name.to_uppercase(), bin.display());
+            println!(
+                "cargo:rustc-env=FIRMWARE_{}={}",
+                name.to_uppercase(),
+                bin.display()
+            );
         }
     }
 }
@@ -158,7 +192,10 @@ fn track_sources(dir: &Path) {
 #[cfg(feature = "tenstorrent")]
 fn copy_tree(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).expect("could not create the firmware build directory");
-    for entry in std::fs::read_dir(src).expect("could not read the firmware sources").flatten() {
+    for entry in std::fs::read_dir(src)
+        .expect("could not read the firmware sources")
+        .flatten()
+    {
         let name = entry.file_name();
         if name == "target" || name == ".git" {
             continue;
@@ -183,8 +220,16 @@ fn tool(name: &str) -> PathBuf {
         .expect("could not ask rustc for its sysroot");
     let sysroot = String::from_utf8(sysroot.stdout).unwrap();
     let host = std::env::var("HOST").unwrap_or_else(|_| "x86_64-unknown-linux-gnu".into());
-    let path = Path::new(sysroot.trim()).join("lib/rustlib").join(host).join("bin").join(name);
-    assert!(path.exists(), "{name} not found at {}. Install it with `rustup component add llvm-tools`.", path.display());
+    let path = Path::new(sysroot.trim())
+        .join("lib/rustlib")
+        .join(host)
+        .join("bin")
+        .join(name);
+    assert!(
+        path.exists(),
+        "{name} not found at {}. Install it with `rustup component add llvm-tools`.",
+        path.display()
+    );
     path
 }
 
@@ -211,7 +256,10 @@ fn check_instruction_set(objdump: &Path, elf: &Path, name: &str) {
     let blocks: Vec<(u64, u64)> = Vec::new();
     let mut checked = 0usize;
     if blocks.is_empty() {
-        assert!(name != TTINSN_IMAGE, "`{name}` has no `.ttinsn` words: the experiment image is the one image that must");
+        assert!(
+            name != TTINSN_IMAGE,
+            "`{name}` has no `.ttinsn` words: the experiment image is the one image that must"
+        );
         checked += judge(&disassemble(objdump, elf, name, None), name);
     } else {
         let mut from = 0u64;
@@ -221,7 +269,10 @@ fn check_instruction_set(objdump: &Path, elf: &Path, name: &str) {
             }
             from = hi;
         }
-        checked += judge(&disassemble(objdump, elf, name, Some((from, u32::MAX as u64 + 1))), name);
+        checked += judge(
+            &disassemble(objdump, elf, name, Some((from, u32::MAX as u64 + 1))),
+            name,
+        );
     }
 
     // A parser that matches nothing passes everything. This check exists because
@@ -245,7 +296,8 @@ fn disassemble(objdump: &Path, elf: &Path, name: &str, range: Option<(u64, u64)>
     // meet them as `<unknown>`.
     cmd.args(["-d", "--no-show-raw-insn", "--mattr=+f"]);
     if let Some((lo, hi)) = range {
-        cmd.arg(format!("--start-address={lo:#x}")).arg(format!("--stop-address={hi:#x}"));
+        cmd.arg(format!("--start-address={lo:#x}"))
+            .arg(format!("--stop-address={hi:#x}"));
     }
     let out = cmd.arg(elf).output().expect("could not run llvm-objdump");
     assert!(out.status.success(), "objdump failed for {name}");
@@ -276,7 +328,12 @@ fn judge(text: &str, name: &str) -> usize {
         // allowed; the experiment image's `.ttinsn` runs never reach this
         // (`check_ttinsn_blocks` validates them and `check_instruction_set`
         // disassembles only the gaps).
-        if rest.split_whitespace().any(|t| matches!(t, ".word" | ".byte" | ".half" | ".short" | ".2byte" | ".4byte")) {
+        if rest.split_whitespace().any(|t| {
+            matches!(
+                t,
+                ".word" | ".byte" | ".half" | ".short" | ".2byte" | ".4byte"
+            )
+        }) {
             panic!(
                 "firmware `{name}` has data in a code section, which the gate cannot \
                  judge: the disassembler prints undecodable words as `.word`\n  in:{line}"
@@ -315,7 +372,10 @@ fn judge(text: &str, name: &str) -> usize {
 #[cfg(feature = "tenstorrent")]
 fn check_ttinsn_blocks(objdump: &Path, elf: &Path, name: &str) -> Vec<(u64, u64)> {
     use std::collections::BTreeMap;
-    let nm = Command::new(tool("llvm-nm")).arg(elf).output().expect("could not run llvm-nm");
+    let nm = Command::new(tool("llvm-nm"))
+        .arg(elf)
+        .output()
+        .expect("could not run llvm-nm");
     assert!(nm.status.success(), "llvm-nm failed for {name}");
     let mut begins = BTreeMap::new();
     let mut ends = BTreeMap::new();
@@ -337,14 +397,22 @@ fn check_ttinsn_blocks(objdump: &Path, elf: &Path, name: &str) -> Vec<(u64, u64)
     );
 
     // The section the words live in, from its header: " N .ttinsn SIZE VMA ...".
-    let headers = Command::new(objdump).arg("-h").arg(elf).output().expect("could not run llvm-objdump -h");
+    let headers = Command::new(objdump)
+        .arg("-h")
+        .arg(elf)
+        .output()
+        .expect("could not run llvm-objdump -h");
     let headers = String::from_utf8_lossy(&headers.stdout).into_owned();
     let section = headers
         .lines()
         .filter_map(|l| {
             let f: Vec<&str> = l.split_whitespace().collect();
-            (f.len() >= 4 && f[1] == ".ttinsn")
-                .then(|| (u64::from_str_radix(f[3], 16).unwrap(), u64::from_str_radix(f[2], 16).unwrap()))
+            (f.len() >= 4 && f[1] == ".ttinsn").then(|| {
+                (
+                    u64::from_str_radix(f[3], 16).unwrap(),
+                    u64::from_str_radix(f[2], 16).unwrap(),
+                )
+            })
         })
         .next()
         .unwrap_or_else(|| panic!("`{name}` has no `.ttinsn` section"));
@@ -427,7 +495,9 @@ fn fence_reason(mnemonic: &str, operands: &str) -> Option<&'static str> {
              `core::hint::spin_loop()` emits it -- use an empty asm block instead",
         );
     }
-    Some("an unrecognised fence ordering; only the forms the specification's recipes use are allowed")
+    Some(
+        "an unrecognised fence ordering; only the forms the specification's recipes use are allowed",
+    )
 }
 
 /// Why this mnemonic must not appear in a firmware image, if it must not.
@@ -456,7 +526,9 @@ fn forbidden_reason(mnemonic: &str) -> Option<&'static str> {
         );
     }
     if mnemonic.starts_with("c.") {
-        return Some("the C extension is not implemented, and its encoding space is reused by `.ttinsn`");
+        return Some(
+            "the C extension is not implemented, and its encoding space is reused by `.ttinsn`",
+        );
     }
     if base.starts_with("lr.") || base.starts_with("sc.") {
         return Some("Zalrsc is not implemented; there is no load-reserved/store-conditional");
