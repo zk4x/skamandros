@@ -41,15 +41,12 @@ pub fn place(k: &Kernel, types: &Types) -> Result<Plan, Error> {
         let (_, _, bytes) = unit_of(shape, dtype)?;
         let base = at.div_ceil(ALIGN) * ALIGN;
         let end = base.checked_add(bytes).ok_or_else(|| {
-            Error(format!(
-                "op {op_at}: buffer {value} overflows the L1 address space"
-            ))
+            let _ = (op_at, value);
+            Error::TT_ERROR_L1_OVERFLOW
         })?;
         if u64::from(end) > tt_isa::l1::DATA.end {
-            return Err(Error(format!(
-                "op {op_at}: buffer {value} ({base:#x}..{end:#x}) runs past the L1 data arena ({:#x})",
-                tt_isa::l1::DATA.end
-            )));
+            let _ = (op_at, value, base, end);
+            return Err(Error::TT_ERROR_L1_ARENA);
         }
         buf[value as usize] = Some(base);
         at = end;

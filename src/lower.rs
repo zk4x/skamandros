@@ -60,23 +60,24 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 let info = types.of(buffer);
                 let Op::Buffer { shape, dtype, .. } = k.ops[def[buffer as usize].expect("defined")]
                 else {
-                    return Err(Error(format!("op {at}: %{buffer} is not a buffer")));
+                    let _ = buffer;
+                    return Err(Error::TT_ERROR_NOT_A_BUFFER);
                 };
                 let int = match dtype {
                     crate::ir::DType::F32 => false,
                     crate::ir::DType::I32 => true,
                     other => {
-                        return Err(Error(format!(
-                            "op {at}: the register datapath is FP32 or I32, not {}",
-                            other.name()
-                        )));
+                        let _ = other;
+                        return Err(Error::TT_ERROR_DATAPATH_DTYPE);
                     }
                 };
                 let (unit_shape, _, _) = unit_of(shape, dtype)?;
                 let rows = rows_of(unit_shape, at)?;
                 let offset = const_offset(offset, at)?;
-                let base = plan.buf[buffer as usize]
-                    .ok_or_else(|| Error(format!("op {at}: buffer %{buffer} was not placed")))?;
+                let base = plan.buf[buffer as usize].ok_or_else(|| {
+                    let _ = buffer;
+                    Error::TT_ERROR_BUFFER_NOT_PLACED
+                })?;
                 let src = base + offset * dtype.bytes();
                 let row = match alloc.place_of(value) {
                     crate::alloc::Place::Dst(slot) => u32::from(slot) * DST_ROWS,
@@ -116,23 +117,24 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             } => {
                 let Op::Buffer { shape, dtype, .. } = k.ops[def[buffer as usize].expect("defined")]
                 else {
-                    return Err(Error(format!("op {at}: %{buffer} is not a buffer")));
+                    let _ = buffer;
+                    return Err(Error::TT_ERROR_NOT_A_BUFFER);
                 };
                 let int = match dtype {
                     crate::ir::DType::F32 => false,
                     crate::ir::DType::I32 => true,
                     other => {
-                        return Err(Error(format!(
-                            "op {at}: the register datapath is FP32 or I32, not {}",
-                            other.name()
-                        )));
+                        let _ = other;
+                        return Err(Error::TT_ERROR_DATAPATH_DTYPE);
                     }
                 };
                 let (unit_shape, _, _) = unit_of(shape, dtype)?;
                 let rows = rows_of(unit_shape, at)?;
                 let offset = const_offset(offset, at)?;
-                let base = plan.buf[buffer as usize]
-                    .ok_or_else(|| Error(format!("op {at}: buffer %{buffer} was not placed")))?;
+                let base = plan.buf[buffer as usize].ok_or_else(|| {
+                    let _ = buffer;
+                    Error::TT_ERROR_BUFFER_NOT_PLACED
+                })?;
                 let dst = base + offset * dtype.bytes();
                 m.t1.push(MirOp::SemPost { sem: SEM_READY });
                 // The packer claims the unit, packs it, and only then releases
@@ -151,9 +153,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 let _ = value;
             }
             Op::Cast { .. } => {
-                return Err(Error(format!(
-                    "op {at}: cast is not lowered yet; the parser and verifier accept it"
-                )));
+                let _ = at;
+                return Err(Error::TT_TODO_CAST);
             }
             Op::Unary { value, op, a } => {
                 let shape = types.of(a).shape;
@@ -186,11 +187,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 let left = *types.of(a);
                 let right = *types.of(b);
                 if left.shape != right.shape {
-                    return Err(Error(format!(
-                        "op {at}: broadcast of a {} and a {} is not lowered yet",
-                        right.shape.name(),
-                        left.shape.name()
-                    )));
+                    let _ = (left.shape, right.shape);
+                    return Err(Error::TT_TODO_BROADCAST);
                 }
                 let int = match left.dtype {
                     crate::ir::DType::F32 => false,
@@ -204,11 +202,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     // `BOp::And`/`Or` too).
                     crate::ir::DType::Bool if matches!(op, BinOp::And | BinOp::Or) => true,
                     other => {
-                        return Err(Error(format!(
-                            "op {at}: {} on {other} is not lowered yet",
-                            op.name(),
-                            other = other.name()
-                        )));
+                        let _ = (op, other);
+                        return Err(Error::TT_TODO_BINARY_DTYPE);
                     }
                 };
                 let rows = rows_of(left.shape, at)?;
@@ -281,7 +276,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 let lt = 0u8;
                 let lf = 2u8;
                 if types.of(cond).dtype != crate::ir::DType::Bool {
-                    return Err(Error(format!("op {at}: sel's condition is not bool")));
+                    let _ = at;
+                    return Err(Error::TT_ERROR_CONDITION_NOT_BOOL);
                 }
                 for row in (0..rows).step_by(2) {
                     m.t1.push(MirOp::Sfpload {
@@ -313,9 +309,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 }
             }
             Op::Matmul { .. } => {
-                return Err(Error(format!(
-                    "op {at}: the matrix path is not lowered yet"
-                )));
+                let _ = at;
+                return Err(Error::TT_TODO_MATMUL);
             }
         }
     }
@@ -324,9 +319,10 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
 
 fn rows_of(shape: RegShape, at: usize) -> Result<u32, Error> {
     match shape {
-        RegShape::Scalar => Err(Error(format!(
-            "op {at}: a scalar register value has no row body"
-        ))),
+        RegShape::Scalar => {
+            let _ = at;
+            Err(Error::TT_ERROR_SCALAR_NO_ROWS)
+        }
         RegShape::Row | RegShape::Column => Ok(2),
         RegShape::Tile => Ok(DST_ROWS),
     }
@@ -341,9 +337,10 @@ fn dst_row(alloc: &Alloc, value: crate::ir::ValueId) -> u32 {
 fn const_offset(dim: Dim, at: usize) -> Result<u32, Error> {
     match dim {
         Dim::Const(n) => Ok(n),
-        Dim::Value(v) => Err(Error(format!(
-            "op {at}: the offset %{v} is symbolic; only a literal offset is lowered yet"
-        ))),
+        Dim::Value(v) => {
+            let _ = (at, v);
+            Err(Error::TT_TODO_SYMBOLIC_OFFSET)
+        }
     }
 }
 
@@ -352,10 +349,10 @@ fn unary(op: UnOp, at: usize) -> Result<SfpOp, Error> {
         UnOp::Neg => Ok(SfpOp::Neg),
         UnOp::Abs => Ok(SfpOp::Abs),
         UnOp::BitNot => Ok(SfpOp::BitNot),
-        other => Err(Error(format!(
-            "op {at}: {} has no SFPU encoding yet",
-            other.name()
-        ))),
+        other => {
+            let _ = (at, other);
+            Err(Error::TT_TODO_UNARY_SFPU)
+        }
     }
 }
 
@@ -367,9 +364,9 @@ fn binary(op: BinOp, at: usize) -> Result<SfpOp, Error> {
         BinOp::And | BinOp::BitAnd => Ok(SfpOp::BitAnd),
         BinOp::Or | BinOp::BitOr => Ok(SfpOp::BitOr),
         BinOp::BitXor => Ok(SfpOp::BitXor),
-        other => Err(Error(format!(
-            "op {at}: {} has no SFPU encoding yet",
-            other.name()
-        ))),
+        other => {
+            let _ = (at, other);
+            Err(Error::TT_TODO_BINARY_SFPU)
+        }
     }
 }

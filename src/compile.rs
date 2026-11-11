@@ -49,9 +49,7 @@ pub fn compile(k: &Kernel) -> Result<Module, Error> {
     let grid = match types.grid {
         [Dim::Const(columns), Dim::Const(rows)] => [columns, rows],
         _ => {
-            return Err(Error(
-                "a symbolic grid is not lowered yet; the parser and verifier accept it".into(),
-            ));
+            return Err(Error::TT_TODO_SYMBOLIC_GRID);
         }
     };
     let plan = place(k, &types)?;
@@ -68,7 +66,7 @@ pub fn compile(k: &Kernel) -> Result<Module, Error> {
         .iter()
         .filter(|op| matches!(op, Op::Param { .. }))
         .count();
-    let params = u32::try_from(params).map_err(|_| Error("too many parameters".into()))?;
+    let params = u32::try_from(params).map_err(|_| Error::TT_ERROR_TOO_MANY_PARAMETERS)?;
     let module = Module {
         grid,
         params,
@@ -81,9 +79,7 @@ pub fn compile(k: &Kernel) -> Result<Module, Error> {
         && module.writer.is_empty()
         && module.cores.iter().all(Vec::is_empty)
     {
-        return Err(Error(
-            "the program does no data movement and no compute".into(),
-        ));
+        return Err(Error::TT_ERROR_EMPTY_MODULE);
     }
     Ok(module)
 }

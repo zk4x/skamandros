@@ -581,25 +581,9 @@ impl Types {
 }
 
 /// The crate's error: the one C ABI enum, [`crate::status::ttStatus`]. The
-/// `Error` name stays as an alias while the string sites migrate; it is not a
-/// second error type and not a second enum.
+/// `Error` name is an alias for it, not a second error type and not a second
+/// enum.
 pub use crate::status::ttStatus as Error;
-
-impl crate::status::ttStatus {
-    /// Migration bridge for a site that has not chosen its variant yet: it is
-    /// `TT_ERROR_PROGRAM` until the site names its concrete failure. Every new
-    /// error uses a concrete variant instead.
-    #[allow(non_snake_case)]
-    pub fn new(_message: impl Into<String>) -> Self {
-        Self::TT_ERROR_PROGRAM
-    }
-}
-
-/// Migration bridge for the tuple form `Error(format!(...))`.
-#[allow(non_snake_case)]
-pub fn Error(_message: String) -> crate::status::ttStatus {
-    crate::status::ttStatus::TT_ERROR_PROGRAM
-}
 
 impl fmt::Display for Dim {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -631,10 +615,10 @@ pub fn unit_of(shape: [u32; 2], dtype: DType) -> Result<(RegShape, u32, u32), Er
     }
     let elements = a
         .checked_mul(b)
-        .ok_or_else(|| Error::new(format!("buffer shape {a},{b} overflows")))?;
+        .ok_or(Error::TT_ERROR_BUFFER_SIZE_OVERFLOW)?;
     let bytes = elements
         .checked_mul(dtype.bytes())
-        .ok_or_else(|| Error::new(format!("buffer shape {a},{b} overflows in bytes")))?;
+        .ok_or(Error::TT_ERROR_BUFFER_BYTES_OVERFLOW)?;
     let (unit, datums) = match (a, b) {
         (1, 1) => (RegShape::Scalar, 1),
         (1, _) => (RegShape::Row, 32),
@@ -694,26 +678,19 @@ impl Kernel {
             }
             if let Some(value) = op.defined() {
                 if value as usize != values.len() {
-                    return Err(Error::new(format!(
-                        "op {at} defines %{value} but the next value is %{}",
-                        values.len()
-                    )));
+                    return Err(Error::TT_ERROR_VALUE_ORDER);
                 }
                 if self.names.get(value as usize).is_none() {
-                    return Err(Error::new(format!("op {at}: value %{value} has no name")));
+                    return Err(Error::TT_ERROR_VALUE_UNNAMED);
                 }
             }
             let info = match *op {
                 Op::Const { dtype, bits, .. } => {
                     if dtype == DType::Bf16 {
-                        return Err(Error::new(format!(
-                            "op {at}: a bf16 constant is not exact; write it as f32 and cast"
-                        )));
+                        return Err(Error::TT_ERROR_CONST_BF16);
                     }
                     if dtype == DType::Bool {
-                        return Err(Error::new(format!(
-                            "op {at}: a bool constant is not a datum; write a comparison"
-                        )));
+                        return Err(Error::TT_ERROR_CONST_BOOL);
                     }
                     let _ = bits;
                     ValueInfo {
@@ -738,11 +715,8 @@ impl Kernel {
                             Dim::Value(v) => {
                                 let i = lookup(&values, &visible, v, at)?;
                                 if i.dtype != INDEX || i.shape != RegShape::Scalar {
-                                    return Err(Error::new(format!(
-                                        "op {at}: dimension {k} is %{v}, a {} {}; a dimension needs an i32 scalar",
-                                        i.dtype.name(),
-                                        i.shape.name()
-                                    )));
+                                    let _ = (k, i);
+                                    return Err(Error::TT_ERROR_DIMENSION_NOT_INDEX);
                                 }
                             }
                         }
@@ -781,9 +755,8 @@ impl Kernel {
                     if let Dim::Value(v) = bound {
                         let i = lookup(&values, &visible, v, at)?;
                         if i.dtype != INDEX || i.shape != RegShape::Scalar {
-                            return Err(Error::new(format!(
-                                "op {at}: the loop bound %{v} is not an i32 scalar"
-                            )));
+                            let _ = i;
+                            return Err(Error::TT_ERROR_LOOP_BOUND_NOT_INDEX);
                         }
                     }
                     loops.push(values.len());
@@ -816,43 +789,43 @@ impl Kernel {
                         (ValueKind::Buffer, ValueKind::Param) => (dst, src, dst_offset, src_offset),
                         (ValueKind::Param, ValueKind::Buffer) => (src, dst, src_offset, dst_offset),
                         _ => {
-                            return Err(Error::new(format!(
-                                "op {at}: a copy moves between a parameter and a buffer, not a {} and a {}",
-                                kind_name(d.kind),
-                                kind_name(s.kind)
-                            )));
+                            let _ = (kind_name(d.kind), kind_name(s.kind));
+                            return Err(Error::TT_ERROR_COPY_ENDS);
                         }
                     };
                     let b = *lookup(&values, &visible, buffer, at)?;
                     let p = *lookup(&values, &visible, param, at)?;
                     if p.shape == RegShape::Scalar {
-                        return Err(Error::new(format!(
-                            "op {at}: %{param} is a scalar parameter; it cannot hold a buffer unit"
-                        )));
+                        let _ = param;
+                        return Err(Error::TT_ERROR_COPY_SCALAR_PARAM);
                     }
                     if b.dtype != p.dtype {
-                        return Err(Error::new(format!(
-                            "op {at}: the buffer is {} and the parameter {}; there is no implicit cast",
-                            b.dtype.name(),
-                            p.dtype.name()
-                        )));
+                        let _ = (b.dtype, p.dtype);
+                        return Err(Error::TT_ERROR_COPY_CAST);
                     }
                     check_dim(
                         &values,
                         &visible,
                         dst_offset,
                         at,
-                        "the destination copy offset",
+                        Error::TT_ERROR_OFFSET_NOT_INDEX,
                     )?;
-                    check_dim(&values, &visible, src_offset, at, "the source copy offset")?;
+                    check_dim(
+                        &values,
+                        &visible,
+                        src_offset,
+                        at,
+                        Error::TT_ERROR_OFFSET_NOT_INDEX,
+                    )?;
                     let Op::Buffer { shape, .. } = self.ops[def[buffer as usize]] else {
-                        return Err(Error::new(format!("op {at}: %{buffer} is not a buffer")));
+                        let _ = buffer;
+                        return Err(Error::TT_ERROR_NOT_A_BUFFER);
                     };
                     let (unit_shape, _, _) = unit_of(shape, b.dtype)?;
                     let total = shape[0] * shape[1];
-                    check_offset(buffer_offset, total, unit_shape.datums(), at, "buffer")?;
+                    check_offset(buffer_offset, total, unit_shape.datums(), at)?;
                     if let Some(count) = param_elements(self, &def, param) {
-                        check_offset(param_offset, count, unit_shape.datums(), at, "parameter")?;
+                        check_offset(param_offset, count, unit_shape.datums(), at)?;
                     }
                     continue;
                 }
@@ -866,14 +839,18 @@ impl Kernel {
                         // A direct parameter access: one tile, which
                         // `mover::add_movers` stages through a `32,32` buffer.
                         if b.shape != RegShape::Tile {
-                            return Err(Error::new(format!(
-                                "op {at}: %{buffer} is a {} parameter; a load reads a tile",
-                                b.shape.name()
-                            )));
+                            let _ = buffer;
+                            return Err(Error::TT_ERROR_LOAD_PARAM_NOT_TILE);
                         }
-                        check_dim(&values, &visible, offset, at, "the load offset")?;
+                        check_dim(
+                            &values,
+                            &visible,
+                            offset,
+                            at,
+                            Error::TT_ERROR_OFFSET_NOT_INDEX,
+                        )?;
                         if let Some(count) = param_elements(self, &def, buffer) {
-                            check_offset(offset, count, 1024, at, "parameter")?;
+                            check_offset(offset, count, 1024, at)?;
                         }
                         let _ = value;
                         ValueInfo {
@@ -883,15 +860,23 @@ impl Kernel {
                         }
                     } else {
                         if b.kind != ValueKind::Buffer {
-                            return Err(Error::new(format!("op {at}: %{buffer} is not a buffer")));
+                            let _ = buffer;
+                            return Err(Error::TT_ERROR_NOT_A_BUFFER);
                         }
-                        check_dim(&values, &visible, offset, at, "the load offset")?;
+                        check_dim(
+                            &values,
+                            &visible,
+                            offset,
+                            at,
+                            Error::TT_ERROR_OFFSET_NOT_INDEX,
+                        )?;
                         let Op::Buffer { shape, .. } = self.ops[def[buffer as usize]] else {
-                            return Err(Error::new(format!("op {at}: %{buffer} is not a buffer")));
+                            let _ = buffer;
+                            return Err(Error::TT_ERROR_NOT_A_BUFFER);
                         };
                         let (unit_shape, _, _) = unit_of(shape, b.dtype)?;
                         let total = shape[0] * shape[1];
-                        check_offset(offset, total, unit_shape.datums(), at, "buffer")?;
+                        check_offset(offset, total, unit_shape.datums(), at)?;
                         let _ = value;
                         ValueInfo {
                             kind: ValueKind::Register,
@@ -908,69 +893,68 @@ impl Kernel {
                     let v = *lookup(&values, &visible, value, at)?;
                     let b = *lookup(&values, &visible, buffer, at)?;
                     if v.kind != ValueKind::Register {
-                        return Err(Error::new(format!(
-                            "op {at}: %{value} is not a register value"
-                        )));
+                        let _ = value;
+                        return Err(Error::TT_ERROR_STORE_VALUE_NOT_REGISTER);
                     }
                     if b.kind == ValueKind::Param {
                         // The direct form; `mover::add_movers` stages it.
                         if b.shape != RegShape::Tile {
-                            return Err(Error::new(format!(
-                                "op {at}: %{buffer} is a {} parameter; a store writes a tile",
-                                b.shape.name()
-                            )));
+                            let _ = buffer;
+                            return Err(Error::TT_ERROR_STORE_PARAM_NOT_TILE);
                         }
                         if v.dtype != b.dtype {
-                            return Err(Error::new(format!(
-                                "op {at}: the value is {} and the parameter {}; there is no implicit cast",
-                                v.dtype.name(),
-                                b.dtype.name()
-                            )));
+                            let _ = (v.dtype, b.dtype);
+                            return Err(Error::TT_ERROR_STORE_PARAM_CAST);
                         }
                         if v.shape != RegShape::Tile {
-                            return Err(Error::new(format!(
-                                "op {at}: a parameter holds a tile, the value is a {}",
-                                v.shape.name()
-                            )));
+                            let _ = v.shape;
+                            return Err(Error::TT_ERROR_STORE_PARAM_VALUE_NOT_TILE);
                         }
-                        check_dim(&values, &visible, offset, at, "the store offset")?;
+                        check_dim(
+                            &values,
+                            &visible,
+                            offset,
+                            at,
+                            Error::TT_ERROR_OFFSET_NOT_INDEX,
+                        )?;
                         if let Some(count) = param_elements(self, &def, buffer) {
-                            check_offset(offset, count, 1024, at, "parameter")?;
+                            check_offset(offset, count, 1024, at)?;
                         }
                         continue;
                     }
                     if b.kind != ValueKind::Buffer {
-                        return Err(Error::new(format!("op {at}: %{buffer} is not a buffer")));
+                        let _ = buffer;
+                        return Err(Error::TT_ERROR_NOT_A_BUFFER);
                     }
                     if v.dtype != b.dtype {
-                        return Err(Error::new(format!(
-                            "op {at}: the value is {} and the buffer {}; there is no implicit cast",
-                            v.dtype.name(),
-                            b.dtype.name()
-                        )));
+                        let _ = (v.dtype, b.dtype);
+                        return Err(Error::TT_ERROR_STORE_BUFFER_CAST);
                     }
                     let Op::Buffer { shape, .. } = self.ops[def[buffer as usize]] else {
-                        return Err(Error::new(format!("op {at}: %{buffer} is not a buffer")));
+                        let _ = buffer;
+                        return Err(Error::TT_ERROR_NOT_A_BUFFER);
                     };
                     let (unit_shape, _, _) = unit_of(shape, b.dtype)?;
                     if v.shape != unit_shape {
-                        return Err(Error::new(format!(
-                            "op {at}: the buffer holds a {}, the value is a {}",
-                            unit_shape.name(),
-                            v.shape.name()
-                        )));
+                        let _ = (unit_shape, v.shape);
+                        return Err(Error::TT_ERROR_STORE_BUFFER_SHAPE);
                     }
-                    check_dim(&values, &visible, offset, at, "the store offset")?;
+                    check_dim(
+                        &values,
+                        &visible,
+                        offset,
+                        at,
+                        Error::TT_ERROR_OFFSET_NOT_INDEX,
+                    )?;
                     let total = shape[0] * shape[1];
-                    check_offset(offset, total, unit_shape.datums(), at, "buffer")?;
+                    check_offset(offset, total, unit_shape.datums(), at)?;
                     continue;
                 }
                 Op::Cast { src, dtype, .. } => {
                     let s = *lookup(&values, &visible, src, at)?;
                     if !is_value(s.kind) {
-                        return Err(Error::new(format!(
-                            "op {at}: %{src} is not a register value"
-                        )));
+                        let _ = src;
+                        return Err(Error::TT_ERROR_CAST_SOURCE);
                     }
                     if s.dtype == DType::Bool || dtype == DType::Bool {
                         todo!("op {at}: a cast to or from bool is not implemented");
@@ -984,34 +968,28 @@ impl Kernel {
                 Op::Unary { op, a, .. } => {
                     let x = *lookup(&values, &visible, a, at)?;
                     if !is_value(x.kind) {
-                        return Err(Error::new(format!("op {at}: %{a} is not a register value")));
+                        let _ = a;
+                        return Err(Error::TT_ERROR_UNARY_OPERAND);
                     }
                     let dtype = match op {
                         UnOp::Not => {
                             if x.dtype != DType::Bool {
-                                return Err(Error::new(format!(
-                                    "op {at}: not needs a bool, not {}",
-                                    x.dtype.name()
-                                )));
+                                let _ = x.dtype;
+                                return Err(Error::TT_ERROR_UNARY_NOT_BOOL);
                             }
                             DType::Bool
                         }
                         UnOp::BitNot => {
                             if x.dtype != DType::I32 {
-                                return Err(Error::new(format!(
-                                    "op {at}: bitnot is integer (i32), not {}",
-                                    x.dtype.name()
-                                )));
+                                let _ = x.dtype;
+                                return Err(Error::TT_ERROR_UNARY_BITNOT_NOT_I32);
                             }
                             DType::I32
                         }
                         _ => {
                             if !x.dtype.is_float() {
-                                return Err(Error::new(format!(
-                                    "op {at}: {} needs a float value, not {}",
-                                    op.name(),
-                                    x.dtype.name()
-                                )));
+                                let _ = (op, x.dtype);
+                                return Err(Error::TT_ERROR_UNARY_NOT_FLOAT);
                             }
                             x.dtype
                         }
@@ -1026,41 +1004,28 @@ impl Kernel {
                     let x = *lookup(&values, &visible, a, at)?;
                     let y = *lookup(&values, &visible, b, at)?;
                     if !is_value(x.kind) || !is_value(y.kind) {
-                        return Err(Error::new(format!(
-                            "op {at}: {} needs two register values",
-                            op.name()
-                        )));
+                        let _ = (a, b);
+                        return Err(Error::TT_ERROR_BINARY_OPERANDS);
                     }
                     if x.dtype != y.dtype {
                         let _ = op;
                         return Err(Error::TT_ERROR_NO_IMPLICIT_CAST);
                     }
                     if op.is_logical() && x.dtype != DType::Bool {
-                        return Err(Error::new(format!(
-                            "op {at}: {} is logical (bool), not {}",
-                            op.name(),
-                            x.dtype.name()
-                        )));
+                        let _ = (op, x.dtype);
+                        return Err(Error::TT_ERROR_BINARY_LOGICAL_NOT_BOOL);
                     }
                     if op.is_integer_only() && x.dtype != INDEX {
-                        return Err(Error::new(format!(
-                            "op {at}: {} is integer math (i32), not {}",
-                            op.name(),
-                            x.dtype.name()
-                        )));
+                        let _ = (op, x.dtype);
+                        return Err(Error::TT_ERROR_BINARY_NOT_INTEGER);
                     }
                     if !op.is_logical() && x.dtype == DType::Bool {
-                        return Err(Error::new(format!(
-                            "op {at}: {} is not a bool operation",
-                            op.name()
-                        )));
+                        let _ = op;
+                        return Err(Error::TT_ERROR_BINARY_BOOL);
                     }
                     let shape = broadcast(x.shape, y.shape).ok_or_else(|| {
-                        Error::new(format!(
-                            "op {at}: cannot broadcast a {} and a {}",
-                            x.shape.name(),
-                            y.shape.name()
-                        ))
+                        let _ = (x.shape, y.shape);
+                        Error::TT_ERROR_BINARY_BROADCAST
                     })?;
                     let dtype = if op.returns_bool() {
                         DType::Bool
@@ -1083,34 +1048,24 @@ impl Kernel {
                     let t = *lookup(&values, &visible, if_true, at)?;
                     let f = *lookup(&values, &visible, if_false, at)?;
                     if !is_value(c.kind) || !is_value(t.kind) || !is_value(f.kind) {
-                        return Err(Error::new(format!(
-                            "op {at}: sel needs three register values"
-                        )));
+                        let _ = (cond, if_true, if_false);
+                        return Err(Error::TT_ERROR_SELECT_OPERANDS);
                     }
                     if c.dtype != DType::Bool {
                         let _ = cond;
                         return Err(Error::TT_ERROR_CONDITION_NOT_BOOL);
                     }
                     if t.dtype != f.dtype {
-                        return Err(Error::new(format!(
-                            "op {at}: sel of {} and {}; there is no implicit cast",
-                            t.dtype.name(),
-                            f.dtype.name()
-                        )));
+                        let _ = (t.dtype, f.dtype);
+                        return Err(Error::TT_ERROR_SELECT_CAST);
                     }
                     let shape = broadcast(t.shape, f.shape).ok_or_else(|| {
-                        Error::new(format!(
-                            "op {at}: cannot broadcast a {} and a {}",
-                            t.shape.name(),
-                            f.shape.name()
-                        ))
+                        let _ = (t.shape, f.shape);
+                        Error::TT_ERROR_SELECT_BROADCAST
                     })?;
                     let shape = broadcast(shape, c.shape).ok_or_else(|| {
-                        Error::new(format!(
-                            "op {at}: cannot broadcast the condition's {} with the values' {}",
-                            c.shape.name(),
-                            shape.name()
-                        ))
+                        let _ = (c.shape, shape);
+                        Error::TT_ERROR_SELECT_CONDITION_BROADCAST
                     })?;
                     ValueInfo {
                         kind: ValueKind::Register,
@@ -1122,23 +1077,16 @@ impl Kernel {
                     let x = *lookup(&values, &visible, a, at)?;
                     let y = *lookup(&values, &visible, b, at)?;
                     if !is_value(x.kind) || !is_value(y.kind) {
-                        return Err(Error::new(format!(
-                            "op {at}: matmul needs two register values"
-                        )));
+                        let _ = (a, b);
+                        return Err(Error::TT_ERROR_MATMUL_OPERANDS);
                     }
                     if x.shape != RegShape::Tile || y.shape != RegShape::Tile {
-                        return Err(Error::new(format!(
-                            "op {at}: matmul needs two tiles, not a {} and a {}",
-                            x.shape.name(),
-                            y.shape.name()
-                        )));
+                        let _ = (x.shape, y.shape);
+                        return Err(Error::TT_ERROR_MATMUL_NOT_TILES);
                     }
                     if x.dtype != y.dtype {
-                        return Err(Error::new(format!(
-                            "op {at}: matmul of {} and {}; there is no implicit cast",
-                            x.dtype.name(),
-                            y.dtype.name()
-                        )));
+                        let _ = (x.dtype, y.dtype);
+                        return Err(Error::TT_ERROR_MATMUL_CAST);
                     }
                     ValueInfo {
                         kind: ValueKind::Register,
@@ -1151,20 +1099,28 @@ impl Kernel {
             visible.push(true);
         }
         if !loops.is_empty() {
-            return Err(Error::new("the program ends inside a loop"));
+            return Err(Error::TT_ERROR_LOOP_UNTERMINATED);
         }
         if values.len() != self.names.len() {
-            return Err(Error::new(format!(
-                "the program defines {} values but names {}",
-                values.len(),
-                self.names.len()
-            )));
+            return Err(Error::TT_ERROR_VALUE_COUNT);
         }
         let Some((grid, at)) = grid else {
             return Err(Error::TT_ERROR_GRID);
         };
-        check_dim(&values, &visible, grid[0], at, "the grid's columns")?;
-        check_dim(&values, &visible, grid[1], at, "the grid's rows")?;
+        check_dim(
+            &values,
+            &visible,
+            grid[0],
+            at,
+            Error::TT_ERROR_GRID_DIMENSION_NOT_INDEX,
+        )?;
+        check_dim(
+            &values,
+            &visible,
+            grid[1],
+            at,
+            Error::TT_ERROR_GRID_DIMENSION_NOT_INDEX,
+        )?;
         Ok(Types { values, grid })
     }
 }
@@ -1201,21 +1157,21 @@ fn broadcast(a: RegShape, b: RegShape) -> Option<RegShape> {
 }
 
 /// A shape term that must name an i32 scalar: a literal, or a visible value.
+///
+/// `bad` is the variant for the concrete context the term appears in (a grid
+/// dimension, an offset, ...), so a caller can tell them apart.
 fn check_dim(
     values: &[ValueInfo],
     visible: &[bool],
     dim: Dim,
     at: usize,
-    what: &str,
+    bad: Error,
 ) -> Result<(), Error> {
     if let Dim::Value(v) = dim {
         let i = lookup(values, visible, v, at)?;
         if i.dtype != INDEX || i.shape != RegShape::Scalar {
-            return Err(Error::new(format!(
-                "op {at}: {what} is %{v}, a {} {}; it must be an i32 scalar",
-                i.dtype.name(),
-                i.shape.name()
-            )));
+            let _ = i;
+            return Err(bad);
         }
     }
     Ok(())
@@ -1223,12 +1179,11 @@ fn check_dim(
 
 /// A bracket must leave room for one unit. A symbolic offset cannot be checked
 /// here; it is checked at run time.
-fn check_offset(offset: Dim, total: u32, unit: u32, at: usize, what: &str) -> Result<(), Error> {
+fn check_offset(offset: Dim, total: u32, unit: u32, at: usize) -> Result<(), Error> {
     if let Dim::Const(n) = offset {
         if n.checked_add(unit).is_none_or(|end| end > total) {
-            return Err(Error::new(format!(
-                "op {at}: {n} + {unit} datums runs past the {what} ({total} datums)"
-            )));
+            let _ = (n, unit, total, at);
+            return Err(Error::TT_ERROR_OFFSET);
         }
     }
     Ok(())
@@ -1472,16 +1427,14 @@ impl Kernel {
                 }
                 10 => {
                     let name = r.name()?;
-                    let op = UnOp::from_tag(r.u8()?)
-                        .ok_or_else(|| Error::new("unknown unary op tag"))?;
+                    let op = UnOp::from_tag(r.u8()?).ok_or(Error::TT_ERROR_UNARY_TAG)?;
                     let a = r.u32()?;
                     let value = define(&mut names, name)?;
                     Op::Unary { value, op, a }
                 }
                 11 => {
                     let name = r.name()?;
-                    let op = BinOp::from_tag(r.u8()?)
-                        .ok_or_else(|| Error::new("unknown binary op tag"))?;
+                    let op = BinOp::from_tag(r.u8()?).ok_or(Error::TT_ERROR_BINARY_TAG)?;
                     let a = r.u32()?;
                     let b = r.u32()?;
                     let value = define(&mut names, name)?;
@@ -1507,7 +1460,10 @@ impl Kernel {
                         if_false,
                     }
                 }
-                other => return Err(Error::new(format!("unknown instruction tag {other}"))),
+                other => {
+                    let _ = other;
+                    return Err(Error::TT_ERROR_INSTRUCTION_TAG);
+                }
             };
             ops.push(op);
         }
@@ -1560,7 +1516,7 @@ impl Cursor<'_> {
     fn take(&mut self, n: usize) -> Result<&[u8], Error> {
         let end = self.at + n;
         if end > self.bytes.len() {
-            return Err(Error::new("byte program ends mid-record"));
+            return Err(Error::TT_ERROR_TRUNCATED);
         }
         let s = &self.bytes[self.at..end];
         self.at = end;
@@ -1577,20 +1533,23 @@ impl Cursor<'_> {
 
     fn dtype(&mut self) -> Result<DType, Error> {
         let tag = self.u8()?;
-        DType::from_tag(tag).ok_or_else(|| Error::new(format!("unknown dtype tag {tag}")))
+        DType::from_tag(tag).ok_or(Error::TT_ERROR_DTYPE_TAG)
     }
 
     fn name(&mut self) -> Result<String, Error> {
         let n = self.u32()? as usize;
         let bytes = self.take(n)?;
-        String::from_utf8(bytes.to_vec()).map_err(|_| Error::new("a name is not UTF-8"))
+        String::from_utf8(bytes.to_vec()).map_err(|_| Error::TT_ERROR_NAME_UTF8)
     }
 
     fn dim(&mut self) -> Result<Dim, Error> {
         match self.u8()? {
             0 => Ok(Dim::Const(self.u32()?)),
             1 => Ok(Dim::Value(self.u32()?)),
-            other => Err(Error::new(format!("unknown shape-term tag {other}"))),
+            other => {
+                let _ = other;
+                Err(Error::TT_ERROR_SHAPE_TERM_TAG)
+            }
         }
     }
 }
@@ -1614,7 +1573,10 @@ impl Kernel {
             if line.is_empty() {
                 continue;
             }
-            let tokens = tokenize(line).map_err(|e| Error::new(format!("line {at}: {e}")))?;
+            let tokens = tokenize(line).map_err(|e| {
+                let _ = e;
+                Error::TT_ERROR_PARSE
+            })?;
             let mut t = Tokens {
                 tok: &tokens,
                 at: 0,

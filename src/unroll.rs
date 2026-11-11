@@ -291,9 +291,10 @@ impl Unroller<'_> {
             Dim::Value(v) => {
                 let v = self.map(v, subs)?;
                 match self.folds.get(&v) {
-                    Some(n) if *n < 0 => Err(Error(format!(
-                        "the value %{v} is {n}; an index cannot be negative"
-                    ))),
+                    Some(n) if *n < 0 => {
+                        let _ = (v, n);
+                        Err(Error::TT_ERROR_NEGATIVE_INDEX)
+                    }
                     Some(n) => Ok(Dim::Const(*n as u32)),
                     None => Ok(Dim::Value(v)),
                 }
@@ -303,9 +304,8 @@ impl Unroller<'_> {
 
     fn map(&self, v: ValueId, subs: &BTreeMap<ValueId, ValueId>) -> Result<ValueId, Error> {
         subs.get(&v).copied().ok_or_else(|| {
-            Error(format!(
-                "%{v} is used where it is not in scope; the program did not verify"
-            ))
+            let _ = v;
+            Error::TT_ERROR_VALUE_NOT_IN_SCOPE
         })
     }
 
@@ -317,7 +317,8 @@ impl Unroller<'_> {
 
     fn define(&mut self, name: String) -> Result<ValueId, Error> {
         if self.out.names.iter().any(|n| *n == name) {
-            return Err(Error(format!("the unrolled program defines %{name} twice")));
+            let _ = name;
+            return Err(Error::TT_ERROR_NAME_DUPLICATE);
         }
         let id = self.out.names.len() as ValueId;
         self.out.names.push(name);
@@ -344,9 +345,10 @@ impl Unroller<'_> {
             match op {
                 Op::Loop { .. } => depth += 1,
                 Op::EndLoop => {
-                    depth = depth
-                        .checked_sub(1)
-                        .ok_or_else(|| Error(format!("op {index}: endloop without a loop")))?;
+                    depth = depth.checked_sub(1).ok_or_else(|| {
+                        let _ = index;
+                        Error::TT_ERROR_ENDLOOP_WITHOUT_LOOP
+                    })?;
                     if depth == 0 {
                         return Ok(index);
                     }
@@ -354,8 +356,6 @@ impl Unroller<'_> {
                 _ => {}
             }
         }
-        Err(Error(format!(
-            "the loop at op {at} has no matching endloop"
-        )))
+        Err(Error::TT_ERROR_LOOP_UNMATCHED)
     }
 }

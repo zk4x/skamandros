@@ -219,10 +219,10 @@ pub fn check_roles(k: &Kernel, types: &Types) -> Result<(), Error> {
 fn stage_shape(shape: crate::ir::RegShape, param: ValueId) -> Result<[u32; 2], Error> {
     match shape {
         crate::ir::RegShape::Tile => Ok([32, 32]),
-        other => Err(Error(format!(
-            "parameter %{param} is a {}; only a tile access can be staged yet",
-            other.name()
-        ))),
+        other => {
+            let _ = (param, other);
+            Err(Error::TT_TODO_SCALAR_PARAMETER)
+        }
     }
 }
 
@@ -366,7 +366,7 @@ fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
         )?;
     }
     a.word(rv::ret());
-    a.finish().map_err(Error)
+    a.finish().map_err(|_| Error::TT_ERROR_MOVER_PROGRAM)
 }
 
 fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<Copy>, Error> {
@@ -408,9 +408,8 @@ fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
                     (dst, src, dst_offset, src_offset)
                 }
                 _ => {
-                    return Err(Error(format!(
-                        "op {at}: a copy moves between a parameter and a buffer"
-                    )));
+                    let _ = (at, dst, src);
+                    return Err(Error::TT_ERROR_COPY_ENDS);
                 }
             };
         let Op::Buffer { shape, dtype, .. } = k.ops[def[buffer as usize].expect("defined")] else {
@@ -419,26 +418,32 @@ fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
         let (_, _, unit_bytes) = unit_of(shape, dtype)?;
         let literal = |offset: Dim, what: &str| match offset {
             Dim::Const(n) => Ok(n),
-            Dim::Value(v) => Err(Error(format!(
-                "op {at}: the {what} offset %{v} is symbolic; only a literal offset is lowered yet"
-            ))),
+            Dim::Value(v) => {
+                let _ = (at, what, v);
+                Err(Error::TT_TODO_SYMBOLIC_OFFSET)
+            }
         };
         let param_offset = literal(param_offset, "parameter")?;
         let buffer_offset = literal(buffer_offset, "buffer")?;
-        let base = plan.buf[buffer as usize]
-            .ok_or_else(|| Error(format!("op {at}: buffer %{buffer} was not placed")))?;
-        let param_bytes = param_offset
-            .checked_mul(dtype.bytes())
-            .ok_or_else(|| Error(format!("op {at}: the parameter offset overflows")))?;
-        let buffer_bytes = buffer_offset
-            .checked_mul(dtype.bytes())
-            .ok_or_else(|| Error(format!("op {at}: the buffer offset overflows")))?;
+        let base = plan.buf[buffer as usize].ok_or_else(|| {
+            let _ = (at, buffer);
+            Error::TT_ERROR_BUFFER_NOT_PLACED
+        })?;
+        let param_bytes = param_offset.checked_mul(dtype.bytes()).ok_or_else(|| {
+            let _ = (at, param_offset);
+            Error::TT_ERROR_PARAM_OFFSET_OVERFLOW
+        })?;
+        let buffer_bytes = buffer_offset.checked_mul(dtype.bytes()).ok_or_else(|| {
+            let _ = (at, buffer_offset);
+            Error::TT_ERROR_BUFFER_OFFSET_OVERFLOW
+        })?;
         copies.push(Copy {
             param: param_index[param as usize].expect("a parameter has an index"),
             offset: param_bytes,
-            l1: base
-                .checked_add(buffer_bytes)
-                .ok_or_else(|| Error(format!("op {at}: the buffer address overflows")))?,
+            l1: base.checked_add(buffer_bytes).ok_or_else(|| {
+                let _ = (at, base, buffer_bytes);
+                Error::TT_ERROR_BUFFER_ADDRESS_OVERFLOW
+            })?,
             bytes: unit_bytes,
         });
     }
@@ -462,10 +467,8 @@ fn emit_copy(
     read: bool,
 ) -> Result<(), Error> {
     if bytes == 0 || bytes > tt_isa::noc::niu::MAX_REQUEST_BYTES {
-        return Err(Error(format!(
-            "copy {at}: {bytes} bytes is not one NOC request (1..={})",
-            tt_isa::noc::niu::MAX_REQUEST_BYTES
-        )));
+        let _ = (at, bytes);
+        return Err(Error::TT_ERROR_NOC_REQUEST_BYTES);
     }
     let (lo_arg, hi_arg) = param_arg(param);
     // Target: the parameter's range base plus the copy's byte offset.

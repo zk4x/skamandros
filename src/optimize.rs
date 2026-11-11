@@ -128,30 +128,26 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
             match ops[at] {
                 MirOp::Sfpload { lreg, row, .. } | MirOp::Sfpstore { lreg, row, .. } => {
                     if lreg >= crate::alloc::LREGS {
-                        return Err(Error(format!(
-                            "{name}[{at}]: lane register L{lreg} does not exist"
-                        )));
+                        let _ = (name, at, lreg);
+                        return Err(Error::TT_ERROR_LANE_REGISTER);
                     }
                     if row >= u32::from(DST_SLOTS) * DST_ROWS {
-                        return Err(Error(format!(
-                            "{name}[{at}]: Dst row {row} is past the last tile"
-                        )));
+                        let _ = (name, at, row);
+                        return Err(Error::TT_ERROR_DST_ROW);
                     }
                 }
                 MirOp::Sfp { a, b, d, .. } => {
                     for lreg in [Some(a), b, Some(d)].into_iter().flatten() {
                         if lreg >= crate::alloc::LREGS {
-                            return Err(Error(format!(
-                                "{name}[{at}]: lane register L{lreg} does not exist"
-                            )));
+                            let _ = (name, at, lreg);
+                            return Err(Error::TT_ERROR_LANE_REGISTER);
                         }
                     }
                 }
                 MirOp::Setdst { row } => {
                     if row >= u32::from(DST_SLOTS) * DST_ROWS {
-                        return Err(Error(format!(
-                            "{name}[{at}]: Dst row {row} is past the last tile"
-                        )));
+                        let _ = (name, at, row);
+                        return Err(Error::TT_ERROR_DST_ROW);
                     }
                 }
                 MirOp::SemPost { sem }
@@ -159,45 +155,41 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                 | MirOp::SemWaitData { sem }
                 | MirOp::SemGet { sem } => {
                     if sem >= tt_isa::sync::Semaphore::COUNT {
-                        return Err(Error(format!(
-                            "{name}[{at}]: semaphore {sem} does not exist"
-                        )));
+                        let _ = (name, at, sem);
+                        return Err(Error::TT_ERROR_SEMAPHORE);
                     }
                 }
                 MirOp::Repeat { len, count } => {
                     if len == 0 || count == 0 {
-                        return Err(Error(format!("{name}[{at}]: empty repeat")));
+                        let _ = (name, at);
+                        return Err(Error::TT_ERROR_REPEAT_EMPTY);
                     }
                     if at + 1 + len as usize > ops.len() {
-                        return Err(Error(format!(
-                            "{name}[{at}]: repeat body runs past the program"
-                        )));
+                        let _ = (name, at);
+                        return Err(Error::TT_ERROR_REPEAT_BODY);
                     }
                 }
                 MirOp::Compare { a, b, d, .. } => {
                     for lreg in [a, b, d] {
                         if lreg >= crate::alloc::LREGS {
-                            return Err(Error(format!(
-                                "{name}[{at}]: lane register L{lreg} does not exist"
-                            )));
+                            let _ = (name, at, lreg);
+                            return Err(Error::TT_ERROR_LANE_REGISTER);
                         }
                     }
                 }
                 MirOp::Select { cond, t, f, d } => {
                     for lreg in [cond, t, f, d] {
                         if lreg >= crate::alloc::LREGS {
-                            return Err(Error(format!(
-                                "{name}[{at}]: lane register L{lreg} does not exist"
-                            )));
+                            let _ = (name, at, lreg);
+                            return Err(Error::TT_ERROR_LANE_REGISTER);
                         }
                     }
                 }
                 MirOp::Max { a, b, d } => {
                     for lreg in [a, b, d] {
                         if lreg >= crate::alloc::LREGS {
-                            return Err(Error(format!(
-                                "{name}[{at}]: lane register L{lreg} does not exist"
-                            )));
+                            let _ = (name, at, lreg);
+                            return Err(Error::TT_ERROR_LANE_REGISTER);
                         }
                     }
                 }

@@ -7,11 +7,8 @@
 //!
 //! It is `#[repr(C)]` and integer-valued, because the C ABI is the only stable
 //! surface and a caller sees only the integer. There is no second error type and
-//! no string in the enum: information a caller needs is a variant.
-//!
-//! The migration from the string errors is in progress (`TODO.md`, "The error
-//! channel"): a new failure gets its own variant here as it is written, and the
-//! older sites move to variants gradually.
+//! no string in the enum: information a caller needs is a variant, so every
+//! distinct failure has its own.
 
 /// What every fallible call returns.
 #[repr(C)]
@@ -62,7 +59,7 @@ pub enum ttStatus {
     TT_ERROR_GRID = 17,
     /// An operand's dtype or kind does not match; there is no implicit cast.
     TT_ERROR_NO_IMPLICIT_CAST = 18,
-    /// A bracket offset runs past its value, or a term is not an index.
+    /// A bracket offset runs past its value.
     TT_ERROR_OFFSET = 19,
     /// `endloop` without a matching `loop`.
     TT_ERROR_ENDLOOP_WITHOUT_LOOP = 20,
@@ -71,6 +68,273 @@ pub enum ttStatus {
     TT_TODO_LOOP = 21,
     /// A `sel` (or its source) condition is not a `bool`.
     TT_ERROR_CONDITION_NOT_BOOL = 22,
+
+    // -- Shapes and definitions ------------------------------------------------
+    /// A buffer's element count overflows a `u32`.
+    TT_ERROR_BUFFER_SIZE_OVERFLOW = 23,
+    /// A buffer's byte count overflows a `u32`.
+    TT_ERROR_BUFFER_BYTES_OVERFLOW = 24,
+    /// An op defines a value whose id is not the next one.
+    TT_ERROR_VALUE_ORDER = 25,
+    /// A defined value has no name.
+    TT_ERROR_VALUE_UNNAMED = 26,
+    /// A bf16 constant is not exact; bf16 is written as f32 and cast.
+    TT_ERROR_CONST_BF16 = 27,
+    /// A bool constant is not a datum; a bool is produced by a comparison.
+    TT_ERROR_CONST_BOOL = 28,
+    /// A parameter dimension is not an i32 scalar.
+    TT_ERROR_DIMENSION_NOT_INDEX = 29,
+    /// A loop's bound is not an i32 scalar.
+    TT_ERROR_LOOP_BOUND_NOT_INDEX = 30,
+    /// A grid dimension is not an i32 scalar.
+    TT_ERROR_GRID_DIMENSION_NOT_INDEX = 31,
+    /// A copy, load or store offset is not an i32 scalar.
+    TT_ERROR_OFFSET_NOT_INDEX = 32,
+    /// A copy's two ends are not one parameter and one buffer.
+    TT_ERROR_COPY_ENDS = 33,
+    /// A copy names a scalar parameter, which cannot hold a buffer unit.
+    TT_ERROR_COPY_SCALAR_PARAM = 34,
+    /// A copy's buffer and parameter dtypes differ.
+    TT_ERROR_COPY_CAST = 35,
+    /// An op that needs a buffer was given a value of another kind.
+    TT_ERROR_NOT_A_BUFFER = 36,
+    /// A direct load reads a parameter that is not a tile.
+    TT_ERROR_LOAD_PARAM_NOT_TILE = 37,
+    /// A direct store writes a parameter that is not a tile.
+    TT_ERROR_STORE_PARAM_NOT_TILE = 38,
+    /// A store's value is not a register value.
+    TT_ERROR_STORE_VALUE_NOT_REGISTER = 39,
+    /// A store to a parameter writes a value of another dtype.
+    TT_ERROR_STORE_PARAM_CAST = 40,
+    /// A store to a parameter writes a value that is not a tile.
+    TT_ERROR_STORE_PARAM_VALUE_NOT_TILE = 41,
+    /// A store to a buffer writes a value of another dtype.
+    TT_ERROR_STORE_BUFFER_CAST = 42,
+    /// A store to a buffer writes a value of another shape.
+    TT_ERROR_STORE_BUFFER_SHAPE = 43,
+    /// A cast's source is not a register value.
+    TT_ERROR_CAST_SOURCE = 44,
+    /// A unary op's operand is not a register value.
+    TT_ERROR_UNARY_OPERAND = 45,
+    /// `not` was given a value that is not a bool.
+    TT_ERROR_UNARY_NOT_BOOL = 46,
+    /// `bitnot` was given a value that is not i32.
+    TT_ERROR_UNARY_BITNOT_NOT_I32 = 47,
+    /// A floating-point unary op was given a non-float value.
+    TT_ERROR_UNARY_NOT_FLOAT = 48,
+    /// A binary op's operand is not a register value.
+    TT_ERROR_BINARY_OPERANDS = 49,
+    /// A logical op (`and`/`or`) was given a non-bool value.
+    TT_ERROR_BINARY_LOGICAL_NOT_BOOL = 50,
+    /// An integer-only op was given a non-i32 value.
+    TT_ERROR_BINARY_NOT_INTEGER = 51,
+    /// Arithmetic was given a bool value.
+    TT_ERROR_BINARY_BOOL = 52,
+    /// A binary op's two shapes cannot broadcast to one.
+    TT_ERROR_BINARY_BROADCAST = 53,
+    /// `sel`'s operands are not three register values.
+    TT_ERROR_SELECT_OPERANDS = 54,
+    /// `sel`'s two values have different dtypes.
+    TT_ERROR_SELECT_CAST = 55,
+    /// `sel`'s two values cannot broadcast to one shape.
+    TT_ERROR_SELECT_BROADCAST = 56,
+    /// `sel`'s condition cannot broadcast with the values' shape.
+    TT_ERROR_SELECT_CONDITION_BROADCAST = 57,
+    /// `matmul`'s operands are not two register values.
+    TT_ERROR_MATMUL_OPERANDS = 58,
+    /// `matmul`'s operands are not two tiles.
+    TT_ERROR_MATMUL_NOT_TILES = 59,
+    /// `matmul`'s operands have different dtypes.
+    TT_ERROR_MATMUL_CAST = 60,
+    /// The program ends inside a loop.
+    TT_ERROR_LOOP_UNTERMINATED = 61,
+    /// The number of defined values is not the number of names.
+    TT_ERROR_VALUE_COUNT = 62,
+
+    // -- Byte form -------------------------------------------------------------
+    /// The byte program ends in the middle of a record.
+    TT_ERROR_TRUNCATED = 63,
+    /// A dtype tag is not one this build knows.
+    TT_ERROR_DTYPE_TAG = 64,
+    /// A name's bytes are not UTF-8.
+    TT_ERROR_NAME_UTF8 = 65,
+    /// A shape-term tag is neither a constant nor a value.
+    TT_ERROR_SHAPE_TERM_TAG = 66,
+    /// A unary op tag is not one this build knows.
+    TT_ERROR_UNARY_TAG = 67,
+    /// A binary op tag is not one this build knows.
+    TT_ERROR_BINARY_TAG = 68,
+    /// An instruction tag is not one this build knows.
+    TT_ERROR_INSTRUCTION_TAG = 69,
+
+    // -- Lowering --------------------------------------------------------------
+    /// A cast reaches lowering.
+    TT_TODO_CAST = 70,
+    /// An operand shape reaches lowering with a broadcast still to do.
+    TT_TODO_BROADCAST = 71,
+    /// An op on a dtype the register datapath does not do reaches lowering.
+    TT_TODO_BINARY_DTYPE = 72,
+    /// `matmul` reaches lowering.
+    TT_TODO_MATMUL = 73,
+    /// A scalar register value has no row body to load or store.
+    TT_ERROR_SCALAR_NO_ROWS = 74,
+    /// A symbolic offset reaches lowering; only a literal offset is lowered.
+    TT_TODO_SYMBOLIC_OFFSET = 75,
+    /// A unary op has no SFPU encoding yet.
+    TT_TODO_UNARY_SFPU = 76,
+    /// A binary op has no SFPU encoding yet.
+    TT_TODO_BINARY_SFPU = 77,
+    /// The register datapath is FP32 or I32, not this dtype.
+    TT_ERROR_DATAPATH_DTYPE = 78,
+    /// A buffer the plan has no address for is accessed.
+    TT_ERROR_BUFFER_NOT_PLACED = 79,
+
+    // -- Machine IR verification ----------------------------------------------
+    /// A lane register an op names does not exist.
+    TT_ERROR_LANE_REGISTER = 80,
+    /// A `Dst` row an op names is past the last tile.
+    TT_ERROR_DST_ROW = 81,
+    /// A semaphore an op names does not exist.
+    TT_ERROR_SEMAPHORE = 82,
+    /// A repeat with a zero length or a zero count.
+    TT_ERROR_REPEAT_EMPTY = 83,
+    /// A repeat's body runs past the program.
+    TT_ERROR_REPEAT_BODY = 84,
+
+    // -- Unrolling -------------------------------------------------------------
+    /// A folded index is negative.
+    TT_ERROR_NEGATIVE_INDEX = 85,
+    /// A value is used where it is not in scope while unrolling.
+    TT_ERROR_VALUE_NOT_IN_SCOPE = 86,
+    /// A loop has no matching `endloop` while unrolling.
+    TT_ERROR_LOOP_UNMATCHED = 87,
+
+    // -- Planning --------------------------------------------------------------
+    /// A buffer's end overflows the L1 address space.
+    TT_ERROR_L1_OVERFLOW = 88,
+    /// A buffer runs past the L1 data arena.
+    TT_ERROR_L1_ARENA = 89,
+
+    // -- Movers ----------------------------------------------------------------
+    /// A direct access to a non-tile parameter needs the 64-byte span read,
+    /// which the movers do not do yet.
+    TT_TODO_SCALAR_PARAMETER = 90,
+    /// A copy's parameter byte offset overflows.
+    TT_ERROR_PARAM_OFFSET_OVERFLOW = 91,
+    /// A copy's buffer byte offset overflows.
+    TT_ERROR_BUFFER_OFFSET_OVERFLOW = 92,
+    /// A copy's buffer address overflows.
+    TT_ERROR_BUFFER_ADDRESS_OVERFLOW = 93,
+    /// A copy's size is not one NoC request.
+    TT_ERROR_NOC_REQUEST_BYTES = 94,
+    /// The mover assembler could not resolve its program.
+    TT_ERROR_MOVER_PROGRAM = 95,
+
+    // -- Allocation ------------------------------------------------------------
+    /// A value needs a `Dst` slot and every slot is live.
+    TT_ERROR_DST_SLOTS_EXHAUSTED = 96,
+
+    // -- Encoding --------------------------------------------------------------
+    /// An instruction has no inline `.ttinsn` form.
+    TT_ERROR_INSTRUCTION_NOT_INLINE = 97,
+    /// A semaphore could not be initialised.
+    TT_ERROR_SEMINIT = 98,
+    /// The unpack program cannot encode this machine op.
+    TT_ERROR_UNPACK_OP = 99,
+    /// `STALLWAIT` could not be encoded.
+    TT_ERROR_STALLWAIT = 100,
+    /// `SETADCXX` could not be encoded.
+    TT_ERROR_SETADCXX = 101,
+    /// `SETADCZW` could not be encoded.
+    TT_ERROR_SETADCZW = 102,
+    /// `UNPACR` could not be encoded.
+    TT_ERROR_UNPACR = 103,
+    /// A math repeat's body runs past the program.
+    TT_ERROR_MATH_REPEAT_BODY = 104,
+    /// A math instruction could not be encoded.
+    TT_ERROR_ENCODE = 105,
+    /// A math op has no encoding yet.
+    TT_ERROR_NO_ENCODING = 106,
+    /// An op in the math program is not a math instruction.
+    TT_ERROR_NOT_MATH = 107,
+    /// The pack program cannot encode this machine op.
+    TT_ERROR_PACK_OP = 108,
+    /// `SETADCXX` in the packer could not be encoded.
+    TT_ERROR_SETADCXX_PACK = 109,
+    /// `SETADCXY` in the packer could not be encoded.
+    TT_ERROR_SETADCXY_PACK = 110,
+    /// `PACR` could not be encoded.
+    TT_ERROR_PACR = 111,
+
+    // -- Device ----------------------------------------------------------------
+    /// The simulator library could not be loaded.
+    TT_ERROR_DLOPEN = 112,
+    /// The simulator library lacks an entry point.
+    TT_ERROR_DLSYM = 113,
+    /// No chip answers configuration space.
+    TT_ERROR_NO_DEVICE = 114,
+    /// The device is not a Blackhole.
+    TT_ERROR_NOT_BLACKHOLE = 115,
+    /// The chip has no Tensix tile.
+    TT_ERROR_NO_TENSIX_TILE = 116,
+    /// A zero-byte DRAM allocation.
+    TT_ERROR_ALLOC_ZERO = 117,
+    /// A DRAM allocation overflows the address space.
+    TT_ERROR_DRAM_ADDRESS_OVERFLOW = 118,
+    /// A DRAM allocation does not fit the channel.
+    TT_ERROR_DRAM_FULL = 119,
+    /// A DRAM transfer does not fit the channel.
+    TT_ERROR_DRAM_RANGE = 120,
+    /// A core cannot be loaded at the requested L1 offset.
+    TT_ERROR_RESET_PC = 121,
+    /// The firmware panicked.
+    TT_ERROR_FIRMWARE_PANIC = 122,
+    /// The firmware did not answer within the cycle budget.
+    TT_ERROR_FIRMWARE_TIMEOUT = 123,
+    /// An empty program cannot be run.
+    TT_ERROR_EMPTY_PROGRAM = 124,
+    /// A program is longer than its limit.
+    TT_ERROR_PROGRAM_TOO_LONG = 125,
+    /// A program would run into its arguments.
+    TT_ERROR_PROGRAM_OVERLAPS_ARGS = 126,
+    /// The executor refused the program.
+    TT_ERROR_PROGRAM_REFUSED = 127,
+    /// An L1 address and length overflow.
+    TT_ERROR_L1_ADDRESS_OVERFLOW = 128,
+    /// An L1 access runs past L1.
+    TT_ERROR_L1_ACCESS = 129,
+    /// A zero-length BAR0 access.
+    TT_ERROR_BAR0_ZERO_LENGTH = 130,
+    /// A BAR0 access overflows.
+    TT_ERROR_BAR0_OVERFLOW = 131,
+    /// A BAR0 access is not decoded.
+    TT_ERROR_BAR0_NOT_DECODED = 132,
+    /// A window is not aligned.
+    TT_ERROR_WINDOW_ALIGNMENT = 133,
+
+    // -- Runtime ---------------------------------------------------------------
+    /// A parameter address does not fit in a word.
+    TT_ERROR_PARAMETER_ADDRESS = 134,
+    /// The staged-program area does not fit in a word.
+    TT_ERROR_PROGRAM_AREA = 135,
+    /// A mover program does not fit the staged-program area.
+    TT_ERROR_PROGRAM_AREA_SIZE = 136,
+    /// A role program is longer than its mailbox slot holds.
+    TT_ERROR_ROLE_PROGRAM_SIZE = 137,
+    /// The device mutex is poisoned.
+    TT_ERROR_DEVICE_LOCK = 138,
+    /// A symbolic grid reaches lowering.
+    TT_TODO_SYMBOLIC_GRID = 139,
+    /// The program has more parameters than a launch can pass.
+    TT_ERROR_TOO_MANY_PARAMETERS = 140,
+    /// The program does no data movement and no compute.
+    TT_ERROR_EMPTY_MODULE = 141,
+    /// An unpack's X range is empty.
+    TT_ERROR_UNPACK_ZERO_RANGE = 142,
+    /// An unpack of zero datums.
+    TT_ERROR_UNPACK_ZERO_DATUMS = 143,
+    /// A pack of zero rows.
+    TT_ERROR_PACK_ZERO_ROWS = 144,
 }
 
 impl ttStatus {
@@ -101,6 +365,128 @@ impl ttStatus {
             ttStatus::TT_ERROR_ENDLOOP_WITHOUT_LOOP => "TT_ERROR_ENDLOOP_WITHOUT_LOOP",
             ttStatus::TT_TODO_LOOP => "TT_TODO_LOOP",
             ttStatus::TT_ERROR_CONDITION_NOT_BOOL => "TT_ERROR_CONDITION_NOT_BOOL",
+            ttStatus::TT_ERROR_BUFFER_SIZE_OVERFLOW => "TT_ERROR_BUFFER_SIZE_OVERFLOW",
+            ttStatus::TT_ERROR_BUFFER_BYTES_OVERFLOW => "TT_ERROR_BUFFER_BYTES_OVERFLOW",
+            ttStatus::TT_ERROR_VALUE_ORDER => "TT_ERROR_VALUE_ORDER",
+            ttStatus::TT_ERROR_VALUE_UNNAMED => "TT_ERROR_VALUE_UNNAMED",
+            ttStatus::TT_ERROR_CONST_BF16 => "TT_ERROR_CONST_BF16",
+            ttStatus::TT_ERROR_CONST_BOOL => "TT_ERROR_CONST_BOOL",
+            ttStatus::TT_ERROR_DIMENSION_NOT_INDEX => "TT_ERROR_DIMENSION_NOT_INDEX",
+            ttStatus::TT_ERROR_LOOP_BOUND_NOT_INDEX => "TT_ERROR_LOOP_BOUND_NOT_INDEX",
+            ttStatus::TT_ERROR_GRID_DIMENSION_NOT_INDEX => "TT_ERROR_GRID_DIMENSION_NOT_INDEX",
+            ttStatus::TT_ERROR_OFFSET_NOT_INDEX => "TT_ERROR_OFFSET_NOT_INDEX",
+            ttStatus::TT_ERROR_COPY_ENDS => "TT_ERROR_COPY_ENDS",
+            ttStatus::TT_ERROR_COPY_SCALAR_PARAM => "TT_ERROR_COPY_SCALAR_PARAM",
+            ttStatus::TT_ERROR_COPY_CAST => "TT_ERROR_COPY_CAST",
+            ttStatus::TT_ERROR_NOT_A_BUFFER => "TT_ERROR_NOT_A_BUFFER",
+            ttStatus::TT_ERROR_LOAD_PARAM_NOT_TILE => "TT_ERROR_LOAD_PARAM_NOT_TILE",
+            ttStatus::TT_ERROR_STORE_PARAM_NOT_TILE => "TT_ERROR_STORE_PARAM_NOT_TILE",
+            ttStatus::TT_ERROR_STORE_VALUE_NOT_REGISTER => "TT_ERROR_STORE_VALUE_NOT_REGISTER",
+            ttStatus::TT_ERROR_STORE_PARAM_CAST => "TT_ERROR_STORE_PARAM_CAST",
+            ttStatus::TT_ERROR_STORE_PARAM_VALUE_NOT_TILE => "TT_ERROR_STORE_PARAM_VALUE_NOT_TILE",
+            ttStatus::TT_ERROR_STORE_BUFFER_CAST => "TT_ERROR_STORE_BUFFER_CAST",
+            ttStatus::TT_ERROR_STORE_BUFFER_SHAPE => "TT_ERROR_STORE_BUFFER_SHAPE",
+            ttStatus::TT_ERROR_CAST_SOURCE => "TT_ERROR_CAST_SOURCE",
+            ttStatus::TT_ERROR_UNARY_OPERAND => "TT_ERROR_UNARY_OPERAND",
+            ttStatus::TT_ERROR_UNARY_NOT_BOOL => "TT_ERROR_UNARY_NOT_BOOL",
+            ttStatus::TT_ERROR_UNARY_BITNOT_NOT_I32 => "TT_ERROR_UNARY_BITNOT_NOT_I32",
+            ttStatus::TT_ERROR_UNARY_NOT_FLOAT => "TT_ERROR_UNARY_NOT_FLOAT",
+            ttStatus::TT_ERROR_BINARY_OPERANDS => "TT_ERROR_BINARY_OPERANDS",
+            ttStatus::TT_ERROR_BINARY_LOGICAL_NOT_BOOL => "TT_ERROR_BINARY_LOGICAL_NOT_BOOL",
+            ttStatus::TT_ERROR_BINARY_NOT_INTEGER => "TT_ERROR_BINARY_NOT_INTEGER",
+            ttStatus::TT_ERROR_BINARY_BOOL => "TT_ERROR_BINARY_BOOL",
+            ttStatus::TT_ERROR_BINARY_BROADCAST => "TT_ERROR_BINARY_BROADCAST",
+            ttStatus::TT_ERROR_SELECT_OPERANDS => "TT_ERROR_SELECT_OPERANDS",
+            ttStatus::TT_ERROR_SELECT_CAST => "TT_ERROR_SELECT_CAST",
+            ttStatus::TT_ERROR_SELECT_BROADCAST => "TT_ERROR_SELECT_BROADCAST",
+            ttStatus::TT_ERROR_SELECT_CONDITION_BROADCAST => "TT_ERROR_SELECT_CONDITION_BROADCAST",
+            ttStatus::TT_ERROR_MATMUL_OPERANDS => "TT_ERROR_MATMUL_OPERANDS",
+            ttStatus::TT_ERROR_MATMUL_NOT_TILES => "TT_ERROR_MATMUL_NOT_TILES",
+            ttStatus::TT_ERROR_MATMUL_CAST => "TT_ERROR_MATMUL_CAST",
+            ttStatus::TT_ERROR_LOOP_UNTERMINATED => "TT_ERROR_LOOP_UNTERMINATED",
+            ttStatus::TT_ERROR_VALUE_COUNT => "TT_ERROR_VALUE_COUNT",
+            ttStatus::TT_ERROR_TRUNCATED => "TT_ERROR_TRUNCATED",
+            ttStatus::TT_ERROR_DTYPE_TAG => "TT_ERROR_DTYPE_TAG",
+            ttStatus::TT_ERROR_NAME_UTF8 => "TT_ERROR_NAME_UTF8",
+            ttStatus::TT_ERROR_SHAPE_TERM_TAG => "TT_ERROR_SHAPE_TERM_TAG",
+            ttStatus::TT_ERROR_UNARY_TAG => "TT_ERROR_UNARY_TAG",
+            ttStatus::TT_ERROR_BINARY_TAG => "TT_ERROR_BINARY_TAG",
+            ttStatus::TT_ERROR_INSTRUCTION_TAG => "TT_ERROR_INSTRUCTION_TAG",
+            ttStatus::TT_TODO_CAST => "TT_TODO_CAST",
+            ttStatus::TT_TODO_BROADCAST => "TT_TODO_BROADCAST",
+            ttStatus::TT_TODO_BINARY_DTYPE => "TT_TODO_BINARY_DTYPE",
+            ttStatus::TT_TODO_MATMUL => "TT_TODO_MATMUL",
+            ttStatus::TT_ERROR_SCALAR_NO_ROWS => "TT_ERROR_SCALAR_NO_ROWS",
+            ttStatus::TT_TODO_SYMBOLIC_OFFSET => "TT_TODO_SYMBOLIC_OFFSET",
+            ttStatus::TT_TODO_UNARY_SFPU => "TT_TODO_UNARY_SFPU",
+            ttStatus::TT_TODO_BINARY_SFPU => "TT_TODO_BINARY_SFPU",
+            ttStatus::TT_ERROR_DATAPATH_DTYPE => "TT_ERROR_DATAPATH_DTYPE",
+            ttStatus::TT_ERROR_BUFFER_NOT_PLACED => "TT_ERROR_BUFFER_NOT_PLACED",
+            ttStatus::TT_ERROR_LANE_REGISTER => "TT_ERROR_LANE_REGISTER",
+            ttStatus::TT_ERROR_DST_ROW => "TT_ERROR_DST_ROW",
+            ttStatus::TT_ERROR_SEMAPHORE => "TT_ERROR_SEMAPHORE",
+            ttStatus::TT_ERROR_REPEAT_EMPTY => "TT_ERROR_REPEAT_EMPTY",
+            ttStatus::TT_ERROR_REPEAT_BODY => "TT_ERROR_REPEAT_BODY",
+            ttStatus::TT_ERROR_NEGATIVE_INDEX => "TT_ERROR_NEGATIVE_INDEX",
+            ttStatus::TT_ERROR_VALUE_NOT_IN_SCOPE => "TT_ERROR_VALUE_NOT_IN_SCOPE",
+            ttStatus::TT_ERROR_LOOP_UNMATCHED => "TT_ERROR_LOOP_UNMATCHED",
+            ttStatus::TT_ERROR_L1_OVERFLOW => "TT_ERROR_L1_OVERFLOW",
+            ttStatus::TT_ERROR_L1_ARENA => "TT_ERROR_L1_ARENA",
+            ttStatus::TT_TODO_SCALAR_PARAMETER => "TT_TODO_SCALAR_PARAMETER",
+            ttStatus::TT_ERROR_PARAM_OFFSET_OVERFLOW => "TT_ERROR_PARAM_OFFSET_OVERFLOW",
+            ttStatus::TT_ERROR_BUFFER_OFFSET_OVERFLOW => "TT_ERROR_BUFFER_OFFSET_OVERFLOW",
+            ttStatus::TT_ERROR_BUFFER_ADDRESS_OVERFLOW => "TT_ERROR_BUFFER_ADDRESS_OVERFLOW",
+            ttStatus::TT_ERROR_NOC_REQUEST_BYTES => "TT_ERROR_NOC_REQUEST_BYTES",
+            ttStatus::TT_ERROR_MOVER_PROGRAM => "TT_ERROR_MOVER_PROGRAM",
+            ttStatus::TT_ERROR_DST_SLOTS_EXHAUSTED => "TT_ERROR_DST_SLOTS_EXHAUSTED",
+            ttStatus::TT_ERROR_INSTRUCTION_NOT_INLINE => "TT_ERROR_INSTRUCTION_NOT_INLINE",
+            ttStatus::TT_ERROR_SEMINIT => "TT_ERROR_SEMINIT",
+            ttStatus::TT_ERROR_UNPACK_OP => "TT_ERROR_UNPACK_OP",
+            ttStatus::TT_ERROR_STALLWAIT => "TT_ERROR_STALLWAIT",
+            ttStatus::TT_ERROR_SETADCXX => "TT_ERROR_SETADCXX",
+            ttStatus::TT_ERROR_SETADCZW => "TT_ERROR_SETADCZW",
+            ttStatus::TT_ERROR_UNPACR => "TT_ERROR_UNPACR",
+            ttStatus::TT_ERROR_MATH_REPEAT_BODY => "TT_ERROR_MATH_REPEAT_BODY",
+            ttStatus::TT_ERROR_ENCODE => "TT_ERROR_ENCODE",
+            ttStatus::TT_ERROR_NO_ENCODING => "TT_ERROR_NO_ENCODING",
+            ttStatus::TT_ERROR_NOT_MATH => "TT_ERROR_NOT_MATH",
+            ttStatus::TT_ERROR_PACK_OP => "TT_ERROR_PACK_OP",
+            ttStatus::TT_ERROR_SETADCXX_PACK => "TT_ERROR_SETADCXX_PACK",
+            ttStatus::TT_ERROR_SETADCXY_PACK => "TT_ERROR_SETADCXY_PACK",
+            ttStatus::TT_ERROR_PACR => "TT_ERROR_PACR",
+            ttStatus::TT_ERROR_DLOPEN => "TT_ERROR_DLOPEN",
+            ttStatus::TT_ERROR_DLSYM => "TT_ERROR_DLSYM",
+            ttStatus::TT_ERROR_NO_DEVICE => "TT_ERROR_NO_DEVICE",
+            ttStatus::TT_ERROR_NOT_BLACKHOLE => "TT_ERROR_NOT_BLACKHOLE",
+            ttStatus::TT_ERROR_NO_TENSIX_TILE => "TT_ERROR_NO_TENSIX_TILE",
+            ttStatus::TT_ERROR_ALLOC_ZERO => "TT_ERROR_ALLOC_ZERO",
+            ttStatus::TT_ERROR_DRAM_ADDRESS_OVERFLOW => "TT_ERROR_DRAM_ADDRESS_OVERFLOW",
+            ttStatus::TT_ERROR_DRAM_FULL => "TT_ERROR_DRAM_FULL",
+            ttStatus::TT_ERROR_DRAM_RANGE => "TT_ERROR_DRAM_RANGE",
+            ttStatus::TT_ERROR_RESET_PC => "TT_ERROR_RESET_PC",
+            ttStatus::TT_ERROR_FIRMWARE_PANIC => "TT_ERROR_FIRMWARE_PANIC",
+            ttStatus::TT_ERROR_FIRMWARE_TIMEOUT => "TT_ERROR_FIRMWARE_TIMEOUT",
+            ttStatus::TT_ERROR_EMPTY_PROGRAM => "TT_ERROR_EMPTY_PROGRAM",
+            ttStatus::TT_ERROR_PROGRAM_TOO_LONG => "TT_ERROR_PROGRAM_TOO_LONG",
+            ttStatus::TT_ERROR_PROGRAM_OVERLAPS_ARGS => "TT_ERROR_PROGRAM_OVERLAPS_ARGS",
+            ttStatus::TT_ERROR_PROGRAM_REFUSED => "TT_ERROR_PROGRAM_REFUSED",
+            ttStatus::TT_ERROR_L1_ADDRESS_OVERFLOW => "TT_ERROR_L1_ADDRESS_OVERFLOW",
+            ttStatus::TT_ERROR_L1_ACCESS => "TT_ERROR_L1_ACCESS",
+            ttStatus::TT_ERROR_BAR0_ZERO_LENGTH => "TT_ERROR_BAR0_ZERO_LENGTH",
+            ttStatus::TT_ERROR_BAR0_OVERFLOW => "TT_ERROR_BAR0_OVERFLOW",
+            ttStatus::TT_ERROR_BAR0_NOT_DECODED => "TT_ERROR_BAR0_NOT_DECODED",
+            ttStatus::TT_ERROR_WINDOW_ALIGNMENT => "TT_ERROR_WINDOW_ALIGNMENT",
+            ttStatus::TT_ERROR_PARAMETER_ADDRESS => "TT_ERROR_PARAMETER_ADDRESS",
+            ttStatus::TT_ERROR_PROGRAM_AREA => "TT_ERROR_PROGRAM_AREA",
+            ttStatus::TT_ERROR_PROGRAM_AREA_SIZE => "TT_ERROR_PROGRAM_AREA_SIZE",
+            ttStatus::TT_ERROR_ROLE_PROGRAM_SIZE => "TT_ERROR_ROLE_PROGRAM_SIZE",
+            ttStatus::TT_ERROR_DEVICE_LOCK => "TT_ERROR_DEVICE_LOCK",
+            ttStatus::TT_TODO_SYMBOLIC_GRID => "TT_TODO_SYMBOLIC_GRID",
+            ttStatus::TT_ERROR_TOO_MANY_PARAMETERS => "TT_ERROR_TOO_MANY_PARAMETERS",
+            ttStatus::TT_ERROR_EMPTY_MODULE => "TT_ERROR_EMPTY_MODULE",
+            ttStatus::TT_ERROR_UNPACK_ZERO_RANGE => "TT_ERROR_UNPACK_ZERO_RANGE",
+            ttStatus::TT_ERROR_UNPACK_ZERO_DATUMS => "TT_ERROR_UNPACK_ZERO_DATUMS",
+            ttStatus::TT_ERROR_PACK_ZERO_ROWS => "TT_ERROR_PACK_ZERO_ROWS",
         }
     }
 }

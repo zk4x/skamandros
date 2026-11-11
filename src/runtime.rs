@@ -100,26 +100,23 @@ fn run(device: &mut Device, module: &Module, params: &[u64]) -> Result<(), Error
     let hi = device.dram_hi();
     for &address in params {
         let low = u32::try_from(address).map_err(|_| {
-            Error(format!(
-                "parameter address {address:#x} does not fit in a word"
-            ))
+            let _ = address;
+            Error::TT_ERROR_PARAMETER_ADDRESS
         })?;
         args.push(low);
         args.push(hi);
     }
 
-    let program_at = u32::try_from(crate::device::PROGRAM_AREA)
-        .map_err(|_| Error("the staged-program area does not fit in a word".into()))?;
+    let program_at =
+        u32::try_from(crate::device::PROGRAM_AREA).map_err(|_| Error::TT_ERROR_PROGRAM_AREA)?;
     let args_at = program_at + PROGRAM_BYTES;
     for (name, words) in [("reader", &module.reader), ("writer", &module.writer)] {
         if words.is_empty() {
             continue;
         }
         if 4 * words.len() as u32 > PROGRAM_BYTES {
-            return Err(Error(format!(
-                "the {name} program ({} words) does not fit in {PROGRAM_BYTES:#x} bytes",
-                words.len()
-            )));
+            let _ = (name, words.len());
+            return Err(Error::TT_ERROR_PROGRAM_AREA_SIZE);
         }
     }
 
@@ -129,18 +126,13 @@ fn run(device: &mut Device, module: &Module, params: &[u64]) -> Result<(), Error
     let arg_bytes: Vec<u8> = args.iter().flat_map(|w| w.to_le_bytes()).collect();
     device.l1_write(u64::from(args_at), &arg_bytes)?;
     if !module.reader.is_empty() {
-        device
-            .run_program(program_at, args_at, &module.reader, &args)
-            .map_err(|e| Error(format!("the reader program: {e}")))?;
+        device.run_program(program_at, args_at, &module.reader, &args)?;
     }
     if module.cores.iter().any(|words| !words.is_empty()) {
-        run_compute(device, module, args_at)
-            .map_err(|e| Error(format!("the compute cores: {e}")))?;
+        run_compute(device, module, args_at)?;
     }
     if !module.writer.is_empty() {
-        device
-            .run_program(program_at, args_at, &module.writer, &args)
-            .map_err(|e| Error(format!("the writer program: {e}")))?;
+        device.run_program(program_at, args_at, &module.writer, &args)?;
     }
     Ok(())
 }
@@ -158,11 +150,9 @@ fn run_compute(device: &mut Device, module: &Module, args_at: u32) -> Result<(),
     stage_role(device, 0, &module.setup, args_at)?;
     let (core, image, at) = crate::images::EXEC_ROLES[0];
     device.load_and_start(core, image, at)?;
-    device
-        .wait_for(mailbox::role::Mailbox::of(0).status(), |s| {
-            s == status::DONE
-        })
-        .map_err(|e| Error(format!("the setup run on thread 0: {e}")))?;
+    device.wait_for(mailbox::role::Mailbox::of(0).status(), |s| {
+        s == status::DONE
+    })?;
 
     let mut images = Vec::new();
     for (thread, words) in module.cores.iter().enumerate() {
@@ -178,9 +168,7 @@ fn run_compute(device: &mut Device, module: &Module, args_at: u32) -> Result<(),
             continue;
         }
         let mb = mailbox::role::Mailbox::of(thread as u32);
-        device
-            .wait_for(mb.status(), |s| s == status::DONE)
-            .map_err(|e| Error(format!("thread {thread}: {e}")))?;
+        device.wait_for(mb.status(), |s| s == status::DONE)?;
     }
     Ok(())
 }
@@ -193,11 +181,8 @@ fn stage_role(
     args_at: u32,
 ) -> Result<(), Error> {
     if words.len() as u32 > mailbox::PROGRAM_MAX {
-        return Err(Error(format!(
-            "the thread-{thread} program ({} words) is longer than the {} a slot holds",
-            words.len(),
-            mailbox::PROGRAM_MAX
-        )));
+        let _ = (thread, words.len());
+        return Err(Error::TT_ERROR_ROLE_PROGRAM_SIZE);
     }
     let mb = mailbox::role::Mailbox::of(thread as u32);
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -225,15 +210,11 @@ fn me_hi(tile: NocCoord<Noc0>) -> u32 {
 }
 
 fn lock() -> Result<std::sync::MutexGuard<'static, Option<Device>>, Error> {
-    DEVICE
-        .lock()
-        .map_err(|_| Error("the device lock is poisoned".into()))
+    DEVICE.lock().map_err(|_| Error::TT_ERROR_DEVICE_LOCK)
 }
 
 fn with_device<T>(f: impl FnOnce(&mut Device) -> Result<T, Error>) -> Result<T, Error> {
     let mut device = lock()?;
-    let device = device
-        .as_mut()
-        .ok_or_else(|| Error("no device is open: call ttInit first".into()))?;
+    let device = device.as_mut().ok_or(Error::TT_ERROR_NO_DEVICE)?;
     f(device)
 }

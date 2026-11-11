@@ -54,10 +54,8 @@ impl Words {
             let mut out = Vec::with_capacity(program.len() + 1);
             for instruction in program {
                 out.push(instruction.ttinsn_word().ok_or_else(|| {
-                    Error(format!(
-                        "instruction {:#010x} has no `.ttinsn` form; it cannot sit inline",
-                        instruction.word()
-                    ))
+                    let _ = instruction;
+                    Error::TT_ERROR_INSTRUCTION_NOT_INLINE
                 })?);
             }
             out.push(crate::riscv::ret());
@@ -98,10 +96,8 @@ pub fn setup(slots: u8) -> Result<Vec<u32>, Error> {
         .into_iter()
         .map(|i| {
             i.ttinsn_word().ok_or_else(|| {
-                Error(format!(
-                    "instruction {:#010x} has no `.ttinsn` form; it cannot sit inline",
-                    i.word()
-                ))
+                let _ = i;
+                Error::TT_ERROR_INSTRUCTION_NOT_INLINE
             })
         })
         .collect::<Result<_, _>>()?;
@@ -126,10 +122,10 @@ fn semaphore_init(slots: u8) -> Result<Vec<Instruction>, Error> {
         (crate::lower::SEM_SLOT, slots),
     ] {
         let sem = semaphore(index)?;
-        out.push(
-            sync::init(sem, value, max)
-                .map_err(|e| Error(format!("SEMINIT on semaphore {index}: {e}")))?,
-        );
+        out.push(sync::init(sem, value, max).map_err(|_| {
+            let _ = index;
+            Error::TT_ERROR_SEMINIT
+        })?);
     }
     Ok(out)
 }
@@ -142,7 +138,10 @@ fn cc_mask(on: bool) -> Result<Instruction, tt_isa::isa::EncodeError> {
 }
 
 fn semaphore(index: u8) -> Result<Semaphore, Error> {
-    Semaphore::new(index).ok_or_else(|| Error(format!("semaphore {index} does not exist")))
+    Semaphore::new(index).ok_or_else(|| {
+        let _ = index;
+        Error::TT_ERROR_SEMAPHORE
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -168,7 +167,7 @@ fn encode_unpack(ops: &[MirOp], out: &mut Vec<Instruction>) -> Result<(), Error>
             MirOp::Setdst { row } => state.dst_row = row,
             MirOp::Setadcx { first, count, .. } => {
                 if count == 0 {
-                    return Err(Error("an unpack with a zero X range".into()));
+                    return Err(Error::TT_ERROR_UNPACK_ZERO_RANGE);
                 }
                 state.x0 = first;
                 state.x1 = first + count - 1;
@@ -182,7 +181,7 @@ fn encode_unpack(ops: &[MirOp], out: &mut Vec<Instruction>) -> Result<(), Error>
                     state.started = true;
                 }
                 if count == 0 {
-                    return Err(Error("an unpack of zero datums".into()));
+                    return Err(Error::TT_ERROR_UNPACK_ZERO_DATUMS);
                 }
                 state.x0 = 0;
                 state.x1 = count - 1;
@@ -205,7 +204,10 @@ fn encode_unpack(ops: &[MirOp], out: &mut Vec<Instruction>) -> Result<(), Error>
             MirOp::SemWait { sem, .. } => {
                 out.extend(sync::take(semaphore(sem)?, Before::EVERYTHING));
             }
-            other => return Err(Error(format!("the unpack program cannot encode {other:?}"))),
+            other => {
+                let _ = other;
+                return Err(Error::TT_ERROR_UNPACK_OP);
+            }
         }
     }
     Ok(())
@@ -242,7 +244,10 @@ fn config_program(words: &ConfigWords) -> Vec<Instruction> {
 }
 
 fn stallwait(block_mask: u32, condition: u32) -> Result<Instruction, Error> {
-    backend::stallwait(block_mask, condition).map_err(|e| Error(format!("stallwait: {e}")))
+    backend::stallwait(block_mask, condition).map_err(|e| {
+        let _ = e;
+        Error::TT_ERROR_STALLWAIT
+    })
 }
 
 /// The unpacker's `Config` for one unit: base, destination, X dimension, FP32
@@ -328,7 +333,10 @@ fn set_adc_x_unpack(first: u32, last: u32) -> Result<Instruction, Error> {
         .x0_val(first)
         .x1_val(last)
         .encode()
-        .map_err(|e| Error(format!("SETADCXX: {e}")))
+        .map_err(|e| {
+            let _ = e;
+            Error::TT_ERROR_SETADCXX
+        })
 }
 
 fn set_adc_z_unpack(face: u32) -> Result<Instruction, Error> {
@@ -337,7 +345,10 @@ fn set_adc_z_unpack(face: u32) -> Result<Instruction, Error> {
         .z0(1)
         .z0_val(face)
         .encode()
-        .map_err(|e| Error(format!("SETADCZW: {e}")))
+        .map_err(|e| {
+            let _ = e;
+            Error::TT_ERROR_SETADCZW
+        })
 }
 
 fn unpack_instruction() -> Result<Instruction, Error> {
@@ -346,7 +357,10 @@ fn unpack_instruction() -> Result<Instruction, Error> {
         .which_unpacker(0)
         .multi_context_mode(1)
         .encode()
-        .map_err(|e| Error(format!("UNPACR: {e}")))?;
+        .map_err(|e| {
+            let _ = e;
+            Error::TT_ERROR_UNPACR
+        })?;
     Ok(Instruction::new(base.word() | 1, &defs::UNPACR_Regular))
 }
 
@@ -360,7 +374,8 @@ fn encode_math(ops: &[MirOp], out: &mut Vec<Instruction>) -> Result<(), Error> {
         match ops[at] {
             MirOp::Repeat { len, count } => {
                 let body = ops.get(at + 1..at + 1 + len as usize).ok_or_else(|| {
-                    Error(format!("math[{at}]: repeat body runs past the program"))
+                    let _ = at;
+                    Error::TT_ERROR_MATH_REPEAT_BODY
                 })?;
                 for iteration in 0..u32::from(count) {
                     for op in body {
@@ -381,7 +396,8 @@ fn encode_math(ops: &[MirOp], out: &mut Vec<Instruction>) -> Result<(), Error> {
 /// iteration).
 fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Vec<Instruction>) -> Result<(), Error> {
     fn bad(e: impl std::fmt::Display, op: &MirOp) -> Error {
-        Error(format!("{op:?}: {e}"))
+        let _ = (e, op);
+        Error::TT_ERROR_ENCODE
     }
     let bad_isa = |e: tt_isa::isa::EncodeError| bad(e, op);
     match *op {
@@ -495,7 +511,10 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Vec<Instruction>) -> Res
         } => {
             out.push(encode::sfpnot(u32::from(a), u32::from(d)).map_err(bad_isa)?);
         }
-        MirOp::Sfp { .. } => return Err(Error(format!("{op:?} has no encoding yet"))),
+        MirOp::Sfp { .. } => {
+            let _ = op;
+            return Err(Error::TT_ERROR_NO_ENCODING);
+        }
         MirOp::Compare { op: cmp, a, b, d } => {
             let set_vd = 8u32;
             let (first, second) = match cmp {
@@ -557,7 +576,10 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Vec<Instruction>) -> Res
         MirOp::SemGet { sem } => {
             out.push(sync::get(semaphore(sem)?));
         }
-        other => return Err(Error(format!("{other:?} is not a math instruction"))),
+        other => {
+            let _ = other;
+            return Err(Error::TT_ERROR_NOT_MATH);
+        }
     }
     Ok(())
 }
@@ -596,7 +618,7 @@ fn encode_pack(ops: &[MirOp], out: &mut Vec<Instruction>) -> Result<(), Error> {
                     started = true;
                 }
                 if rows == 0 {
-                    return Err(Error("a pack of zero rows".into()));
+                    return Err(Error::TT_ERROR_PACK_ZERO_ROWS);
                 }
                 let mut words = ConfigWords::new();
                 pack_config(&mut words, dst, int);
@@ -604,7 +626,10 @@ fn encode_pack(ops: &[MirOp], out: &mut Vec<Instruction>) -> Result<(), Error> {
                 out.push(stallwait(block::PACKER | block::CONFIG, cond::CONFIG_BUSY)?);
                 pack_rows(out, rows, last)?;
             }
-            other => return Err(Error(format!("the pack program cannot encode {other:?}"))),
+            other => {
+                let _ = other;
+                return Err(Error::TT_ERROR_PACK_OP);
+            }
         }
     }
     Ok(())
@@ -692,7 +717,10 @@ fn pack_rows(out: &mut Vec<Instruction>, rows: u32, last: bool) -> Result<(), Er
             .x0_val(0)
             .x1_val(15)
             .encode()
-            .map_err(|e| Error(format!("SETADCXX (pack): {e}")))?,
+            .map_err(|e| {
+                let _ = e;
+                Error::TT_ERROR_SETADCXX_PACK
+            })?,
     );
     out.push(
         encode::Setadcxy::ZERO
@@ -700,7 +728,10 @@ fn pack_rows(out: &mut Vec<Instruction>, rows: u32, last: bool) -> Result<(), Er
             .y0(1)
             .y0_val(0)
             .encode()
-            .map_err(|e| Error(format!("SETADCXY (pack): {e}")))?,
+            .map_err(|e| {
+                let _ = e;
+                Error::TT_ERROR_SETADCXY_PACK
+            })?,
     );
     let groups = rows.div_ceil(4);
     for group in 0..groups {
@@ -717,7 +748,10 @@ fn pack_rows(out: &mut Vec<Instruction>, rows: u32, last: bool) -> Result<(), Er
                 .addr_mod(if is_last { 0 } else { PACK_ADDR_MOD_NEXT_GROUP })
                 .last(u32::from(is_last))
                 .encode()
-                .map_err(|e| Error(format!("PACR: {e}")))?,
+                .map_err(|e| {
+                    let _ = e;
+                    Error::TT_ERROR_PACR
+                })?,
         );
     }
     Ok(())

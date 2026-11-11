@@ -81,26 +81,27 @@ impl Lib {
     /// `dlopen` the simulator and resolve the entry points. The library is
     /// initialized on the first successful load, once per process.
     fn open(path: &OsStr) -> Result<&'static Lib, Error> {
-        static LIB: OnceLock<Result<&'static Lib, String>> = OnceLock::new();
-        LIB.get_or_init(|| Self::load(path).map_err(|e| e.to_string()))
+        static LIB: OnceLock<Result<&'static Lib, Error>> = OnceLock::new();
+        LIB.get_or_init(|| Self::load(path))
             .as_ref()
             .map(|lib| *lib)
-            .map_err(|e| Error(e.clone()))
+            .map_err(|e| *e)
     }
 
     fn load(path: &OsStr) -> Result<&'static Lib, Error> {
         // SAFETY: the caller named a libttsim shared object; loading a shared
         // object runs its initializers, which is what the caller asked for.
         let library = unsafe { Library::new(path) }.map_err(|e| {
-            Error(format!(
-                "cannot dlopen {}: {e}",
-                PathBuf::from(path).display()
-            ))
+            let _ = (e, PathBuf::from(path));
+            Error::TT_ERROR_DLOPEN
         })?;
         macro_rules! sym {
             ($name:literal) => {{
                 let s: Symbol<'_, _> = unsafe { library.get(concat!($name, "\0").as_bytes()) }
-                    .map_err(|e| Error(format!("libttsim has no `{}`: {e}", $name)))?;
+                    .map_err(|e| {
+                        let _ = (e, $name);
+                        Error::TT_ERROR_DLSYM
+                    })?;
                 *s
             }};
         }
@@ -190,21 +191,19 @@ impl Device {
         // every address constant above is Blackhole's.
         let id = lib.config_rd32(0, 0);
         if id == u32::MAX {
-            return Err(Error("no chip answers configuration space at bdf 0".into()));
+            return Err(Error::TT_ERROR_NO_DEVICE);
         }
         let vendor = (id & 0xFFFF) as u16;
         let device = (id >> 16) as u16;
         if vendor != VENDOR_ID_TENSTORRENT || device != DEVICE_ID_BLACKHOLE {
-            return Err(Error(format!(
-                "the device is {vendor:#06x}:{device:#06x}, not a Blackhole \
-                 ({VENDOR_ID_TENSTORRENT:#06x}:{DEVICE_ID_BLACKHOLE:#06x})"
-            )));
+            let _ = (vendor, device);
+            return Err(Error::TT_ERROR_NOT_BLACKHOLE);
         }
 
         let tile = tt_isa::noc::grid::Tensix::FULL
             .tiles::<Noc0>()
             .next()
-            .ok_or_else(|| Error("the chip has no Tensix tile".into()))?;
+            .ok_or(Error::TT_ERROR_NO_TENSIX_TILE)?;
         Ok(Device {
             lib,
             shadow: None,
@@ -232,16 +231,15 @@ impl Device {
     /// offset. This is what a caller passes back to `ttMemcpy` and `ttLaunch`.
     pub fn alloc_dram(&mut self, bytes: usize) -> Result<u64, Error> {
         if bytes == 0 {
-            return Err(Error("cannot allocate zero bytes".into()));
+            return Err(Error::TT_ERROR_ALLOC_ZERO);
         }
         let at = self.dram_used.next_multiple_of(64);
         let end = at
             .checked_add(bytes as u64)
-            .ok_or_else(|| Error("allocation overflows the DRAM address space".into()))?;
+            .ok_or(Error::TT_ERROR_DRAM_ADDRESS_OVERFLOW)?;
         if end > CHANNEL_BYTES {
-            return Err(Error(format!(
-                "{bytes} bytes does not fit in DRAM channel 0 ({at:#x}..{CHANNEL_BYTES:#x} used)"
-            )));
+            let _ = (bytes, at);
+            return Err(Error::TT_ERROR_DRAM_FULL);
         }
         self.dram_used = end;
         Ok(at)
@@ -263,10 +261,8 @@ impl Device {
     pub fn dram_write(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {
         let channel = self.dram_channel();
         let range = channel.range(offset, bytes.len() as u64).ok_or_else(|| {
-            Error(format!(
-                "{} bytes at {offset:#x} do not fit in DRAM channel 0",
-                bytes.len()
-            ))
+            let _ = (bytes.len(), offset);
+            Error::TT_ERROR_DRAM_RANGE
         })?;
         let ep = self.channel_endpoint(channel);
         self.window_write(ep, range.offset(), bytes)?;
@@ -288,10 +284,8 @@ impl Device {
     pub fn dram_read(&mut self, offset: u64, out: &mut [u8]) -> Result<(), Error> {
         let channel = self.dram_channel();
         channel.range(offset, out.len() as u64).ok_or_else(|| {
-            Error(format!(
-                "{} bytes does not fit in DRAM channel 0",
-                out.len()
-            ))
+            let _ = out.len();
+            Error::TT_ERROR_DRAM_RANGE
         })?;
         let ep = self.channel_endpoint(channel);
         self.window_read(ep, offset, out)
@@ -357,10 +351,8 @@ impl Device {
             }
             None if at == u64::from(core.default_reset_pc()) => {}
             None => {
-                return Err(Error(format!(
-                    "{core:?} starts at L1 offset {:#x}; it cannot be loaded at {at:#x}",
-                    core.default_reset_pc()
-                )));
+                let _ = (core, at);
+                return Err(Error::TT_ERROR_RESET_PC);
             }
         }
         Ok(())
@@ -402,12 +394,12 @@ impl Device {
             }
             if value == status::PANICKED {
                 let code = self.read32(mailbox::PANIC_CODE)?;
-                return Err(Error(format!("firmware panicked with code {code}")));
+                let _ = code;
+                return Err(Error::TT_ERROR_FIRMWARE_PANIC);
             }
             if waited >= BUDGET {
-                return Err(Error(format!(
-                    "the core did not answer within {BUDGET} cycles; last status {value:#010x}"
-                )));
+                let _ = value;
+                return Err(Error::TT_ERROR_FIRMWARE_TIMEOUT);
             }
             self.clock(CYCLES_PER_POLL);
             waited += u64::from(CYCLES_PER_POLL);
@@ -441,19 +433,15 @@ impl Device {
         args: &[u32],
     ) -> Result<u32, Error> {
         if words.is_empty() {
-            return Err(Error("an empty program cannot be run".into()));
+            return Err(Error::TT_ERROR_EMPTY_PROGRAM);
         }
         if words.len() as u64 > mailbox::exec::MAX_WORDS {
-            return Err(Error(format!(
-                "{} words is longer than the executor's limit of {}",
-                words.len(),
-                mailbox::exec::MAX_WORDS
-            )));
+            let _ = words.len();
+            return Err(Error::TT_ERROR_PROGRAM_TOO_LONG);
         }
         if (program_at as u64) + 4 * words.len() as u64 > args_at as u64 {
-            return Err(Error(format!(
-                "the program at {program_at:#x} would run into its arguments at {args_at:#x}"
-            )));
+            let _ = (program_at, args_at);
+            return Err(Error::TT_ERROR_PROGRAM_OVERLAPS_ARGS);
         }
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         self.l1_write(u64::from(program_at), &code)?;
@@ -469,9 +457,8 @@ impl Device {
         self.wait_for(mailbox::exec::DONE, |d| d == seq)?;
         let error = self.read32(mailbox::exec::ERROR)?;
         if error != 0 {
-            return Err(Error(format!(
-                "the program on RISCV B was refused (error {error})"
-            )));
+            let _ = error;
+            return Err(Error::TT_ERROR_PROGRAM_REFUSED);
         }
         self.read32(mailbox::exec::RET)
     }
@@ -551,12 +538,10 @@ impl Device {
     fn check_l1(&self, address: u64, len: usize) -> Result<(), Error> {
         let end = address
             .checked_add(len as u64)
-            .ok_or_else(|| Error("L1 address overflows".into()))?;
+            .ok_or(Error::TT_ERROR_L1_ADDRESS_OVERFLOW)?;
         if end > tensix::L1_SIZE {
-            return Err(Error(format!(
-                "L1 access {address:#x}..{end:#x} runs past L1 ({:#x})",
-                tensix::L1_SIZE
-            )));
+            let _ = (address, end);
+            return Err(Error::TT_ERROR_L1_ACCESS);
         }
         Ok(())
     }
@@ -584,17 +569,16 @@ const fn window_bar_offset() -> u64 {
 /// the configuration array.
 fn check_bar0(offset: u64, len: usize) -> Result<(), Error> {
     if len == 0 {
-        return Err(Error("zero-length access".into()));
+        return Err(Error::TT_ERROR_BAR0_ZERO_LENGTH);
     }
     let end = offset
         .checked_add(len as u64)
-        .ok_or_else(|| Error("BAR0 access overflows".into()))?;
+        .ok_or(Error::TT_ERROR_BAR0_OVERFLOW)?;
     let in_aperture = end <= 202 * WINDOW_SIZE;
     let in_config = offset >= TLB_CONFIG_BASE && end <= TLB_CONFIG_BASE + 210 * 12;
     if !in_aperture && !in_config {
-        return Err(Error(format!(
-            "BAR0 access {offset:#x}..{end:#x} is not decoded"
-        )));
+        let _ = (offset, end);
+        return Err(Error::TT_ERROR_BAR0_NOT_DECODED);
     }
     Ok(())
 }
@@ -602,9 +586,8 @@ fn check_bar0(offset: u64, len: usize) -> Result<(), Error> {
 /// Encode the three dwords of a 2 MiB unicast window on NoC #0, strict ordering.
 fn tlb_words(base_address: u64, tile: NocCoord<Noc0>) -> Result<[u32; 3], Error> {
     if base_address % WINDOW_SIZE != 0 {
-        return Err(Error(format!(
-            "device address {base_address:#x} is not {WINDOW_SIZE:#x}-byte aligned"
-        )));
+        let _ = base_address;
+        return Err(Error::TT_ERROR_WINDOW_ALIGNMENT);
     }
     // Field positions, `HostToDeviceTLBs.md`: local offset 43 bits, then the
     // unicast end coordinate, NoC index and ordering.

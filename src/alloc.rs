@@ -84,9 +84,8 @@ pub fn allocate(k: &Kernel, types: &Types) -> Result<Alloc, Error> {
             continue;
         }
         let Some(slot) = free.iter().position(|in_use| !in_use) else {
-            return Err(Error(format!(
-                "value %{value} needs a Dst slot but all {DST_SLOTS} are live"
-            )));
+            let _ = (value, DST_SLOTS);
+            return Err(Error::TT_ERROR_DST_SLOTS_EXHAUSTED);
         };
         free[slot] = true;
         place[value as usize] = Some(Place::Dst(slot as u8));
