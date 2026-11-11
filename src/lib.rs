@@ -19,6 +19,7 @@ pub mod alloc;
 pub mod images;
 pub mod ir;
 pub mod lower;
+pub mod optimize;
 pub mod mir;
 pub mod mover;
 pub mod planner;
