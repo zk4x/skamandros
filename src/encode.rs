@@ -41,12 +41,29 @@ pub struct Words {
 
 impl Words {
     /// The encoded words, as the program slot takes them.
-    pub fn words(&self) -> [Vec<u32>; 3] {
-        [
-            self.t0.iter().map(|i| i.word()).collect(),
-            self.t1.iter().map(|i| i.word()).collect(),
-            self.t2.iter().map(|i| i.word()).collect(),
-        ]
+    ///
+    /// A role's program is RISC-V code with the Tensix words inline, so each
+    /// Tensix word goes in as the `.ttinsn` operand form (rotated left two) and
+    /// a non-empty program ends in `ret`; an empty one is not started, and gets
+    /// no `ret` that would make it look non-empty.
+    pub fn words(&self) -> Result<[Vec<u32>; 3], Error> {
+        let one = |program: &[Instruction]| {
+            if program.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut out = Vec::with_capacity(program.len() + 1);
+            for instruction in program {
+                out.push(instruction.ttinsn_word().ok_or_else(|| {
+                    Error(format!(
+                        "instruction {:#010x} has no `.ttinsn` form; it cannot sit inline",
+                        instruction.word()
+                    ))
+                })?);
+            }
+            out.push(crate::riscv::ret());
+            Ok(out)
+        };
+        Ok([one(&self.t0)?, one(&self.t1)?, one(&self.t2)?])
     }
 }
 
@@ -77,10 +94,21 @@ pub fn encode(m: &Machine) -> Result<Words, Error> {
 /// another role has already posted. The semaphore that counts free `Dst` slots
 /// starts at one instead of zero, because the first load has a slot to fill.
 pub fn setup(slots: u8) -> Result<Vec<u32>, Error> {
-    Ok(semaphore_init(slots)?
+    let mut out: Vec<u32> = semaphore_init(slots)?
         .into_iter()
-        .map(|i| i.word())
-        .collect())
+        .map(|i| {
+            i.ttinsn_word().ok_or_else(|| {
+                Error(format!(
+                    "instruction {:#010x} has no `.ttinsn` form; it cannot sit inline",
+                    i.word()
+                ))
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    // A program is RISC-V code ending in `ret` (NOTES, "Role programs are
+    // RISC-V code"); the setup run is called by T0's executor like any other.
+    out.push(crate::riscv::ret());
+    Ok(out)
 }
 
 /// `SEMINIT` each semaphore with max 1 — the boot sequence's shape.

@@ -69,7 +69,7 @@ pub fn compile(k: &Kernel) -> Result<Module, Error> {
         params,
         reader,
         writer,
-        cores: words.words(),
+        cores: words.words()?,
         setup,
     };
     if module.reader.is_empty()

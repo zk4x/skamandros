@@ -49,6 +49,19 @@ fn main() {
             tt_isa::mailbox::role::BASE + t * tt_isa::mailbox::role::STRIDE,
         );
     }
+    // The role executors (NOTES "Role programs are RISC-V code"): the same
+    // slots the pushers took, each with its own role mailbox.
+    for (bin, script, t) in [
+        ("exec_t0", "link_role_t0.x", 0),
+        ("exec_t1", "link_role_t1.x", 1),
+        ("exec_t2", "link_role_t2.x", 2),
+    ] {
+        link(
+            bin,
+            script,
+            tt_isa::mailbox::role::BASE + t * tt_isa::mailbox::role::STRIDE,
+        );
+    }
     // The `.ttinsn` experiment image, linked as the T1 role image is
     // (`docs/plans/ttinsn-push-experiment.md`). Only when the feature is on: cargo
     // refuses link arguments for a binary it is not building.

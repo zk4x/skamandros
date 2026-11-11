@@ -70,10 +70,14 @@ form (`TTIR`).
 - **L1 is declared, not managed.** The program declares every buffer and its
   shape; the compiler places it and may not change its size. The shape is the
   footprint, so a `32,64` buffer is two pages and the program chooses it.
-- **The firmware ships inside the library.** `exec_b`, the NC mover and the three
-  role images are built from `firmware/tt-firmware` and embedded, so a consumer
-  needs neither the RISC-V target nor `llvm-objcopy`. This is what makes the
-  `.so` self-contained.
+- **The firmware ships inside the library.** `exec_b`, the three role executors
+  (`exec_t0`/`exec_t1`/`exec_t2`), the NC mover and the other images are built
+  from `firmware/tt-firmware` and embedded, so a consumer needs neither the
+  RISC-V target nor `llvm-objcopy`. This is what makes the `.so` self-contained.
+- **A role program is RISC-V code, as in tt-metal.** T0/T1/T2 and the movers are
+  programs the firmware calls with the launch arguments in `a0`; the Tensix
+  words sit inline as the `.ttinsn` form, and a program returns with `ret`. There
+  is no staged word list pushed into `INSTRN_BUF`.
 - **A program format, not a Rust API.** C ABI only: pointers, lengths, scalars.
   Everything else in the crate is free to move.
 
@@ -182,8 +186,8 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   runs end to end through the C ABI, and the bytes come back equal.
 - An elementwise kernel runs the whole datapath through the C ABI: the inbound
   mover on RISCV B, the three compute cores (unpack on T0, math on T1, pack on
-  T2) released together, and the outbound mover. A 32x32 FP32 tile of inputs
-  comes back negated, every datum.
+  T2) released together as RISC-V programs, and the outbound mover. A 32x32 FP32
+  tile of inputs comes back negated, every datum.
 - The three compute programs are paced as a ring by three semaphores: the
   packer hands a `Dst` slot back, the unpacker publishes each loaded unit, and
   the math core publishes each stored one. Thread 0 runs the setup program

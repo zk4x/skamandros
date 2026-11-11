@@ -124,13 +124,18 @@ fn run(device: &mut Device, module: &Module, params: &[u64]) -> Result<(), Error
     }
 
     device.start_executor()?;
+    // Every core of the launch reads the same arguments array; write it before
+    // the first core starts, not only as a side effect of a mover run.
+    let arg_bytes: Vec<u8> = args.iter().flat_map(|w| w.to_le_bytes()).collect();
+    device.l1_write(u64::from(args_at), &arg_bytes)?;
     if !module.reader.is_empty() {
         device
             .run_program(program_at, args_at, &module.reader, &args)
             .map_err(|e| Error(format!("the reader program: {e}")))?;
     }
     if module.cores.iter().any(|words| !words.is_empty()) {
-        run_compute(device, module).map_err(|e| Error(format!("the compute cores: {e}")))?;
+        run_compute(device, module, args_at)
+            .map_err(|e| Error(format!("the compute cores: {e}")))?;
     }
     if !module.writer.is_empty() {
         device
@@ -148,10 +153,10 @@ fn run(device: &mut Device, module: &Module, params: &[u64]) -> Result<(), Error
 /// program (the semaphore initialisation) to completion, and only after that are
 /// the three roles released together — the order tt-metal uses, where BRISC
 /// initialises the semaphores before it releases the TRISCs.
-fn run_compute(device: &mut Device, module: &Module) -> Result<(), Error> {
+fn run_compute(device: &mut Device, module: &Module, args_at: u32) -> Result<(), Error> {
     device.release_tensix_backend()?;
-    stage_role(device, 0, &module.setup)?;
-    let (core, image, at) = crate::images::ROLES[0];
+    stage_role(device, 0, &module.setup, args_at)?;
+    let (core, image, at) = crate::images::EXEC_ROLES[0];
     device.load_and_start(core, image, at)?;
     device
         .wait_for(mailbox::role::Mailbox::of(0).status(), |s| {
@@ -164,8 +169,8 @@ fn run_compute(device: &mut Device, module: &Module) -> Result<(), Error> {
         if words.is_empty() {
             continue;
         }
-        stage_role(device, thread, words)?;
-        images.push(crate::images::ROLES[thread]);
+        stage_role(device, thread, words, args_at)?;
+        images.push(crate::images::EXEC_ROLES[thread]);
     }
     device.load_and_start_together(&images)?;
     for (thread, words) in module.cores.iter().enumerate() {
@@ -181,7 +186,12 @@ fn run_compute(device: &mut Device, module: &Module) -> Result<(), Error> {
 }
 
 /// Stage `words` in `thread`'s role slot and write its descriptor.
-fn stage_role(device: &mut Device, thread: usize, words: &[u32]) -> Result<(), Error> {
+fn stage_role(
+    device: &mut Device,
+    thread: usize,
+    words: &[u32],
+    args_at: u32,
+) -> Result<(), Error> {
     if words.len() as u32 > mailbox::PROGRAM_MAX {
         return Err(Error(format!(
             "the thread-{thread} program ({} words) is longer than the {} a slot holds",
@@ -197,7 +207,10 @@ fn stage_role(device: &mut Device, thread: usize, words: &[u32]) -> Result<(), E
         thread_index: thread as u32,
         dst_access_fmt: 0,
         program_len: words.len() as u32,
-        push_window: mailbox::SIM_PUSH_WINDOW,
+        // An executor calls the program; there is nothing to push and no push
+        // window. The program lives in the fixed slot (`program_addr` 0).
+        push_window: 0,
+        args: args_at,
         ..Default::default()
     };
     for (at, value) in descriptor.writes(mb) {

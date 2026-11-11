@@ -45,6 +45,28 @@ pub const ROLES: [Image; 3] = [
 /// from the mailbox, invalidates the I-cache and calls it.
 pub const EXEC_B: &[u8] = include_bytes!(env!("FIRMWARE_EXEC_B"));
 
+/// The three role executors -- unpack on T0, math on T1, pack on T2 -- each
+/// linked at its role slot. They read their own role mailbox and call the
+/// program with `a0` at its arguments, the way tt-metal's firmware calls a
+/// kernel; nothing is pushed.
+pub const EXEC_ROLES: [Image; 3] = [
+    (
+        Core::T0,
+        include_bytes!(env!("FIRMWARE_EXEC_T0")),
+        tt_isa::l1::roles::BASE[0],
+    ),
+    (
+        Core::T1,
+        include_bytes!(env!("FIRMWARE_EXEC_T1")),
+        tt_isa::l1::roles::BASE[1],
+    ),
+    (
+        Core::T2,
+        include_bytes!(env!("FIRMWARE_EXEC_T2")),
+        tt_isa::l1::roles::BASE[2],
+    ),
+];
+
 /// RISCV NC's mover image (`tt_isa::dm::nc`), reached through the stub at NC's
 /// reset PC.
 pub const DM_NC: &[u8] = include_bytes!(env!("FIRMWARE_DM_NC"));
@@ -59,6 +81,9 @@ pub const DM_B: &[u8] = include_bytes!(env!("FIRMWARE_DM_B"));
 pub fn all() -> Vec<(&'static str, &'static [u8])> {
     vec![
         ("exec_b", EXEC_B),
+        ("exec_t0", EXEC_ROLES[0].1),
+        ("exec_t1", EXEC_ROLES[1].1),
+        ("exec_t2", EXEC_ROLES[2].1),
         ("dm_nc", DM_NC),
         ("dm_b", DM_B),
         ("role_t0", ROLES[0].1),

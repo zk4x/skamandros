@@ -80,6 +80,54 @@ where
     run_in::<Riscv, Thread>(Mailbox::of(Thread::INDEX), true)
 }
 
+/// Run a role's program as RISC-V code, the way tt-metal's kernels run: the
+/// firmware reads the program address, word count and arguments base from the
+/// role mailbox, invalidates the instruction cache for the last written word,
+/// calls the program with `a0` at the arguments, and publishes the return.
+///
+/// The program is a leaf of RV32IM with the Tensix words inline (`.ttinsn`);
+/// like tt-metal's kernels it ends in `ret` and uses the caller-saved registers
+/// only. There is no push and no MOP/replay setup: the core executes the stream.
+pub fn run_exec<Thread>() -> !
+where
+    Thread: TensixThread,
+{
+    let mb = Mailbox::of(Thread::INDEX);
+    crate::disable_gathering();
+    // SAFETY: fixed aligned mailbox words inside L1; the host wrote the
+    // descriptor before this core left reset.
+    unsafe { l1_write32(mb.status(), status::RUNNING) };
+    publish();
+    let mut program = unsafe { l1_read32(mb.program_addr()) } as u64;
+    let words = unsafe { l1_read32(mb.program_len()) };
+    let args = unsafe { l1_read32(mb.args()) };
+    if program == 0 {
+        program = mb.program();
+    }
+    // A bad address would execute whatever lies there, so the range is checked
+    // here rather than trusted: the fixed slot, or the program cache.
+    let bytes = u64::from(words) * 4;
+    let in_slot = program >= mailbox::PROGRAM_REGION
+        && program % 4 == 0
+        && program + bytes <= mailbox::PROGRAM_REGION_END;
+    let in_cache = program % 16 == 0 && tt_isa::l1::PROGRAM_CACHE.contains(program, bytes);
+    if words == 0 || words > mailbox::PROGRAM_MAX || !(in_slot || in_cache) {
+        fail_in(mb, mailbox::panic_code::EXPLICIT);
+    }
+    // SAFETY: the range was checked above, and the host published the words
+    // before starting this core. The mask is this core's cache bit.
+    unsafe {
+        crate::ttinsn::invalidate_icache(program + 4 * (u64::from(words) - 1), 1 << (Thread::INDEX + 1));
+        let ret = crate::ttinsn::call_with(program, args);
+        l1_write32(mb.result(), ret);
+    }
+    publish();
+    // SAFETY: fixed aligned mailbox word inside L1.
+    unsafe { l1_write32(mb.status(), status::DONE) };
+    publish();
+    spin()
+}
+
 /// Words of expanded program per stored word the translation must save before it
 /// is worth doing: `expanded * 2.1 > stored * 22 + 330`, the measured break-even
 /// for one launch with no translation cache (`docs/plans/ttinsn-push-experiment.md`).
