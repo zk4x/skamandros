@@ -76,8 +76,8 @@ fn same_shifted(body: &[MirOp; 3], following: &[MirOp; 3]) -> bool {
                 && aa == ab
                 && ba == bb
                 && da == db
-                && *rb == ra + 1
-                && *sb_row == *sa_row + 1
+                && *rb == ra + 2
+                && *sb_row == *sa_row + 2
         }
         _ => false,
     }
@@ -167,16 +167,16 @@ copy_out buf 1 param 1 offset 0 len 4096
         fuse(&mut m);
         // One repeat marker plus the body, around the two hand-offs.
         assert_eq!(m.t1.len(), 6, "got {:?}", m.t1);
-        assert!(matches!(m.t1[0], MirOp::Repeat { len: 3, count: 64 }));
+        assert!(matches!(m.t1[0], MirOp::Repeat { len: 3, count: 32 }));
         assert!(matches!(m.t1[1], MirOp::Sfpload { lreg: 0, row: 0 }));
-        assert_eq!(m.t1.len(), before - (64 - 1) * 3 + 1);
+        assert_eq!(m.t1.len(), before - (32 - 1) * 3 + 1);
     }
 
     #[test]
     fn a_hand_off_breaks_a_run() {
         let mut m = machine();
         // Cut the body: a semaphore in the middle must stop fusion across it.
-        m.t1.insert(3 * 32, MirOp::SemPost { sem: 7 });
+        m.t1.insert(3 * 16, MirOp::SemPost { sem: 7 });
         fuse(&mut m);
         let repeats = m.t1.iter().filter(|op| matches!(op, MirOp::Repeat { .. })).count();
         assert_eq!(repeats, 2, "one repeat on each side of the hand-off");
@@ -198,7 +198,7 @@ copy_out buf 1 param 1 offset 0 len 4096
                 _ => None,
             })
             .collect();
-        assert_eq!(repeats, vec![62], "the changed row splits the run");
+        assert_eq!(repeats, vec![30], "the changed row splits the run");
     }
 
     #[test]

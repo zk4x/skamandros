@@ -52,10 +52,14 @@ pub fn lower(k: &Kernel, plan: &Plan, alloc: &Alloc) -> Result<Machine, Error> {
                     _ => return Err(Error(format!("op {at}: an SFPU value is not in Dst"))),
                 };
                 let (lreg_in, lreg_out) = alloc.lreg[value as usize];
-                for r in 0..DST_ROWS {
-                    m.t1.push(MirOp::Sfpload { lreg: lreg_in, row: src_row + r });
+                // One `SFPLOAD`/`SFPSTORE` reaches four `Dst` rows and eight of
+                // the sixteen columns (`SFPLOAD.md`: `row = (addr & !3) +
+                // lane/8`, `col = (lane & 7) * 2 + (addr & 2)`), so a 64-row
+                // tile is 32 addresses, stepping by two: bit 1 is the odd half.
+                for at in (0..DST_ROWS).step_by(2) {
+                    m.t1.push(MirOp::Sfpload { lreg: lreg_in, row: src_row + at });
                     m.t1.push(MirOp::Sfp { op: SfpOp::from(kind), a: lreg_in, b: None, d: lreg_out });
-                    m.t1.push(MirOp::Sfpstore { lreg: lreg_out, row: dst_row + r });
+                    m.t1.push(MirOp::Sfpstore { lreg: lreg_out, row: dst_row + at });
                 }
                 emit_sync(&mut m, &mut syncs, Role::Math);
             }
@@ -126,12 +130,12 @@ copy_out buf 1 param 1 offset 0 len 4096
         let alloc = allocate(&k).unwrap();
         let m = lower(&k, &plan, &alloc).unwrap();
         let math: Vec<MirOp> = m.t1.iter().copied().filter(|op| !matches!(op, MirOp::SemWait { .. } | MirOp::SemPost { .. })).collect();
-        assert_eq!(math.len(), (DST_ROWS * 3) as usize);
+        assert_eq!(math.len(), (DST_ROWS / 2 * 3) as usize);
         assert!(matches!(math[0], MirOp::Sfpload { lreg: 0, row: 0 }));
         assert!(matches!(math[1], MirOp::Sfp { op: SfpOp::Neg, a: 0, b: None, d: 1 }));
         assert!(matches!(math[2], MirOp::Sfpstore { lreg: 1, row: 0 }));
-        // The last triple is the last row, in place in the same slot.
-        assert!(matches!(math[math.len() - 3], MirOp::Sfpload { row, .. } if row == DST_ROWS - 1));
+        // The last triple is the last address, in place.
+        assert!(matches!(math[math.len() - 3], MirOp::Sfpload { row, .. } if row == DST_ROWS - 2));
     }
 
     #[test]
