@@ -777,5 +777,5 @@ fn place(words: &mut [u32; 3], first_bit: u32, count: u32, value: u64) {
 }
 
 /// Re-exported so the runtime need not depend on the location of the program
-/// arena; this is where a staged program lives in L1.
+/// arena; this is where every program lives in L1, named by its launch message.
 pub const PROGRAM_AREA: u64 = l1::PROGRAM_CACHE.base;

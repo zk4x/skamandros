@@ -7,6 +7,12 @@
 //! the three compute cores are staged and released together, then the outbound
 //! mover runs on RISCV B. A module without compute programs skips the middle
 //! step, and a module with neither mover runs only the compute cores.
+//!
+//! Every core has a launch message (`mailbox::launch::Mailbox`): the program's
+//! address in `l1::PROGRAM_CACHE`, its length, the arguments base and a
+//! generation. A program is placed once and later launches only name it; the
+//! resident executor on the core runs the generation it sees
+//! (tt-metal's launch message and kernel-text offset).
 
 use std::sync::Mutex;
 

@@ -27,13 +27,8 @@ where
     run_in::<Riscv, Thread>(Mailbox::single_core())
 }
 
-/// The same runner, reporting through a role mailbox: one of three cores each
-/// running its own part of a kernel (`tt_isa::mailbox::launch`).
-///
-/// A role also translates a program with block repeats into looping code when
-/// the exchange pays ([`translate`]): each role runs on the core whose Tensix
-/// thread it pushes to, so the code goes in that role's own window and the core
-/// invalidates its own instruction cache.
+/// The same runner, reporting through a role launch mailbox: one of three cores
+/// each running its own part of a kernel (`tt_isa::mailbox::launch`).
 pub fn run_role<Riscv, Thread>() -> !
 where
     Thread: TensixThread,
@@ -464,9 +459,9 @@ where
             spin()
         }
         // Resident (`mailbox::GENERATION`): acknowledge, then wait for the next
-        // one. The host writes the whole descriptor and program before the new
-        // generation, and the poll goes through a fence, since nothing the NoC
-        // writes invalidates the L0 data cache (`MemoryOrdering.md:59`).
+        // one. The host writes the whole launch message and program before the
+        // new generation, and the poll goes through a fence, since nothing the
+        // NoC writes invalidates the L0 data cache (`MemoryOrdering.md:59`).
         // SAFETY: fixed aligned mailbox locations inside L1.
         let tracing = || unsafe { l1_read32(mb.trace()) } != 0;
         trace(tracing(), Thread::INDEX, mailbox::trace::ACKED);
@@ -492,8 +487,8 @@ where
     }
 }
 
-/// One run of the staged program: read the descriptor, push the program, wait
-/// for it to retire, dump `Dst`. Returns the program's length.
+/// One run of the named program: read the launch message, push the program,
+/// wait for it to retire, dump `Dst`. Returns the program's length.
 fn run_once<Riscv, Thread>(mb: Mailbox) -> u32
 where
     Thread: TensixThread,
