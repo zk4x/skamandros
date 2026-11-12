@@ -19,7 +19,6 @@ use crate::riscv::{self as rv, Asm, reg};
 use tt_isa::backend::{
     self, Before, ConfigWords, ThreadConfigEntry, block, cond, wait_for_packer, wait_for_unpacker0,
 };
-use tt_isa::cfg::ConfigBank;
 use tt_isa::cfg::generated::{alu, global, pack0, thcon, thread, unpack1};
 use tt_isa::isa::Instruction;
 use tt_isa::isa::generated::{defs, encode};
@@ -284,6 +283,17 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
     Ok(())
 }
 
+/// The Tensix GPR the ring base is staged through before its `WRCFG`. GPR *n*
+/// is 16-bit halves `2n` and `2n + 1` (`SETDMAREG_Immediate.md`).
+const BASE_GPR: u32 = 24;
+/// `SETDMAREG`'s opcode, fixed bits and field positions (`SETDMAREG_Immediate`):
+/// `(0x45 << 24) | (NewValue << 8) | ResultHalfReg`.
+const SETDMAREG: u32 = 0x4500_0000;
+/// `INSTRN_BUF_BASE`: the store target that pushes a Tensix instruction. RISC-V
+/// T0/T1/T2 all push their own thread through this address
+/// (`PushTensixInstruction.md`); a `.ttinsn` is the same store.
+const INSTRN_BUF: u32 = tt_isa::tensix::INSTRN_BUF_BASE as u32;
+
 /// The unpacker's read base: the ring's read pointer in 16-byte units, minus the
 /// header unit the unpacker adds (`UNPACR_Regular.md`: `InAddr = (Base_address +
 /// 1 + DigestSize) * 16`).
@@ -293,8 +303,7 @@ fn cb_base_unpack(out: &mut Stream, cb: u32) -> Result<(), Error> {
         out,
         cb,
         rv::cb::RD_PTR,
-        thcon::THCON_SEC0_REG3_Base_address.riscv_address(ConfigBank::Bank0),
-        block::UNPACKER,
+        thcon::THCON_SEC0_REG3_Base_address.addr32(),
     )
 }
 
@@ -305,16 +314,26 @@ fn cb_base_pack(out: &mut Stream, cb: u32) -> Result<(), Error> {
         out,
         cb,
         rv::cb::WR_PTR,
-        thcon::THCON_SEC0_REG1_L1_Dest_addr.riscv_address(ConfigBank::Bank0),
-        block::PACKER,
+        thcon::THCON_SEC0_REG1_L1_Dest_addr.addr32(),
     )
 }
 
-/// `unit` is the block that must not run until the base store has landed: tt-metal
-/// stalls `STALL_UNPACK`/`STALL_PACK` with `TRISC_CFG`, not the Configuration
-/// Unit, because `STALLWAIT`'s block mask names the *following* instructions to
-/// hold back.
-fn cb_base(out: &mut Stream, cb: u32, field: i32, config: u64, unit: u32) -> Result<(), Error> {
+/// Write the ring page into a `Config` word from a Tensix GPR, never from a
+/// RISC-V `sw` into `Config`.
+///
+/// A plain `sw` to `Config` is processed by the LSU, not the Tensix instruction
+/// FIFO, so it overtakes the `UNPACR`/`PACR` already reading the same word; the
+/// role's per-iteration page then lags by one (`firmware/tt-firmware/src/
+/// ttinsn.rs`, `STEP_STORE`). The write has to be a pushed Tensix instruction:
+/// `SETDMAREG` stages the dynamic value, then `WRCFG` copies it, in FIFO order
+/// with the backend. This is tt-metal's `program_packer_destination`
+/// (`SETDMAREG` × 2, `STALLWAIT(STALL_CFG, THCON)`, `WRCFG`, `DMANOP`) and
+/// `_llk_unpack_configure_addresses_`' ordering requirement.
+///
+/// The caller's `wait_for_unpacker0`/`wait_for_packer` now reaches the write:
+/// because the write is a pushed instruction, `STALLWAIT`'s CONFIG block holds
+/// it until the previous unit has drained.
+fn cb_base(out: &mut Stream, cb: u32, field: i32, config: u16) -> Result<(), Error> {
     out.asm(|a| {
         a.word(rv::lw(
             reg::T0,
@@ -323,15 +342,36 @@ fn cb_base(out: &mut Stream, cb: u32, field: i32, config: u64, unit: u32) -> Res
         ));
         a.word(rv::srli(reg::T0, reg::T0, 4));
         a.word(rv::addi(reg::T0, reg::T0, -1));
-        a.li(reg::T1, config as u32);
-        a.word(rv::sw(reg::T0, reg::T1, 0));
+        // `SETDMAREG` with a run-time immediate: the word is built here and
+        // pushed through the instruction FIFO, exactly as tt-metal's
+        // `TT_SETDMAREG` macro does (`instrn_buffer[0] = ...`).
+        a.word(rv::slli(reg::T1, reg::T0, 16));
+        a.word(rv::srli(reg::T1, reg::T1, 16));
+        a.word(rv::slli(reg::T1, reg::T1, 8));
+        a.li(reg::T2, SETDMAREG);
+        a.word(rv::or(reg::T1, reg::T1, reg::T2));
+        a.word(rv::ori(reg::T1, reg::T1, (BASE_GPR * 2) as i32));
+        a.li(reg::T2, INSTRN_BUF);
+        a.word(rv::sw(reg::T1, reg::T2, 0));
+        a.word(rv::srli(reg::T1, reg::T0, 16));
+        a.word(rv::slli(reg::T1, reg::T1, 8));
+        a.li(reg::T2, SETDMAREG);
+        a.word(rv::or(reg::T1, reg::T1, reg::T2));
+        a.word(rv::ori(reg::T1, reg::T1, (BASE_GPR * 2 + 1) as i32));
+        a.li(reg::T2, INSTRN_BUF);
+        a.word(rv::sw(reg::T1, reg::T2, 0));
     })?;
-    // The Configuration Unit processes RISC-V writes asynchronously; the next
-    // `UNPACR`/`PACR` must not run until the store has landed.
+    // The Scalar Unit fills the GPR; `WRCFG` reads it. `WRCFG.md` also wants a
+    // non-consumer after the write, which the trailing NOP gives it.
     out.push(
-        backend::stallwait(unit | block::CONFIG, cond::RISCV_REQUEST_PENDING)
+        backend::stallwait(block::CONFIG, cond::SCALAR_OUTSTANDING)
             .map_err(|_| Error::TT_ERROR_STALLWAIT)?,
     );
+    out.push(backend::write_word(BASE_GPR, config).map_err(|e| {
+        let _ = e;
+        Error::TT_ERROR_STALLWAIT
+    })?);
+    out.push(backend::nop());
     Ok(())
 }
 
