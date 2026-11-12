@@ -93,31 +93,23 @@ pub unsafe extern "C" fn ttCompile(
 ) -> ttStatus {
     clear(err);
     if out.is_null() {
-        return fail(ttStatus::TT_ERROR_ARGUMENT, "ttCompile: out is null", err);
+        return fail(ttStatus::TT_ERROR_ARGUMENT, err);
     }
     unsafe { *out = std::ptr::null_mut() };
     if text.is_null() || len == 0 {
-        return fail(
-            ttStatus::TT_ERROR_ARGUMENT,
-            "ttCompile: the program is empty",
-            err,
-        );
+        return fail(ttStatus::TT_ERROR_ARGUMENT, err);
     }
     let bytes = unsafe { std::slice::from_raw_parts(text as *const u8, len) };
     let Ok(source) = std::str::from_utf8(bytes) else {
-        return fail(
-            ttStatus::TT_ERROR_PROGRAM,
-            "ttCompile: the program is not UTF-8",
-            err,
-        );
+        return fail(ttStatus::TT_ERROR_PROGRAM, err);
     };
     let kernel = match Kernel::parse(source) {
         Ok(k) => k,
-        Err(e) => return fail(e, e.name().to_string(), err),
+        Err(e) => return fail(e, err),
     };
     let module = match compile::compile(&kernel) {
         Ok(m) => m,
-        Err(e) => return fail(e, e.name().to_string(), err),
+        Err(e) => return fail(e, err),
     };
     unsafe { *out = add_module(module) };
     ttStatus::TT_OK
@@ -139,28 +131,20 @@ pub unsafe extern "C" fn ttModuleLoad(
 ) -> ttStatus {
     clear(err);
     if out.is_null() {
-        return fail(
-            ttStatus::TT_ERROR_ARGUMENT,
-            "ttModuleLoad: out is null",
-            err,
-        );
+        return fail(ttStatus::TT_ERROR_ARGUMENT, err);
     }
     unsafe { *out = std::ptr::null_mut() };
     if bytes.is_null() || len == 0 {
-        return fail(
-            ttStatus::TT_ERROR_ARGUMENT,
-            "ttModuleLoad: the program is empty",
-            err,
-        );
+        return fail(ttStatus::TT_ERROR_ARGUMENT, err);
     }
     let bytes = unsafe { std::slice::from_raw_parts(bytes, len) };
     let kernel = match Kernel::from_bytes(bytes) {
         Ok(k) => k,
-        Err(e) => return fail(e, e.name().to_string(), err),
+        Err(e) => return fail(e, err),
     };
     let module = match compile::compile(&kernel) {
         Ok(m) => m,
-        Err(e) => return fail(e, e.name().to_string(), err),
+        Err(e) => return fail(e, err),
     };
     unsafe { *out = add_module(module) };
     ttStatus::TT_OK
@@ -176,19 +160,11 @@ pub unsafe extern "C" fn ttModuleLoad(
 pub unsafe extern "C" fn ttModuleUnload(module: *mut ttModule, err: *mut *mut c_char) -> ttStatus {
     clear(err);
     if module.is_null() {
-        return fail(
-            ttStatus::TT_ERROR_ARGUMENT,
-            "ttModuleUnload: the handle is null",
-            err,
-        );
+        return fail(ttStatus::TT_ERROR_ARGUMENT, err);
     }
     match modules().remove(&(module as usize)) {
         Some(_) => ttStatus::TT_OK,
-        None => fail(
-            ttStatus::TT_ERROR_MODULE,
-            "ttModuleUnload: not a live module handle",
-            err,
-        ),
+        None => fail(ttStatus::TT_ERROR_MODULE, err),
     }
 }
 
@@ -205,7 +181,7 @@ pub unsafe extern "C" fn ttInit(err: *mut *mut c_char) -> ttStatus {
     clear(err);
     match runtime::init() {
         Ok(()) => ttStatus::TT_OK,
-        Err(e) => fail(ttStatus::TT_ERROR_DEVICE, e.to_string(), err),
+        Err(e) => fail(e, err),
     }
 }
 
@@ -220,7 +196,7 @@ pub unsafe extern "C" fn ttRelease(err: *mut *mut c_char) -> ttStatus {
     clear(err);
     match runtime::release() {
         Ok(()) => ttStatus::TT_OK,
-        Err(e) => fail(ttStatus::TT_ERROR_DEVICE, e.to_string(), err),
+        Err(e) => fail(e, err),
     }
 }
 
@@ -240,18 +216,18 @@ pub unsafe extern "C" fn ttMemAlloc(
 ) -> ttStatus {
     clear(err);
     if addr.is_null() {
-        return fail(ttStatus::TT_ERROR_ARGUMENT, "ttMemAlloc: addr is null", err);
+        return fail(ttStatus::TT_ERROR_ARGUMENT, err);
     }
     unsafe { *addr = 0 };
     if bytes == 0 {
-        return fail(ttStatus::TT_ERROR_ARGUMENT, "ttMemAlloc: zero bytes", err);
+        return fail(ttStatus::TT_ERROR_ARGUMENT, err);
     }
     match runtime::alloc(bytes) {
         Ok(at) => {
             unsafe { *addr = at };
             ttStatus::TT_OK
         }
-        Err(e) => fail(ttStatus::TT_ERROR_DEVICE, e.to_string(), err),
+        Err(e) => fail(e, err),
     }
 }
 
@@ -269,16 +245,12 @@ pub unsafe extern "C" fn ttMemcpyH2D(
 ) -> ttStatus {
     clear(err);
     if src.is_null() || len == 0 {
-        return fail(
-            ttStatus::TT_ERROR_ARGUMENT,
-            "ttMemcpyH2D: the source is empty",
-            err,
-        );
+        return fail(ttStatus::TT_ERROR_ARGUMENT, err);
     }
     let bytes = unsafe { std::slice::from_raw_parts(src, len) };
     match runtime::h2d(dst, bytes) {
         Ok(()) => ttStatus::TT_OK,
-        Err(e) => fail(ttStatus::TT_ERROR_DEVICE, e.to_string(), err),
+        Err(e) => fail(e, err),
     }
 }
 
@@ -296,16 +268,12 @@ pub unsafe extern "C" fn ttMemcpyD2H(
 ) -> ttStatus {
     clear(err);
     if dst.is_null() || len == 0 {
-        return fail(
-            ttStatus::TT_ERROR_ARGUMENT,
-            "ttMemcpyD2H: the destination is empty",
-            err,
-        );
+        return fail(ttStatus::TT_ERROR_ARGUMENT, err);
     }
     let out = unsafe { std::slice::from_raw_parts_mut(dst, len) };
     match runtime::d2h(src, out) {
         Ok(()) => ttStatus::TT_OK,
-        Err(e) => fail(ttStatus::TT_ERROR_DEVICE, e.to_string(), err),
+        Err(e) => fail(e, err),
     }
 }
 
@@ -327,14 +295,10 @@ pub unsafe extern "C" fn ttLaunch(
 ) -> ttStatus {
     clear(err);
     if module.is_null() {
-        return fail(
-            ttStatus::TT_ERROR_ARGUMENT,
-            "ttLaunch: the handle is null",
-            err,
-        );
+        return fail(ttStatus::TT_ERROR_ARGUMENT, err);
     }
     if params.is_null() && nparams != 0 {
-        return fail(ttStatus::TT_ERROR_ARGUMENT, "ttLaunch: params is null", err);
+        return fail(ttStatus::TT_ERROR_ARGUMENT, err);
     }
     let addresses = if nparams == 0 {
         &[][..]
@@ -343,33 +307,19 @@ pub unsafe extern "C" fn ttLaunch(
     };
     let modules = modules();
     let Some(m) = lookup_module(&modules, module) else {
-        return fail(
-            ttStatus::TT_ERROR_MODULE,
-            "ttLaunch: not a live module handle",
-            err,
-        );
+        return fail(ttStatus::TT_ERROR_MODULE, err);
     };
     // The count is the caller's contract, not the device's business: refuse it
     // before anything is touched.
     if m.params as usize != addresses.len() {
-        return fail(
-            ttStatus::TT_ERROR_ARGUMENT,
-            format!(
-                "ttLaunch: the module takes {} parameters, {} were given",
-                m.params,
-                addresses.len()
-            ),
-            err,
-        );
+        return fail(ttStatus::TT_ERROR_ARGUMENT, err);
     }
     match runtime::launch(m, addresses) {
         Ok(()) => ttStatus::TT_OK,
-        Err(runtime::LaunchError::Argument(m)) => fail(ttStatus::TT_ERROR_ARGUMENT, m, err),
-        Err(runtime::LaunchError::Unsupported(m)) => fail(ttStatus::TT_ERROR_UNSUPPORTED, m, err),
-        // The launch failure is already the concrete `ttStatus` variant: a
-        // watchdog timeout must reach the caller as `TT_ERROR_FIRMWARE_TIMEOUT`,
-        // not collapsed into the generic device code.
-        Err(runtime::LaunchError::Device(e)) => fail(e, e.name().to_string(), err),
+        // The failure is the status itself: a watchdog timeout reaches the
+        // caller as `TT_ERROR_FIRMWARE_TIMEOUT`, not collapsed into a generic
+        // device code.
+        Err(e) => fail(e, err),
     }
 }
 
@@ -395,12 +345,15 @@ fn clear(err: *mut *mut c_char) {
     }
 }
 
-/// Leave `message` for the caller and return `status`. A null `err` is
-/// tolerated: the status is the answer, the message is the explanation.
-fn fail(status: ttStatus, message: impl AsRef<str>, err: *mut *mut c_char) -> ttStatus {
+/// Leave the variant's name for the caller and return its integer. A null
+/// `err` is tolerated: the status is the answer, its name is the spelling.
+///
+/// The name is the only text on the channel; a detail that matters is a
+/// variant, not a message (`status.rs`).
+fn fail(status: ttStatus, err: *mut *mut c_char) -> ttStatus {
     if !err.is_null() {
-        let text = message.as_ref().replace('\0', " ");
-        let msg = CString::new(text).expect("NULs were replaced");
+        let name = status.name().replace('\0', " ");
+        let msg = CString::new(name).expect("a variant name has no NUL");
         unsafe { *err = msg.into_raw() };
     }
     status

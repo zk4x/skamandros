@@ -53,45 +53,26 @@ pub fn d2h(address: u64, out: &mut [u8]) -> Result<(), Error> {
     with_device(|d| d.dram_read(address, out))
 }
 
-/// Why a launch did not happen, or did not finish.
-#[derive(Debug)]
-pub enum LaunchError {
-    /// The caller's parameter count is not the module's.
-    Argument(String),
-    /// The module is valid, but this build cannot run it.
-    Unsupported(String),
-    /// The device failed.
-    Device(Error),
-}
-
 /// Run a module over its grid with one DRAM address per parameter.
 ///
 /// The launch arguments are built here, not by the caller: the grid, this
 /// tile's high word, and each parameter's `(low, high)` pair. A count that
-/// disagrees with the module is refused.
-pub fn launch(module: &Module, params: &[u64]) -> Result<(), LaunchError> {
+/// disagrees with the module is refused. Every failure is a [`ttStatus`]
+/// variant; there is no second error channel and no string error.
+pub fn launch(module: &Module, params: &[u64]) -> Result<(), Error> {
     if module.params as usize != params.len() {
-        return Err(LaunchError::Argument(format!(
-            "the module takes {} parameters, {n} were given",
-            module.params,
-            n = params.len()
-        )));
+        return Err(Error::TT_ERROR_ARGUMENT);
     }
     if module.grid != [1, 1] {
-        return Err(LaunchError::Unsupported(format!(
-            "a launch over a {}x{} grid is not implemented",
-            module.grid[0], module.grid[1]
-        )));
+        return Err(Error::TT_ERROR_UNSUPPORTED);
     }
     if module.reader.is_empty()
         && module.writer.is_empty()
         && module.cores.iter().all(Vec::is_empty)
     {
-        return Err(LaunchError::Unsupported(
-            "the module has no program to run".into(),
-        ));
+        return Err(Error::TT_ERROR_UNSUPPORTED);
     }
-    with_device(|device| run(device, module, params)).map_err(LaunchError::Device)
+    with_device(|device| run(device, module, params))
 }
 
 fn run(device: &mut Device, module: &Module, params: &[u64]) -> Result<(), Error> {
@@ -280,7 +261,7 @@ mod tests {
     fn a_timed_out_launch_returns_timeout_and_the_next_launch_runs() {
         init().expect("init");
         match launch(&module(vec![HANG]), &[]) {
-            Err(LaunchError::Device(Error::TT_ERROR_FIRMWARE_TIMEOUT)) => {}
+            Err(Error::TT_ERROR_FIRMWARE_TIMEOUT) => {}
             other => panic!("expected a timeout, got {other:?}"),
         }
         // The failed launch held B and cleared its mailboxes, so this one
