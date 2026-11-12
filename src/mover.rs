@@ -394,10 +394,11 @@ fn remap(op: &Op, map: &[ValueId], value: Option<ValueId>) -> Op {
             if_true: v(if_true),
             if_false: v(if_false),
         },
-        Op::Matmul { a, b, .. } => Op::Matmul {
+        Op::Matmul { a, b, dtype, .. } => Op::Matmul {
             value: own(),
             a: v(a),
             b: v(b),
+            dtype,
         },
     }
 }

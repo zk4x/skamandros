@@ -76,7 +76,7 @@ fn library() -> &'static Library {
 }
 
 const COPY: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -160,7 +160,7 @@ fn a_refused_program_comes_back_as_an_error_not_a_crash() {
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
 
-    let bad = "version 4\ngrid 1,1\n%out = param f32 1024\n%x = neg %y\n";
+    let bad = "version 5\ngrid 1,1\n%out = param f32 1024\n%x = neg %y\n";
     let mut module: *mut c_void = std::ptr::null_mut();
     let mut err: *mut c_char = std::ptr::null_mut();
     let code = unsafe { compile(bad.as_ptr().cast(), bad.len(), &mut module, &mut err) };
@@ -239,7 +239,7 @@ fn the_error_codes_are_the_documented_ones() {
 /// A copy kernel over a two-page buffer: DRAM into L1, and the same L1 buffer
 /// back into DRAM, in 32x32 units.
 const COPY_8K: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
@@ -253,7 +253,7 @@ copy_to %out from %b0 [1024]
 /// One 32x32 tile through the datapath: DRAM into L1, unpack, negate, pack,
 /// L1 into DRAM. The program names no core, no `Dst` slot and no unpacker.
 const NEG_TILE: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -270,7 +270,7 @@ copy_to %out from %bo [0]
 /// the step are constants, so the loop becomes a RISC-V branch in the movers and
 /// each iteration's addresses are computed from the counter.
 const NEG_TWO_TILES: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
@@ -293,7 +293,7 @@ endloop
 /// start row is its `W` counter, set per pack (`SETADC`, tt-metal's
 /// `set_dst_write_addr`); a packer stuck on row 0 repeats the first value.
 const NEG_TWO_LIVE: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
@@ -315,7 +315,7 @@ copy_to %out from %bo [1024]
 /// named directly and `mover::add_movers` supplies the staging and the traffic,
 /// as zyx's `tt_add_movers` does.
 const NEG_TILE_DIRECT: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -840,7 +840,7 @@ fn a_constant_loop_runs_on_the_simulator() {
 #[test]
 fn arithmetic_ops_run_on_the_simulator() {
     const TWO_LOAD: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
@@ -855,7 +855,7 @@ store_to %bo from %r [0]
 copy_to %out from %bo [0]
 ";
     const ONE_LOAD: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -1008,7 +1008,7 @@ copy_to %out from %bo [0]
 #[test]
 fn comparisons_select_and_max_run_on_the_simulator() {
     const TEMPLATE: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
@@ -1142,7 +1142,7 @@ copy_to %out from %bo [0]
 #[test]
 fn bitwise_ops_run_on_the_simulator() {
     const TWO_LOAD: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param i32 2048
 %out = param i32 2048
@@ -1157,7 +1157,7 @@ store_to %bo from %r [0]
 copy_to %out from %bo [0]
 ";
     const ONE_LOAD: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param i32 1024
 %out = param i32 1024
@@ -1285,7 +1285,7 @@ copy_to %out from %bo [0]
 /// count is a scalar argument, loaded by the movers and by each compute role,
 /// and branched on in RISC-V; both tiles come back negated.
 const NEG_SYMBOLIC_LOOP: &str = "\
-version 4
+version 5
 grid 1,1
 %n = param i32 0
 %in = param f32 2048
@@ -1403,7 +1403,7 @@ fn a_symbolic_loop_bound_runs_on_the_simulator() {
 /// A symbolic `2,2` grid: each of the four tiles negates its own slice, selected
 /// from `grid.x`/`grid.y`. Four executors run and all four slices come back.
 const NEG_GRID: &str = "\
-version 4
+version 5
 %nx = param i32 0
 %ny = param i32 0
 %in = param f32 4096
@@ -1524,6 +1524,12 @@ fn a_symbolic_grid_runs_each_tiles_own_slice() {
 /// Compile `program`, upload `input`, launch it once over one tile and return
 /// the output bytes. Two parameters, in then out.
 fn run_kernel(program: &str, input: &[u8], out_bytes: usize) -> Vec<u8> {
+    run_kernel_tensors(program, &[input], out_bytes)
+}
+
+/// The same launch with `inputs.len()` tensor parameters, in order, followed by
+/// the output parameter.
+fn run_kernel_tensors(program: &str, inputs: &[&[u8]], out_bytes: usize) -> Vec<u8> {
     let _device = device();
     let sim = simulator_path();
     // SAFETY: no other thread reads the environment concurrently; the library
@@ -1549,26 +1555,30 @@ fn run_kernel(program: &str, input: &[u8], out_bytes: usize) -> Vec<u8> {
         "ttInit: {}",
         take_error(&free, err)
     );
-    let (mut input_at, mut output_at) = (0u64, 0u64);
-    assert_eq!(
-        unsafe { alloc(input.len(), &mut input_at, &mut err) },
-        TT_OK,
-        "input: {}",
-        take_error(&free, err)
-    );
+    let mut tensors: Vec<u64> = Vec::new();
+    for (i, input) in inputs.iter().enumerate() {
+        let mut at = 0u64;
+        assert_eq!(
+            unsafe { alloc(input.len(), &mut at, &mut err) },
+            TT_OK,
+            "input {i}: {}",
+            take_error(&free, err)
+        );
+        assert_eq!(
+            unsafe { h2d(at, input.as_ptr(), input.len(), &mut err) },
+            TT_OK,
+            "upload {i}: {}",
+            take_error(&free, err)
+        );
+        tensors.push(at);
+    }
+    let mut output_at = 0u64;
     assert_eq!(
         unsafe { alloc(out_bytes, &mut output_at, &mut err) },
         TT_OK,
         "output: {}",
         take_error(&free, err)
     );
-    assert_eq!(
-        unsafe { h2d(input_at, input.as_ptr(), input.len(), &mut err) },
-        TT_OK,
-        "upload: {}",
-        take_error(&free, err)
-    );
-
     let mut module: *mut c_void = std::ptr::null_mut();
     let code = unsafe {
         compile(
@@ -1580,8 +1590,8 @@ fn run_kernel(program: &str, input: &[u8], out_bytes: usize) -> Vec<u8> {
     };
     assert_eq!(code, TT_OK, "compile: {}", take_error(&free, err));
 
-    let params = [input_at, output_at];
-    let code = unsafe { launch(module, params.as_ptr(), params.len(), &mut err) };
+    tensors.push(output_at);
+    let code = unsafe { launch(module, tensors.as_ptr(), tensors.len(), &mut err) };
     assert_eq!(code, TT_OK, "ttLaunch: {}", take_error(&free, err));
 
     let mut back = vec![0u8; out_bytes];
@@ -1608,7 +1618,7 @@ fn run_kernel(program: &str, input: &[u8], out_bytes: usize) -> Vec<u8> {
 
 /// `(int)f`: truncation toward zero, in two's complement.
 const CAST_F32_TO_I32: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param f32 1024
 %out = param i32 1024
@@ -1623,7 +1633,7 @@ copy_to %out from %bo [0]
 
 /// `(float)i`: two's complement to FP32, round to nearest even.
 const CAST_I32_TO_F32: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param i32 1024
 %out = param f32 1024
@@ -1638,7 +1648,7 @@ copy_to %out from %bo [0]
 
 /// The same bits under another name: no instruction at all.
 const BITCAST_F32_TO_I32: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param f32 1024
 %out = param i32 1024
@@ -1654,7 +1664,7 @@ copy_to %out from %bo [0]
 /// A comparison writes `-1`/`0` in the lane; a cast to an integer is the C
 /// value, one or zero.
 const CAST_BOOL_TO_I32: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param f32 1024
 %out = param i32 1024
@@ -1711,7 +1721,7 @@ fn casts_and_bitcasts_run_on_the_simulator() {
 /// the packer writes 16-bit datums back. A negation only flips the sign bit, so
 /// every pattern -- zeros, subnormals, infinities, NaN payloads -- is exact.
 const NEG_BF16: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param bf16 1024
 %out = param bf16 1024
@@ -1794,7 +1804,7 @@ fn packer_bf16(value: f32) -> u16 {
 /// bf16 arithmetic in the 16-bit `Dst`: two tiles in, one out, every datum the
 /// SFPU's widening and truncating round trip.
 const BF16_TWO_LOAD: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param bf16 2048
 %out = param bf16 1024
@@ -1952,7 +1962,7 @@ fn bf16_arithmetic_runs_on_the_simulator() {
 
 /// The 32-bit `Dst` kernel's bf16 output: the packer narrows as it writes.
 const CAST_F32_TO_BF16: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param f32 1024
 %out = param bf16 1024
@@ -1967,7 +1977,7 @@ copy_to %out from %bo [0]
 
 /// `i32` to bf16: `(float)i` in the lane, then the same narrowing.
 const CAST_I32_TO_BF16: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param i32 1024
 %out = param bf16 1024
@@ -1982,7 +1992,7 @@ copy_to %out from %bo [0]
 
 /// A comparison's `bool` to bf16: one or zero.
 const CAST_BOOL_TO_BF16: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param f32 1024
 %out = param bf16 1024
@@ -2000,7 +2010,7 @@ copy_to %out from %bo [0]
 /// bf16 to bf16, the 16-bit `Dst`'s identity: the store truncates what the load
 /// widened, so every normal comes back unchanged.
 const CAST_BF16_TO_BF16: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param bf16 1024
 %out = param bf16 1024
@@ -2016,7 +2026,7 @@ copy_to %out from %bo [0]
 /// bf16 into `f32` has no `Dst` path: the unpacker cannot widen a bf16 page into
 /// a 32-bit `Dst`, and a 16-bit `Dst` cannot pack `f32`.
 const CAST_BF16_TO_F32: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param bf16 1024
 %out = param f32 1024
@@ -2032,7 +2042,7 @@ copy_to %out from %bo [0]
 /// `sel` on bf16: against `y`, so the `bool` lives in the 16-bit `Dst` as the
 /// `-1.0`/`0.0` lane the comparison writes, and the result is the smaller value.
 const BF16_MIN: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param bf16 2048
 %out = param bf16 1024
@@ -2159,4 +2169,202 @@ fn a_bf16_value_cannot_widen_through_dst() {
     assert_eq!(code, TT_ERROR_BF16_WIDEN, "bf16 to f32 is refused");
     assert!(module.is_null() && !err.is_null());
     assert_eq!(take_error(&free, err), "TT_ERROR_BF16_WIDEN");
+}
+
+/// `m = a x b` over two `f32` tiles: the operands ride the Matrix Unit's `SrcA`
+/// / `SrcB` path (unpacked straight from their CB pages), the accumulator is the
+/// 32-bit `Dst`, and the packer drains it.
+const MATMUL_F32: &str = "\
+version 5
+grid 1,1
+%pa = param f32 1024
+%pb = param f32 1024
+%out = param f32 1024
+%ba = buffer f32 32,32
+%bb = buffer f32 32,32
+%bo = buffer f32 32,32
+copy_to %ba from %pa [0]
+copy_to %bb from %pb [0]
+%a = load %ba [0]
+%b = load %bb [0]
+%m = matmul f32 %a %b
+store_to %bo from %m [0]
+copy_to %out from %bo [0]
+";
+
+/// The same product, with `%a` also feeding a datapath op: the load keeps its
+/// `Dst` unpack and the matmul unpacks the same page again into `Src`.
+const MATMUL_F32_MIXED: &str = "\
+version 5
+grid 1,1
+%pa = param f32 1024
+%pb = param f32 1024
+%out = param f32 1024
+%ba = buffer f32 32,32
+%bb = buffer f32 32,32
+%bo = buffer f32 32,32
+copy_to %ba from %pa [0]
+copy_to %bb from %pb [0]
+%a = load %ba [0]
+%b = load %bb [0]
+%n = neg %a
+%m = matmul f32 %a %b
+store_to %bo from %m [0]
+copy_to %out from %bo [0]
+";
+
+/// The `(row, column)` of a 32x32 matrix that L1 datum `index` holds. A tile in
+/// L1 is four 16x16 faces; each face is 256 contiguous datums, row-major.
+fn tile_rc(index: usize) -> (usize, usize) {
+    let (face, within) = (index / 256, index % 256);
+    let (fr, fc) = (face / 2, face % 2);
+    (fr * 16 + within / 16, fc * 16 + within % 16)
+}
+
+/// The L1 index of matrix element `(row, column)`.
+fn tile_index(row: usize, column: usize) -> usize {
+    let face = (row / 16) * 2 + column / 16;
+    face * 256 + (row % 16) * 16 + column % 16
+}
+
+/// `a @ b` over 32x32 tiles, in L1 order.
+fn tile_matmul(a: &[f32], b: &[f32]) -> Vec<f32> {
+    let mut out = vec![0.0f32; 1024];
+    for row in 0..32 {
+        for column in 0..32 {
+            let mut sum = 0.0f32;
+            for k in 0..32 {
+                sum += a[tile_index(row, k)] * b[tile_index(k, column)];
+            }
+            out[tile_index(row, column)] = sum;
+        }
+    }
+    out
+}
+
+#[test]
+fn matmul_runs_on_the_simulator() {
+    let run = |a: &[f32], b: &[f32]| -> Vec<f32> {
+        let a_bytes: Vec<u8> = a.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let b_bytes: Vec<u8> = b.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let out = run_kernel_tensors(MATMUL_F32, &[&a_bytes, &b_bytes], 4096);
+        out.chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    };
+
+    // The identity on the left leaves B untouched, in whatever order the Matrix
+    // Unit reads the faces: no layout assumption enters this case.
+    let mut a = vec![0.0f32; 1024];
+    for i in 0..32 {
+        a[tile_index(i, i)] = 1.0;
+    }
+    let b: Vec<f32> = (0..1024).map(|i| (i % 23) as f32 - 11.0).collect();
+    let got = run(&a, &b);
+    for i in 0..1024 {
+        assert_eq!(got[i], b[i], "identity x B, datum {i}");
+    }
+
+    // A whole product: every value is an integer, so TF32 reads it exactly and
+    // the accumulator is exact.
+    let a: Vec<f32> = (0..1024).map(|i| (i % 7) as f32 - 3.0).collect();
+    let b: Vec<f32> = (0..1024).map(|i| (i % 5) as f32 - 2.0).collect();
+    let got = run(&a, &b);
+    let want = tile_matmul(&a, &b);
+    for i in 0..1024 {
+        let (row, column) = tile_rc(i);
+        assert_eq!(
+            got[i], want[i],
+            "a x b, datum {i} at ({row}, {column}): got {}, want {}",
+            got[i], want[i]
+        );
+    }
+
+    // The same product when `%a` also feeds a datapath op: one page, unpacked
+    // once into `Dst` and once into `Src`.
+    let a_bytes: Vec<u8> = a.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let b_bytes: Vec<u8> = b.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_tensors(MATMUL_F32_MIXED, &[&a_bytes, &b_bytes], 4096);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for i in 0..1024 {
+        assert_eq!(got[i], want[i], "a x b with a shared page, datum {i}");
+    }
+}
+
+/// bf16 operands over an `f32` accumulator: `SrcA`/`SrcB` take the bf16 pages as
+/// they are, the Matrix Unit accumulates in the 32-bit `Dst`, and the packer
+/// writes the f32 result.
+const MATMUL_BF16_F32: &str = "\
+version 5
+grid 1,1
+%pa = param bf16 1024
+%pb = param bf16 1024
+%out = param f32 1024
+%ba = buffer bf16 32,32
+%bb = buffer bf16 32,32
+%bo = buffer f32 32,32
+copy_to %ba from %pa [0]
+copy_to %bb from %pb [0]
+%a = load %ba [0]
+%b = load %bb [0]
+%m = matmul f32 %a %b
+store_to %bo from %m [0]
+copy_to %out from %bo [0]
+";
+
+/// bf16 operands over a `bf16` accumulator: the 16-bit `Dst`, the native path.
+const MATMUL_BF16: &str = "\
+version 5
+grid 1,1
+%pa = param bf16 1024
+%pb = param bf16 1024
+%out = param bf16 1024
+%ba = buffer bf16 32,32
+%bb = buffer bf16 32,32
+%bo = buffer bf16 32,32
+copy_to %ba from %pa [0]
+copy_to %bb from %pb [0]
+%a = load %ba [0]
+%b = load %bb [0]
+%m = matmul bf16 %a %b
+store_to %bo from %m [0]
+copy_to %out from %bo [0]
+";
+
+#[test]
+fn bf16_matmul_runs_on_the_simulator() {
+    // Integers: exact in bf16, and a product's sum stays inside bf16's eight
+    // mantissa bits, so an f32 and a bf16 accumulator must agree.
+    let a: Vec<f32> = (0..1024).map(|i| (i % 3) as f32 - 1.0).collect();
+    let b: Vec<f32> = (0..1024).map(|i| (i % 5) as f32 - 2.0).collect();
+    let a_bf16: Vec<u16> = a.iter().map(|v| truncate_to_bf16(*v)).collect();
+    let b_bf16: Vec<u16> = b.iter().map(|v| truncate_to_bf16(*v)).collect();
+    let want = tile_matmul(&a, &b);
+    let a_bytes: Vec<u8> = a_bf16.iter().flat_map(|h| h.to_le_bytes()).collect();
+    let b_bytes: Vec<u8> = b_bf16.iter().flat_map(|h| h.to_le_bytes()).collect();
+
+    let out = run_kernel_tensors(MATMUL_BF16_F32, &[&a_bytes, &b_bytes], 4096);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for i in 0..1024 {
+        assert_eq!(got[i], want[i], "bf16 operands, f32 accumulator, datum {i}");
+    }
+
+    let out = run_kernel_tensors(MATMUL_BF16, &[&a_bytes, &b_bytes], 2048);
+    let got: Vec<u16> = out
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (i, v) in want.iter().enumerate() {
+        assert_eq!(
+            got[i],
+            truncate_to_bf16(*v),
+            "bf16 operands, bf16 accumulator, datum {i}"
+        );
+    }
 }

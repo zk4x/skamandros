@@ -225,7 +225,7 @@ impl Words {
 /// Encode only the math core.
 pub fn math(m: &Machine) -> Result<Vec<u32>, Error> {
     let mut out = Stream::default();
-    encode_math(&m.t1, &mut out)?;
+    encode_math(&m.t1, &mut out, m.dst_is_16_bit)?;
     out.words()
 }
 
@@ -233,7 +233,7 @@ pub fn math(m: &Machine) -> Result<Vec<u32>, Error> {
 pub fn encode(m: &Machine) -> Result<Words, Error> {
     let mut out = Words::default();
     encode_unpack(&m.t0, &mut out.t0, m.dst_is_16_bit)?;
-    encode_math(&m.t1, &mut out.t1)?;
+    encode_math(&m.t1, &mut out.t1, m.dst_is_16_bit)?;
     encode_pack(&m.t2, &mut out.t2, m.dst_is_16_bit)?;
     Ok(out)
 }
@@ -310,10 +310,13 @@ fn semaphore(index: u8) -> Result<Semaphore, Error> {
 /// unpack that uses it.
 #[derive(Default)]
 struct UnpackState {
+    /// The `Dst` row an unpack with `to_src` clear lands in.
     dst_row: u32,
-    x0: u32,
-    x1: u32,
-    face: u32,
+    /// Per unpacker (0 = `SrcA`, 1 = `SrcB`): the face `SETADCZW` chose and the
+    /// datum run `SETADCX` chose.
+    face: [u32; 2],
+    x0: [u32; 2],
+    x1: [u32; 2],
 }
 
 fn encode_unpack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(), Error> {
@@ -324,6 +327,7 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result
     // kernel: `CFG_STATE_ID` decides which `Config` bank later writes land in, so
     // no config store may race with them.
     thread_config(out);
+    alu_acc_ctrl(out, dst_is_16_bit);
     // Every role is called with `a0` = the launch arguments; word 2 is the CB
     // interface table (`tt-metal`'s `ARG_IFACE`).
     out.rv(rv::lw(reg::A6, reg::A0, crate::mover::ARG_IFACE as i32 * 4));
@@ -337,46 +341,84 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result
             MirOp::Loop { count } => open_loop(out, &mut loops, count)?,
             MirOp::EndLoop => close_loop(out, &mut loops)?,
             MirOp::Setdst { row } => state.dst_row = row,
-            MirOp::Setadcx { first, count, .. } => {
+            MirOp::Setadcx { unit, first, count } => {
                 if count == 0 {
                     return Err(Error::TT_ERROR_UNPACK_ZERO_RANGE);
                 }
-                state.x0 = first;
-                state.x1 = first + count - 1;
+                let u = usize::from(unit);
+                state.x0[u] = first;
+                state.x1[u] = first + count - 1;
             }
-            MirOp::Setadczw { face, .. } => state.face = face,
+            MirOp::Setadczw { unit, face } => state.face[usize::from(unit)] = face,
             MirOp::Unpacr {
-                cb, count, dtype, ..
+                cb,
+                unit,
+                count,
+                dtype,
+                to_src,
+                flip,
             } => {
                 if count == 0 {
                     return Err(Error::TT_ERROR_UNPACK_ZERO_DATUMS);
                 }
-                state.x0 = 0;
-                state.x1 = count - 1;
+                let u = usize::from(unit);
+                // `SRCA_SET_SetOvrdWithAddr`: the Src path wants it set, the Dst
+                // path clear, and the unpacker reads it at execution time, so a
+                // role that does both toggles it here. ttsim refuses either
+                // combination otherwise.
+                out.push(thread_entry(
+                    thread::SRCA_SET_SetOvrdWithAddr,
+                    u16::from(to_src),
+                ));
                 // The page is at the ring's read pointer, not a compile-time L1
                 // address: write that pointer into the unpacker's base register
                 // after draining the previous unpack.
-                cb_base_unpack(out, cb)?;
+                cb_base_unpack(out, cb, unit)?;
                 let mut words = ConfigWords::new();
-                unpack_config(&mut words, count, state.dst_row, dtype, dst_is_16_bit);
+                if to_src {
+                    // One 16x16 face: the descriptor's X run of the Z plane
+                    // `SETADCZW` selected. The unpacker's datum count comes from
+                    // `SETADCX`, not from the descriptor.
+                    state.x0[u] = 0;
+                    state.x1[u] = 255;
+                    src_unpack_config(&mut words, unit, dtype);
+                } else {
+                    state.x0[u] = 0;
+                    state.x1[u] = count - 1;
+                    unpack_config(&mut words, count, state.dst_row, dtype, dst_is_16_bit);
+                }
                 out.extend(config_program(&words));
                 out.push(stallwait(
                     block::UNPACKER | block::CONFIG,
                     cond::CONFIG_BUSY,
                 )?);
-                out.push(set_adc_x_unpack(state.x0, state.x1)?);
-                if state.face != 0 {
-                    out.push(set_adc_z_unpack(state.face)?);
+                if to_src {
+                    // The Src path walks the descriptor's Z planes, one face
+                    // each; the face is always named, because the two unpackers
+                    // keep their own counter.
+                    out.push(set_adc_x_unpack(unit, state.x0[u], state.x1[u])?);
+                    out.push(set_adc_z_unpack(unit, state.face[u])?);
+                } else {
+                    out.push(set_adc_x_unpack(unit, state.x0[u], state.x1[u])?);
+                    // Always named: the address counters outlive the program, so
+                    // a face a previous kernel left behind would be read again.
+                    out.push(set_adc_z_unpack(unit, state.face[u])?);
                 }
-                out.push(unpack_instruction()?);
+                out.push(unpack_instruction(unit, flip)?);
             }
             MirOp::CbWait { cb } => {
                 out.asm(|a| rv::cb::wait_front(a, reg::A6, cb, 1, [reg::T0, reg::T1, reg::T2]))?;
             }
             MirOp::CbPop { cb } => {
-                // The page is only free once the unpacker has read it.
+                // The page is only free once both unpackers have read it.
                 out.push(
                     wait_for_unpacker0(Before::EVERYTHING)
+                        .map_err(|_| Error::TT_ERROR_STALLWAIT)?,
+                );
+                // A page the Matrix Unit read is released only once its own
+                // unpacker has drained too.
+                out.push(
+                    tt_isa::backend::wait_for_unpacker1(Before::EVERYTHING)
                         .map_err(|_| Error::TT_ERROR_STALLWAIT)?,
                 );
                 out.asm(|a| {
@@ -415,14 +457,23 @@ const INSTRN_BUF: u32 = tt_isa::tensix::INSTRN_BUF_BASE as u32;
 /// The unpacker's read base: the ring's read pointer in 16-byte units, minus the
 /// header unit the unpacker adds (`UNPACR_Regular.md`: `InAddr = (Base_address +
 /// 1 + DigestSize) * 16`).
-fn cb_base_unpack(out: &mut Stream, cb: u32) -> Result<(), Error> {
+fn cb_base_unpack(out: &mut Stream, cb: u32, unit: u8) -> Result<(), Error> {
     out.push(wait_for_unpacker0(Before::EVERYTHING).map_err(|_| Error::TT_ERROR_STALLWAIT)?);
-    cb_base(
-        out,
-        cb,
-        rv::cb::RD_PTR,
-        thcon::THCON_SEC0_REG3_Base_address.addr32(),
-    )
+    if unit == 1 {
+        out.push(
+            tt_isa::backend::wait_for_unpacker1(Before::EVERYTHING)
+                .map_err(|_| Error::TT_ERROR_STALLWAIT)?,
+        );
+    }
+    let config = match unit {
+        0 => thcon::THCON_SEC0_REG3_Base_address.addr32(),
+        1 => thcon::THCON_SEC1_REG3_Base_address.addr32(),
+        _ => {
+            let _ = unit;
+            return Err(Error::TT_ERROR_UNPACR);
+        }
+    };
+    cb_base(out, cb, rv::cb::RD_PTR, config)
 }
 
 /// The packer's output base: the ring's write pointer, same 16-byte conversion.
@@ -491,6 +542,23 @@ fn cb_base(out: &mut Stream, cb: u32, field: i32, config: u16) -> Result<(), Err
     })?);
     out.push(backend::nop());
     Ok(())
+}
+
+/// `ALU_ACC_CTRL`: the `Dst` width the whole program is built for, written
+/// before any unit runs. `Fp32_enabled` is the 32-bit bank; a bf16 kernel clears
+/// it. The packer writes the same value with its own config, but the SFPU and
+/// the Matrix Unit read it long before the first pack — and it outlives the
+/// program, so every role sets it rather than inheriting it from whatever ran
+/// before.
+fn alu_acc_ctrl(out: &mut Stream, dst_is_16_bit: bool) {
+    let mut words = ConfigWords::new();
+    words
+        .set(alu::ALU_ACC_CTRL_Fp32_enabled, u32::from(!dst_is_16_bit))
+        .unwrap()
+        // `MVMUL.md`: the "keep SrcB denormals" mode must not be used.
+        .set(alu::ALU_ACC_CTRL_Zero_Flag_disabled_src, 0)
+        .unwrap();
+    out.extend(config_program(&words));
 }
 
 /// `SETC16.md`: the first `ThreadConfig` writes any thread must make. Emitted
@@ -633,41 +701,116 @@ fn unpack_config(
     }
 }
 
+/// Configure unpacker `unit` to move a 32x32 tile's four 16x16 faces from L1
+/// into `SrcA` (`unit` 0) or `SrcB` (`unit` 1), as the Matrix Unit reads them.
+///
+/// The `Src` side is not `Dst`: `Unpack_if_sel_cntx0` clear, no `SETADCX` run,
+/// and the descriptor names four Z planes of one 16x16 face each. What comes
+/// out of the unpacker is `TF32` for an `f32` operand (FP32 *into* `Src` is
+/// undefined) and `BF16` for a bf16 one; the Matrix Unit learns it from the
+/// implied format the handover sets, not from `ALU_FORMAT_SPEC`.
+fn src_unpack_config(words: &mut ConfigWords, unit: u8, dtype: DType) {
+    let out = match dtype {
+        DType::Bf16 => L1Format::Bf16,
+        _ => L1Format::Tf32,
+    };
+    let descriptor = TileDescriptor::zeroed()
+        .with_x_dim(16)
+        .with_y_dim(16)
+        .with_z_dim(4)
+        .with_is_uncompressed(true)
+        .with_in_data_format_raw(l1_format(dtype).code().expect("a measured format"));
+    let span = match unit {
+        0 => {
+            words
+                .set(thcon::THCON_SEC0_REG7_Offset_address, 0)
+                .unwrap()
+                .set(thcon::THCON_SEC0_REG5_Tile_x_dim_cntx0, 16)
+                .unwrap()
+                .set(thcon::THCON_SEC0_REG2_Out_data_format, out.code().unwrap())
+                .unwrap()
+                // `Src`, not `Dst`.
+                .set(thcon::THCON_SEC0_REG2_Unpack_if_sel_cntx0, 0)
+                .unwrap()
+                .set(thcon::THCON_SEC0_REG2_Disable_zero_compress_cntx0, 1)
+                .unwrap()
+                // With `UnpackToDst` clear this *replaces* the output address;
+                // `SrcA` row 0 is `OutAddr / 16 - 4`, so 64 is row 0.
+                .set(thcon::THCON_SEC0_REG5_Dest_cntx0_address, 64)
+                .unwrap()
+                .set(unpack1::UNP0_ADDR_CTRL_XY_REG_1_Ystride, 0)
+                .unwrap()
+                .set(unpack1::UNP0_ADDR_CTRL_ZW_REG_1_Zstride, 0)
+                .unwrap();
+            thcon::THCON_SEC0_REG0_TileDescriptor
+        }
+        _ => {
+            // Unpacker 1 takes far fewer fields: no `Dest_cntx` term, no
+            // `Tile_x_dim_cntx` (the descriptor carries the width), and its
+            // `Offset_address` cannot be written (reset zero).
+            words
+                .set(thcon::THCON_SEC1_REG2_Out_data_format, out.code().unwrap())
+                .unwrap()
+                .set(thcon::THCON_SEC1_REG2_Disable_zero_compress_cntx0, 1)
+                .unwrap()
+                .set(unpack1::UNP1_ADDR_CTRL_ZW_REG_1_Zstride, 0)
+                .unwrap();
+            thcon::THCON_SEC1_REG0_TileDescriptor
+        }
+    };
+    for (i, word) in descriptor.words().iter().enumerate() {
+        if *word != 0 {
+            words.seed(span.addr32() + i as u16, *word).unwrap();
+        }
+    }
+}
+
 /// The `REG5_Dest_cntx0_address` that lands an unpack's first datum in `Dst`
 /// row `row`: `Dst` row is `OutAddr / 16 - 4`.
 pub const fn dst_address(row: u32) -> u32 {
     (row + 4) * 16
 }
 
-fn set_adc_x_unpack(first: u32, last: u32) -> Result<Instruction, Error> {
-    encode::Setadcxx::ZERO
-        .u0(1)
-        .x0_val(first)
-        .x1_val(last)
-        .encode()
-        .map_err(|e| {
-            let _ = e;
-            Error::TT_ERROR_SETADCXX
-        })
+fn set_adc_x_unpack(unit: u8, first: u32, last: u32) -> Result<Instruction, Error> {
+    let base = encode::Setadcxx::ZERO;
+    let base = match unit {
+        0 => base.u0(1),
+        1 => base.u1(1),
+        _ => {
+            let _ = unit;
+            return Err(Error::TT_ERROR_SETADCXX);
+        }
+    };
+    base.x0_val(first).x1_val(last).encode().map_err(|e| {
+        let _ = e;
+        Error::TT_ERROR_SETADCXX
+    })
 }
 
-fn set_adc_z_unpack(face: u32) -> Result<Instruction, Error> {
-    encode::Setadczw::ZERO
-        .u0(1)
-        .z0(1)
-        .z0_val(face)
-        .encode()
-        .map_err(|e| {
-            let _ = e;
-            Error::TT_ERROR_SETADCZW
-        })
+fn set_adc_z_unpack(unit: u8, face: u32) -> Result<Instruction, Error> {
+    let base = encode::Setadczw::ZERO;
+    let base = match unit {
+        0 => base.u0(1),
+        1 => base.u1(1),
+        _ => {
+            let _ = unit;
+            return Err(Error::TT_ERROR_SETADCZW);
+        }
+    };
+    base.z0(1).z0_val(face).encode().map_err(|e| {
+        let _ = e;
+        Error::TT_ERROR_SETADCZW
+    })
 }
 
-fn unpack_instruction() -> Result<Instruction, Error> {
+/// `UNPACR` into `Dst` (unit 0, no `flip`) or into `SrcA`/`SrcB` (`flip` hands
+/// the bank to the Matrix Unit).
+fn unpack_instruction(unit: u8, flip: bool) -> Result<Instruction, Error> {
     // Bit 0 is undocumented and ttsim refuses the instruction without it.
     let base = encode::UnpacrRegular::ZERO
-        .which_unpacker(0)
+        .which_unpacker(u32::from(unit))
         .multi_context_mode(1)
+        .flip_src(u32::from(flip))
         .encode()
         .map_err(|e| {
             let _ = e;
@@ -680,7 +823,11 @@ fn unpack_instruction() -> Result<Instruction, Error> {
 // The math core (T1)
 // ---------------------------------------------------------------------------
 
-fn encode_math(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
+fn encode_math(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(), Error> {
+    if ops.is_empty() {
+        return Ok(());
+    }
+    alu_acc_ctrl(out, dst_is_16_bit);
     let mut at = 0usize;
     let mut loops = Vec::new();
     while at < ops.len() {
@@ -875,6 +1022,46 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
             );
             out.push(encode::sfpmov(u32::from(a), u32::from(d), 0).map_err(bad_isa)?);
             out.push(cc_mask(false).map_err(bad_isa)?);
+        }
+        MirOp::Mvmul {
+            row,
+            addr_mod,
+            flip_a,
+            flip_b,
+        } => {
+            let i = encode::Mvmul::ZERO
+                .dst_row(row + row_delta)
+                .addr_mod(addr_mod)
+                .flip_src_a(u32::from(flip_a))
+                .flip_src_b(u32::from(flip_b))
+                .broadcast_src_b_row(0)
+                .encode()
+                .map_err(bad_isa)?;
+            out.push(i);
+        }
+        MirOp::Zeroacc { block } => {
+            out.push(encode::zeroacc(1, 0, 0, block).map_err(bad_isa)?);
+        }
+        MirOp::Setrwc { src_a, src_b, dst } => {
+            let i = encode::Setrwc::ZERO
+                .src_a(1)
+                .src_a_val(src_a)
+                .src_b(1)
+                .src_b_val(src_b)
+                .dst(1)
+                .dst_val(dst)
+                .fidelity(1)
+                .encode()
+                .map_err(bad_isa)?;
+            out.push(i);
+        }
+        MirOp::ThreadWord { addr, value } => {
+            // A whole `ThreadConfig` word: `SETC16` carries the composed value
+            // and `0` leaves every other field of the entry clear.
+            out.push(backend::set_thread_entry(addr, value).map_err(|e| bad(e, op))?);
+        }
+        MirOp::WaitMatrix => {
+            out.push(backend::wait_for_matrix(Before::EVERYTHING).map_err(|e| bad(e, op))?);
         }
         MirOp::SemPost { sem } => {
             let s = semaphore(sem)?;

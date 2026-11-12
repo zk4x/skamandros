@@ -79,20 +79,50 @@ pub enum MirOp {
     Select { cond: u8, t: u8, f: u8, d: u8 },
     /// The lanewise maximum, through the SFPU lane flags.
     Max { a: u8, b: u8, d: u8 },
-    /// `UNPACR`: the page at the head of `cb`'s ring into unpacker `unit`'s
-    /// destination. `dtype` picks the L1 format: `Bf16` for a 16-bit datum,
-    /// `Fp32` otherwise (an `i32` datum is opaque 32 bits). The base is read
-    /// from the ring's read pointer at run time.
+    /// `UNPACR`: the page at the head of `cb`'s ring into the destination
+    /// `unit` names. With `to_src` clear it lands in `Dst` at the row
+    /// [`MirOp::Setdst`] chose (`unit` is 0 then); with `to_src` set it lands in
+    /// `SrcA` (`unit` 0) or `SrcB` (`unit` 1) at the face
+    /// [`MirOp::Setadczw`] chose, and `flip` hands the bank to the Matrix Unit.
+    /// `dtype` picks the L1 format: `Bf16` for a 16-bit datum, `Fp32` otherwise
+    /// (an `i32` datum is opaque 32 bits). The base is read from the ring's read
+    /// pointer at run time.
     Unpacr {
         cb: u32,
         unit: u8,
         count: u32,
         dtype: DType,
+        to_src: bool,
+        flip: bool,
     },
     /// `SETADCZW`: which face the unpacker reads next.
     Setadczw { unit: u8, face: u32 },
     /// `SETADCX`: the datum run the unpacker walks.
     Setadcx { unit: u8, first: u32, count: u32 },
+    /// `MVMUL`: `Dst` rows starting at `row` accumulate `SrcA * SrcB` for one
+    /// fidelity phase; `addr_mod` is the address-modifier entry the Matrix Unit
+    /// applies afterwards, and the flips hand `SrcA`/`SrcB` back to the
+    /// unpacker.
+    Mvmul {
+        row: u32,
+        addr_mod: u32,
+        flip_a: bool,
+        flip_b: bool,
+    },
+    /// `ZEROACC` on one eight-row block of the 32-bit `Dst` (`block` is the
+    /// block index, eight rows each).
+    Zeroacc { block: u32 },
+    /// `SETRWC`: the `SrcA`/`SrcB`/`Dst` row counters and the fidelity phase,    /// which is how the Matrix Unit is told where its operands and accumulator
+    /// start. The SFPU addresses `Dst` relative to the same counter, so the
+    /// matmul restores it after its groups.
+    Setrwc { src_a: u32, src_b: u32, dst: u32 },
+    /// One whole `SETC16` `ThreadConfig` word (address and value), which is how
+    /// the Matrix Unit's address modifiers and fidelity phase are set.
+    ThreadWord { addr: u16, value: u16 },
+    /// Wait until the Matrix Unit has drained. Its writes to `Dst` are
+    /// asynchronous, so a value the Matrix Unit produced is not readable — by
+    /// the packer or by the next kernel — until this returns.
+    WaitMatrix,
     /// The base `Dst` row an unpack writes to.
     Setdst { row: u32 },
     /// The packer drains into the page at the tail of `cb`'s ring. The base is

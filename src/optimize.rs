@@ -211,6 +211,31 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                     let _ = cb;
                 }
                 MirOp::Setadczw { .. } | MirOp::Setadcx { .. } => {}
+                MirOp::Mvmul { row, addr_mod, .. } => {
+                    if row >= u32::from(DST_SLOTS) * DST_ROWS {
+                        let _ = (name, at, row);
+                        return Err(Error::TT_ERROR_DST_ROW);
+                    }
+                    if addr_mod > 7 {
+                        let _ = (name, at, addr_mod);
+                        return Err(Error::TT_ERROR_ADDR_MOD);
+                    }
+                }
+                MirOp::Zeroacc { block } => {
+                    // `CLR_16` names one of 64 sixteen-row blocks of `Dst`.
+                    if block >= 64 {
+                        let _ = (name, at, block);
+                        return Err(Error::TT_ERROR_DST_ROW);
+                    }
+                }
+                MirOp::Setrwc { src_a, src_b, dst } => {
+                    // Each counter's field is four bits: sixteen rows.
+                    if src_a >= 16 || src_b >= 16 || dst >= 16 {
+                        let _ = (name, at, src_a, src_b, dst);
+                        return Err(Error::TT_ERROR_SETRWC);
+                    }
+                }
+                MirOp::ThreadWord { .. } | MirOp::WaitMatrix => {}
                 MirOp::Loop { count } => {
                     let _ = count;
                     depth += 1;
@@ -257,7 +282,7 @@ mod tests {
     use crate::planner::place;
 
     const NEG: &str = "\
-version 4
+version 5
 grid 1,1
 %in = param f32 4096
 %out = param f32 4096

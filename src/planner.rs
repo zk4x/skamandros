@@ -113,7 +113,7 @@ mod tests {
     use crate::ir::Kernel;
 
     const TWO: &str = "\
-version 4
+version 5
 %in = param f32 2048
 %out = param f32 2048
 %bi = buffer f32 32,64

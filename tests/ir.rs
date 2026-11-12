@@ -14,7 +14,7 @@ use TT::ir::Kernel;
 #[test]
 fn the_unified_program_round_trips() {
     const PROGRAM: &str = "\
-version 4
+version 5
 grid 4,6
 %p0 = param bf16 1024,132,453
 %p1 = param bf16 1024,232
@@ -44,7 +44,7 @@ copy_to %p1 from %b0 [%i6]
 endloop
 %a = load %b0 [1024]
 %b = load %b0 [0]
-%m = matmul %a %b
+%m = matmul f32 %a %b
 ";
 
     let k = Kernel::parse(PROGRAM).unwrap_or_else(|e| panic!("the unified program parses: {e}"));
@@ -55,7 +55,7 @@ endloop
     // Symbolic grid and symbolic parameter dims, with the grid after the values
     // it reads: a scalar parameter is a rank-0 shape.
     const SYMBOLIC: &str = "\
-version 4
+version 5
 %d = param i32 0
 %x = param bf16 1024,%d
 grid %d,8
@@ -69,13 +69,13 @@ grid %d,8
 #[test]
 fn a_buffer_shape_that_is_not_one_or_a_multiple_of_32_is_refused() {
     for shape in ["33,32", "32,33", "16,32"] {
-        let text = format!("version 4\n%x = buffer f32 {shape}\ngrid 1,1\n");
+        let text = format!("version 5\n%x = buffer f32 {shape}\ngrid 1,1\n");
         let err = Kernel::parse(&text).expect_err(shape);
         assert_eq!(err, TT::status::ttStatus::TT_ERROR_BUFFER_SHAPE, "{shape}");
     }
     // A buffer is always two-dimensional and always constant.
     for shape in ["32", "32,%d"] {
-        let text = format!("version 4\n%d = const i32 4\n%x = buffer f32 {shape}\ngrid 1,1\n");
+        let text = format!("version 5\n%d = const i32 4\n%x = buffer f32 {shape}\ngrid 1,1\n");
         assert!(
             Kernel::parse(&text).is_err(),
             "{shape} is not a buffer shape"
@@ -85,7 +85,7 @@ fn a_buffer_shape_that_is_not_one_or_a_multiple_of_32_is_refused() {
 
 #[test]
 fn a_zero_dimension_is_not_the_way_to_write_a_tensor() {
-    let text = "version 4\n%p = param f32 0,32\ngrid 1,1\n";
+    let text = "version 5\n%p = param f32 0,32\ngrid 1,1\n";
     let err = Kernel::parse(text).expect_err("a zero in a dimension list");
     assert_eq!(err, TT::status::ttStatus::TT_ERROR_ZERO_DIMENSION);
 }
@@ -93,7 +93,7 @@ fn a_zero_dimension_is_not_the_way_to_write_a_tensor() {
 #[test]
 fn an_implicit_dtype_conversion_is_refused() {
     let text = "\
-version 4
+version 5
 %a = const f32 1.0
 %b = const i32 1
 %c = add %a %b
@@ -105,7 +105,7 @@ grid 1,1
 
 #[test]
 fn a_use_before_its_definition_is_refused() {
-    let text = "version 4\n%x = add %a %b\n%a = const i32 1\n%b = const i32 2\ngrid 1,1\n";
+    let text = "version 5\n%x = add %a %b\n%a = const i32 1\n%b = const i32 2\ngrid 1,1\n";
     let err = Kernel::parse(text).expect_err("undefined value");
     assert_eq!(err, TT::status::ttStatus::TT_ERROR_PARSE);
 }
@@ -113,7 +113,7 @@ fn a_use_before_its_definition_is_refused() {
 #[test]
 fn a_value_does_not_escape_its_loop() {
     let text = "\
-version 4
+version 5
 %n = const i32 4
 %i = loop %n
 %x = add %i %n
@@ -127,9 +127,9 @@ grid 1,1
 
 #[test]
 fn a_program_needs_exactly_one_grid() {
-    let err = Kernel::parse("version 4\n%x = const i32 1\n").expect_err("no grid");
+    let err = Kernel::parse("version 5\n%x = const i32 1\n").expect_err("no grid");
     assert_eq!(err, TT::status::ttStatus::TT_ERROR_GRID);
-    let err = Kernel::parse("version 4\ngrid 1,1\ngrid 2,2\n").expect_err("two grids");
+    let err = Kernel::parse("version 5\ngrid 1,1\ngrid 2,2\n").expect_err("two grids");
     assert_eq!(err, TT::status::ttStatus::TT_ERROR_GRID);
 }
 
@@ -138,7 +138,7 @@ fn an_unknown_version_is_refused_in_both_forms() {
     let err = Kernel::parse("version 1\ngrid 1,1\n").expect_err("version 1");
     assert_eq!(err, TT::status::ttStatus::TT_ERROR_VERSION);
 
-    let mut bytes = Kernel::parse("version 4\ngrid 1,1\n%x = const i32 1\n")
+    let mut bytes = Kernel::parse("version 5\ngrid 1,1\n%x = const i32 1\n")
         .unwrap()
         .to_bytes();
     assert_eq!(&bytes[..4], b"TTIR");
@@ -152,7 +152,7 @@ fn an_unknown_version_is_refused_in_both_forms() {
         Err(TT::status::ttStatus::TT_ERROR_NOT_TTIR),
         "a wrong magic"
     );
-    let mut bytes = Kernel::parse("version 4\ngrid 1,1\n%x = const i32 1\n")
+    let mut bytes = Kernel::parse("version 5\ngrid 1,1\n%x = const i32 1\n")
         .unwrap()
         .to_bytes();
     bytes.push(0);
@@ -165,7 +165,7 @@ fn an_unknown_version_is_refused_in_both_forms() {
 #[test]
 fn a_copy_kernel_compiles_to_mover_programs_only() {
     const COPY: &str = "\
-version 4
+version 5
 %in = param f32 8192
 %out = param f32 8192
 %b0 = buffer f32 32,64
@@ -194,7 +194,7 @@ grid 1,1
 #[test]
 fn an_elementwise_kernel_compiles_to_all_five_programs() {
     const NEG: &str = "\
-version 4
+version 5
 %in = param f32 4096
 %out = param f32 4096
 %bi = buffer f32 32,32
@@ -222,7 +222,7 @@ grid 1,1
 #[test]
 fn a_direct_parameter_access_gets_its_movers() {
     const DIRECT: &str = "\
-version 4
+version 5
 %in = param f32 4096
 %out = param f32 4096
 %x = load %in [0]
@@ -275,7 +275,7 @@ grid 1,1
 #[test]
 fn a_constant_loop_becomes_a_branch() {
     const LOOP_TWO: &str = "\
-version 4
+version 5
 %in = param f32 2048
 %out = param f32 2048
 %bi = buffer f32 32,64
@@ -321,7 +321,7 @@ fn has_backward_branch(words: &[u32]) -> bool {
 #[test]
 fn a_dynamic_loop_becomes_a_branch() {
     const DYNAMIC: &str = "\
-version 4
+version 5
 %n = param i32 0
 %in = param f32 2048
 %out = param f32 2048
@@ -350,7 +350,7 @@ grid 1,1
 #[test]
 fn the_grid_is_symbolic_and_the_coordinate_is_a_value() {
     const SYMBOLIC: &str = "\
-version 4
+version 5
 %nx = param i32 0
 %ny = param i32 0
 %in = param f32 2048
@@ -388,7 +388,7 @@ grid %nx,%ny
 #[test]
 fn comparisons_make_a_bool_and_sel_takes_one() {
     const SELECT: &str = "\
-version 4
+version 5
 %x = const i32 3
 %y = const i32 5
 %lt = cmplt %x %y
@@ -403,11 +403,11 @@ grid 1,1
     assert_eq!(types.values[3].dtype, TT::ir::DType::I32, "sel is i32");
 
     // A bool condition is required, and a value with no bool is not one.
-    let bad = "version 4\n%x = const i32 3\n%m = sel %x %x %x\ngrid 1,1\n";
+    let bad = "version 5\n%x = const i32 3\n%m = sel %x %x %x\ngrid 1,1\n";
     let err = Kernel::parse(bad).expect_err("an i32 condition is refused");
     assert_eq!(err, TT::status::ttStatus::TT_ERROR_CONDITION_NOT_BOOL);
 
-    let err = Kernel::parse("version 4\n%x = const i32 3\n%y = relu %x\ngrid 1,1\n")
+    let err = Kernel::parse("version 5\n%x = const i32 3\n%y = relu %x\ngrid 1,1\n")
         .expect_err("relu is not an op");
     assert_eq!(err, TT::status::ttStatus::TT_ERROR_PARSE);
 }
@@ -417,7 +417,7 @@ grid 1,1
 #[test]
 fn a_bitcast_is_the_same_bits_under_another_name() {
     const SAME: &str = "\
-version 4
+version 5
 %in = param f32 2048
 %out = param i32 2048
 %bi = buffer f32 32,32
@@ -440,7 +440,7 @@ grid 1,1
 
     // 32 bits do not fit a 16-bit dtype, and a bitcast may not convert.
     const NARROW: &str = "\
-version 4
+version 5
 %b = buffer f32 32,32
 %x = load %b [0]
 %y = bitcast %x to bf16
@@ -448,4 +448,138 @@ grid 1,1
 ";
     let err = Kernel::parse(NARROW).expect_err("a narrower dtype cannot hold the bits");
     assert_eq!(err, TT::status::ttStatus::TT_ERROR_BITCAST_WIDTH);
+}
+
+/// `m = a x b` over two `f32` tiles: the operands must be `load`s, because the
+/// Matrix Unit's `SrcA`/`SrcB` are filled by the unpacker from a CB page.
+const MATMUL: &str = "\
+version 5
+grid 1,1
+%pa = param f32 1024
+%pb = param f32 1024
+%out = param f32 1024
+%ba = buffer f32 32,32
+%bb = buffer f32 32,32
+%bo = buffer f32 32,32
+copy_to %ba from %pa [0]
+copy_to %bb from %pb [0]
+%a = load %ba [0]
+%b = load %bb [0]
+%m = matmul f32 %a %b
+store_to %bo from %m [0]
+copy_to %out from %bo [0]
+";
+
+#[test]
+fn a_matmul_compiles_to_the_matrix_unit() {
+    let k = Kernel::parse(MATMUL).expect("it parses");
+    let m = TT::compile::compile(&k).unwrap_or_else(|e| panic!("it compiles: {e}"));
+    assert_eq!(m.params.len(), 3);
+}
+
+#[test]
+fn a_matmul_is_refused_for_what_the_matrix_unit_cannot_take() {
+    use TT::status::ttStatus as S;
+    let case = |what: &str, text: &str, want: S| {
+        let err = match Kernel::parse(text) {
+            Ok(k) => TT::compile::compile(&k).expect_err(what),
+            Err(e) => e,
+        };
+        assert_eq!(err, want, "{what}");
+    };
+
+    // An operand the datapath computed has no page to unpack into `Src`.
+    case(
+        "a negated operand",
+        "\
+version 5
+grid 1,1
+%pa = param f32 1024
+%out = param f32 1024
+%ba = buffer f32 32,32
+%bb = buffer f32 32,32
+%bo = buffer f32 32,32
+copy_to %ba from %pa [0]
+copy_to %bb from %pa [0]
+%a = load %ba [0]
+%b = load %bb [0]
+%n = neg %a
+%m = matmul f32 %n %b
+store_to %bo from %m [0]
+copy_to %out from %bo [0]
+",
+        S::TT_ERROR_MATMUL_OPERAND,
+    );
+
+    // A bf16 accumulator in a module whose `Dst` is 32-bit: the Matrix Unit
+    // would accumulate in FP32, not at the bf16 the op names.
+    case(
+        "bf16 accumulation beside an f32 value",
+        "\
+version 5
+grid 1,1
+%pa = param bf16 1024
+%pf = param f32 1024
+%out = param bf16 1024
+%of = param f32 1024
+%ba = buffer bf16 32,32
+%bb = buffer bf16 32,32
+%bf = buffer f32 32,32
+%bg = buffer f32 32,32
+%bo = buffer bf16 32,32
+copy_to %ba from %pa [0]
+copy_to %bb from %pa [0]
+copy_to %bf from %pf [0]
+%a = load %ba [0]
+%b = load %bb [0]
+%f = load %bf [0]
+%g = neg %f
+store_to %bg from %g [0]
+copy_to %of from %bg [0]
+%m = matmul bf16 %a %b
+store_to %bo from %m [0]
+copy_to %out from %bo [0]
+",
+        S::TT_ERROR_MATMUL_ACCUM_WIDE,
+    );
+
+    // `f32` operands are TF32 in `Src` and cannot accumulate into a 16-bit
+    // `Dst`.
+    case(
+        "f32 operands, bf16 accumulator",
+        "\
+version 5
+grid 1,1
+%pa = param f32 1024
+%out = param bf16 1024
+%ba = buffer f32 32,32
+%bo = buffer bf16 32,32
+copy_to %ba from %pa [0]
+%a = load %ba [0]
+%m = matmul bf16 %a %a
+store_to %bo from %m [0]
+copy_to %out from %bo [0]
+",
+        S::TT_ERROR_MATMUL_DTYPE,
+    );
+
+    // An `i32` operand: integer matmul is `Int8`/`Int32` `Src` formats and a
+    // different set of phases.
+    case(
+        "i32 operands",
+        "\
+version 5
+grid 1,1
+%pa = param i32 1024
+%out = param i32 1024
+%ba = buffer i32 32,32
+%bo = buffer i32 32,32
+copy_to %ba from %pa [0]
+%a = load %ba [0]
+%m = matmul f32 %a %a
+store_to %bo from %m [0]
+copy_to %out from %bo [0]
+",
+        S::TT_ERROR_MATMUL_DTYPE,
+    );
 }

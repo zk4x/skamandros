@@ -20,6 +20,7 @@ use crate::ir::{BinOp, Dim, Error, Kernel, Op, RegShape, Types, UnOp, unit_of};
 use crate::mir::{CmpOp, IOp, Machine, MirOp, SfpOp};
 use crate::planner::Plan;
 use crate::riscv::reg;
+use tt_isa::cfg::generated::thread;
 
 /// `Dst` rows one 32x32 F32 tile occupies (`tt_isa`'s SFPU row is 16 datums).
 pub const DST_ROWS: u32 = 64;
@@ -105,6 +106,25 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             alias[value as usize] = Some(resolve(&alias, src));
         }
     }
+    // Who reads each value, and where it last does: a `matmul` reads its
+    // operands' CB pages straight into `SrcA`/`SrcB`, so a page stays reserved
+    // until the last of its readers, and only then is popped.
+    let mut last_use: Vec<Option<usize>> = vec![None; types.values.len()];
+    let mut matmul_use: Vec<bool> = vec![false; types.values.len()];
+    let mut non_matmul_use: Vec<bool> = vec![false; types.values.len()];
+    for (at, op) in k.ops.iter().enumerate() {
+        for v in op.used() {
+            last_use[v as usize] = Some(at);
+            match *op {
+                Op::Matmul { a, b, .. } if v == a || v == b => matmul_use[v as usize] = true,
+                _ => non_matmul_use[v as usize] = true,
+            }
+        }
+    }
+    // The page of a load that a `matmul` also reads is released at the last
+    // reader, not at the load: the ring's read pointer must not move while the
+    // Matrix Unit's unpack still points at it.
+    let mut pop_here: Vec<Vec<u32>> = vec![Vec::new(); k.ops.len()];
     for (at, op) in k.ops.iter().enumerate() {
         match *op {
             Op::Const { .. }
@@ -161,15 +181,6 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     let _ = buffer;
                     return Err(Error::TT_ERROR_NOT_A_BUFFER);
                 };
-                // A bf16 page can only be unpacked into a bf16 `Dst`
-                // (`BF16 -> BF16` is the unpacker's only Dst-path conversion for
-                // it), so a bf16 buffer only enters a 16-bit kernel. Reaching one
-                // from a 32-bit kernel needs SrcA/SrcB and the widening
-                // `BF16 -> TF32` path.
-                if wide && dtype == crate::ir::DType::Bf16 {
-                    let _ = (at, buffer);
-                    return Err(Error::TT_ERROR_BF16_WIDEN);
-                }
                 let (unit_shape, _, _) = unit_of(shape, dtype)?;
                 let rows = rows_of(unit_shape, at)?;
                 let cb = plan.cb[buffer as usize].ok_or_else(|| {
@@ -177,34 +188,63 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     Error::TT_ERROR_BUFFER_NOT_PLACED
                 })?;
                 let row = dst_row(alloc, resolve(&alias, value));
-                // The unpacker writes `Dst`: it waits for a slot the packer has
-                // given back, so the first unit's result cannot be overwritten
-                // before it has been packed. The page itself comes from the ring:
-                // wait for the producer's push, unpack, then release the page.
-                m.t0.push(MirOp::SemWait {
-                    sem: SEM_SLOT,
-                    before: 0,
-                });
-                m.t0.push(MirOp::CbWait { cb });
-                m.t0.push(MirOp::Setdst { row });
-                m.t0.push(MirOp::Setadczw { unit: 0, face: 0 });
-                m.t0.push(MirOp::Setadcx {
-                    unit: 0,
-                    first: 0,
-                    count: unit_shape.datums(),
-                });
-                m.t0.push(MirOp::Unpacr {
-                    cb,
-                    unit: 0,
-                    count: unit_shape.datums(),
-                    dtype,
-                });
-                m.t0.push(MirOp::CbPop { cb });
-                m.t0.push(MirOp::SemPost { sem: SEM_UNPACKED });
-                m.t1.push(MirOp::SemWait {
-                    sem: SEM_UNPACKED,
-                    before: 0,
-                });
+                // A value only a `matmul` reads never enters `Dst`: the unpack
+                // goes straight into `SrcA`/`SrcB` at the matmul, and this load
+                // only reserves the page.
+                let lands_in_dst = non_matmul_use[value as usize] || !matmul_use[value as usize];
+                if lands_in_dst {
+                    // A bf16 page can only be unpacked into a bf16 `Dst`
+                    // (`BF16 -> BF16` is the unpacker's only Dst-path conversion
+                    // for it), so a bf16 buffer only enters a 16-bit kernel.
+                    // Reaching one from a 32-bit kernel needs SrcA/SrcB and the
+                    // widening `BF16 -> TF32` path.
+                    if wide && dtype == crate::ir::DType::Bf16 {
+                        let _ = (at, buffer);
+                        return Err(Error::TT_ERROR_BF16_WIDEN);
+                    }
+                    // The unpacker writes `Dst`: it waits for a slot the packer
+                    // has given back, so the first unit's result cannot be
+                    // overwritten before it has been packed. The page itself
+                    // comes from the ring: wait for the producer's push, unpack,
+                    // then release the page.
+                    m.t0.push(MirOp::SemWait {
+                        sem: SEM_SLOT,
+                        before: 0,
+                    });
+                    m.t0.push(MirOp::CbWait { cb });
+                    m.t0.push(MirOp::Setdst { row });
+                    m.t0.push(MirOp::Setadczw { unit: 0, face: 0 });
+                    m.t0.push(MirOp::Setadcx {
+                        unit: 0,
+                        first: 0,
+                        count: unit_shape.datums(),
+                    });
+                    m.t0.push(MirOp::Unpacr {
+                        cb,
+                        unit: 0,
+                        count: unit_shape.datums(),
+                        dtype,
+                        to_src: false,
+                        flip: false,
+                    });
+                    m.t0.push(MirOp::SemPost { sem: SEM_UNPACKED });
+                    m.t1.push(MirOp::SemWait {
+                        sem: SEM_UNPACKED,
+                        before: 0,
+                    });
+                } else {
+                    // The Matrix Unit's operand: the page is reserved here and
+                    // unpacked at the matmul; the bank handover gates the rest.
+                    m.t0.push(MirOp::CbWait { cb });
+                }
+                // A page the Matrix Unit still reads is released after that
+                // read, not here.
+                if matmul_use[value as usize] {
+                    let last = last_use[value as usize].expect("a read value has a last use");
+                    pop_here[last].push(cb);
+                } else {
+                    m.t0.push(MirOp::CbPop { cb });
+                }
                 let _ = info;
                 let _ = rows;
                 let _ = offset;
@@ -448,13 +488,238 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     });
                 }
             }
-            Op::Matmul { .. } => {
-                let _ = at;
-                return Err(Error::TT_TODO_MATMUL);
+            Op::Matmul { value, a, b, dtype } => {
+                let dt_a = types.of(a).dtype;
+                let dt_b = types.of(b).dtype;
+                // The accumulator is the `Dst` width; a `bf16` accumulator in a
+                // module whose bank is 32-bit would accumulate in FP32 instead.
+                if dtype == crate::ir::DType::Bf16 && wide {
+                    let _ = at;
+                    return Err(Error::TT_ERROR_MATMUL_ACCUM_WIDE);
+                }
+                let cb_a = matmul_page(k, plan, &def, &alias, a, at)?;
+                let cb_b = matmul_page(k, plan, &def, &alias, b, at)?;
+                let base = dst_row(alloc, resolve(&alias, value));
+                // The Matrix Unit's address modifiers, fidelity phase and row
+                // counters are this thread's `ThreadConfig` and RWC state. Every
+                // word goes out as a whole `SETC16`, so an entry carrying several
+                // fields of one word is composed here.
+                for entry in [
+                    vec![(thread::ADDR_MOD_AB_SEC0_SrcAIncr, 0u16)],
+                    vec![(thread::ADDR_MOD_DST_SEC0_DestIncr, 0)],
+                    vec![(thread::ADDR_MOD_AB_SEC1_SrcAIncr, 0)],
+                    vec![(thread::ADDR_MOD_DST_SEC1_FidelityIncr, 1)],
+                    // End of a group's first `SrcB` half: `SrcB` on eight rows,
+                    // phase back to 0.
+                    vec![
+                        (thread::ADDR_MOD_AB_SEC2_SrcBIncr, 8),
+                        (thread::ADDR_MOD_AB_SEC2_SrcBClear, 0),
+                    ],
+                    vec![
+                        (thread::ADDR_MOD_DST_SEC2_DestIncr, 0),
+                        (thread::ADDR_MOD_DST_SEC2_DestCR, 0),
+                        (thread::ADDR_MOD_DST_SEC2_FidelityClear, 1),
+                    ],
+                    // End of a group that is not the `fi`'s last: phase and
+                    // `SrcB` back to 0.
+                    vec![
+                        (thread::ADDR_MOD_AB_SEC3_SrcBIncr, 0),
+                        (thread::ADDR_MOD_AB_SEC3_SrcBClear, 1),
+                    ],
+                    vec![
+                        (thread::ADDR_MOD_DST_SEC3_DestIncr, 0),
+                        (thread::ADDR_MOD_DST_SEC3_DestCR, 0),
+                        (thread::ADDR_MOD_DST_SEC3_FidelityClear, 1),
+                    ],
+                    // End of an `fi`: as 3, and the `Dst` base on 32 rows for
+                    // the next `fi`.
+                    vec![
+                        (thread::ADDR_MOD_AB_SEC4_SrcBIncr, 0),
+                        (thread::ADDR_MOD_AB_SEC4_SrcBClear, 1),
+                    ],
+                    vec![
+                        (thread::ADDR_MOD_DST_SEC4_DestIncr, 32),
+                        (thread::ADDR_MOD_DST_SEC4_DestCR, 0),
+                        (thread::ADDR_MOD_DST_SEC4_FidelityClear, 1),
+                    ],
+                    vec![(thread::FIDELITY_BASE_Phase, 0)],
+                ] {
+                    m.t1.push(thread_word(&entry));
+                }
+                // Src rows and the `Dst` counter start at 0.
+                m.t1.push(MirOp::Setrwc {
+                    src_a: 0,
+                    src_b: 0,
+                    dst: 0,
+                });
+                // The accumulator's own rows only: `CLR_16` blocks are eight
+                // 32-bit rows each (sixteen 16-bit ones).
+                let block = if dtype == crate::ir::DType::Bf16 {
+                    base / 16
+                } else {
+                    base / 8
+                };
+                let blocks = if dtype == crate::ir::DType::Bf16 {
+                    4
+                } else {
+                    8
+                };
+                for i in 0..blocks {
+                    m.t1.push(MirOp::Zeroacc { block: block + i });
+                }
+                // One `(fi, k)` group: A's face `(fi, k)` into `SrcB`, B's two
+                // faces `(k, 0)` and `(k, 1)` into `SrcA`. The unpacker and the
+                // Matrix Unit alternate through the bank handover, so the two
+                // roles interleave by ownership, not by instruction position.
+                for fi in 0..2u32 {
+                    for kk in 0..2u32 {
+                        m.t0.push(MirOp::Setadczw {
+                            unit: 1,
+                            face: 2 * fi + kk,
+                        });
+                        m.t0.push(MirOp::Unpacr {
+                            cb: cb_a,
+                            unit: 1,
+                            count: TILE_DATUMS,
+                            dtype: dt_a,
+                            to_src: true,
+                            flip: true,
+                        });
+                        m.t0.push(MirOp::Setadczw {
+                            unit: 0,
+                            face: 2 * kk,
+                        });
+                        m.t0.push(MirOp::Unpacr {
+                            cb: cb_b,
+                            unit: 0,
+                            count: TILE_DATUMS,
+                            dtype: dt_b,
+                            to_src: true,
+                            flip: true,
+                        });
+                        mvmul_group(&mut m.t1, base);
+                        m.t1.push(MirOp::Mvmul {
+                            row: base + 8,
+                            addr_mod: MATMUL_AM_GROUP,
+                            flip_a: true,
+                            flip_b: false,
+                        });
+                        m.t0.push(MirOp::Setadczw {
+                            unit: 0,
+                            face: 2 * kk + 1,
+                        });
+                        m.t0.push(MirOp::Unpacr {
+                            cb: cb_b,
+                            unit: 0,
+                            count: TILE_DATUMS,
+                            dtype: dt_b,
+                            to_src: true,
+                            flip: true,
+                        });
+                        mvmul_group(&mut m.t1, base + 16);
+                        let end = if kk == 0 {
+                            MATMUL_AM_GROUP
+                        } else {
+                            MATMUL_AM_FI
+                        };
+                        m.t1.push(MirOp::Mvmul {
+                            row: base + 24,
+                            addr_mod: end,
+                            flip_a: true,
+                            flip_b: true,
+                        });
+                    }
+                }
+                // The Matrix Unit advanced the thread's `Dst` counter as it
+                // walked the accumulator, and an `SFPLOAD`/`SFPSTORE` address is
+                // relative to it, so the counter goes back to 0. Its writes are
+                // still in flight, so the accumulator is not readable (the pack
+                // follows on T2) until the unit drains.
+                m.t1.push(MirOp::WaitMatrix);
+                m.t1.push(MirOp::Setrwc {
+                    src_a: 0,
+                    src_b: 0,
+                    dst: 0,
+                });
             }
+        }
+        // A page a `matmul` read is released once the last reader of the loaded
+        // value has consumed it, which is after the matmul's own unpacks.
+        for cb in std::mem::take(&mut pop_here[at]) {
+            m.t0.push(MirOp::CbPop { cb });
         }
     }
     Ok(m)
+}
+
+/// `MVMUL`'s `ADDR_MOD` entries, one per column-group boundary: the next
+/// fidelity phase, the end of a first `SrcB` half, the end of a group, and the
+/// end of an `fi`.
+const MATMUL_AM_PHASE: u32 = 1;
+const MATMUL_AM_HALF: u32 = 2;
+const MATMUL_AM_GROUP: u32 = 3;
+const MATMUL_AM_FI: u32 = 4;
+
+/// One `MVMUL` group into `Dst` rows `base..base + 16`: both `SrcB` halves and
+/// every fidelity phase, all but the group's last multiply, which the caller
+/// issues with its flips.
+fn mvmul_group(role: &mut Vec<MirOp>, base: u32) {
+    for half in 0..2u32 {
+        let phases = if half == 0 { 4 } else { 3 };
+        for phase in 0..phases {
+            let addr_mod = if half == 0 && phase + 1 == 4 {
+                MATMUL_AM_HALF
+            } else {
+                MATMUL_AM_PHASE
+            };
+            role.push(MirOp::Mvmul {
+                row: base + 8 * half,
+                addr_mod,
+                flip_a: false,
+                flip_b: false,
+            });
+        }
+    }
+}
+
+/// One whole `SETC16` `ThreadConfig` word composed from `fields`.
+fn thread_word(fields: &[(tt_isa::cfg::ThreadConfigField, u16)]) -> MirOp {
+    let mut entry = tt_isa::backend::ThreadConfigEntry::zeroed(fields[0].0.addr32());
+    for &(field, value) in fields {
+        entry = entry
+            .set(field, value)
+            .expect("the matmul's thread entry is encodable");
+    }
+    MirOp::ThreadWord {
+        addr: entry.addr32(),
+        value: entry.value(),
+    }
+}
+
+/// The CB a `matmul` operand reads: the value must be a `load` (possibly through
+/// a bitcast), because the Matrix Unit's `SrcA`/`SrcB` are filled by the
+/// unpacker from a page, not from `Dst`.
+fn matmul_page(
+    k: &Kernel,
+    plan: &Plan,
+    def: &[Option<usize>],
+    alias: &[Option<crate::ir::ValueId>],
+    value: crate::ir::ValueId,
+    at: usize,
+) -> Result<u32, Error> {
+    let id = resolve(alias, value);
+    let Some(op_at) = def[id as usize] else {
+        let _ = (at, value);
+        return Err(Error::TT_ERROR_MATMUL_OPERAND);
+    };
+    let Op::Load { buffer, .. } = k.ops[op_at] else {
+        let _ = (at, value);
+        return Err(Error::TT_ERROR_MATMUL_OPERAND);
+    };
+    plan.cb[buffer as usize].ok_or_else(|| {
+        let _ = buffer;
+        Error::TT_ERROR_BUFFER_NOT_PLACED
+    })
 }
 
 /// The literal trip count of a bound, if it has one.

@@ -364,6 +364,27 @@ pub enum ttStatus {
     /// conversion needs `SrcA`/`SrcB` and the Matrix Unit, which this compiler
     /// does not place.
     TT_ERROR_BF16_WIDEN = 153,
+    /// `matmul`'s operands or its accumulation dtype are not a pair the Matrix
+    /// Unit's `Src` path takes: both operands must be `f32` or `bf16` and equal,
+    /// the accumulation dtype must be `f32` or `bf16`, and `f32` operands cannot
+    /// accumulate into a 16-bit `Dst` (the `Src` format would be TF32 and the
+    /// bank 16-bit).
+    TT_ERROR_MATMUL_DTYPE = 154,
+    /// A `matmul` names a `bf16` accumulator while some other value in the
+    /// module forces the 32-bit `Dst`: the bank is one width, and the Matrix
+    /// Unit would then accumulate in FP32, not at the `bf16` the op names.
+    TT_ERROR_MATMUL_ACCUM_WIDE = 155,
+    /// A `matmul` operand is not a `load` value. The Matrix Unit reads
+    /// `SrcA`/`SrcB`, which the unpacker fills straight from a CB page; a value
+    /// the datapath computed lives in `Dst` and has no page to unpack.
+    TT_ERROR_MATMUL_OPERAND = 156,
+    /// A `Config` word the program seeds is outside the `Config` address space.
+    TT_ERROR_CONFIG_WORD = 157,
+    /// A machine `MVMUL` names an address-modifier entry the Matrix Unit does
+    /// not have (three bits on Blackhole).
+    TT_ERROR_ADDR_MOD = 158,
+    /// A `SETRWC` counter value does not fit its four-bit field.
+    TT_ERROR_SETRWC = 159,
 }
 
 impl ttStatus {
@@ -525,6 +546,12 @@ impl ttStatus {
             ttStatus::TT_ERROR_BITCAST_WIDTH => "TT_ERROR_BITCAST_WIDTH",
             ttStatus::TT_ERROR_TELEMETRY => "TT_ERROR_TELEMETRY",
             ttStatus::TT_ERROR_BF16_WIDEN => "TT_ERROR_BF16_WIDEN",
+            ttStatus::TT_ERROR_MATMUL_DTYPE => "TT_ERROR_MATMUL_DTYPE",
+            ttStatus::TT_ERROR_MATMUL_ACCUM_WIDE => "TT_ERROR_MATMUL_ACCUM_WIDE",
+            ttStatus::TT_ERROR_MATMUL_OPERAND => "TT_ERROR_MATMUL_OPERAND",
+            ttStatus::TT_ERROR_CONFIG_WORD => "TT_ERROR_CONFIG_WORD",
+            ttStatus::TT_ERROR_ADDR_MOD => "TT_ERROR_ADDR_MOD",
+            ttStatus::TT_ERROR_SETRWC => "TT_ERROR_SETRWC",
         }
     }
 }

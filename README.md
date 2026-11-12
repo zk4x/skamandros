@@ -18,7 +18,7 @@ values. It names no processor, no `Dst` slot, no `Src` bank, no lane register,
 no semaphore, no unpacker, no packer and no Tensix word:
 
 ```
-version 4
+version 5
 grid 1,1
 %in  = param f32 1024,128
 %out = param f32 1024,128
@@ -266,9 +266,19 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   bf16 and a 32-bit dtype* is a `Dst` boundary, not a lane instruction: the
   packer narrows into a bf16 buffer, and widening out of one is refused
   (`TT_ERROR_BF16_WIDEN`) because the hardware has no such path through `Dst`.
-- Broadcast, `matmul`, `eq`/`noteq`, the remaining unary and binary ops, the
-  `bool` datapath in a parameter or buffer, and the reduce op are accepted by
-  the format and verifier and refused loudly by lowering, not guessed at.
+- `matmul` is the Matrix Unit's: `%m = matmul f32 %a %b` multiplies two 32x32
+  tiles and names its accumulator's dtype (`f32` in the 32-bit `Dst`, `bf16` in
+  the 16-bit one). Both operands must be `load` values — the unpacker fills
+  `SrcA`/`SrcB` straight from their CB pages, in the `Src` format their dtype
+  implies (`TF32` for `f32`, `BF16` for bf16) — and they are the same dtype:
+  `bf16`/`bf16`, `bf16`/`f32` and `f32`/`f32` run; an `f32` operand with a
+  `bf16` accumulator is refused. A `bf16` accumulator needs the whole module to
+  be 16-bit, since the bank is one width. A `load` that also feeds a datapath op
+  keeps its `Dst` unpack and is unpacked once more into `Src` at the matmul; its
+  page is released after the Matrix Unit has read it.
+- Broadcast, `eq`/`noteq`, the remaining unary and binary ops, the `bool`
+  datapath in a parameter or buffer, and the reduce op are accepted by the
+  format and verifier and refused loudly by lowering, not guessed at.
 - bf16 is a real L1 format and the native compute path. A bf16 buffer is two
   bytes per datum, and the `Dst` width is one mode for the whole module, as
   tt-metal's `DST_ACCUM_MODE` (`fp32_dest_acc_en`) is: if every value that
@@ -281,7 +291,8 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
 - A bf16 value cannot *widen* into a 32-bit `Dst`: the unpacker has no
   `BF16 -> FP32` Dst path and a 16-bit `Dst` cannot pack `f32`/`i32`, so
   `cast %x to f32` on a bf16 value is `TT_ERROR_BF16_WIDEN` (the conversion
-  exists only on the `SrcA`/`SrcB` path, which this compiler does not place).
+  exists only on the `SrcA`/`SrcB` path, which this compiler drives for
+  `matmul` operands and not for a `cast`).
 - Transcendentals are the caller's to unfold. zyx rewrites `Exp2`/`Log2`/`Sin`/
   `Cos` (and `Pow` as `exp2(y * log2 x)`) into primitive arithmetic in
   `tt_unfold`, before the backend sees them, and skamandros does the same by

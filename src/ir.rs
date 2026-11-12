@@ -490,11 +490,16 @@ pub enum Op {
         if_true: ValueId,
         if_false: ValueId,
     },
-    /// `a x b` accumulating into a tile.
+    /// `a x b` accumulating into a tile: the two operands are `SrcA`/`SrcB`
+    /// tiles, multiplied and summed over the K faces into `value`. `dtype` is
+    /// the accumulator's: `f32` accumulates in the 32-bit `Dst`, `bf16` in the
+    /// 16-bit one. The operands keep their own dtype, so `bf16` operands over an
+    /// `f32` accumulator is the usual mixed form.
     Matmul {
         value: ValueId,
         a: ValueId,
         b: ValueId,
+        dtype: DType,
     },
 }
 
@@ -1159,7 +1164,7 @@ impl Kernel {
                         shape,
                     }
                 }
-                Op::Matmul { a, b, .. } => {
+                Op::Matmul { a, b, dtype, .. } => {
                     let x = *lookup(&values, &visible, a, at)?;
                     let y = *lookup(&values, &visible, b, at)?;
                     if !is_value(x.kind) || !is_value(y.kind) {
@@ -1174,9 +1179,19 @@ impl Kernel {
                         let _ = (x.dtype, y.dtype);
                         return Err(Error::TT_ERROR_MATMUL_CAST);
                     }
+                    // The Matrix Unit's Src path takes `f32` (TF32 in Src) and
+                    // `bf16` only, and the accumulator is the `Dst` width: a
+                    // 32-bit `Src` cannot accumulate into a 16-bit `Dst`.
+                    let ok_operand = matches!(x.dtype, DType::F32 | DType::Bf16);
+                    let ok_accum = matches!(dtype, DType::F32 | DType::Bf16)
+                        && !(x.dtype == DType::F32 && dtype == DType::Bf16);
+                    if !ok_operand || !ok_accum {
+                        let _ = (x.dtype, dtype);
+                        return Err(Error::TT_ERROR_MATMUL_DTYPE);
+                    }
                     ValueInfo {
                         kind: ValueKind::Register,
-                        dtype: x.dtype,
+                        dtype,
                         shape: RegShape::Tile,
                     }
                 }
@@ -1306,7 +1321,7 @@ fn param_elements(k: &Kernel, def: &[usize], param: ValueId) -> Option<u32> {
 /// The byte form's magic.
 pub const MAGIC: [u8; 4] = *b"TTIR";
 /// The IR version this build reads and writes.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 impl Kernel {
     /// The byte form: the same program as [`Kernel::to_text`], little-endian and
@@ -1429,11 +1444,17 @@ impl Kernel {
                     put_u32(&mut b, *if_true);
                     put_u32(&mut b, *if_false);
                 }
-                Op::Matmul { value, a, b: rhs } => {
+                Op::Matmul {
+                    value,
+                    a,
+                    b: rhs,
+                    dtype,
+                } => {
                     b.push(12);
                     put_name(&mut b, &self.names[*value as usize]);
                     put_u32(&mut b, *a);
                     put_u32(&mut b, *rhs);
+                    b.push(dtype.tag());
                 }
                 Op::Bitcast { value, src, dtype } => {
                     b.push(15);
@@ -1564,8 +1585,9 @@ impl Kernel {
                     let name = r.name()?;
                     let a = r.u32()?;
                     let b = r.u32()?;
+                    let dtype = DType::from_tag(r.u8()?).ok_or(Error::TT_ERROR_DTYPE_TAG)?;
                     let value = define(&mut names, name)?;
-                    Op::Matmul { value, a, b }
+                    Op::Matmul { value, a, b, dtype }
                 }
                 13 => {
                     let name = r.name()?;
@@ -1934,10 +1956,11 @@ impl Kernel {
                         name(*if_false)
                     ));
                 }
-                Op::Matmul { value, a, b } => {
+                Op::Matmul { value, a, b, dtype } => {
                     s.push_str(&format!(
-                        "%{} = matmul %{} %{}\n",
+                        "%{} = matmul {} %{} %{}\n",
                         name(*value),
+                        dtype.name(),
                         name(*a),
                         name(*b)
                     ));
@@ -2073,10 +2096,11 @@ fn parse_definition(t: &mut Tokens, p: &mut Parser) -> Result<Op, Error> {
             Op::Bitcast { value, src, dtype }
         }
         "matmul" => {
+            let dtype = t.dtype()?;
             let a = t.value(&p.symbols)?;
             let b = t.value(&p.symbols)?;
             t.end()?;
-            Op::Matmul { value, a, b }
+            Op::Matmul { value, a, b, dtype }
         }
         "sel" => {
             let cond = t.value(&p.symbols)?;
