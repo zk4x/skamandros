@@ -75,6 +75,27 @@ impl Stream {
         Ok(())
     }
 
+    /// Words appended so far. One elem is one RISC-V word, Tensix or not, so a
+    /// branch distance is a difference of these.
+    fn len(&self) -> usize {
+        self.elems.len()
+    }
+
+    /// Replace an already-appended word. Used to close a branch whose target
+    /// is only known later (a loop's forward skip).
+    fn patch(&mut self, at: usize, word: u32) {
+        self.elems[at] = Elem::Riscv(word);
+    }
+
+    /// `li rd, value`: the same two words [`Asm::li`] emits.
+    fn li(&mut self, rd: u8, value: u32) {
+        let imm = value as i32;
+        let hi = (imm.wrapping_add(0x800) >> 12) as u32;
+        let lo = imm - (hi as i32) * 4096;
+        self.rv(rv::lui(rd, hi & 0xf_ffff));
+        self.rv(rv::addi(rd, rd, lo));
+    }
+
     /// The encoded words, ending in `ret`. An empty program stays empty: it is
     /// not started, and a lone `ret` would make it look non-empty.
     fn words(&self) -> Result<Vec<u32>, Error> {
@@ -96,30 +117,70 @@ impl Stream {
     }
 }
 
+/// One open [`MirOp::Loop`]: the register holding the remaining trip count, the
+/// word the forward skip is patched into, and the word the body starts at.
+struct OpenLoop {
+    reg: u8,
+    top: usize,
+    skip: usize,
+}
+
+/// Open a loop: `reg = count; if reg == 0 goto end; top:`.
+///
+/// The skip's target is the end, which is not known until [`close_loop`], so
+/// that one word is patched there. One caller-saved register per nesting level:
+/// `T4` then `T5`. A deeper loop is a concrete future item, not a guess at a
+/// register.
+fn open_loop(out: &mut Stream, loops: &mut Vec<OpenLoop>, count: u32) -> Result<(), Error> {
+    let reg = match loops.len() {
+        0 => reg::T4,
+        1 => reg::T5,
+        _ => return Err(Error::TT_TODO_LOOP_DEPTH),
+    };
+    out.li(reg, count);
+    let skip = out.len();
+    out.rv(rv::beq(reg, reg::ZERO, 0));
+    let top = out.len();
+    loops.push(OpenLoop { reg, top, skip });
+    Ok(())
+}
+
+/// Close a loop: `addi reg, reg, -1; bne reg, zero, top; end:` and the patched
+/// forward skip of [`open_loop`].
+fn close_loop(out: &mut Stream, loops: &mut Vec<OpenLoop>) -> Result<(), Error> {
+    let loop_ = loops.pop().ok_or(Error::TT_ERROR_ENDLOOP_MACHINE)?;
+    out.rv(rv::addi(loop_.reg, loop_.reg, -1));
+    let here = out.len();
+    out.rv(rv::bne(loop_.reg, reg::ZERO, 0));
+    let after = out.len();
+    // The back branch is emitted at `here` and targets `top`.
+    let back = ((loop_.top as i32) - (here as i32)) * 4;
+    out.patch(here, rv::bne(loop_.reg, reg::ZERO, back));
+    let forward = ((after as i32) - (loop_.skip as i32)) * 4;
+    out.patch(loop_.skip, rv::beq(loop_.reg, reg::ZERO, forward));
+    Ok(())
+}
+
 /// One instruction stream per compute core.
 #[derive(Debug, Clone, Default)]
 pub struct Words {
     t0: Stream,
-    t1: Vec<Instruction>,
+    t1: Stream,
     t2: Stream,
 }
 
 impl Words {
     /// The encoded words, as the program slot takes them.
     pub fn words(&self) -> Result<[Vec<u32>; 3], Error> {
-        let mut t1 = Stream::default();
-        for instruction in &self.t1 {
-            t1.push(*instruction);
-        }
-        Ok([self.t0.words()?, t1.words()?, self.t2.words()?])
+        Ok([self.t0.words()?, self.t1.words()?, self.t2.words()?])
     }
 }
 
 /// Encode only the math core.
-pub fn math(m: &Machine) -> Result<Vec<Instruction>, Error> {
-    let mut out = Vec::new();
+pub fn math(m: &Machine) -> Result<Vec<u32>, Error> {
+    let mut out = Stream::default();
     encode_math(&m.t1, &mut out)?;
-    Ok(out)
+    out.words()
 }
 
 /// Encode all three compute programs.
@@ -221,8 +282,11 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
     // interface table (`tt-metal`'s `ARG_IFACE`).
     out.rv(rv::lw(reg::A6, reg::A0, crate::mover::ARG_IFACE as i32 * 4));
     let mut state = UnpackState::default();
+    let mut loops = Vec::new();
     for op in ops {
         match *op {
+            MirOp::Loop { count } => open_loop(out, &mut loops, count)?,
+            MirOp::EndLoop => close_loop(out, &mut loops)?,
             MirOp::Setdst { row } => state.dst_row = row,
             MirOp::Setadcx { first, count, .. } => {
                 if count == 0 {
@@ -279,6 +343,9 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
                 return Err(Error::TT_ERROR_UNPACK_OP);
             }
         }
+    }
+    if !loops.is_empty() {
+        return Err(Error::TT_ERROR_ENDLOOP_MACHINE);
     }
     Ok(())
 }
@@ -527,8 +594,9 @@ fn unpack_instruction() -> Result<Instruction, Error> {
 // The math core (T1)
 // ---------------------------------------------------------------------------
 
-fn encode_math(ops: &[MirOp], out: &mut Vec<Instruction>) -> Result<(), Error> {
+fn encode_math(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
     let mut at = 0usize;
+    let mut loops = Vec::new();
     while at < ops.len() {
         match ops[at] {
             MirOp::Repeat { len, count } => {
@@ -544,16 +612,29 @@ fn encode_math(ops: &[MirOp], out: &mut Vec<Instruction>) -> Result<(), Error> {
                 at += 1 + len as usize;
                 continue;
             }
+            MirOp::Loop { count } => {
+                open_loop(out, &mut loops, count)?;
+                at += 1;
+                continue;
+            }
+            MirOp::EndLoop => {
+                close_loop(out, &mut loops)?;
+                at += 1;
+                continue;
+            }
             op => encode_math_op(&op, 0, out)?,
         }
         at += 1;
+    }
+    if !loops.is_empty() {
+        return Err(Error::TT_ERROR_ENDLOOP_MACHINE);
     }
     Ok(())
 }
 
 /// One math op at `row_delta` (a repeat's iteration offset, two address units per
 /// iteration).
-fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Vec<Instruction>) -> Result<(), Error> {
+fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Error> {
     fn bad(e: impl std::fmt::Display, op: &MirOp) -> Error {
         let _ = (e, op);
         Error::TT_ERROR_ENCODE
@@ -757,8 +838,11 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
     thread_config(out);
     // `a0` = the launch arguments; word 2 is the CB interface table.
     out.rv(rv::lw(reg::A6, reg::A0, crate::mover::ARG_IFACE as i32 * 4));
+    let mut loops = Vec::new();
     for op in ops {
         match *op {
+            MirOp::Loop { count } => open_loop(out, &mut loops, count)?,
+            MirOp::EndLoop => close_loop(out, &mut loops)?,
             MirOp::SemWait { sem, .. } => {
                 out.extend(sync::take(semaphore(sem)?, Before::EVERYTHING));
             }
@@ -808,6 +892,9 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
                 return Err(Error::TT_ERROR_PACK_OP);
             }
         }
+    }
+    if !loops.is_empty() {
+        return Err(Error::TT_ERROR_ENDLOOP_MACHINE);
     }
     Ok(())
 }

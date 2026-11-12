@@ -16,7 +16,7 @@
 //! way round. Which copies belong to the inbound program and which to the
 //! outbound one is decided here from the operands, not by the caller.
 
-use crate::ir::{Dim, Error, Kernel, Op, Types, ValueId};
+use crate::ir::{BinOp, Dim, Error, Kernel, Op, Types, ValueId};
 use crate::planner::Plan;
 use crate::riscv::{self as rv, Asm, reg};
 use tt_isa::noc::niu::{
@@ -48,11 +48,47 @@ pub const fn param_arg(param: u32) -> (i32, i32) {
 /// One copy, resolved against the plan.
 struct Copy {
     param: u32,
-    /// Byte offset into the parameter.
-    offset: u32,
+    /// Where in the parameter this copy reads or writes.
+    offset: ParamOffset,
     /// The CB whose ring holds the L1 side of the copy.
     cb: u32,
     bytes: u32,
+}
+
+/// The parameter side of a copy: a literal byte offset, or a value computed
+/// each iteration of an enclosing loop (the address a loop index names).
+enum ParamOffset {
+    Const(u32),
+    /// `value` is the index expression, in datums; `dtype_bytes` scales it.
+    Index {
+        value: ValueId,
+        dtype_bytes: u32,
+    },
+}
+
+/// One item of a boundary program, in program order. The copies between a
+/// [`Item::Loop`] and its [`Item::EndLoop`] run once per iteration; the loop is
+/// a RISC-V branch, not an unroll, so the trip count can be any constant.
+enum Item {
+    Copy(Copy),
+    Loop { index: ValueId, count: u32 },
+    EndLoop,
+}
+
+/// The parameter-side offset [`emit_copy`] adds: a literal, or the register an
+/// enclosing loop's index expression left it in.
+enum CopyOffset {
+    Const(u32),
+    Reg(u8),
+}
+
+/// One open loop in a boundary program: the register pair the branch counts in,
+/// and the label it branches back to.
+struct MoverLoop {
+    index: ValueId,
+    index_reg: u8,
+    limit_reg: u8,
+    top: String,
 }
 
 /// The inbound program: every copy from a parameter into a buffer, in program
@@ -353,8 +389,8 @@ fn remap(op: &Op, map: &[ValueId], value: Option<ValueId>) -> Op {
 }
 
 fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<u32>, Error> {
-    let copies = collect(k, types, plan, inbound)?;
-    if copies.is_empty() {
+    let items = collect(k, types, plan, inbound)?;
+    if !items.iter().any(|item| matches!(item, Item::Copy(_))) {
         return Ok(Vec::new());
     }
     let mut a = Asm::new();
@@ -363,25 +399,173 @@ fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
     // initiator) and `a6` (the interface) alone.
     let sync3 = [reg::T0, reg::T1, reg::T2];
     let sync4 = [reg::T0, reg::T1, reg::T2, reg::T6];
-    for (at, copy) in copies.iter().enumerate() {
-        let cb = copy.cb;
-        if inbound {
-            rv::cb::reserve_back(&mut a, reg::A6, cb, 1, sync3);
-        } else {
-            rv::cb::wait_front(&mut a, reg::A6, cb, 1, sync3);
+    let def = definitions(k);
+    let mut loops: Vec<MoverLoop> = Vec::new();
+    let mut at = 0usize;
+    for item in &items {
+        match *item {
+            Item::Loop { index, count } => {
+                // `a0` holds the arguments, `a5` stages the offset, `t3`/`t5`
+                // hold the NoC words. Two nesting levels fit in `a1..a4`.
+                let (index_reg, limit_reg) = match loops.len() {
+                    0 => (reg::A1, reg::A2),
+                    1 => (reg::A3, reg::A4),
+                    _ => return Err(Error::TT_TODO_LOOP_DEPTH),
+                };
+                a.li(index_reg, 0);
+                a.li(limit_reg, count);
+                let top = a.fresh_label();
+                a.label(top.clone());
+                loops.push(MoverLoop {
+                    index,
+                    index_reg,
+                    limit_reg,
+                    top,
+                });
+            }
+            Item::EndLoop => {
+                let loop_ = loops.pop().ok_or(Error::TT_ERROR_ENDLOOP_MACHINE)?;
+                a.word(rv::addi(loop_.index_reg, loop_.index_reg, 1));
+                a.bltu_label(loop_.index_reg, loop_.limit_reg, loop_.top);
+            }
+            Item::Copy(ref copy) => {
+                let cb = copy.cb;
+                if inbound {
+                    rv::cb::reserve_back(&mut a, reg::A6, cb, 1, sync3);
+                } else {
+                    rv::cb::wait_front(&mut a, reg::A6, cb, 1, sync3);
+                }
+                let offset = match copy.offset {
+                    ParamOffset::Const(bytes) => CopyOffset::Const(bytes),
+                    ParamOffset::Index { value, dtype_bytes } => {
+                        eval_value(
+                            &mut a,
+                            k,
+                            &def,
+                            &loops,
+                            value,
+                            reg::A5,
+                            &mut [reg::T6, reg::T4],
+                        )?;
+                        if dtype_bytes != 1 {
+                            a.li(reg::T4, dtype_bytes);
+                            a.word(rv::mul(reg::A5, reg::A5, reg::T4));
+                        }
+                        CopyOffset::Reg(reg::A5)
+                    }
+                };
+                emit_copy(&mut a, at, copy.param, offset, cb, copy.bytes, inbound)?;
+                if inbound {
+                    rv::cb::push_back(&mut a, reg::A6, cb, 1, sync4);
+                } else {
+                    rv::cb::pop_front(&mut a, reg::A6, cb, 1, sync4);
+                }
+                at += 1;
+            }
         }
-        emit_copy(&mut a, at, copy.param, copy.offset, cb, copy.bytes, inbound)?;
-        if inbound {
-            rv::cb::push_back(&mut a, reg::A6, cb, 1, sync4);
-        } else {
-            rv::cb::pop_front(&mut a, reg::A6, cb, 1, sync4);
-        }
+    }
+    if !loops.is_empty() {
+        return Err(Error::TT_ERROR_ENDLOOP_MACHINE);
     }
     a.word(rv::ret());
     a.finish().map_err(|_| Error::TT_ERROR_MOVER_PROGRAM)
 }
 
-fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<Copy>, Error> {
+/// The definition site of every value, for lowering an index expression.
+fn definitions(k: &Kernel) -> Vec<Option<usize>> {
+    let mut def: Vec<Option<usize>> = vec![None; k.names.len()];
+    for (at, op) in k.ops.iter().enumerate() {
+        if let Some(value) = op.defined() {
+            def[value as usize] = Some(at);
+        }
+    }
+    def
+}
+
+/// Compute `value` (an `i32` index expression) into `dest` with ordinary
+/// RV32IM, the way a C kernel's loop address is computed by the RISC-V
+/// compiler.
+///
+/// Only expressions a RISC-V instruction can evaluate are accepted: constants,
+/// an enclosing loop's index, and `+ - * / % & | ^ << >>` over those. Anything
+/// else (a comparison, `max`, `pow`, a cast) would need a decision this pass
+/// must not make, so it is a concrete refusal.
+///
+/// `temps` are the registers a right operand may use; the left accumulates in
+/// `dest`. `A1..A4` are the loop indices and are only read.
+fn eval_value(
+    a: &mut Asm,
+    k: &Kernel,
+    def: &[Option<usize>],
+    loops: &[MoverLoop],
+    value: ValueId,
+    dest: u8,
+    temps: &mut [u8],
+) -> Result<(), Error> {
+    if let Some(loop_) = loops.iter().rev().find(|l| l.index == value) {
+        let index_reg = loop_.index_reg;
+        a.word(rv::add(dest, index_reg, reg::ZERO));
+        return Ok(());
+    }
+    let Some(at) = def[value as usize] else {
+        let _ = value;
+        return Err(Error::TT_TODO_LOOP_ADDRESS);
+    };
+    match k.ops[at] {
+        Op::Const {
+            dtype: crate::ir::DType::I32,
+            bits,
+            ..
+        } => {
+            a.li(dest, bits);
+            Ok(())
+        }
+        Op::Binary {
+            op, a: lhs, b: rhs, ..
+        } => {
+            if !matches!(
+                op,
+                BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Mod
+                    | BinOp::BitAnd
+                    | BinOp::BitOr
+                    | BinOp::BitXor
+                    | BinOp::BitShiftLeft
+                    | BinOp::BitShiftRight
+            ) {
+                let _ = (at, op);
+                return Err(Error::TT_TODO_LOOP_ADDRESS);
+            }
+            eval_value(a, k, def, loops, lhs, dest, temps)?;
+            let Some((right, rest)) = temps.split_first_mut() else {
+                return Err(Error::TT_TODO_LOOP_ADDRESS);
+            };
+            let right = *right;
+            eval_value(a, k, def, loops, rhs, right, rest)?;
+            a.word(match op {
+                BinOp::Add => rv::add(dest, dest, right),
+                BinOp::Sub => rv::sub(dest, dest, right),
+                BinOp::Mul => rv::mul(dest, dest, right),
+                BinOp::Div => rv::div(dest, dest, right),
+                BinOp::Mod => rv::rem(dest, dest, right),
+                BinOp::BitAnd => rv::and(dest, dest, right),
+                BinOp::BitOr => rv::or(dest, dest, right),
+                BinOp::BitXor => rv::xor(dest, dest, right),
+                BinOp::BitShiftLeft => rv::sll(dest, dest, right),
+                // The unroll folded `i32::checked_shr`, an arithmetic shift.
+                BinOp::BitShiftRight => rv::sra(dest, dest, right),
+                _ => unreachable!("the match above refused the rest"),
+            });
+            Ok(())
+        }
+        _ => Err(Error::TT_TODO_LOOP_ADDRESS),
+    }
+}
+
+fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<Item>, Error> {
     let mut param_index: Vec<Option<u32>> = vec![None; types.values.len()];
     let mut def: Vec<Option<usize>> = vec![None; types.values.len()];
     let mut next = 0u32;
@@ -394,73 +578,104 @@ fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
             next += 1;
         }
     }
-    let mut copies = Vec::new();
+    let mut items = Vec::new();
     for (at, op) in k.ops.iter().enumerate() {
-        let Op::CopyTo {
-            dst,
-            src,
-            dst_offset,
-            src_offset,
-        } = *op
-        else {
-            continue;
-        };
-        let (param, buffer, param_offset, buffer_offset) =
-            match (types.of(dst).kind, types.of(src).kind) {
-                (crate::ir::ValueKind::Buffer, crate::ir::ValueKind::Param) => {
-                    if !inbound {
-                        continue;
-                    }
-                    (src, dst, src_offset, dst_offset)
-                }
-                (crate::ir::ValueKind::Param, crate::ir::ValueKind::Buffer) => {
-                    if inbound {
-                        continue;
-                    }
-                    (dst, src, dst_offset, src_offset)
-                }
-                _ => {
-                    let _ = (at, dst, src);
-                    return Err(Error::TT_ERROR_COPY_ENDS);
-                }
-            };
-        let Op::Buffer { dtype, .. } = k.ops[def[buffer as usize].expect("defined")] else {
-            unreachable!("the type says it is a buffer");
-        };
-        let literal = |offset: Dim, what: &str| match offset {
-            Dim::Const(n) => Ok(n),
-            Dim::Value(v) => {
-                let _ = (at, what, v);
-                Err(Error::TT_TODO_SYMBOLIC_OFFSET)
+        match *op {
+            Op::Loop { value, bound } => {
+                let count = match bound {
+                    Dim::Const(n) => n,
+                    Dim::Value(v) => match k.const_i32(v) {
+                        Some(n) if n >= 0 => n as u32,
+                        _ => return Err(Error::TT_ERROR_LOOP_BOUND_SYMBOLIC),
+                    },
+                };
+                items.push(Item::Loop {
+                    index: value,
+                    count,
+                });
+                continue;
             }
-        };
-        let param_offset = literal(param_offset, "parameter")?;
-        let buffer_offset = literal(buffer_offset, "buffer")?;
-        let cb = plan.cb[buffer as usize].ok_or_else(|| {
-            let _ = (at, buffer);
-            Error::TT_ERROR_BUFFER_NOT_PLACED
-        })?;
-        let param_bytes = param_offset.checked_mul(dtype.bytes()).ok_or_else(|| {
-            let _ = (at, param_offset);
-            Error::TT_ERROR_PARAM_OFFSET_OVERFLOW
-        })?;
-        let buffer_bytes = buffer_offset.checked_mul(dtype.bytes()).ok_or_else(|| {
-            let _ = (at, buffer_offset);
-            Error::TT_ERROR_BUFFER_OFFSET_OVERFLOW
-        })?;
-        // The ring position, not the literal offset, is the L1 address: a page is
-        // one unit and the pointers advance in program order. The offset is still
-        // checked (it must be a literal that fits) but it names the parameter's
-        // side only.
-        let _ = buffer_bytes;
-        copies.push(Copy {
-            param: param_index[param as usize].expect("a parameter has an index"),
-            offset: param_bytes,
-            cb,
-            bytes: plan.cbs[cb as usize].page,
-        });
+            Op::EndLoop => {
+                items.push(Item::EndLoop);
+                continue;
+            }
+            Op::CopyTo {
+                dst,
+                src,
+                dst_offset,
+                src_offset,
+            } => {
+                let (param, buffer, param_offset, buffer_offset) =
+                    match (types.of(dst).kind, types.of(src).kind) {
+                        (crate::ir::ValueKind::Buffer, crate::ir::ValueKind::Param) => {
+                            if !inbound {
+                                continue;
+                            }
+                            (src, dst, src_offset, dst_offset)
+                        }
+                        (crate::ir::ValueKind::Param, crate::ir::ValueKind::Buffer) => {
+                            if inbound {
+                                continue;
+                            }
+                            (dst, src, dst_offset, src_offset)
+                        }
+                        _ => {
+                            let _ = (at, dst, src);
+                            return Err(Error::TT_ERROR_COPY_ENDS);
+                        }
+                    };
+                let Op::Buffer { dtype, .. } = k.ops[def[buffer as usize].expect("defined")] else {
+                    unreachable!("the type says it is a buffer");
+                };
+                let cb = plan.cb[buffer as usize].ok_or_else(|| {
+                    let _ = (at, buffer);
+                    Error::TT_ERROR_BUFFER_NOT_PLACED
+                })?;
+                let offset = match param_offset {
+                    Dim::Const(n) => {
+                        ParamOffset::Const(n.checked_mul(dtype.bytes()).ok_or_else(|| {
+                            let _ = (at, n);
+                            Error::TT_ERROR_PARAM_OFFSET_OVERFLOW
+                        })?)
+                    }
+                    Dim::Value(value) => match k.const_i32(value) {
+                        // A constant written as a value is still a literal.
+                        Some(n) if n >= 0 => ParamOffset::Const(
+                            (n as u32).checked_mul(dtype.bytes()).ok_or_else(|| {
+                                let _ = (at, n);
+                                Error::TT_ERROR_PARAM_OFFSET_OVERFLOW
+                            })?,
+                        ),
+                        _ => {
+                            // The value depends on a loop index; the loop
+                            // carries it in a register and the copy scales it
+                            // by the datum size.
+                            ParamOffset::Index {
+                                value,
+                                dtype_bytes: dtype.bytes(),
+                            }
+                        }
+                    },
+                };
+                // The L1 side is the ring's next page, so the declared buffer
+                // offset only has to fit when it is a literal; the ring pointer
+                // is the address (`planner`): a page is one unit and the
+                // pointers advance in program order.
+                if let Dim::Const(n) = buffer_offset {
+                    n.checked_mul(dtype.bytes())
+                        .ok_or(Error::TT_ERROR_BUFFER_OFFSET_OVERFLOW)?;
+                }
+                items.push(Item::Copy(Copy {
+                    param: param_index[param as usize].expect("a parameter has an index"),
+                    offset,
+                    cb,
+                    bytes: plan.cbs[cb as usize].page,
+                }));
+            }
+            _ => continue,
+        }
     }
-    Ok(copies)
+    Ok(items)
 }
 
 /// `t5` = this NIU's base, `t3` = this tile's NOC high word (the launch's third
@@ -475,7 +690,7 @@ fn emit_copy(
     a: &mut Asm,
     at: usize,
     param: u32,
-    offset: u32,
+    offset: CopyOffset,
     cb: u32,
     bytes: u32,
     read: bool,
@@ -487,9 +702,15 @@ fn emit_copy(
     let (lo_arg, hi_arg) = param_arg(param);
     // Target: the parameter's range base plus the copy's byte offset.
     a.word(rv::lw(reg::T1, reg::A0, lo_arg));
-    if offset != 0 {
-        a.li(reg::T4, offset);
-        a.word(rv::add(reg::T1, reg::T1, reg::T4));
+    match offset {
+        CopyOffset::Const(0) => {}
+        CopyOffset::Const(n) => {
+            a.li(reg::T4, n);
+            a.word(rv::add(reg::T1, reg::T1, reg::T4));
+        }
+        CopyOffset::Reg(reg) => {
+            a.word(rv::add(reg::T1, reg::T1, reg));
+        }
     }
     a.word(rv::lw(reg::T2, reg::A0, hi_arg));
     // The local side is the ring's write pointer for a publish and its read

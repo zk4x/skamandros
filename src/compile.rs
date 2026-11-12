@@ -42,8 +42,6 @@ pub struct Module {
 /// Compile one program. Every refusal is an error, never a partial module.
 pub fn compile(k: &Kernel) -> Result<Module, Error> {
     k.verify()?;
-    let k = crate::unroll::constant_loops(k)?;
-    let k = &k;
     let types = k.verify()?;
     // `tt_add_movers`: a direct parameter access gets its staging and copy.
     let k = mover::add_movers(k, &types)?;

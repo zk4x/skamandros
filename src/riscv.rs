@@ -127,6 +127,30 @@ pub fn mul(rd: u8, rs1: u8, rs2: u8) -> u32 {
     r_type(1, rs2, rs1, 0, rd, 0x33)
 }
 
+pub fn div(rd: u8, rs1: u8, rs2: u8) -> u32 {
+    r_type(1, rs2, rs1, 4, rd, 0x33)
+}
+
+pub fn rem(rd: u8, rs1: u8, rs2: u8) -> u32 {
+    r_type(1, rs2, rs1, 6, rd, 0x33)
+}
+
+pub fn xor(rd: u8, rs1: u8, rs2: u8) -> u32 {
+    r_type(0, rs2, rs1, 4, rd, 0x33)
+}
+
+pub fn sll(rd: u8, rs1: u8, rs2: u8) -> u32 {
+    r_type(0, rs2, rs1, 1, rd, 0x33)
+}
+
+pub fn srl(rd: u8, rs1: u8, rs2: u8) -> u32 {
+    r_type(0, rs2, rs1, 5, rd, 0x33)
+}
+
+pub fn sra(rd: u8, rs1: u8, rs2: u8) -> u32 {
+    r_type(0x20, rs2, rs1, 5, rd, 0x33)
+}
+
 pub fn lw(rd: u8, rs1: u8, imm: i32) -> u32 {
     i_type(imm, rs1, 2, rd, 0x03)
 }

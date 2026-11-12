@@ -335,6 +335,15 @@ pub enum ttStatus {
     TT_ERROR_UNPACK_ZERO_DATUMS = 143,
     /// A pack of zero rows.
     TT_ERROR_PACK_ZERO_ROWS = 144,
+    /// A loop bound is not a constant, so it cannot become a RISC-V trip count.
+    TT_ERROR_LOOP_BOUND_SYMBOLIC = 145,
+    /// A loop bigger than the caller-saved registers allow nested branches for.
+    TT_TODO_LOOP_DEPTH = 146,
+    /// A loop-carried address expression is beyond what the movers can lower to
+    /// RISC-V (a tree that needs more temporaries than the loop leaves free).
+    TT_TODO_LOOP_ADDRESS = 147,
+    /// A machine program's `endloop` has no matching `loop`.
+    TT_ERROR_ENDLOOP_MACHINE = 148,
 }
 
 impl ttStatus {
@@ -487,6 +496,10 @@ impl ttStatus {
             ttStatus::TT_ERROR_UNPACK_ZERO_RANGE => "TT_ERROR_UNPACK_ZERO_RANGE",
             ttStatus::TT_ERROR_UNPACK_ZERO_DATUMS => "TT_ERROR_UNPACK_ZERO_DATUMS",
             ttStatus::TT_ERROR_PACK_ZERO_ROWS => "TT_ERROR_PACK_ZERO_ROWS",
+            ttStatus::TT_ERROR_LOOP_BOUND_SYMBOLIC => "TT_ERROR_LOOP_BOUND_SYMBOLIC",
+            ttStatus::TT_TODO_LOOP_DEPTH => "TT_TODO_LOOP_DEPTH",
+            ttStatus::TT_TODO_LOOP_ADDRESS => "TT_TODO_LOOP_ADDRESS",
+            ttStatus::TT_ERROR_ENDLOOP_MACHINE => "TT_ERROR_ENDLOOP_MACHINE",
         }
     }
 }

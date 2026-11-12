@@ -83,6 +83,11 @@ pub fn allocate(k: &Kernel, types: &Types) -> Result<Alloc, Error> {
         ) {
             continue;
         }
+        // A scalar is index arithmetic (it names a `Dim`), not a datapath
+        // value: the movers evaluate it in RISC-V and it has no `Dst` home.
+        if types.of(value).shape == crate::ir::RegShape::Scalar {
+            continue;
+        }
         let Some(slot) = free.iter().position(|in_use| !in_use) else {
             let _ = (value, DST_SLOTS);
             return Err(Error::TT_ERROR_DST_SLOTS_EXHAUSTED);

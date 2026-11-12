@@ -264,10 +264,10 @@ grid 1,1
     );
 }
 
-/// A loop with a constant bound is unrolled before anything reads the program,
-/// and `%o = mul %i %step` folds to the literal offset of each iteration.
+/// A constant-bound loop stays a loop: the movers and the compute roles get a
+/// RISC-V branch, not a copy of the body per iteration.
 #[test]
-fn a_constant_loop_unrolls_into_literal_offsets() {
+fn a_constant_loop_becomes_a_branch() {
     const LOOP_TWO: &str = "\
 version 4
 %in = param f32 2048
@@ -287,32 +287,31 @@ endloop
 grid 1,1
 ";
     let k = Kernel::parse(LOOP_TWO).expect("the loop kernel parses");
-    let u = TT::unroll::constant_loops(&k).expect("the loop unrolls");
-    assert!(
-        u.ops
-            .iter()
-            .all(|op| !matches!(op, TT::ir::Op::Loop { .. } | TT::ir::Op::EndLoop)),
-        "no loop survives: {:?}",
-        u.ops
-    );
-    let loads: Vec<TT::ir::Dim> = u
-        .ops
-        .iter()
-        .filter_map(|op| match *op {
-            TT::ir::Op::Load { offset, .. } => Some(offset),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(loads, vec![TT::ir::Dim::Const(0), TT::ir::Dim::Const(1024)]);
-    u.verify().expect("the unrolled program verifies");
-
     let m = TT::compile::compile(&k).expect("the loop kernel compiles");
     assert!(!m.reader.is_empty() && !m.writer.is_empty());
     assert!(m.cores.iter().all(|c| !c.is_empty()));
+    // Both movers branch backwards: one body, run twice.
+    assert!(has_backward_branch(&m.reader), "the reader loops");
+    assert!(has_backward_branch(&m.writer), "the writer loops");
+    for (role, words) in ["t0", "t1", "t2"].into_iter().zip(&m.cores) {
+        assert!(has_backward_branch(words), "{role} loops");
+    }
 }
 
-/// A loop with a symbolic bound is left alone, and lowering still refuses it
-/// loudly rather than unrolling a guess.
+/// A RISC-V `BRANCH` (opcode `0x63`) whose B-type immediate is negative, i.e.
+/// a branch back to an earlier word.
+fn has_backward_branch(words: &[u32]) -> bool {
+    words.iter().any(|word| {
+        word & 0x7f == 0x63 && {
+            // imm[12] is the sign bit.
+            let imm12 = (word >> 31) & 1;
+            imm12 == 1
+        }
+    })
+}
+
+/// A loop with a symbolic bound cannot become a RISC-V trip count yet, so
+/// lowering refuses it loudly rather than guessing.
 #[test]
 fn a_dynamic_loop_is_still_refused() {
     const DYNAMIC: &str = "\
@@ -333,7 +332,7 @@ grid 1,1
 ";
     let k = Kernel::parse(DYNAMIC).expect("the dynamic loop parses");
     let err = TT::compile::compile(&k).expect_err("a dynamic loop is not lowered");
-    assert_eq!(err, TT::status::ttStatus::TT_TODO_LOOP);
+    assert_eq!(err, TT::status::ttStatus::TT_ERROR_LOOP_BOUND_SYMBOLIC);
 }
 
 /// Comparisons produce a `bool`, `sel` takes one, and `relu` is not an op:

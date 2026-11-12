@@ -92,6 +92,12 @@ pub enum MirOp {
     /// The next `len` ops form one row body run `count` times, stepping the
     /// `Dst` row by one per iteration. Placed by [`crate::optimize::fuse`].
     Repeat { len: u16, count: u16 },
+    /// Start of a loop: the ops up to the matching [`MirOp::EndLoop`] run
+    /// `count` times, as a RISC-V branch around the body. An IR loop that was
+    /// constant-bound is this, per role.
+    Loop { count: u32 },
+    /// The branch back to the matching [`MirOp::Loop`].
+    EndLoop,
 }
 
 /// The three compute programs. The movers' RISC-V programs are emitted

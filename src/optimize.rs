@@ -124,6 +124,7 @@ fn same_shifted(body: &[MirOp; 3], following: &[MirOp; 3]) -> bool {
 pub fn verify(m: &Machine) -> Result<(), Error> {
     for (name, ops) in [("t0", &m.t0), ("t1", &m.t1), ("t2", &m.t2)] {
         let mut at = 0usize;
+        let mut depth = 0usize;
         while at < ops.len() {
             match ops[at] {
                 MirOp::Sfpload { lreg, row, .. } | MirOp::Sfpstore { lreg, row, .. } => {
@@ -202,8 +203,26 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                     let _ = cb;
                 }
                 MirOp::Setadczw { .. } | MirOp::Setadcx { .. } => {}
+                MirOp::Loop { count } => {
+                    let _ = count;
+                    depth += 1;
+                    if depth > 2 {
+                        let _ = (name, at, depth);
+                        return Err(Error::TT_TODO_LOOP_DEPTH);
+                    }
+                }
+                MirOp::EndLoop => {
+                    depth = depth.checked_sub(1).ok_or_else(|| {
+                        let _ = (name, at);
+                        Error::TT_ERROR_ENDLOOP_MACHINE
+                    })?;
+                }
             }
             at += 1;
+        }
+        if depth != 0 {
+            let _ = (name, depth);
+            return Err(Error::TT_ERROR_ENDLOOP_MACHINE);
         }
     }
     Ok(())

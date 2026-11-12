@@ -648,6 +648,50 @@ fn lookup<'a>(
 }
 
 impl Kernel {
+    /// The `i32` a value folds to, when it is a constant or constant-only
+    /// arithmetic. This is how a `Dim::Value` that names a literal (`%two`,
+    /// `%step`) becomes a `Dim::Const` without unrolling the loop that carries
+    /// it; a value that depends on a loop index is not constant.
+    ///
+    /// The folds are exact two's-complement `i32`; a division by zero or a
+    /// shift outside `0..32` is `None`, never a guess.
+    pub fn const_i32(&self, value: ValueId) -> Option<i32> {
+        let op = self.ops.iter().find(|op| op.defined() == Some(value))?;
+        match *op {
+            Op::Const {
+                dtype: DType::I32,
+                bits,
+                ..
+            } => Some(bits as i32),
+            Op::Binary { op, a, b, .. } => {
+                let a = self.const_i32(a)?;
+                let b = self.const_i32(b)?;
+                match op {
+                    BinOp::Add => Some(a.wrapping_add(b)),
+                    BinOp::Sub => Some(a.wrapping_sub(b)),
+                    BinOp::Mul => Some(a.wrapping_mul(b)),
+                    BinOp::Div => a.checked_div(b),
+                    BinOp::Mod => a.checked_rem(b),
+                    BinOp::Pow => a.checked_pow(u32::try_from(b).ok()?),
+                    BinOp::Max => Some(a.max(b)),
+                    BinOp::BitAnd => Some(a & b),
+                    BinOp::BitOr => Some(a | b),
+                    BinOp::BitXor => Some(a ^ b),
+                    BinOp::BitShiftLeft => a.checked_shl(u32::try_from(b).ok()?),
+                    BinOp::BitShiftRight => a.checked_shr(u32::try_from(b).ok()?),
+                    BinOp::Cmplt
+                    | BinOp::Cmpgt
+                    | BinOp::Cmpge
+                    | BinOp::Eq
+                    | BinOp::NotEq
+                    | BinOp::Or
+                    | BinOp::And => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Check every reference, dtype, shape and scope, and return what each
     /// value means.
     pub fn verify(&self) -> Result<Types, Error> {

@@ -266,8 +266,8 @@ copy_to %out from %bo [0]
 ";
 
 /// The same elementwise kernel over two tiles, written as a loop. The bound and
-/// the step are constants, so the loop is unrolled and each iteration's offset
-/// becomes a literal.
+/// the step are constants, so the loop becomes a RISC-V branch in the movers and
+/// each iteration's addresses are computed from the counter.
 const NEG_TWO_TILES: &str = "\
 version 4
 grid 1,1
@@ -609,10 +609,10 @@ fn a_direct_parameter_kernel_runs_on_the_simulator() {
     );
 }
 
-/// The loop form of the elementwise kernel runs too: the constant loop unrolls
-/// into two literal offsets, and both tiles come back negated.
+/// The loop form of the elementwise kernel runs too: the constant loop is a
+/// RISC-V branch in every role, and both tiles come back negated.
 #[test]
-fn an_unrolled_loop_runs_on_the_simulator() {
+fn a_constant_loop_runs_on_the_simulator() {
     let _device = device();
     let sim = simulator_path();
     // SAFETY: no other thread reads the environment concurrently; the library

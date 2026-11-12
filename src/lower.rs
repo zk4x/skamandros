@@ -16,7 +16,7 @@
 //! named none of them.
 
 use crate::alloc::Alloc;
-use crate::ir::{BinOp, Error, Kernel, Op, RegShape, Types, UnOp, unit_of};
+use crate::ir::{BinOp, Dim, Error, Kernel, Op, RegShape, Types, UnOp, unit_of};
 use crate::mir::{CmpOp, Machine, MirOp, SfpOp};
 use crate::planner::Plan;
 
@@ -48,9 +48,39 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             | Op::Buffer { .. }
             | Op::Grid { .. }
             | Op::CopyTo { .. } => {}
-            Op::Loop { .. } | Op::EndLoop => {
-                let _ = at;
-                return Err(Error::TT_TODO_LOOP);
+            // A scalar is index arithmetic: it names a `Dim`, and the mover
+            // evaluates it in RISC-V. The datapath has no scalar values, so
+            // nothing here has to produce one.
+            Op::Cast { value, .. }
+            | Op::Unary { value, .. }
+            | Op::Binary { value, .. }
+            | Op::Select { value, .. }
+                if types.of(value).shape == RegShape::Scalar => {}
+            Op::Loop { bound, .. } => {
+                // Only a constant bound becomes a RISC-V trip count; a symbolic
+                // one would need the bound's value in a register, which is the
+                // symbolic-dimension item, not this one.
+                let count = match bound {
+                    Dim::Const(n) => n,
+                    Dim::Value(v) => match k.const_i32(v) {
+                        Some(n) if n >= 0 => n as u32,
+                        _ => {
+                            let _ = at;
+                            return Err(Error::TT_ERROR_LOOP_BOUND_SYMBOLIC);
+                        }
+                    },
+                };
+                // The body is emitted between the markers into every role; a
+                // role whose body is empty gets an empty loop, which the
+                // encoder skips.
+                m.t0.push(MirOp::Loop { count });
+                m.t1.push(MirOp::Loop { count });
+                m.t2.push(MirOp::Loop { count });
+            }
+            Op::EndLoop => {
+                m.t0.push(MirOp::EndLoop);
+                m.t1.push(MirOp::EndLoop);
+                m.t2.push(MirOp::EndLoop);
             }
             Op::Load {
                 value,
