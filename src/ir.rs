@@ -144,6 +144,8 @@ pub enum ValueKind {
     GridCoord,
     /// A register value.
     Register,
+    /// A named `Dst` accumulator: mutable, one 32x32 tile.
+    Acc,
 }
 
 /// Everything the compiler knows about one value.
@@ -426,6 +428,16 @@ pub enum Op {
         dtype: DType,
         shape: [u32; 2],
     },
+    /// A named `Dst` accumulator: one 32x32 tile that `matmul` and `store_to`
+    /// write, read back by `store_to` into a buffer. It is mutable — the whole
+    /// point of it is that a K loop adds into the same rows — and it starts
+    /// unspecified: a program that needs zeros stores them (`store_to %acc from
+    /// %zero`). Every name is its own tile; a name is never redefined.
+    Acc {
+        value: ValueId,
+        dtype: DType,
+        shape: [u32; 2],
+    },
     /// The launch grid, as a shape of two terms.
     Grid { columns: Dim, rows: Dim },
     /// `%i = loop %bound`.
@@ -490,16 +502,15 @@ pub enum Op {
         if_true: ValueId,
         if_false: ValueId,
     },
-    /// `a x b` accumulating into a tile: the two operands are `SrcA`/`SrcB`
-    /// tiles, multiplied and summed over the K faces into `value`. `dtype` is
-    /// the accumulator's: `f32` accumulates in the 32-bit `Dst`, `bf16` in the
-    /// 16-bit one. The operands keep their own dtype, so `bf16` operands over an
-    /// `f32` accumulator is the usual mixed form.
+    /// `a x b` accumulating into a named `Dst` tile. The operands are
+    /// `SrcA`/`SrcB` tiles, multiplied and summed over the K faces into `acc`,
+    /// which the op adds to rather than replaces: a K loop is one `matmul` under
+    /// one `loop`, and two products in a row are two `matmul`s on one `acc`.
+    /// The accumulator's dtype is the `acc`'s, so this op names no dtype.
     Matmul {
-        value: ValueId,
+        acc: ValueId,
         a: ValueId,
         b: ValueId,
-        dtype: DType,
     },
 }
 
@@ -510,6 +521,7 @@ impl Op {
             Op::Const { value, .. }
             | Op::Param { value, .. }
             | Op::Buffer { value, .. }
+            | Op::Acc { value, .. }
             | Op::Loop { value, .. }
             | Op::GridCoord { value, .. }
             | Op::Load { value, .. }
@@ -517,9 +529,12 @@ impl Op {
             | Op::Bitcast { value, .. }
             | Op::Unary { value, .. }
             | Op::Binary { value, .. }
-            | Op::Select { value, .. }
-            | Op::Matmul { value, .. } => Some(value),
-            Op::Grid { .. } | Op::EndLoop | Op::CopyTo { .. } | Op::StoreTo { .. } => None,
+            | Op::Select { value, .. } => Some(value),
+            Op::Grid { .. }
+            | Op::EndLoop
+            | Op::CopyTo { .. }
+            | Op::StoreTo { .. }
+            | Op::Matmul { .. } => None,
         }
     }
 
@@ -566,11 +581,15 @@ impl Op {
                 if_false,
                 ..
             } => vec![*cond, *if_true, *if_false],
-            Op::Matmul { a, b, .. } => vec![*a, *b],
+            Op::Matmul { acc, a, b } => vec![*acc, *a, *b],
             Op::Loop { bound, .. } => dim(bound).into_iter().collect(),
             Op::Grid { columns, rows } => dim(columns).into_iter().chain(dim(rows)).collect(),
             Op::Param { dims, .. } => dims.iter().filter_map(dim).collect(),
-            Op::Const { .. } | Op::Buffer { .. } | Op::EndLoop | Op::GridCoord { .. } => Vec::new(),
+            Op::Const { .. }
+            | Op::Buffer { .. }
+            | Op::Acc { .. }
+            | Op::EndLoop
+            | Op::GridCoord { .. } => Vec::new(),
         }
     }
 }
@@ -806,6 +825,21 @@ impl Kernel {
                         shape: RegShape::Tile,
                     }
                 }
+                Op::Acc { dtype, shape, .. } => {
+                    if shape != [32, 32] {
+                        let _ = (at, shape);
+                        return Err(Error::TT_ERROR_ACC_SHAPE);
+                    }
+                    if !matches!(dtype, DType::F32 | DType::Bf16) {
+                        let _ = (at, dtype);
+                        return Err(Error::TT_ERROR_ACC_DTYPE);
+                    }
+                    ValueInfo {
+                        kind: ValueKind::Acc,
+                        dtype,
+                        shape: RegShape::Tile,
+                    }
+                }
                 Op::Grid { columns, rows } => {
                     if grid.is_some() {
                         return Err(Error::TT_ERROR_GRID);
@@ -965,7 +999,21 @@ impl Kernel {
                 } => {
                     let v = *lookup(&values, &visible, value, at)?;
                     let b = *lookup(&values, &visible, buffer, at)?;
-                    if v.kind != ValueKind::Register {
+                    if b.kind == ValueKind::Acc {
+                        // An accumulator is one tile and is written in place: the
+                        // only form implemented is a fill from an f32 constant,
+                        // which is how a program zeroes it.
+                        if !matches!(offset, Dim::Const(0)) {
+                            let _ = offset;
+                            return Err(Error::TT_ERROR_ACC_OFFSET);
+                        }
+                        if v.kind != ValueKind::Const || v.dtype != DType::F32 {
+                            let _ = (value, v.kind, v.dtype);
+                            return Err(Error::TT_TODO_ACC_STORE);
+                        }
+                        continue;
+                    }
+                    if v.kind != ValueKind::Register && v.kind != ValueKind::Acc {
                         let _ = value;
                         return Err(Error::TT_ERROR_STORE_VALUE_NOT_REGISTER);
                     }
@@ -1164,9 +1212,14 @@ impl Kernel {
                         shape,
                     }
                 }
-                Op::Matmul { a, b, dtype, .. } => {
+                Op::Matmul { acc, a, b } => {
+                    let c = *lookup(&values, &visible, acc, at)?;
                     let x = *lookup(&values, &visible, a, at)?;
                     let y = *lookup(&values, &visible, b, at)?;
+                    if c.kind != ValueKind::Acc {
+                        let _ = (at, acc);
+                        return Err(Error::TT_ERROR_MATMUL_ACC);
+                    }
                     if !is_value(x.kind) || !is_value(y.kind) {
                         let _ = (a, b);
                         return Err(Error::TT_ERROR_MATMUL_OPERANDS);
@@ -1183,17 +1236,14 @@ impl Kernel {
                     // `bf16` only, and the accumulator is the `Dst` width: a
                     // 32-bit `Src` cannot accumulate into a 16-bit `Dst`.
                     let ok_operand = matches!(x.dtype, DType::F32 | DType::Bf16);
-                    let ok_accum = matches!(dtype, DType::F32 | DType::Bf16)
-                        && !(x.dtype == DType::F32 && dtype == DType::Bf16);
+                    let ok_accum = matches!(c.dtype, DType::F32 | DType::Bf16)
+                        && !(x.dtype == DType::F32 && c.dtype == DType::Bf16);
                     if !ok_operand || !ok_accum {
-                        let _ = (x.dtype, dtype);
+                        let _ = (x.dtype, c.dtype);
                         return Err(Error::TT_ERROR_MATMUL_DTYPE);
                     }
-                    ValueInfo {
-                        kind: ValueKind::Register,
-                        dtype,
-                        shape: RegShape::Tile,
-                    }
+                    // The accumulator is written in place: no value is defined.
+                    continue;
                 }
             };
             values.push(info);
@@ -1252,6 +1302,7 @@ fn kind_name(kind: ValueKind) -> &'static str {
         ValueKind::Induction => "induction value",
         ValueKind::GridCoord => "grid coordinate",
         ValueKind::Register => "register value",
+        ValueKind::Acc => "accumulator",
     }
 }
 
@@ -1321,7 +1372,7 @@ fn param_elements(k: &Kernel, def: &[usize], param: ValueId) -> Option<u32> {
 /// The byte form's magic.
 pub const MAGIC: [u8; 4] = *b"TTIR";
 /// The IR version this build reads and writes.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 impl Kernel {
     /// The byte form: the same program as [`Kernel::to_text`], little-endian and
@@ -1444,17 +1495,22 @@ impl Kernel {
                     put_u32(&mut b, *if_true);
                     put_u32(&mut b, *if_false);
                 }
-                Op::Matmul {
-                    value,
-                    a,
-                    b: rhs,
-                    dtype,
-                } => {
+                Op::Matmul { acc, a, b: rhs } => {
                     b.push(12);
-                    put_name(&mut b, &self.names[*value as usize]);
+                    put_u32(&mut b, *acc);
                     put_u32(&mut b, *a);
                     put_u32(&mut b, *rhs);
+                }
+                Op::Acc {
+                    value,
+                    dtype,
+                    shape,
+                } => {
+                    b.push(16);
+                    put_name(&mut b, &self.names[*value as usize]);
                     b.push(dtype.tag());
+                    put_u32(&mut b, shape[0]);
+                    put_u32(&mut b, shape[1]);
                 }
                 Op::Bitcast { value, src, dtype } => {
                     b.push(15);
@@ -1582,12 +1638,21 @@ impl Kernel {
                     Op::Binary { value, op, a, b }
                 }
                 12 => {
-                    let name = r.name()?;
+                    let acc = r.u32()?;
                     let a = r.u32()?;
                     let b = r.u32()?;
-                    let dtype = DType::from_tag(r.u8()?).ok_or(Error::TT_ERROR_DTYPE_TAG)?;
+                    Op::Matmul { acc, a, b }
+                }
+                16 => {
+                    let name = r.name()?;
+                    let dtype = r.dtype()?;
+                    let shape = [r.u32()?, r.u32()?];
                     let value = define(&mut names, name)?;
-                    Op::Matmul { value, a, b, dtype }
+                    Op::Acc {
+                        value,
+                        dtype,
+                        shape,
+                    }
                 }
                 13 => {
                     let name = r.name()?;
@@ -1774,13 +1839,28 @@ impl Kernel {
                 let buffer = t.value(&p.symbols)?;
                 t.expect("from")?;
                 let value = t.value(&p.symbols)?;
-                let offset = t.bracket(&p.symbols)?;
+                // An `acc` has no offset to name; a buffer's bracket is still
+                // required by every program that has one, and a missing one
+                // reads as zero.
+                let offset = if matches!(t.peek(), Some(Token::LBracket)) {
+                    t.bracket(&p.symbols)?
+                } else {
+                    Dim::Const(0)
+                };
                 t.end()?;
                 p.ops.push(Op::StoreTo {
                     value,
                     buffer,
                     offset,
                 });
+                continue;
+            }
+            if first == "matmul" {
+                let acc = t.value(&p.symbols)?;
+                let a = t.value(&p.symbols)?;
+                let b = t.value(&p.symbols)?;
+                t.end()?;
+                p.ops.push(Op::Matmul { acc, a, b });
                 continue;
             }
             if first == "endloop" {
@@ -1843,6 +1923,19 @@ impl Kernel {
                 } => {
                     s.push_str(&format!(
                         "%{} = buffer {} {},{}\n",
+                        name(*value),
+                        dtype.name(),
+                        shape[0],
+                        shape[1]
+                    ));
+                }
+                Op::Acc {
+                    value,
+                    dtype,
+                    shape,
+                } => {
+                    s.push_str(&format!(
+                        "%{} = acc {} {},{}\n",
                         name(*value),
                         dtype.name(),
                         shape[0],
@@ -1956,11 +2049,10 @@ impl Kernel {
                         name(*if_false)
                     ));
                 }
-                Op::Matmul { value, a, b, dtype } => {
+                Op::Matmul { acc, a, b } => {
                     s.push_str(&format!(
-                        "%{} = matmul {} %{} %{}\n",
-                        name(*value),
-                        dtype.name(),
+                        "matmul %{} %{} %{}\n",
+                        name(*acc),
                         name(*a),
                         name(*b)
                     ));
@@ -2056,6 +2148,18 @@ fn parse_definition(t: &mut Tokens, p: &mut Parser) -> Result<Op, Error> {
                 shape: [a, b],
             }
         }
+        "acc" => {
+            let dtype = t.dtype()?;
+            let a = t.number_u32()?;
+            t.comma()?;
+            let b = t.number_u32()?;
+            t.end()?;
+            Op::Acc {
+                value,
+                dtype,
+                shape: [a, b],
+            }
+        }
         "loop" => {
             let bound = t.term(&p.symbols)?;
             t.end()?;
@@ -2094,13 +2198,6 @@ fn parse_definition(t: &mut Tokens, p: &mut Parser) -> Result<Op, Error> {
             let dtype = t.dtype()?;
             t.end()?;
             Op::Bitcast { value, src, dtype }
-        }
-        "matmul" => {
-            let dtype = t.dtype()?;
-            let a = t.value(&p.symbols)?;
-            let b = t.value(&p.symbols)?;
-            t.end()?;
-            Op::Matmul { value, a, b, dtype }
         }
         "sel" => {
             let cond = t.value(&p.symbols)?;

@@ -18,7 +18,7 @@ values. It names no processor, no `Dst` slot, no `Src` bank, no lane register,
 no semaphore, no unpacker, no packer and no Tensix word:
 
 ```
-version 5
+version 6
 grid 1,1
 %in  = param f32 1024,128
 %out = param f32 1024,128
@@ -266,16 +266,20 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   bf16 and a 32-bit dtype* is a `Dst` boundary, not a lane instruction: the
   packer narrows into a bf16 buffer, and widening out of one is refused
   (`TT_ERROR_BF16_WIDEN`) because the hardware has no such path through `Dst`.
-- `matmul` is the Matrix Unit's: `%m = matmul f32 %a %b` multiplies two 32x32
-  tiles and names its accumulator's dtype (`f32` in the 32-bit `Dst`, `bf16` in
-  the 16-bit one). Both operands must be `load` values — the unpacker fills
-  `SrcA`/`SrcB` straight from their CB pages, in the `Src` format their dtype
-  implies (`TF32` for `f32`, `BF16` for bf16) — and they are the same dtype:
-  `bf16`/`bf16`, `bf16`/`f32` and `f32`/`f32` run; an `f32` operand with a
-  `bf16` accumulator is refused. A `bf16` accumulator needs the whole module to
-  be 16-bit, since the bank is one width. A `load` that also feeds a datapath op
-  keeps its `Dst` unpack and is unpacked once more into `Src` at the matmul; its
-  page is released after the Matrix Unit has read it.
+- `matmul` is the Matrix Unit's: `matmul %acc %a %b` multiplies two 32x32 tiles
+  and adds the product into `%acc`, a named accumulator declared as
+  `%acc = acc f32 32,32` (or `bf16`). It adds rather than replaces, so a K loop
+  is one `matmul` under one `loop` — the accumulator is written every iteration
+  and packed once after it. `acc` starts unspecified: a program that needs zeros
+  writes them itself (`store_to %acc from %zero`, a fill from an `f32` constant).
+  Both operands must be `load` values — the unpacker fills `SrcA`/`SrcB` straight
+  from their CB pages, in the `Src` format their dtype implies (`TF32` for `f32`,
+  `BF16` for bf16) — and they are the same dtype: `bf16`/`bf16`, `bf16`/`f32`
+  and `f32`/`f32` run; an `f32` operand with a `bf16` accumulator is refused. A
+  `bf16` accumulator needs the whole module to be 16-bit, since the bank is one
+  width. A `load` that also feeds a datapath op keeps its `Dst` unpack and is
+  unpacked once more into `Src` at the matmul; its page is released after the
+  Matrix Unit has read it.
 - Broadcast, `eq`/`noteq`, the remaining unary and binary ops, the `bool`
   datapath in a parameter or buffer, and the reduce op are accepted by the
   format and verifier and refused loudly by lowering, not guessed at.

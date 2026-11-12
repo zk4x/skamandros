@@ -364,15 +364,15 @@ pub enum ttStatus {
     /// conversion needs `SrcA`/`SrcB` and the Matrix Unit, which this compiler
     /// does not place.
     TT_ERROR_BF16_WIDEN = 153,
-    /// `matmul`'s operands or its accumulation dtype are not a pair the Matrix
+    /// `matmul`'s operands or its accumulator's dtype are not a pair the Matrix
     /// Unit's `Src` path takes: both operands must be `f32` or `bf16` and equal,
-    /// the accumulation dtype must be `f32` or `bf16`, and `f32` operands cannot
+    /// the accumulator must be `f32` or `bf16`, and `f32` operands cannot
     /// accumulate into a 16-bit `Dst` (the `Src` format would be TF32 and the
     /// bank 16-bit).
     TT_ERROR_MATMUL_DTYPE = 154,
-    /// A `matmul` names a `bf16` accumulator while some other value in the
-    /// module forces the 32-bit `Dst`: the bank is one width, and the Matrix
-    /// Unit would then accumulate in FP32, not at the `bf16` the op names.
+    /// An accumulator is `bf16` while some other value in the module forces the
+    /// 32-bit `Dst`: the bank is one width, and the Matrix Unit would then
+    /// accumulate in FP32, not at the `bf16` the accumulator names.
     TT_ERROR_MATMUL_ACCUM_WIDE = 155,
     /// A `matmul` operand is not a `load` value. The Matrix Unit reads
     /// `SrcA`/`SrcB`, which the unpacker fills straight from a CB page; a value
@@ -383,6 +383,21 @@ pub enum ttStatus {
     TT_ERROR_ADDR_MOD = 158,
     /// A `SETRWC` counter value does not fit its four-bit field.
     TT_ERROR_SETRWC = 159,
+    /// A `matmul`'s destination is not an `acc` value. The Matrix Unit writes a
+    /// `Dst` tile that is named once and accumulated into; an immutable value or
+    /// a buffer has no accumulator to write.
+    TT_ERROR_MATMUL_ACC = 160,
+    /// An `acc` is declared with a shape other than `32,32`.
+    TT_ERROR_ACC_SHAPE = 161,
+    /// An `acc`'s dtype is neither `f32` nor `bf16`.
+    TT_ERROR_ACC_DTYPE = 162,
+    /// A `store_to` names an `acc` with an offset. An `acc` is one tile; there
+    /// is nothing to index.
+    TT_ERROR_ACC_OFFSET = 163,
+    /// A `store_to` into an `acc` names a value that is not a scalar constant.
+    /// Only a fill from a constant is implemented; a tile value moving into an
+    /// accumulator needs the SFPU to walk both tiles.
+    TT_TODO_ACC_STORE = 164,
 }
 
 impl ttStatus {
@@ -549,6 +564,11 @@ impl ttStatus {
             ttStatus::TT_ERROR_MATMUL_OPERAND => "TT_ERROR_MATMUL_OPERAND",
             ttStatus::TT_ERROR_ADDR_MOD => "TT_ERROR_ADDR_MOD",
             ttStatus::TT_ERROR_SETRWC => "TT_ERROR_SETRWC",
+            ttStatus::TT_ERROR_MATMUL_ACC => "TT_ERROR_MATMUL_ACC",
+            ttStatus::TT_ERROR_ACC_SHAPE => "TT_ERROR_ACC_SHAPE",
+            ttStatus::TT_ERROR_ACC_DTYPE => "TT_ERROR_ACC_DTYPE",
+            ttStatus::TT_ERROR_ACC_OFFSET => "TT_ERROR_ACC_OFFSET",
+            ttStatus::TT_TODO_ACC_STORE => "TT_TODO_ACC_STORE",
         }
     }
 }

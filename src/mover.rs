@@ -327,6 +327,11 @@ fn remap(op: &Op, map: &[ValueId], value: Option<ValueId>) -> Op {
             dtype,
             shape,
         },
+        Op::Acc { dtype, shape, .. } => Op::Acc {
+            value: own(),
+            dtype,
+            shape,
+        },
         Op::Grid { columns, rows } => Op::Grid {
             columns: d(columns),
             rows: d(rows),
@@ -394,11 +399,10 @@ fn remap(op: &Op, map: &[ValueId], value: Option<ValueId>) -> Op {
             if_true: v(if_true),
             if_false: v(if_false),
         },
-        Op::Matmul { a, b, dtype, .. } => Op::Matmul {
-            value: own(),
+        Op::Matmul { acc, a, b } => Op::Matmul {
+            acc: v(acc),
             a: v(a),
             b: v(b),
-            dtype,
         },
     }
 }

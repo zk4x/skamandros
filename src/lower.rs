@@ -130,6 +130,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             Op::Const { .. }
             | Op::Param { .. }
             | Op::Buffer { .. }
+            | Op::Acc { .. }
             | Op::Grid { .. }
             | Op::CopyTo { .. } => {}
             // A scalar is index arithmetic: it names a `Dim`, and the mover
@@ -254,6 +255,40 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 buffer,
                 offset,
             } => {
+                // An accumulator is written in place in `Dst`, not packed: the
+                // only form the verifier admits is a fill from an f32 constant,
+                // and the SFPU writes it row by row.
+                if types.of(buffer).kind == crate::ir::ValueKind::Acc {
+                    let bits = match k.ops[def[value as usize].expect("defined")] {
+                        Op::Const { bits, .. } => bits,
+                        _ => {
+                            let _ = value;
+                            return Err(Error::TT_TODO_ACC_STORE);
+                        }
+                    };
+                    let acc_dtype = types.of(buffer).dtype;
+                    let (unit_shape, _, _) = unit_of([32, 32], acc_dtype)?;
+                    let rows = rows_of(unit_shape, at)?;
+                    let base = dst_row(alloc, buffer);
+                    m.t1.push(MirOp::LaneConst { lreg: 0, bits });
+                    // An SFPU store covers a row pair (`SFPSTORE` refuses an odd
+                    // row and writes two), the same step the datapath uses.
+                    for row in (0..rows).step_by(2) {
+                        m.t1.push(MirOp::Sfpstore {
+                            lreg: 0,
+                            row: base + row,
+                            dtype: acc_dtype,
+                        });
+                    }
+                    let _ = (offset, value);
+                    // An accumulator store never reads a CB page, but a page
+                    // this instruction was the last reader of is released here
+                    // exactly like the packed path's.
+                    for cb in std::mem::take(&mut pop_here[at]) {
+                        m.t0.push(MirOp::CbPop { cb });
+                    }
+                    continue;
+                }
                 let Op::Buffer { shape, dtype, .. } = k.ops[def[buffer as usize].expect("defined")]
                 else {
                     let _ = buffer;
@@ -488,9 +523,10 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     });
                 }
             }
-            Op::Matmul { value, a, b, dtype } => {
+            Op::Matmul { acc, a, b } => {
                 let dt_a = types.of(a).dtype;
                 let dt_b = types.of(b).dtype;
+                let dtype = types.of(acc).dtype;
                 // The accumulator is the `Dst` width; a `bf16` accumulator in a
                 // module whose bank is 32-bit would accumulate in FP32 instead.
                 if dtype == crate::ir::DType::Bf16 && wide {
@@ -499,7 +535,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 }
                 let cb_a = matmul_page(k, plan, &def, &alias, a, at)?;
                 let cb_b = matmul_page(k, plan, &def, &alias, b, at)?;
-                let base = dst_row(alloc, resolve(&alias, value));
+                let base = dst_row(alloc, acc);
                 // The Matrix Unit's address modifiers, fidelity phase and row
                 // counters are this thread's `ThreadConfig` and RWC state. Every
                 // word goes out as a whole `SETC16`, so an entry carrying several
@@ -552,21 +588,9 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     src_b: 0,
                     dst: 0,
                 });
-                // The accumulator's own rows only: `CLR_16` blocks are eight
-                // 32-bit rows each (sixteen 16-bit ones).
-                let block = if dtype == crate::ir::DType::Bf16 {
-                    base / 16
-                } else {
-                    base / 8
-                };
-                let blocks = if dtype == crate::ir::DType::Bf16 {
-                    4
-                } else {
-                    8
-                };
-                for i in 0..blocks {
-                    m.t1.push(MirOp::Zeroacc { block: block + i });
-                }
+                // The accumulator's rows are added to, never cleared: an `acc`
+                // holds whatever the program last put there, and zeroing it is a
+                // `store_to %acc from %zero` the program writes itself.
                 // One `(fi, k)` group: A's face `(fi, k)` into `SrcB`, B's two
                 // faces `(k, 0)` and `(k, 1)` into `SrcA`. The unpacker and the
                 // Matrix Unit alternate through the bank handover, so the two

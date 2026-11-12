@@ -86,12 +86,12 @@ pub fn allocate(k: &Kernel, types: &Types) -> Result<Alloc, Error> {
         let Some(value) = op.defined() else { continue };
         if !matches!(
             op,
-            Op::Load { .. }
+            Op::Acc { .. }
+                | Op::Load { .. }
                 | Op::Cast { .. }
                 | Op::Unary { .. }
                 | Op::Binary { .. }
                 | Op::Select { .. }
-                | Op::Matmul { .. }
         ) {
             continue;
         }

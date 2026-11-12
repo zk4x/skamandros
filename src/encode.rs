@@ -888,6 +888,12 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
                 .map_err(bad_isa)?;
             out.push(i);
         }
+        MirOp::LaneConst { lreg, bits } => {
+            let halves = tt_isa::sfpu::load_f32(u32::from(lreg), bits).map_err(|e| bad(e, op))?;
+            for i in halves {
+                out.push(i);
+            }
+        }
         MirOp::Sfp {
             op: SfpOp::Neg,
             a,

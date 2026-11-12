@@ -137,6 +137,12 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                         return Err(Error::TT_ERROR_DST_ROW);
                     }
                 }
+                MirOp::LaneConst { lreg, .. } => {
+                    if lreg >= crate::alloc::LREGS {
+                        let _ = (name, at, lreg);
+                        return Err(Error::TT_ERROR_LANE_REGISTER);
+                    }
+                }
                 MirOp::Sfp { a, b, d, .. } => {
                     for lreg in [Some(a), b, Some(d)].into_iter().flatten() {
                         if lreg >= crate::alloc::LREGS {
@@ -282,7 +288,7 @@ mod tests {
     use crate::planner::place;
 
     const NEG: &str = "\
-version 5
+version 6
 grid 1,1
 %in = param f32 4096
 %out = param f32 4096

@@ -57,6 +57,10 @@ pub enum MirOp {
     Sfpload { lreg: u8, row: u32, dtype: DType },
     /// `SFPSTORE`: lane register into a `Dst` row.
     Sfpstore { lreg: u8, row: u32, dtype: DType },
+    /// `SFPLOADI` twice: the two halves of `bits` into every lane of `lreg`.
+    /// The only way a compile-time constant reaches the `Dst`, so a fill of an
+    /// accumulator can name its value.
+    LaneConst { lreg: u8, bits: u32 },
     /// One SFPU arithmetic instruction; `b` is `None` for a unary op.
     Sfp {
         op: SfpOp,
