@@ -214,22 +214,29 @@ impl Device {
             return Err(Error::TT_ERROR_NOT_BLACKHOLE);
         }
 
-        let tiles: Vec<NocCoord<Noc0>> = tt_isa::noc::grid::Tensix::FULL.tiles::<Noc0>().collect();
-        let first = *tiles.first().ok_or(Error::TT_ERROR_NO_TENSIX_TILE)?;
-        let first_y = first.y();
-        let columns = tiles.iter().take_while(|t| t.y() == first_y).count();
+        // The live Tensix grid comes from the ARC's telemetry, never from the
+        // part's population: ttsim v1.16 (and a harvested chip) refuses accesses
+        // to a fused-off tile's registers, and a guessed full grid writes
+        // exactly there.
         let mut device = Device {
             lib,
             shadow: None,
-            tile: first,
-            tiles,
-            columns,
+            tile: tt_isa::arc::arc_tile(),
+            tiles: Vec::new(),
+            columns: 0,
             dram: Dram::FULL,
             dram_used: 0x10_0000,
             exec_started: Vec::new(),
             launch_seq: 0,
             placed: Vec::new(),
         };
+        let tensix = device.probe_tensix()?;
+        device.tiles = tensix.tiles::<Noc0>().collect();
+        device.columns = tensix.enabled_column_count();
+        device.tile = *device
+            .tiles
+            .first()
+            .ok_or(Error::TT_ERROR_NO_TENSIX_TILE)?;
         // A previous process (`ttRelease` only drops this struct) leaves its
         // cores running and its mailboxes written. Reopening is the 0 -> 1
         // transition, so it cannot disturb a live caller: hold the five cores
@@ -242,6 +249,66 @@ impl Device {
     /// The tile the low-level accessors currently target.
     pub fn tile(&self) -> NocCoord<Noc0> {
         self.tile
+    }
+
+    /// This chip's live Tensix columns, from the ARC's telemetry table.
+    ///
+    /// tt-metal's `ArcTelemetryReader` (`umd/device/arc/arc_telemetry_reader.cpp`)
+    /// takes the table and value pointers from the ARC's reset-unit scratch, then
+    /// the entry count and the tag table from the table, whose words are
+    /// `tag | offset << 16` and whose values live in the value block at that
+    /// offset. The tag this driver needs is `ENABLED_TENSIX_COL`, whose bits
+    /// index the harvesting order rather than physical columns
+    /// (`NoC/Coordinates.md:54`: fused columns are remapped to maximal `X`, so
+    /// the survivors are a prefix). A chip that will not name its columns, or
+    /// names a shape the specification forbids, is refused: assuming a full part
+    /// writes to a fused-off tile, which ttsim v1.16 treats as undefined.
+    fn probe_tensix(&mut self) -> Result<tt_isa::noc::grid::Tensix, Error> {
+        use tt_isa::arc;
+        let arc_tile = arc::arc_tile();
+        let table = u64::from(self.arc_word(arc_tile, arc::TELEMETRY_PTR)?);
+        let values = u64::from(self.arc_word(arc_tile, arc::TELEMETRY_DATA)?);
+        // The pointers come from firmware: a CSM read is a NoC read, and an
+        // address outside the CSM is an unmapped ARC read, which hangs.
+        if !arc::is_within_csm(table, 8) || !arc::is_within_csm(values, 4) {
+            let _ = (table, values);
+            return Err(Error::TT_ERROR_TELEMETRY);
+        }
+        let version = self.arc_word(arc_tile, table)?;
+        let entries = self.arc_word(arc_tile, table + 4)?;
+        // The header is two words and the tag table follows it.
+        let tag_table = 8 + 4 * u64::from(entries);
+        if version > arc::TELEMETRY_MAX_MAJOR_VERSION
+            || entries > arc::TELEMETRY_MAX_ENTRIES
+            || !arc::is_within_csm(table, tag_table)
+        {
+            let _ = (version, entries);
+            return Err(Error::TT_ERROR_TELEMETRY);
+        }
+        let mut enabled = None;
+        for i in 0..u64::from(entries) {
+            let entry = self.arc_word(arc_tile, table + 8 + 4 * i)?;
+            if entry & 0xFFFF != u32::from(arc::tag::ENABLED_TENSIX_COL) {
+                continue;
+            }
+            let at = values + 4 * u64::from(entry >> 16);
+            if !arc::is_within_csm(at, 4) {
+                let _ = at;
+                return Err(Error::TT_ERROR_TELEMETRY);
+            }
+            enabled = Some(self.arc_word(arc_tile, at)?);
+        }
+        let mask = enabled.ok_or(Error::TT_ERROR_TELEMETRY)?;
+        tt_isa::noc::grid::Tensix::from_enabled_column_mask(mask)
+            .ok_or(Error::TT_ERROR_TELEMETRY)
+    }
+
+    /// One word of the ARC's address space, through the window: its reset-unit
+    /// scratch and its CSM are ordinary tile addresses.
+    fn arc_word(&mut self, arc_tile: NocCoord<Noc0>, address: u64) -> Result<u32, Error> {
+        let mut bytes = [0u8; 4];
+        self.window_read(arc_tile, address, &mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
     }
 
     /// Target `tile` for the low-level accessors (`l1_write`, `read32`, the

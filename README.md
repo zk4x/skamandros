@@ -192,7 +192,10 @@ cp $TT_METAL_HOME/tt_metal/soc_descriptors/blackhole_140_arch.yaml vendor/soc_de
 ```
 
 `1.13.0` or newer: that is the first release that runs a bf16 `UnpackToDst`
-into a 16-bit `Dst`.
+into a 16-bit `Dst`. `1.16.0` or newer is what this tree is measured on: it
+refuses accesses to a harvested tile's registers, which is why the driver takes
+the live Tensix grid from the ARC's `ENABLED_TENSIX_COL` telemetry instead of
+assuming a full part.
 
 The measure is the end-to-end suite (`tests/e2e.rs`): it `dlopen`s the built
 `libTT.so` with `libloading` and drives the C ABI exactly as a consumer would.

@@ -352,6 +352,11 @@ pub enum ttStatus {
     /// A bitcast names a dtype of a different width: the bits would not all be
     /// the value.
     TT_ERROR_BITCAST_WIDTH = 151,
+    /// The ARC's telemetry did not name this chip's Tensix columns usably: no
+    /// table pointer, a header that does not parse, no `ENABLED_TENSIX_COL`
+    /// entry, or a mask that contradicts the specification (holes in the middle,
+    /// or more columns than the part has).
+    TT_ERROR_TELEMETRY = 152,
 }
 
 impl ttStatus {
@@ -511,6 +516,7 @@ impl ttStatus {
             ttStatus::TT_ERROR_GRID_AXIS => "TT_ERROR_GRID_AXIS",
             ttStatus::TT_ERROR_GRID_COORD => "TT_ERROR_GRID_COORD",
             ttStatus::TT_ERROR_BITCAST_WIDTH => "TT_ERROR_BITCAST_WIDTH",
+            ttStatus::TT_ERROR_TELEMETRY => "TT_ERROR_TELEMETRY",
         }
     }
 }
