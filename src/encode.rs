@@ -875,6 +875,7 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
             MirOp::Pack {
                 cb,
                 rows,
+                row,
                 last,
                 int,
             } => {
@@ -885,7 +886,7 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
                 // 16-byte units minus the header unit the packer adds.
                 cb_base_pack(out, cb)?;
                 let mut words = ConfigWords::new();
-                pack_config(&mut words, int);
+                pack_config(&mut words, int, row);
                 out.extend(config_program(&words));
                 out.push(stallwait(block::PACKER | block::CONFIG, cond::CONFIG_BUSY)?);
                 pack_rows(out, rows, last)?;
@@ -902,11 +903,20 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
     Ok(())
 }
 
-/// The packer's `Config` for one unit: read `Dst` as 32-bit, write FP32 to the
-/// ring's page. The output address is in 16-byte units and the generator always
-/// adds the one 16-byte tile header unit it never writes; the base store takes
-/// the same `- 1`.
-fn pack_config(words: &mut ConfigWords, int: bool) {
+/// The packer's `Config` for one unit: read `Dst` as 32-bit from row `row`,
+/// write FP32 to the ring's page. The output address is in 16-byte units and
+/// the generator always adds the one 16-byte tile header unit it never writes;
+/// the base store takes the same `- 1`.
+///
+/// `DEST_TARGET_REG_CFG_PACK_SEC0_Offset` is the `Dst` row the packer reads
+/// from (`Dst` addresses are 16-word rows, and tt-metal's own values for this
+/// field — 0 and `DEST_REGISTER_HALF_SIZE`, 512 — are row counts). tt-metal
+/// splits the same job: this field holds the half base, and
+/// `set_dst_write_addr(tile_index)` puts the tile within it in the packer's `W`
+/// address counter (`TT_SETADC(PAC, CH_0, SET_W, tile_index)`). The simulator
+/// does not model that counter — a `SETADC` there leaves the pack reading row
+/// 0 — so the row is written here, per pack, which is also what zyx did.
+fn pack_config(words: &mut ConfigWords, int: bool, row: u32) {
     // The datum is opaque 32 bits at this layer: `Int32` in the packer's
     // `Out_data_format` requires the `Dst` access format to match it, and the
     // role descriptor's is 32-bit. The `int` flag instead selects the
@@ -963,7 +973,7 @@ fn pack_config(words: &mut ConfigWords, int: bool) {
         .unwrap()
         .set(pack0::PACK_COUNTERS_SEC0_pack_reads_per_xy_plane, 4)
         .unwrap()
-        .set(global::DEST_TARGET_REG_CFG_PACK_SEC0_Offset, 0)
+        .set(global::DEST_TARGET_REG_CFG_PACK_SEC0_Offset, row)
         .unwrap()
         .set(pack0::PCK_EDGE_MODE_mode, 0)
         .unwrap()
@@ -973,7 +983,8 @@ fn pack_config(words: &mut ConfigWords, int: bool) {
         .unwrap();
 }
 
-/// Pack `rows` rows of FP32 `Dst`, from row 0, to the run `pack_config` set up.
+/// Pack `rows` rows of FP32 `Dst` from the row `pack_config` set, to the run it
+/// set up.
 fn pack_rows(out: &mut Stream, rows: u32, last: bool) -> Result<(), Error> {
     out.push(thread_entry(thread::ADDR_MOD_PACK_SEC0_YsrcIncr, 0));
     out.push(thread_entry(thread::ADDR_MOD_PACK_SEC1_YsrcIncr, 4));

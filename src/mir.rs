@@ -63,10 +63,12 @@ pub enum MirOp {
     /// The base `Dst` row an unpack writes to.
     Setdst { row: u32 },
     /// The packer drains into the page at the tail of `cb`'s ring. The base is
-    /// read from the ring's write pointer at run time.
+    /// read from the ring's write pointer at run time; `row` is the `Dst` row
+    /// the first packed row comes from, the packer's `W` counter.
     Pack {
         cb: u32,
         rows: u32,
+        row: u32,
         last: bool,
         int: bool,
     },

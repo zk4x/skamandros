@@ -287,6 +287,29 @@ copy_to %out from %bo [%o] [%o]
 endloop
 ";
 
+/// Two values live in `Dst` at once, so each is packed from its own row: the
+/// second store's page must be the second value, not the first. The packer's
+/// start row is its `W` counter, set per pack (`SETADC`, tt-metal's
+/// `set_dst_write_addr`); a packer stuck on row 0 repeats the first value.
+const NEG_TWO_LIVE: &str = "\
+version 4
+grid 1,1
+%in = param f32 2048
+%out = param f32 2048
+%bi = buffer f32 32,64
+%bo = buffer f32 32,64
+copy_to %bi from %in [0]
+copy_to %bi from %in [1024]
+%a = load %bi [0]
+%b = load %bi [1024]
+%na = neg %a
+%nb = neg %b
+store_to %bo from %na [0]
+store_to %bo from %nb [1024]
+copy_to %out from %bo [0]
+copy_to %out from %bo [1024]
+";
+
 /// The same elementwise kernel with no buffer and no `copy_to`: the parameter is
 /// named directly and `mover::add_movers` supplies the staging and the traffic,
 /// as zyx's `tt_add_movers` does.
@@ -476,6 +499,105 @@ fn an_elementwise_kernel_runs_on_the_simulator() {
         compile(
             NEG_TILE.as_ptr().cast(),
             NEG_TILE.len(),
+            &mut module,
+            &mut err,
+        )
+    };
+    assert_eq!(code, TT_OK, "compile: {}", take_error(&free, err));
+    assert!(!module.is_null());
+
+    let params = [input, output];
+    let code = unsafe { launch(module, params.as_ptr(), params.len(), &mut err) };
+    assert_eq!(code, TT_OK, "ttLaunch: {}", take_error(&free, err));
+
+    let mut back = vec![0u8; bytes];
+    assert_eq!(
+        unsafe { d2h(back.as_mut_ptr(), output, back.len(), &mut err) },
+        TT_OK,
+        "download: {}",
+        take_error(&free, err)
+    );
+    let got: Vec<f32> = back
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (i, (x, y)) in host.iter().zip(&got).enumerate() {
+        assert_eq!(*y, -*x, "datum {i}: {x} negated is {}", -*x);
+    }
+
+    assert_eq!(
+        unsafe { unload(module, &mut err) },
+        TT_OK,
+        "unload: {}",
+        take_error(&free, err)
+    );
+    assert_eq!(
+        unsafe { release(&mut err) },
+        TT_OK,
+        "ttRelease: {}",
+        take_error(&free, err)
+    );
+}
+
+/// Each store packs the value in its own `Dst` rows: the second page is not the
+/// first page repeated.
+#[test]
+fn two_live_values_pack_from_their_own_dst_rows() {
+    let _device = device();
+    let sim = simulator_path();
+    // SAFETY: no other thread reads the environment concurrently; the library
+    // reads it when it opens the device.
+    unsafe { std::env::set_var("TT_TTSIM_LIB", &sim) };
+
+    let lib = library();
+    let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
+    let unload: Symbol<ModuleUnload> =
+        unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
+    let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
+    let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
+    let release: Symbol<Release> = unsafe { lib.get(b"ttRelease\0") }.expect("ttRelease");
+    let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
+    let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
+    let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
+    let launch: Symbol<Launch> = unsafe { lib.get(b"ttLaunch\0") }.expect("ttLaunch");
+
+    let mut err: *mut c_char = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { init(&mut err) },
+        TT_OK,
+        "ttInit: {}",
+        take_error(&free, err)
+    );
+
+    let bytes = 2048 * 4;
+    let (mut input, mut output) = (0u64, 0u64);
+    assert_eq!(
+        unsafe { alloc(bytes, &mut input, &mut err) },
+        TT_OK,
+        "input: {}",
+        take_error(&free, err)
+    );
+    assert_eq!(
+        unsafe { alloc(bytes, &mut output, &mut err) },
+        TT_OK,
+        "output: {}",
+        take_error(&free, err)
+    );
+
+    let host: Vec<f32> = (0..2048).map(|i| (i as f32 - 1024.0) * 0.25).collect();
+    let host_bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+    assert_eq!(
+        unsafe { h2d(input, host_bytes.as_ptr(), host_bytes.len(), &mut err) },
+        TT_OK,
+        "upload: {}",
+        take_error(&free, err)
+    );
+
+    let mut module: *mut c_void = std::ptr::null_mut();
+    let code = unsafe {
+        compile(
+            NEG_TWO_LIVE.as_ptr().cast(),
+            NEG_TWO_LIVE.len(),
             &mut module,
             &mut err,
         )

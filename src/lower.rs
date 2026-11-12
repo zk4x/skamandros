@@ -177,6 +177,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 m.t2.push(MirOp::Pack {
                     cb,
                     rows,
+                    row: dst_row(alloc, value),
                     last: true,
                     int,
                 });
@@ -184,7 +185,6 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 m.t2.push(MirOp::CbPush { cb });
                 // The pack has retired, so the `Dst` slot is free again.
                 m.t2.push(MirOp::SemPost { sem: SEM_SLOT });
-                let _ = value;
                 let _ = offset;
             }
             Op::Cast { .. } => {
