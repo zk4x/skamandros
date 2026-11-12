@@ -23,7 +23,6 @@ use tt_isa::cfg::generated::{alu, global, pack0, thcon, thread, unpack1};
 use tt_isa::isa::Instruction;
 use tt_isa::isa::generated::{defs, encode};
 use tt_isa::sync::{self, Semaphore};
-use tt_isa::tile::{L1Format, TileDescriptor};
 
 /// The GPR the configuration program stages each word through.
 pub const SCRATCH_GPR: u32 = 8;
@@ -615,10 +614,10 @@ fn lane_format(dtype: DType) -> u32 {
 
 /// The L1 format of one buffer datum: a bf16 datum is two bytes in L1, every
 /// other datum is carried as 32 opaque bits.
-fn l1_format(dtype: DType) -> L1Format {
+fn l1_format(dtype: DType) -> u32 {
     match dtype {
-        DType::Bf16 => L1Format::Bf16,
-        _ => L1Format::Fp32,
+        DType::Bf16 => DATA_FORMAT_BF16,
+        _ => DATA_FORMAT_FP32,
     }
 }
 
@@ -626,12 +625,46 @@ fn l1_format(dtype: DType) -> L1Format {
 /// (`DST_ACCUM_MODE`'s 16-bit half), the 32-bit bank is an opaque 32-bit one.
 /// The unpacker's `Out_data_format`, the packer's `In_data_format` and the
 /// packer's 16-bit read path all follow it.
-fn dst_format(dst_is_16_bit: bool) -> L1Format {
+fn dst_format(dst_is_16_bit: bool) -> u32 {
     if dst_is_16_bit {
-        L1Format::Bf16
+        DATA_FORMAT_BF16
     } else {
-        L1Format::Fp32
+        DATA_FORMAT_FP32
     }
+}
+
+/// The 4-bit `InDataFormat`/`OutDataFormat` codes, tt-metal's `DataFormat`:
+/// `Float32` 0, `Float16` 1, `Tf32` 4, `BFloat16` 5, `Int32` 8.
+///
+/// `MEASURED` on ttsim rather than transcribed
+/// (`metalium-rs/docs/learnings/ttsim-divergence.md` rows G and H): exactly
+/// `(0, 0)`, `(0, 4)` and `(8, 8)` run to `Dst` out of the 256 pairs, and the
+/// `Src` path separates 1 from 5 by the mantissa cut. The measurement agrees
+/// with tt-metal's enum, which was not consulted to find it.
+const DATA_FORMAT_FP32: u32 = 0;
+const DATA_FORMAT_TF32: u32 = 4;
+const DATA_FORMAT_BF16: u32 = 5;
+
+/// The unpacker's tile descriptor, tt-metal's `unpack_tile_descriptor_t`
+/// (`tt_llk_wormhole_b0/common/inc/cunpack_common.h:22-53`): four words.
+///
+/// ```text
+/// word 0  in_data_format:4  uncompressed:1  reserved:3  blobs_per_xy_plane:4
+///         reserved:4  x_dim:16
+/// word 1  y_dim:16  z_dim:16
+/// word 2  w_dim:16  blobs_y_start_lo:16
+/// word 3  blobs_y_start_hi:16  digest_type:8  digest_size:8
+/// ```
+///
+/// A tile this compiler stages is uncompressed and carries no blobs, so only
+/// the dims and the format are ever set.
+fn tile_descriptor(in_data_format: u32, x_dim: u16, y_dim: u16, z_dim: u16) -> [u32; 4] {
+    [
+        in_data_format | (1 << 4) | (u32::from(x_dim) << 16),
+        u32::from(y_dim) | (u32::from(z_dim) << 16),
+        0,
+        0,
+    ]
 }
 
 /// The unpacker's `Config` for one unit: base, destination, X dimension, FP32
@@ -654,7 +687,7 @@ fn unpack_config(
         .unwrap()
         .set(thcon::THCON_SEC0_REG5_Tile_x_dim_cntx0, datums)
         .unwrap()
-        .set(thcon::THCON_SEC0_REG2_Out_data_format, dst.code().unwrap())
+        .set(thcon::THCON_SEC0_REG2_Out_data_format, dst)
         .unwrap()
         .set(thcon::THCON_SEC0_REG2_Ovrd_data_format, 0)
         .unwrap()
@@ -685,16 +718,10 @@ fn unpack_config(
         .unwrap()
         .set(unpack1::UNP0_ADDR_CTRL_ZW_REG_1_Zstride, 0)
         .unwrap();
-    let descriptor = TileDescriptor::zeroed()
-        .with_x_dim(datums)
-        .with_y_dim(1)
-        .with_z_dim(0)
-        .with_w_dim(0)
-        .with_is_uncompressed(true)
-        .with_in_data_format_raw(fmt.code().unwrap());
+    let descriptor = tile_descriptor(fmt, datums as u16, 1, 0);
     // Words 0 and 1 always; 2 and 3 only when they carry something (ttsim
     // refuses a write of the all-zero tail).
-    for (i, word) in descriptor.words().iter().enumerate() {
+    for (i, word) in descriptor.iter().enumerate() {
         if i < 2 || *word != 0 {
             words
                 .seed(
@@ -716,15 +743,10 @@ fn unpack_config(
 /// implied format the handover sets, not from `ALU_FORMAT_SPEC`.
 fn src_unpack_config(words: &mut ConfigWords, unit: u8, dtype: DType) {
     let out = match dtype {
-        DType::Bf16 => L1Format::Bf16,
-        _ => L1Format::Tf32,
+        DType::Bf16 => DATA_FORMAT_BF16,
+        _ => DATA_FORMAT_TF32,
     };
-    let descriptor = TileDescriptor::zeroed()
-        .with_x_dim(16)
-        .with_y_dim(16)
-        .with_z_dim(4)
-        .with_is_uncompressed(true)
-        .with_in_data_format_raw(l1_format(dtype).code().expect("a measured format"));
+    let descriptor = tile_descriptor(l1_format(dtype), 16, 16, 4);
     let span = match unit {
         0 => {
             words
@@ -732,7 +754,7 @@ fn src_unpack_config(words: &mut ConfigWords, unit: u8, dtype: DType) {
                 .unwrap()
                 .set(thcon::THCON_SEC0_REG5_Tile_x_dim_cntx0, 16)
                 .unwrap()
-                .set(thcon::THCON_SEC0_REG2_Out_data_format, out.code().unwrap())
+                .set(thcon::THCON_SEC0_REG2_Out_data_format, out)
                 .unwrap()
                 // `Src`, not `Dst`.
                 .set(thcon::THCON_SEC0_REG2_Unpack_if_sel_cntx0, 0)
@@ -754,7 +776,7 @@ fn src_unpack_config(words: &mut ConfigWords, unit: u8, dtype: DType) {
             // `Tile_x_dim_cntx` (the descriptor carries the width), and its
             // `Offset_address` cannot be written (reset zero).
             words
-                .set(thcon::THCON_SEC1_REG2_Out_data_format, out.code().unwrap())
+                .set(thcon::THCON_SEC1_REG2_Out_data_format, out)
                 .unwrap()
                 .set(thcon::THCON_SEC1_REG2_Disable_zero_compress_cntx0, 1)
                 .unwrap()
@@ -763,7 +785,7 @@ fn src_unpack_config(words: &mut ConfigWords, unit: u8, dtype: DType) {
             thcon::THCON_SEC1_REG0_TileDescriptor
         }
     };
-    for (i, word) in descriptor.words().iter().enumerate() {
+    for (i, word) in descriptor.iter().enumerate() {
         if *word != 0 {
             words.seed(span.addr32() + i as u16, *word).unwrap();
         }
@@ -1382,9 +1404,9 @@ fn pack_config(words: &mut ConfigWords, dtype: DType, row: u32, dst_is_16_bit: b
     let in_ = dst_format(dst_is_16_bit);
     let narrow = dst_is_16_bit;
     words
-        .set(thcon::THCON_SEC0_REG1_In_data_format, in_.code().unwrap())
+        .set(thcon::THCON_SEC0_REG1_In_data_format, in_)
         .unwrap()
-        .set(thcon::THCON_SEC0_REG1_Out_data_format, out.code().unwrap())
+        .set(thcon::THCON_SEC0_REG1_Out_data_format, out)
         .unwrap()
         .set(thcon::THCON_SEC0_REG1_Source_interface_selection, 0)
         .unwrap()
