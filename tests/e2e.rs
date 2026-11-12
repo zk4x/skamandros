@@ -2491,3 +2491,61 @@ fn a_matmul_accumulates_over_a_k_loop() {
         );
     }
 }
+
+/// The accumulator is packed, refilled and written again: the second `matmul`
+/// and the fill after a pack write the same `Dst` rows the packer has just
+/// read, so the math thread must wait for that section to drain first. The
+/// values are what the wait protects on a board; on the simulator they are what
+/// the program produces either way.
+const MATMUL_ACC_REUSED: &str = "\
+version 6
+grid 1,1
+%pa = param f32 1024
+%pb = param f32 1024
+%pc = param f32 1024
+%out = param f32 2048
+%ba = buffer f32 32,32
+%bb = buffer f32 32,32
+%bc = buffer f32 32,32
+%b0 = buffer f32 32,32
+copy_to %ba from %pa [0]
+copy_to %bb from %pb [0]
+copy_to %bc from %pc [0]
+%m = acc f32 32,32
+%zero = const f32 0
+store_to %m from %zero
+%a = load %ba [0]
+%b = load %bb [0]
+%c = load %bc [0]
+matmul %m %a %b
+store_to %b0 from %m [0]
+copy_to %out from %b0 [0] [0]
+store_to %m from %zero
+matmul %m %a %c
+store_to %b0 from %m [0]
+copy_to %out from %b0 [1024] [0]
+";
+
+#[test]
+fn an_acc_is_reused_after_it_has_been_packed() {
+    let a: Vec<f32> = (0..1024).map(|i| (i % 7) as f32 - 3.0).collect();
+    let b: Vec<f32> = (0..1024).map(|i| (i % 5) as f32 - 2.0).collect();
+    let c: Vec<f32> = (0..1024).map(|i| (i % 11) as f32 - 5.0).collect();
+    let want_ab = tile_matmul(&a, &b);
+    let want_ac = tile_matmul(&a, &c);
+
+    let bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let out = run_kernel_tensors(
+        MATMUL_ACC_REUSED,
+        &[&bytes(&a), &bytes(&b), &bytes(&c)],
+        8192,
+    );
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for i in 0..1024 {
+        assert_eq!(got[i], want_ab[i], "first product, datum {i}");
+        assert_eq!(got[1024 + i], want_ac[i], "second product, datum {i}");
+    }
+}

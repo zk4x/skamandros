@@ -270,6 +270,11 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     let (unit_shape, _, _) = unit_of([32, 32], acc_dtype)?;
                     let rows = rows_of(unit_shape, at)?;
                     let base = dst_row(alloc, buffer);
+                    // The fill writes `Dst` rows. If those rows were packed
+                    // since their last write, the packer may still be reading
+                    // them, so the math thread waits for the section to drain
+                    // first (`wait_math_semaphores`).
+                    m.t1.push(MirOp::SemWaitFree { sem: SEM_READY });
                     m.t1.push(MirOp::LaneConst { lreg: 0, bits });
                     // An SFPU store covers a row pair (`SFPSTORE` refuses an odd
                     // row and writes two), the same step the datapath uses.
@@ -300,6 +305,12 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     let _ = buffer;
                     Error::TT_ERROR_BUFFER_NOT_PLACED
                 })?;
+                // One `Dst` section is in flight at a time, as in tt_llk: the
+                // math thread waits until the packer has released the previous
+                // one before it offers this one. Without the wait two posts
+                // coalesce in the one-deep pack hand-off and the packer waits
+                // for a section that never comes.
+                m.t1.push(MirOp::SemWaitFree { sem: SEM_READY });
                 m.t1.push(MirOp::SemPost { sem: SEM_READY });
                 // The packer claims the unit, packs it, and only then releases
                 // the semaphore — so the math core cannot overwrite `Dst` until
@@ -536,6 +547,11 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 let cb_a = matmul_page(k, plan, &def, &alias, a, at)?;
                 let cb_b = matmul_page(k, plan, &def, &alias, b, at)?;
                 let base = dst_row(alloc, acc);
+                // The Matrix Unit writes the accumulator's rows. If they were
+                // packed since their last write, the packer may still be
+                // reading them; wait for the section to drain
+                // (`_llk_math_wait_for_dest_available_`).
+                m.t1.push(MirOp::SemWaitFree { sem: SEM_READY });
                 // The Matrix Unit's address modifiers, fidelity phase and row
                 // counters are this thread's `ThreadConfig` and RWC state. Every
                 // word goes out as a whole `SETC16`, so an entry carrying several
@@ -918,5 +934,72 @@ fn binary(op: BinOp, at: usize) -> Result<SfpOp, Error> {
             let _ = (at, other);
             Err(Error::TT_TODO_BINARY_SFPU)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `matmul`, the fill and the SFPU all write `Dst` rows the packer reads.
+    /// Once a `store_to` posts its section, the next `Dst` write must wait for
+    /// the packer to release it — otherwise the two posts coalesce in the
+    /// one-deep hand-off and the write lands while the pack is still reading.
+    #[test]
+    fn a_dst_write_after_a_post_waits_for_the_packer() {
+        const PROGRAM: &str = "\
+version 6
+grid 1,1
+%pa = param f32 1024
+%pb = param f32 1024
+%out = param f32 2048
+%ba = buffer f32 32,32
+%bb = buffer f32 32,32
+%bo = buffer f32 32,32
+copy_to %ba from %pa [0]
+copy_to %bb from %pb [0]
+%m = acc f32 32,32
+%zero = const f32 0
+store_to %m from %zero
+%a = load %ba [0]
+%b = load %bb [0]
+matmul %m %a %b
+store_to %bo from %m [0]
+copy_to %out from %bo [0] [0]
+store_to %m from %zero
+matmul %m %a %b
+store_to %bo from %m [0]
+copy_to %out from %bo [1024] [0]
+";
+        let k = Kernel::parse(PROGRAM).expect("it parses");
+        let types = k.verify().expect("it verifies");
+        let k = crate::mover::add_movers(&k, &types).expect("the movers are added");
+        let types = k.verify().expect("it verifies");
+        let plan = crate::planner::place(&k, &types).expect("it places");
+        let alloc = crate::alloc::allocate(&k, &types).expect("it allocates");
+        let m = lower(&k, &types, &plan, &alloc).expect("it lowers");
+
+        let mut released = false;
+        let mut posts = 0;
+        let mut writes = 0;
+        for op in &m.t1 {
+            match *op {
+                MirOp::SemPost { sem } if sem == SEM_READY => {
+                    posts += 1;
+                    released = false;
+                }
+                MirOp::SemWaitFree { sem } if sem == SEM_READY => released = true,
+                MirOp::Mvmul { .. } | MirOp::Sfpstore { .. } | MirOp::Zeroacc { .. } => {
+                    writes += 1;
+                    assert!(
+                        released,
+                        "a Dst write follows a section post with no drain wait: {op:?}"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(posts, 2, "one post per pack");
+        assert!(writes > 2, "the program writes Dst");
     }
 }

@@ -127,7 +127,7 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
         let mut depth = 0usize;
         while at < ops.len() {
             match ops[at] {
-                MirOp::Sfpload { lreg, row, .. } | MirOp::Sfpstore { lreg, row, .. } => {
+                MirOp::Sfpload { lreg, row, .. } => {
                     if lreg >= crate::alloc::LREGS {
                         let _ = (name, at, lreg);
                         return Err(Error::TT_ERROR_LANE_REGISTER);
@@ -135,6 +135,23 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                     if row >= u32::from(DST_SLOTS) * DST_ROWS {
                         let _ = (name, at, row);
                         return Err(Error::TT_ERROR_DST_ROW);
+                    }
+                }
+                MirOp::Sfpstore { lreg, row, .. } => {
+                    if lreg >= crate::alloc::LREGS {
+                        let _ = (name, at, lreg);
+                        return Err(Error::TT_ERROR_LANE_REGISTER);
+                    }
+                    if row >= u32::from(DST_SLOTS) * DST_ROWS {
+                        let _ = (name, at, row);
+                        return Err(Error::TT_ERROR_DST_ROW);
+                    }
+                    // `SFPSTORE`'s `dest_reg_addr` names a row *pair*: the
+                    // hardware refuses an odd row (`tensix.cpp`:
+                    // `TTSIM_VERIFY(!(dest_reg_addr & 1))`) and writes two.
+                    if row & 1 != 0 {
+                        let _ = (name, at, row);
+                        return Err(Error::TT_ERROR_DST_ROW_ODD);
                     }
                 }
                 MirOp::LaneConst { lreg, .. } => {
@@ -167,6 +184,7 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                 }
                 MirOp::SemPost { sem }
                 | MirOp::SemWait { sem, .. }
+                | MirOp::SemWaitFree { sem }
                 | MirOp::SemWaitData { sem }
                 | MirOp::SemGet { sem } => {
                     if sem >= tt_isa::sync::Semaphore::COUNT {
@@ -313,8 +331,9 @@ copy_to %out from %b0 [0]
         let mut m = machine();
         let before = m.t1.len();
         fuse(&mut m);
-        // One repeat marker plus the body, around the two hand-offs.
-        assert_eq!(m.t1.len(), 6, "got {:?}", m.t1);
+        // One repeat marker plus the body, around the two hand-offs and the
+        // packer drain wait.
+        assert_eq!(m.t1.len(), 7, "got {:?}", m.t1);
         assert!(matches!(m.t1[1], MirOp::Repeat { len: 3, count: 32 }));
         assert!(matches!(
             m.t1[2],
@@ -386,6 +405,22 @@ copy_to %out from %b0 [0]
             dtype: crate::ir::DType::F32,
         });
         assert!(verify(&m).is_err());
+    }
+
+    #[test]
+    fn an_odd_sfpstore_row_is_refused() {
+        // `SFPSTORE`'s address names a row pair; the hardware refuses an odd
+        // one, so the machine IR must too, before it reaches the encoder.
+        let mut m = machine();
+        m.t1.push(MirOp::Sfpstore {
+            lreg: 0,
+            row: 1,
+            dtype: crate::ir::DType::F32,
+        });
+        assert_eq!(
+            verify(&m).expect_err("an odd row"),
+            Error::TT_ERROR_DST_ROW_ODD
+        );
     }
 
     #[test]

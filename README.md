@@ -240,7 +240,15 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   the math core publishes each stored one. Thread 0 runs the setup program
   (`SEMINIT` each semaphore with max 1, as tt-metal's boot sequence does) to
   completion before the three roles are released, so no role depends on another
-  role's initialisation having already run.
+  role's initialisation having already run. The pack hand-off is one section
+  deep, as tt_llk's is: the math core waits until the packer has drained the
+  previous section before it writes `Dst` again, and the packer only releases
+  the section after the pack has retired.
+- A tensor parameter is **tiled**: its bytes are the tile layout below, not a
+  row-major matrix, exactly as tt-metal's DRAM tensors are in `TILE_LAYOUT`.
+  `copy_to` moves one page of `page` bytes contiguously, so a kernel never
+  gathers a tile out of row-major data; the host does that when it fills the
+  parameter.
 - A launch runs the module's whole grid: every tile of it gets the module's
   programs and arguments, and all of them run concurrently. A symbolic grid
   (`grid %nx,%ny`) is resolved at launch from the scalar arguments before any

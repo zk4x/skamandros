@@ -398,6 +398,9 @@ pub enum ttStatus {
     /// Only a fill from a constant is implemented; a tile value moving into an
     /// accumulator needs the SFPU to walk both tiles.
     TT_TODO_ACC_STORE = 164,
+    /// A machine `SFPSTORE` names an odd `Dst` row. The store's
+    /// `dest_reg_addr` names a row pair and the hardware refuses an odd one.
+    TT_ERROR_DST_ROW_ODD = 165,
 }
 
 impl ttStatus {
@@ -569,6 +572,7 @@ impl ttStatus {
             ttStatus::TT_ERROR_ACC_DTYPE => "TT_ERROR_ACC_DTYPE",
             ttStatus::TT_ERROR_ACC_OFFSET => "TT_ERROR_ACC_OFFSET",
             ttStatus::TT_TODO_ACC_STORE => "TT_TODO_ACC_STORE",
+            ttStatus::TT_ERROR_DST_ROW_ODD => "TT_ERROR_DST_ROW_ODD",
         }
     }
 }

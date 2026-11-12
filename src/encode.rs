@@ -264,19 +264,24 @@ pub fn setup(slots: u8) -> Result<Vec<u32>, Error> {
     Ok(out)
 }
 
-/// `SEMINIT` each semaphore with max 1 — the boot sequence's shape.
+/// `SEMINIT` each semaphore with the maximum its wait condition reads.
 fn semaphore_init(slots: u8) -> Result<Vec<Instruction>, Error> {
     let mut out = Vec::new();
-    let max = sync::MAX_VALUE;
-    for (index, value) in [
-        (crate::lower::SEM_UNPACKED, 0),
-        (crate::lower::SEM_READY, 0),
+    for (index, value, max) in [
+        // One unpacked unit, taken by the math thread.
+        (crate::lower::SEM_UNPACKED, 0, 1),
+        // Posted by the math thread when it has a `Dst` section to pack, taken
+        // (back to zero) by the packer once that section has drained. The
+        // math thread's `SemWaitFree` waits for `Value < Max`, so `Max` is one:
+        // a zero means the packer is done with `Dst` and the math thread may
+        // write it again.
+        (crate::lower::SEM_READY, 0, 1),
         // Every `Dst` slot this kernel uses is free at the start; the packer
         // hands each back. The count is the allocation's peak liveness, not the
         // whole bank: with more tokens than the program can have live units, the
         // unpacker would run a second unit into a slot the packer is still
         // reading.
-        (crate::lower::SEM_SLOT, slots),
+        (crate::lower::SEM_SLOT, slots, sync::MAX_VALUE),
     ] {
         let sem = semaphore(index)?;
         out.push(sync::init(sem, value, max).map_err(|_| {
@@ -1068,6 +1073,9 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
         }
         MirOp::WaitMatrix => {
             out.push(backend::wait_for_matrix(Before::EVERYTHING).map_err(|e| bad(e, op))?);
+        }
+        MirOp::SemWaitFree { sem } => {
+            out.push(sync::wait_below_max(semaphore(sem)?, Before::EVERYTHING));
         }
         MirOp::SemPost { sem } => {
             let s = semaphore(sem)?;
