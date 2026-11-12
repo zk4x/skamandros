@@ -164,8 +164,9 @@ error channel.
 An error message is a NUL-terminated string the caller frees with `ttFree`; a
 null pointer there is a no-op.
 
-The device is `libttsim` through `dlopen`: `$TT_TTSIM_LIB`, or
-`libttsim_bh.so` in the current directory. Nothing links it.
+The device is `libttsim` through `dlopen`: `$TT_METAL_SIMULATOR` (tt-metal's
+own name, `TTSIM.md`), or `libttsim_bh.so` in the current directory. Nothing
+links it.
 
 ## Building and testing
 
@@ -177,6 +178,21 @@ cargo test           # unit tests and the end-to-end suite
 The end-to-end suite loads `target/<profile>/libTT.so`, so build the library
 before running it (`cargo build && cargo test`); `cargo test` alone does not
 rebuild the `cdylib` if only its Rust sources changed.
+
+The end-to-end suite also needs Tenstorrent's functional simulator, `ttsim`,
+which is not part of this repository: download `libttsim_bh.so` from the
+[ttsim releases](https://github.com/tenstorrent/ttsim/releases) and either name
+it in `$TT_METAL_SIMULATOR` (tt-metal's own variable, `TTSIM.md`) or drop it in
+`vendor/` next to the crate (`vendor/` is git-ignored):
+
+```bash
+mkdir -p vendor && curl -L -o vendor/libttsim_bh.so \
+  https://github.com/tenstorrent/ttsim/releases/latest/download/libttsim_bh.so
+cp $TT_METAL_HOME/tt_metal/soc_descriptors/blackhole_140_arch.yaml vendor/soc_descriptor.yaml
+```
+
+`1.13.0` or newer: that is the first release that runs a bf16 `UnpackToDst`
+into a 16-bit `Dst`.
 
 The measure is the end-to-end suite (`tests/e2e.rs`): it `dlopen`s the built
 `libTT.so` with `libloading` and drives the C ABI exactly as a consumer would.

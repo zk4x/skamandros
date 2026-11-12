@@ -426,10 +426,10 @@ mod tests {
     /// A launch that hangs is a status, not a wedged tile: the watchdog's
     /// timeout reaches the caller and the next launch still runs.
     ///
-    /// Ignored because it opens the simulator, which needs `TT_TTSIM_LIB`.
-    /// Run with `TT_TTSIM_LIB=... cargo test --lib -- --ignored`.
+    /// Ignored because it opens the simulator, which needs `TT_METAL_SIMULATOR`.
+    /// Run with `TT_METAL_SIMULATOR=... cargo test --lib -- --ignored`.
     #[test]
-    #[ignore = "needs the simulator: set TT_TTSIM_LIB"]
+    #[ignore = "needs the simulator: set TT_METAL_SIMULATOR"]
     fn a_timed_out_launch_returns_timeout_and_the_next_launch_runs() {
         init().expect("init");
         match launch(&module(vec![HANG]), &[]) {

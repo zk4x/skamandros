@@ -929,8 +929,9 @@ fn cast_lanes(from: DType, to: DType, a: u8, d: u8, out: &mut Stream) -> Result<
             place(out, encode::sfpcast(t, d, CAST_INT32_TO_FP32_RNE));
         }
         (DType::F32, DType::I32) => {
-            // Lanes come in with nothing to be conditional on.
-            place(out, encode::sfpencc(0, 0, ENCC_ALL));
+            // The exponent's lane flags decide which lanes saturate, so
+            // conditional execution is on for the whole sequence.
+            place(out, cc_mask(true));
             place(out, loadi(d, loadi_mode::USHORT, 0));
             place(out, encode::sfpexexp(a, t, EXEXP_CC_SGN_COMP));
             // Saturated lanes keep `INT_MIN` (`0x8000_0000`).
@@ -948,7 +949,7 @@ fn cast_lanes(from: DType, to: DType, a: u8, d: u8, out: &mut Stream) -> Result<
                 out,
                 encode::sfpiadd(0, LREG_ZERO, d, IADD_2SCOMP_LREG_DST | IADD_CC_NONE),
             );
-            place(out, encode::sfpencc(0, 0, ENCC_ALL));
+            place(out, cc_mask(false));
         }
         // A comparison's true has the sign bit set and its false is zero, so a
         // logical shift by 31 is the C value: one or zero.
@@ -964,7 +965,7 @@ fn cast_lanes(from: DType, to: DType, a: u8, d: u8, out: &mut Stream) -> Result<
             place(out, encode::sfpcast(d, d, CAST_INT32_TO_FP32_RNE));
         }
         (from, DType::Bool) => {
-            place(out, encode::sfpencc(0, 0, ENCC_ALL));
+            place(out, cc_mask(true));
             if from == DType::F32 {
                 // `|x|` first: `-0.0` is zero and a NaN is not.
                 place(out, encode::sfpabs(a, t, 0));
@@ -975,7 +976,7 @@ fn cast_lanes(from: DType, to: DType, a: u8, d: u8, out: &mut Stream) -> Result<
                 encode::sfpsetcc(0, if from == DType::F32 { t } else { a }, 0, SETCC_NE0),
             );
             place(out, loadi(d, loadi_mode::UPPER, 0xBF80));
-            place(out, encode::sfpencc(0, 0, ENCC_ALL));
+            place(out, cc_mask(false));
         }
         (DType::Bf16, _) | (_, DType::Bf16) => {
             let _ = (from, to);

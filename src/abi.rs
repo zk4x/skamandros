@@ -171,7 +171,7 @@ pub unsafe extern "C" fn ttModuleUnload(module: *mut ttModule, err: *mut *mut c_
 /// Open the device.
 ///
 /// Idempotent. The simulator is initialized once per process, from
-/// `$TT_TTSIM_LIB` or `libttsim_bh.so` in the current directory.
+/// `$TT_METAL_SIMULATOR` or `libttsim_bh.so` in the current directory.
 ///
 /// # Safety
 ///

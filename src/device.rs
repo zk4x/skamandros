@@ -10,9 +10,10 @@
 //! the TLB configuration is the one the library accepts, and L1 access is
 //! bounded by [`tt_isa::tensix::L1_SIZE`].
 //!
-//! The simulator is loaded from `$TT_TTSIM_LIB`, or `libttsim_bh.so` in the
-//! current directory. It is initialized once per process; [`Device`] can be
-//! dropped and reopened without re-initializing it.
+//! The simulator is loaded from `$TT_METAL_SIMULATOR` — the name tt-metal's own
+//! runtime and the ttsim project use — or `libttsim_bh.so` in the current
+//! directory. It is initialized once per process; [`Device`] can be dropped and
+//! reopened without re-initializing it.
 
 use std::ffi::{OsStr, c_void};
 use std::path::PathBuf;
@@ -28,8 +29,9 @@ use tt_isa::noc::niu::Endpoint;
 use tt_isa::noc::{Noc0, NocCoord};
 use tt_isa::tensix::{self, Core};
 
-/// The environment variable that names the simulator's shared object.
-pub const LIB_PATH_ENV: &str = "TT_TTSIM_LIB";
+/// The environment variable that names the simulator's shared object:
+/// tt-metal's own (`TT_METAL_SIMULATOR`, `TTSIM.md`).
+pub const LIB_PATH_ENV: &str = "TT_METAL_SIMULATOR";
 
 /// Where `libttsim` decodes chip 0's BARs, and where the TLB configuration
 /// array lives. These are compile-time constants inside the library, not
