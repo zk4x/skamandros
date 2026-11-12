@@ -22,3 +22,17 @@ tenstorrent = []
 tt-isa = { path = "../tt-isa" }
 libloading = "0.8"
 libc = "0.2"
+
+# The release artifact is what ships: fully optimized, stripped, and
+# `panic = "abort"` so a panic cannot unwind across the C ABI. This is zyx's
+# `[profile.release]` verbatim.
+[profile.release]
+opt-level = 3
+strip = true
+debug-assertions = false
+overflow-checks = false
+lto = true
+panic = "abort"
+incremental = false
+codegen-units = 1
+debug = 0
