@@ -95,6 +95,18 @@ pub fn launch(module: &Module, params: &[u64]) -> Result<(), LaunchError> {
 }
 
 fn run(device: &mut Device, module: &Module, params: &[u64]) -> Result<(), Error> {
+    let result = launch_steps(device, module, params);
+    if result.is_err() {
+        // A failed launch is a status, not a wedged tile: stop the cores this
+        // launch started and clear the mailboxes it wrote before returning, so
+        // the next launch starts from a known state (user requirement). No
+        // `ttReset` exists; this is the driver's own cleanup.
+        device.quiesce()?;
+    }
+    result
+}
+
+fn launch_steps(device: &mut Device, module: &Module, params: &[u64]) -> Result<(), Error> {
     let tile: NocCoord<Noc0> = device.tile();
     let mut args: Vec<u32> = vec![module.grid[0], module.grid[1], module.iface, me_hi(tile)];
     let hi = device.dram_hi();
@@ -234,4 +246,46 @@ fn with_device<T>(f: impl FnOnce(&mut Device) -> Result<T, Error>) -> Result<T, 
     let mut device = lock()?;
     let device = device.as_mut().ok_or(Error::TT_ERROR_NO_DEVICE)?;
     f(device)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `jal x0, 0`: the program never returns.
+    const HANG: u32 = 0x0000_006f;
+    /// `jalr x0, 0(ra)`: the program returns at once.
+    const RET: u32 = 0x0000_8067;
+
+    fn module(reader: Vec<u32>) -> Module {
+        Module {
+            grid: [1, 1],
+            params: 0,
+            reader,
+            writer: Vec::new(),
+            cores: Default::default(),
+            setup: Vec::new(),
+            iface: 0,
+            cbs: Vec::new(),
+        }
+    }
+
+    /// A launch that hangs is a status, not a wedged tile: the watchdog's
+    /// timeout reaches the caller and the next launch still runs.
+    ///
+    /// Ignored because it opens the simulator, which needs `TT_TTSIM_LIB`.
+    /// Run with `TT_TTSIM_LIB=... cargo test --lib -- --ignored`.
+    #[test]
+    #[ignore = "needs the simulator: set TT_TTSIM_LIB"]
+    fn a_timed_out_launch_returns_timeout_and_the_next_launch_runs() {
+        init().expect("init");
+        match launch(&module(vec![HANG]), &[]) {
+            Err(LaunchError::Device(Error::TT_ERROR_FIRMWARE_TIMEOUT)) => {}
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+        // The failed launch held B and cleared its mailboxes, so this one
+        // stages the executor again instead of waiting on a stale `DONE`.
+        launch(&module(vec![RET]), &[]).expect("a launch after the timeout");
+        release().expect("release");
+    }
 }

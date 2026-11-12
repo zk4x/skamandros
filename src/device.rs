@@ -406,6 +406,48 @@ impl Device {
         }
     }
 
+    /// Stop every core this driver can start and clear the launch mailboxes it
+    /// wrote, so a failed launch leaves nothing polling the L1 that the next
+    /// launch rewrites.
+    ///
+    /// The failure path has no `ttReset` (user decision): this is the driver's
+    /// own cleanup. Every step is attempted even if one fails, and the first
+    /// failure is returned, so a wedged tile is reported rather than hidden.
+    pub fn quiesce(&mut self) -> Result<(), Error> {
+        let mut first: Result<(), Error> = Ok(());
+        for core in [Core::B, Core::T0, Core::T1, Core::T2] {
+            if let Err(e) = self.set_core_reset(core, true) {
+                first = first.and(Err(e));
+            }
+        }
+        for at in [
+            mailbox::exec::PROGRAM,
+            mailbox::exec::LEN,
+            mailbox::exec::ARGS,
+            mailbox::exec::SEQ,
+            mailbox::exec::DONE,
+            mailbox::exec::RET,
+            mailbox::exec::ERROR,
+            mailbox::STATUS,
+            mailbox::PANIC_CODE,
+        ] {
+            if let Err(e) = self.write32(at, 0) {
+                first = first.and(Err(e));
+            }
+        }
+        for thread in 0..3u32 {
+            let mb = mailbox::role::Mailbox::of(thread);
+            if let Err(e) = self.write32(mb.status(), 0) {
+                first = first.and(Err(e));
+            }
+        }
+        // The executor on B is gone with the reset; the next launch stages it
+        // again instead of waiting on a mailbox nobody will write.
+        self.exec_started = false;
+        self.exec_seq = 0;
+        first
+    }
+
     /// Boot the staged-program executor on RISCV B, once.
     pub fn start_executor(&mut self) -> Result<(), Error> {
         if self.exec_started {

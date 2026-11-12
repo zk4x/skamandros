@@ -366,7 +366,10 @@ pub unsafe extern "C" fn ttLaunch(
         Ok(()) => ttStatus::TT_OK,
         Err(runtime::LaunchError::Argument(m)) => fail(ttStatus::TT_ERROR_ARGUMENT, m, err),
         Err(runtime::LaunchError::Unsupported(m)) => fail(ttStatus::TT_ERROR_UNSUPPORTED, m, err),
-        Err(runtime::LaunchError::Device(e)) => fail(ttStatus::TT_ERROR_DEVICE, e.to_string(), err),
+        // The launch failure is already the concrete `ttStatus` variant: a
+        // watchdog timeout must reach the caller as `TT_ERROR_FIRMWARE_TIMEOUT`,
+        // not collapsed into the generic device code.
+        Err(runtime::LaunchError::Device(e)) => fail(e, e.name().to_string(), err),
     }
 }
 
