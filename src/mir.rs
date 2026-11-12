@@ -17,7 +17,7 @@ pub enum SfpOp {
     BitNot,
 }
 
-/// The comparison a [`MirOp::Compare`] performs; the result is `-1` for true
+/// A comparison a [`MirOp::Compare`] performs; the result is `-1` for true
 /// and `0` for false, lanewise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CmpOp {
@@ -25,6 +25,26 @@ pub enum CmpOp {
     Gt,
     Ge,
 }
+
+/// An integer operation a role computes with RISC-V, for a loop bound that is
+/// not a literal. The set is what an index expression may contain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    And,
+    Or,
+    Xor,
+    Sll,
+    Sra,
+}
+
+/// This core's `core_info`: the logical grid coordinate the host wrote before
+/// the launch. `x` is at this address, `y` four bytes after it.
+pub const CORE_INFO: u32 = tt_isa::mailbox::MAILBOX_BASE as u32 + 0x100;
 
 /// One instruction of a compute core's program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +118,20 @@ pub enum MirOp {
     /// `count` times, as a RISC-V branch around the body. An IR loop that was
     /// constant-bound is this, per role.
     Loop { count: u32 },
-    /// The branch back to the matching [`MirOp::Loop`].
+    /// Start of a loop whose trip count is already in `reg`: the dynamic bound
+    /// was computed by the [`MirOp::Li`]/[`MirOp::LoadArg`]/[`MirOp::IArith`]
+    /// ops just before it.
+    LoopReg { reg: u8 },
+    /// `reg = value`.
+    Li { reg: u8, value: u32 },
+    /// `reg = *(a0 + arg)`: a launch argument word, which for a scalar
+    /// parameter is its value.
+    LoadArg { reg: u8, arg: i32 },
+    /// `reg = core_info[axis]`: this core's logical grid coordinate.
+    LoadCoord { reg: u8, axis: u8 },
+    /// `d = a op b`, in RISC-V.
+    IArith { op: IOp, d: u8, a: u8, b: u8 },
+    /// The branch back to the matching [`MirOp::Loop`] or [`MirOp::LoopReg`].
     EndLoop,
 }
 

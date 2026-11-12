@@ -1281,3 +1281,243 @@ copy_to %out from %bo [0]
         take_error(&free, err)
     );
 }
+
+/// The loop form of the elementwise kernel with a launch-bound trip count: the
+/// count is a scalar argument, loaded by the movers and by each compute role,
+/// and branched on in RISC-V; both tiles come back negated.
+const NEG_SYMBOLIC_LOOP: &str = "\
+version 4
+grid 1,1
+%n = param i32 0
+%in = param f32 2048
+%out = param f32 2048
+%bi = buffer f32 32,64
+%bo = buffer f32 32,64
+%step = const i32 1024
+%i = loop %n
+%o = mul %i %step
+copy_to %bi from %in [%o] [%o]
+%x = load %bi [%o]
+%y = neg %x
+store_to %bo from %y [%o]
+copy_to %out from %bo [%o] [%o]
+endloop
+";
+
+#[test]
+fn a_symbolic_loop_bound_runs_on_the_simulator() {
+    let _device = device();
+    let sim = simulator_path();
+    // SAFETY: no other thread reads the environment concurrently; the library
+    // reads it when it opens the device.
+    unsafe { std::env::set_var("TT_TTSIM_LIB", &sim) };
+
+    let lib = library();
+    let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
+    let unload: Symbol<ModuleUnload> =
+        unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
+    let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
+    let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
+    let release: Symbol<Release> = unsafe { lib.get(b"ttRelease\0") }.expect("ttRelease");
+    let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
+    let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
+    let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
+    let launch: Symbol<Launch> = unsafe { lib.get(b"ttLaunch\0") }.expect("ttLaunch");
+
+    let mut err: *mut c_char = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { init(&mut err) },
+        TT_OK,
+        "ttInit: {}",
+        take_error(&free, err)
+    );
+
+    let count = 2048;
+    let bytes = count * 4;
+    let (mut input, mut output) = (0u64, 0u64);
+    assert_eq!(
+        unsafe { alloc(bytes, &mut input, &mut err) },
+        TT_OK,
+        "input: {}",
+        take_error(&free, err)
+    );
+    assert_eq!(
+        unsafe { alloc(bytes, &mut output, &mut err) },
+        TT_OK,
+        "output: {}",
+        take_error(&free, err)
+    );
+    let host: Vec<f32> = (0..count).map(|i| (i as f32 - 1024.0) * 0.125).collect();
+    let host_bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+    assert_eq!(
+        unsafe { h2d(input, host_bytes.as_ptr(), host_bytes.len(), &mut err) },
+        TT_OK,
+        "upload: {}",
+        take_error(&free, err)
+    );
+
+    let mut module: *mut c_void = std::ptr::null_mut();
+    let code = unsafe {
+        compile(
+            NEG_SYMBOLIC_LOOP.as_ptr().cast(),
+            NEG_SYMBOLIC_LOOP.len(),
+            &mut module,
+            &mut err,
+        )
+    };
+    assert_eq!(code, TT_OK, "compile: {}", take_error(&free, err));
+
+    // The trip count is a scalar argument: its value, not an address.
+    let params = [2u64, input, output];
+    let code = unsafe { launch(module, params.as_ptr(), params.len(), &mut err) };
+    assert_eq!(code, TT_OK, "ttLaunch: {}", take_error(&free, err));
+
+    let mut back = vec![0u8; bytes];
+    assert_eq!(
+        unsafe { d2h(back.as_mut_ptr(), output, back.len(), &mut err) },
+        TT_OK,
+        "download: {}",
+        take_error(&free, err)
+    );
+    let got: Vec<f32> = back
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (i, (x, y)) in host.iter().zip(&got).enumerate() {
+        assert_eq!(*y, -*x, "datum {i}: {x} negated is {}", -*x);
+    }
+
+    assert_eq!(
+        unsafe { unload(module, &mut err) },
+        TT_OK,
+        "unload: {}",
+        take_error(&free, err)
+    );
+    assert_eq!(
+        unsafe { release(&mut err) },
+        TT_OK,
+        "ttRelease: {}",
+        take_error(&free, err)
+    );
+}
+
+/// A symbolic `2,2` grid: each of the four tiles negates its own slice, selected
+/// from `grid.x`/`grid.y`. Four executors run and all four slices come back.
+const NEG_GRID: &str = "\
+version 4
+%nx = param i32 0
+%ny = param i32 0
+%in = param f32 4096
+%out = param f32 4096
+%x = grid.x
+%y = grid.y
+%row = mul %y %nx
+%idx = add %row %x
+%tile = const i32 1024
+%o = mul %idx %tile
+%bi = buffer f32 32,32
+%bo = buffer f32 32,32
+copy_to %bi from %in [%o] [%o]
+%v = load %bi [0]
+%n = neg %v
+store_to %bo from %n [0]
+copy_to %out from %bo [%o] [%o]
+grid %nx,%ny
+";
+
+#[test]
+fn a_symbolic_grid_runs_each_tiles_own_slice() {
+    let _device = device();
+    let sim = simulator_path();
+    // SAFETY: no other thread reads the environment concurrently; the library
+    // reads it when it opens the device.
+    unsafe { std::env::set_var("TT_TTSIM_LIB", &sim) };
+
+    let lib = library();
+    let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
+    let unload: Symbol<ModuleUnload> =
+        unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
+    let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
+    let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
+    let release: Symbol<Release> = unsafe { lib.get(b"ttRelease\0") }.expect("ttRelease");
+    let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
+    let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
+    let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
+    let launch: Symbol<Launch> = unsafe { lib.get(b"ttLaunch\0") }.expect("ttLaunch");
+
+    let mut err: *mut c_char = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { init(&mut err) },
+        TT_OK,
+        "ttInit: {}",
+        take_error(&free, err)
+    );
+
+    let count = 4096;
+    let bytes = count * 4;
+    let (mut input, mut output) = (0u64, 0u64);
+    assert_eq!(
+        unsafe { alloc(bytes, &mut input, &mut err) },
+        TT_OK,
+        "input: {}",
+        take_error(&free, err)
+    );
+    assert_eq!(
+        unsafe { alloc(bytes, &mut output, &mut err) },
+        TT_OK,
+        "output: {}",
+        take_error(&free, err)
+    );
+    let host: Vec<f32> = (0..count).map(|i| (i as f32 - 2048.0) * 0.0625).collect();
+    let host_bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+    assert_eq!(
+        unsafe { h2d(input, host_bytes.as_ptr(), host_bytes.len(), &mut err) },
+        TT_OK,
+        "upload: {}",
+        take_error(&free, err)
+    );
+
+    let mut module: *mut c_void = std::ptr::null_mut();
+    let code = unsafe {
+        compile(
+            NEG_GRID.as_ptr().cast(),
+            NEG_GRID.len(),
+            &mut module,
+            &mut err,
+        )
+    };
+    assert_eq!(code, TT_OK, "compile: {}", take_error(&free, err));
+
+    // `grid %nx,%ny` with both extents launch-bound.
+    let params = [2u64, 2, input, output];
+    let code = unsafe { launch(module, params.as_ptr(), params.len(), &mut err) };
+    assert_eq!(code, TT_OK, "ttLaunch: {}", take_error(&free, err));
+
+    let mut back = vec![0u8; bytes];
+    assert_eq!(
+        unsafe { d2h(back.as_mut_ptr(), output, back.len(), &mut err) },
+        TT_OK,
+        "download: {}",
+        take_error(&free, err)
+    );
+    let got: Vec<f32> = back
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (i, (x, y)) in host.iter().zip(&got).enumerate() {
+        assert_eq!(*y, -*x, "datum {i}: {x} negated is {}", -*x);
+    }
+
+    assert_eq!(
+        unsafe { unload(module, &mut err) },
+        TT_OK,
+        "unload: {}",
+        take_error(&free, err)
+    );
+    assert_eq!(
+        unsafe { release(&mut err) },
+        TT_OK,
+        "ttRelease: {}",
+        take_error(&free, err)
+    );
+}

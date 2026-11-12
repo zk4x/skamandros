@@ -17,8 +17,9 @@
 
 use crate::alloc::Alloc;
 use crate::ir::{BinOp, Dim, Error, Kernel, Op, RegShape, Types, UnOp, unit_of};
-use crate::mir::{CmpOp, Machine, MirOp, SfpOp};
+use crate::mir::{CmpOp, IOp, Machine, MirOp, SfpOp};
 use crate::planner::Plan;
+use crate::riscv::reg;
 
 /// `Dst` rows one 32x32 F32 tile occupies (`tt_isa`'s SFPU row is 16 datums).
 pub const DST_ROWS: u32 = 64;
@@ -32,6 +33,15 @@ pub const SEM_READY: u8 = 1;
 /// load has one slot to fill.
 pub const SEM_SLOT: u8 = 2;
 
+/// The RISC-V register a loop counts in, by nesting depth. `encode` uses the
+/// same two for a constant bound, so a dynamic bound leaves its count there.
+const COUNTERS: [u8; 2] = [reg::T4, reg::T5];
+
+/// Registers a role owns for evaluating a bound expression. They are disjoint
+/// from `a0` (the launch arguments), `a6` (the CB interface), the loop counters
+/// and the sync scratch `encode` uses.
+const SCRATCH: [u8; 6] = [reg::A1, reg::A2, reg::A3, reg::A4, reg::A5, reg::T3];
+
 /// Lower `k` to the three compute programs.
 pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Machine, Error> {
     let mut m = Machine::default();
@@ -41,6 +51,19 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             def[value as usize] = Some(at);
         }
     }
+    // The launch argument index of every parameter, in program order: a scalar
+    // parameter's value is loaded from its pair in the arguments array.
+    let mut param: Vec<Option<u32>> = vec![None; types.values.len()];
+    let mut next = 0u32;
+    for op in &k.ops {
+        if let Op::Param { value, .. } = *op {
+            param[value as usize] = Some(next);
+            next += 1;
+        }
+    }
+    // The induction value of every loop being lowered, innermost last: a bound
+    // may name an outer loop's index, whose value is its counter register.
+    let mut loops: Vec<crate::ir::ValueId> = Vec::new();
     for (at, op) in k.ops.iter().enumerate() {
         match *op {
             Op::Const { .. }
@@ -51,33 +74,36 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             // A scalar is index arithmetic: it names a `Dim`, and the mover
             // evaluates it in RISC-V. The datapath has no scalar values, so
             // nothing here has to produce one.
+            Op::GridCoord { .. } => {}
             Op::Cast { value, .. }
             | Op::Unary { value, .. }
             | Op::Binary { value, .. }
             | Op::Select { value, .. }
                 if types.of(value).shape == RegShape::Scalar => {}
-            Op::Loop { bound, .. } => {
-                // Only a constant bound becomes a RISC-V trip count; a symbolic
-                // one would need the bound's value in a register, which is the
-                // symbolic-dimension item, not this one.
-                let count = match bound {
-                    Dim::Const(n) => n,
-                    Dim::Value(v) => match k.const_i32(v) {
-                        Some(n) if n >= 0 => n as u32,
-                        _ => {
-                            let _ = at;
-                            return Err(Error::TT_ERROR_LOOP_BOUND_SYMBOLIC);
+            Op::Loop { value, bound } => {
+                let depth = loops.len();
+                let counter = *COUNTERS.get(depth).ok_or(Error::TT_TODO_LOOP_DEPTH)?;
+                match bound_const(k, bound) {
+                    Some(count) => {
+                        m.t0.push(MirOp::Loop { count });
+                        m.t1.push(MirOp::Loop { count });
+                        m.t2.push(MirOp::Loop { count });
+                    }
+                    None => {
+                        // A symbolic bound is RISC-V arithmetic in the role,
+                        // like the C loop of a tt-metal kernel; the count ends
+                        // in the counter register and the branch reads it.
+                        for role in [&mut m.t0, &mut m.t1, &mut m.t2] {
+                            let mut scratch = SCRATCH.iter().copied();
+                            scalar(k, types, role, &param, &loops, bound, counter, &mut scratch)?;
+                            role.push(MirOp::LoopReg { reg: counter });
                         }
-                    },
-                };
-                // The body is emitted between the markers into every role; a
-                // role whose body is empty gets an empty loop, which the
-                // encoder skips.
-                m.t0.push(MirOp::Loop { count });
-                m.t1.push(MirOp::Loop { count });
-                m.t2.push(MirOp::Loop { count });
+                    }
+                }
+                loops.push(value);
             }
             Op::EndLoop => {
+                loops.pop();
                 m.t0.push(MirOp::EndLoop);
                 m.t1.push(MirOp::EndLoop);
                 m.t2.push(MirOp::EndLoop);
@@ -350,6 +376,131 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
         }
     }
     Ok(m)
+}
+
+/// The literal trip count of a bound, if it has one.
+fn bound_const(k: &Kernel, bound: Dim) -> Option<u32> {
+    match bound {
+        Dim::Const(n) => Some(n),
+        Dim::Value(v) => match k.const_i32(v) {
+            Some(n) if n >= 0 => Some(n as u32),
+            _ => None,
+        },
+    }
+}
+
+/// Emit `dim` into `dest` as role RISC-V integer ops: a literal, or an index
+/// expression over literals, scalar parameters, grid coordinates, enclosing
+/// loop indices and ordinary arithmetic.
+#[allow(clippy::too_many_arguments)]
+fn scalar(
+    k: &Kernel,
+    types: &Types,
+    role: &mut Vec<MirOp>,
+    param: &[Option<u32>],
+    loops: &[crate::ir::ValueId],
+    dim: Dim,
+    dest: u8,
+    scratch: &mut impl Iterator<Item = u8>,
+) -> Result<(), Error> {
+    match dim {
+        Dim::Const(n) => {
+            role.push(MirOp::Li {
+                reg: dest,
+                value: n,
+            });
+            Ok(())
+        }
+        Dim::Value(value) => eval(k, types, role, param, loops, value, dest, scratch),
+    }
+}
+
+/// Emit the value `value` into `dest`; `scratch` supplies the temporaries a
+/// right-hand operand needs.
+#[allow(clippy::too_many_arguments)]
+fn eval(
+    k: &Kernel,
+    types: &Types,
+    role: &mut Vec<MirOp>,
+    param: &[Option<u32>],
+    loops: &[crate::ir::ValueId],
+    value: crate::ir::ValueId,
+    dest: u8,
+    scratch: &mut impl Iterator<Item = u8>,
+) -> Result<(), Error> {
+    // An enclosing loop's induction value is in that loop's counter register.
+    if let Some(depth) = loops.iter().rposition(|v| *v == value) {
+        let a = *COUNTERS.get(depth).ok_or(Error::TT_TODO_LOOP_DEPTH)?;
+        role.push(MirOp::IArith {
+            op: IOp::Add,
+            d: dest,
+            a,
+            b: reg::ZERO,
+        });
+        return Ok(());
+    }
+    let op = k
+        .ops
+        .iter()
+        .find(|op| op.defined() == Some(value))
+        .ok_or(Error::TT_TODO_LOOP_ADDRESS)?;
+    match *op {
+        Op::Const {
+            dtype: crate::ir::DType::I32,
+            bits,
+            ..
+        } => {
+            role.push(MirOp::Li {
+                reg: dest,
+                value: bits,
+            });
+            Ok(())
+        }
+        Op::Param { value: p, .. } if types.of(p).shape == RegShape::Scalar => {
+            let index = param[p as usize].ok_or(Error::TT_TODO_LOOP_ADDRESS)?;
+            role.push(MirOp::LoadArg {
+                reg: dest,
+                arg: crate::mover::param_arg(index).0,
+            });
+            Ok(())
+        }
+        Op::GridCoord { axis, .. } => {
+            role.push(MirOp::LoadCoord { reg: dest, axis });
+            Ok(())
+        }
+        Op::Binary { op, a, b, .. } => {
+            let op = int_op(op).ok_or(Error::TT_TODO_LOOP_ADDRESS)?;
+            eval(k, types, role, param, loops, a, dest, scratch)?;
+            let right = scratch.next().ok_or(Error::TT_TODO_LOOP_ADDRESS)?;
+            eval(k, types, role, param, loops, b, right, scratch)?;
+            role.push(MirOp::IArith {
+                op,
+                d: dest,
+                a: dest,
+                b: right,
+            });
+            Ok(())
+        }
+        _ => Err(Error::TT_TODO_LOOP_ADDRESS),
+    }
+}
+
+/// The RISC-V form of an index arithmetic op; a comparison, `max` or `pow` is
+/// not one.
+fn int_op(op: BinOp) -> Option<IOp> {
+    Some(match op {
+        BinOp::Add => IOp::Add,
+        BinOp::Sub => IOp::Sub,
+        BinOp::Mul => IOp::Mul,
+        BinOp::Div => IOp::Div,
+        BinOp::Mod => IOp::Rem,
+        BinOp::BitAnd => IOp::And,
+        BinOp::BitOr => IOp::Or,
+        BinOp::BitXor => IOp::Xor,
+        BinOp::BitShiftLeft => IOp::Sll,
+        BinOp::BitShiftRight => IOp::Sra,
+        _ => return None,
+    })
 }
 
 fn rows_of(shape: RegShape, at: usize) -> Result<u32, Error> {

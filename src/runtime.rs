@@ -81,30 +81,32 @@ pub fn d2h(address: u64, out: &mut [u8]) -> Result<(), Error> {
     with_device(|d| d.dram_read(address, out))
 }
 
-/// Run a module over its grid with one DRAM address per parameter.
+/// Run a module over its grid with one launch argument per parameter.
 ///
-/// The launch arguments are built here, not by the caller: the grid, this
-/// tile's high word, and each parameter's `(low, high)` pair. A count that
-/// disagrees with the module is refused. Every failure is a [`ttStatus`]
-/// variant; there is no second error channel and no string error.
+/// A tensor parameter's argument is its DRAM address; a scalar parameter's is
+/// its value, as CUDA's kernel parameter buffer holds values for scalars and
+/// addresses for pointers. A grid extent may be a launch-bound value too, so it
+/// is resolved here, before any core starts. The launch arguments are built
+/// here, not by the caller: the grid, this tile's coordinate, and each
+/// parameter's word(s). A count that disagrees with the module is refused.
+/// Every failure is a [`ttStatus`] variant; there is no second error channel
+/// and no string error.
 pub fn launch(module: &Module, params: &[u64]) -> Result<(), Error> {
-    if module.params as usize != params.len() {
+    if module.params.len() != params.len() {
         return Err(Error::TT_ERROR_ARGUMENT);
     }
-    if module.grid != [1, 1] {
-        return Err(Error::TT_ERROR_UNSUPPORTED);
-    }
+    let grid = resolve_grid(module, params)?;
     if module.reader.is_empty()
         && module.writer.is_empty()
         && module.cores.iter().all(Vec::is_empty)
     {
         return Err(Error::TT_ERROR_UNSUPPORTED);
     }
-    with_device(|device| run(device, module, params))
+    with_device(|device| run(device, module, params, grid))
 }
 
-fn run(device: &mut Device, module: &Module, params: &[u64]) -> Result<(), Error> {
-    let result = launch_steps(device, module, params);
+fn run(device: &mut Device, module: &Module, params: &[u64], grid: [u32; 2]) -> Result<(), Error> {
+    let result = launch_steps(device, module, params, grid);
     if result.is_err() {
         // A failed launch is a status, not a wedged tile: stop the cores this
         // launch started and clear the mailboxes it wrote before returning, so
@@ -115,37 +117,127 @@ fn run(device: &mut Device, module: &Module, params: &[u64]) -> Result<(), Error
     result
 }
 
-fn launch_steps(device: &mut Device, module: &Module, params: &[u64]) -> Result<(), Error> {
-    let tile: NocCoord<Noc0> = device.tile();
-    // One arguments array per data mover: a DRAM endpoint is a NoC coordinate,
-    // and the reader on B and the writer on NC use opposite NoCs (tt-metal's
-    // BRISC NoC #0, NCRISC NoC #1). The compute cores read the reader's array;
-    // they never name a DRAM endpoint.
-    let args_at = |niu| {
-        if niu == Niu::Noc1 {
-            ARGS_WRITER
-        } else {
-            ARGS_AT
+/// The grid extent of one axis, from the launch's scalar arguments. Zero, a
+/// value beyond the part and a malformed expression are refused.
+fn resolve_grid(module: &Module, params: &[u64]) -> Result<[u32; 2], Error> {
+    let mut grid = [0u32; 2];
+    for (axis, term) in module.grid.iter().enumerate() {
+        let value = grid_eval(term, module, params)?;
+        grid[axis] = u32::try_from(value)
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or(Error::TT_ERROR_GRID)?;
+    }
+    Ok(grid)
+}
+
+fn grid_eval(
+    term: &crate::compile::GridTerm,
+    module: &Module,
+    params: &[u64],
+) -> Result<i64, Error> {
+    use crate::compile::GridTerm;
+    use crate::ir::BinOp;
+    let value = match term {
+        GridTerm::Const(n) => i64::from(*n),
+        GridTerm::Param(index) => {
+            let index = *index as usize;
+            if module.params.get(index) != Some(&crate::compile::ParamKind::Scalar) {
+                return Err(Error::TT_ERROR_GRID);
+            }
+            let word = *params.get(index).ok_or(Error::TT_ERROR_ARGUMENT)?;
+            // A scalar is an `i32`: its low word, read as one.
+            i64::from(word as u32 as i32)
+        }
+        GridTerm::Binary(op, a, b) => {
+            let a = grid_eval(a, module, params)?;
+            let b = grid_eval(b, module, params)?;
+            match op {
+                BinOp::Add => a.checked_add(b).ok_or(Error::TT_ERROR_GRID)?,
+                BinOp::Sub => a.checked_sub(b).ok_or(Error::TT_ERROR_GRID)?,
+                BinOp::Mul => a.checked_mul(b).ok_or(Error::TT_ERROR_GRID)?,
+                BinOp::Div => a.checked_div(b).ok_or(Error::TT_ERROR_GRID)?,
+                BinOp::Mod => a.checked_rem(b).ok_or(Error::TT_ERROR_GRID)?,
+                BinOp::Pow => a
+                    .checked_pow(u32::try_from(b).map_err(|_| Error::TT_ERROR_GRID)?)
+                    .ok_or(Error::TT_ERROR_GRID)?,
+                BinOp::Max => a.max(b),
+                BinOp::BitAnd => a & b,
+                BinOp::BitOr => a | b,
+                BinOp::BitXor => a ^ b,
+                BinOp::BitShiftLeft => a
+                    .checked_shl(u32::try_from(b).map_err(|_| Error::TT_ERROR_GRID)?)
+                    .ok_or(Error::TT_ERROR_GRID)?,
+                BinOp::BitShiftRight => a
+                    .checked_shr(u32::try_from(b).map_err(|_| Error::TT_ERROR_GRID)?)
+                    .ok_or(Error::TT_ERROR_GRID)?,
+                _ => {
+                    return Err(Error::TT_ERROR_GRID);
+                }
+            }
         }
     };
+    Ok(value)
+}
+
+/// The arguments base of each data mover's array.
+fn args_at(niu: Niu) -> u32 {
+    if niu == Niu::Noc1 {
+        ARGS_WRITER
+    } else {
+        ARGS_AT
+    }
+}
+
+/// The two argument arrays for one tile: a DRAM endpoint is a NoC coordinate,
+/// and the reader on B and the writer on NC use opposite NoCs (tt-metal's
+/// BRISC NoC #0, NCRISC NoC #1). The compute cores read the reader's array;
+/// they never name a DRAM endpoint.
+fn args_for(
+    device: &Device,
+    module: &Module,
+    params: &[u64],
+    grid: [u32; 2],
+    tile: NocCoord<Noc0>,
+) -> Result<[(Niu, Vec<u32>); 2], Error> {
     let mut arrays = [(Niu::Noc0, Vec::new()), (Niu::Noc1, Vec::new())];
     for (niu, args) in arrays.iter_mut() {
-        *args = vec![module.grid[0], module.grid[1], module.iface, me_hi(tile)];
+        *args = vec![grid[0], grid[1], module.iface, me_hi(tile)];
         let hi = device.dram_hi_for(*niu);
-        for &address in params {
-            let low = u32::try_from(address).map_err(|_| {
-                let _ = address;
-                Error::TT_ERROR_PARAMETER_ADDRESS
-            })?;
+        for (index, kind) in module.params.iter().enumerate() {
+            let word = params[index];
+            let (low, high) = match kind {
+                crate::compile::ParamKind::Scalar => (word as u32, 0),
+                crate::compile::ParamKind::Tensor => (
+                    u32::try_from(word).map_err(|_| Error::TT_ERROR_PARAMETER_ADDRESS)?,
+                    hi,
+                ),
+            };
             args.push(low);
-            args.push(hi);
+            args.push(high);
         }
         if (args_at(*niu) as u64) + 4 * args.len() as u64 > tt_isa::l1::PROGRAM_CACHE.end {
             let _ = args.len();
             return Err(Error::TT_ERROR_PROGRAM_AREA_SIZE);
         }
     }
-    let [args, writer_args] = arrays.map(|(_, v)| v);
+    Ok(arrays)
+}
+
+fn launch_steps(
+    device: &mut Device,
+    module: &Module,
+    params: &[u64],
+    grid: [u32; 2],
+) -> Result<(), Error> {
+    // The logical grid the module asks for, as physical tiles, row-major. Each
+    // tile's logical coordinate is what `grid.x`/`grid.y` read.
+    let mut tiles = Vec::with_capacity(grid[0] as usize * grid[1] as usize);
+    for y in 0..grid[1] {
+        for x in 0..grid[0] {
+            tiles.push(((x, y), device.tile_at(x, y)?));
+        }
+    }
     for (name, words) in [("reader", &module.reader), ("writer", &module.writer)] {
         if words.is_empty() {
             continue;
@@ -155,85 +247,104 @@ fn launch_steps(device: &mut Device, module: &Module, params: &[u64]) -> Result<
             return Err(Error::TT_ERROR_PROGRAM_AREA_SIZE);
         }
     }
-
     let compute = module.cores.iter().any(|words| !words.is_empty());
-    if compute {
-        device.release_tensix_backend()?;
-    }
-    device.start_executors()?;
-    // The CB interface is host state: tt-metal's `setup_local_cb_read_write_interfaces`
-    // writes each `LocalCBInterface` before the roles start, and every mover and
-    // compute role reads its ring pointers from there. Bytes, not tt-metal's
-    // 16-byte units (`riscv::cb`).
-    if !module.cbs.is_empty() {
-        let mut words = Vec::with_capacity(module.cbs.len() * 8);
-        for ring in &module.cbs {
-            words.extend_from_slice(&crate::riscv::cb::interface(
-                ring.base,
-                ring.page * ring.pages,
-                ring.page,
-                ring.pages,
-            ));
+
+    // Every tile is staged, then all of them are started and joined, so the
+    // grid runs concurrently rather than one core at a time.
+    let mut launched: Vec<(NocCoord<Noc0>, u32)> = Vec::new();
+    for ((x, y), tile) in &tiles {
+        device.select(*tile);
+        // The CB interface is host state: tt-metal's
+        // `setup_local_cb_read_write_interfaces` writes each
+        // `LocalCBInterface` before the roles start, and every mover and
+        // compute role reads its ring pointers from there. Bytes, not
+        // tt-metal's 16-byte units (`riscv::cb`).
+        if !module.cbs.is_empty() {
+            let mut words = Vec::with_capacity(module.cbs.len() * 8);
+            for ring in &module.cbs {
+                words.extend_from_slice(&crate::riscv::cb::interface(
+                    ring.base,
+                    ring.page * ring.pages,
+                    ring.page,
+                    ring.pages,
+                ));
+            }
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            device.l1_write(u64::from(module.iface), &bytes)?;
         }
-        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        device.l1_write(u64::from(module.iface), &bytes)?;
+        // This core's logical coordinate, host-written like tt-metal's
+        // `core_info`: `%x = grid.x` and `%y = grid.y` read it.
+        let mut info = Vec::with_capacity(8);
+        info.extend_from_slice(&x.to_le_bytes());
+        info.extend_from_slice(&y.to_le_bytes());
+        device.l1_write(u64::from(crate::mir::CORE_INFO), &info)?;
+        if compute {
+            device.release_tensix_backend()?;
+        }
+        device.start_executors()?;
+        let [args, writer_args] = args_for(device, module, params, grid, *tile)?.map(|(_, v)| v);
+        // Write both arrays before the first core starts, not only as a side
+        // effect of a mover run.
+        for (at, words) in [(ARGS_AT, &args), (ARGS_WRITER, &writer_args)] {
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            device.l1_write(u64::from(at), &bytes)?;
+        }
+        // The semaphore and unpacker setup runs on T0 first and to completion,
+        // as BRISC initialises the semaphores before it releases the TRISCs. A
+        // launch with no compute program has no semaphores to set up.
+        if compute && !module.setup.is_empty() {
+            stage_role(device, 0, &module.setup, ARGS_AT)?;
+            let mb = mailbox::launch::Mailbox::of(0);
+            let generation = device.start(mb)?;
+            device.await_launch(mb, generation)?;
+        }
+
+        // Name every program of the launch. B is dispatched once and starts
+        // the enabled cores itself; the reader on B and the writer on NC
+        // therefore run with the compute cores, not before or after them.
+        let mut enables = 0u32;
+        if !module.reader.is_empty() {
+            device.place(slot(SLOT_READER), &module.reader)?;
+            device.prepare(
+                mailbox::launch::Mailbox::b(),
+                slot(SLOT_READER),
+                module.reader.len() as u32,
+                ARGS_AT,
+            )?;
+            enables |= mailbox::launch::ENABLE_B;
+        }
+        if !module.writer.is_empty() {
+            device.place(slot(SLOT_WRITER), &module.writer)?;
+            device.prepare(
+                mailbox::launch::Mailbox::nc(),
+                slot(SLOT_WRITER),
+                module.writer.len() as u32,
+                ARGS_WRITER,
+            )?;
+            enables |= mailbox::launch::ENABLE_NC;
+        }
+        for (thread, words) in module.cores.iter().enumerate() {
+            if words.is_empty() {
+                continue;
+            }
+            stage_role(device, thread, words, ARGS_AT)?;
+            enables |= ROLE_ENABLE[thread];
+        }
+        let mb = mailbox::launch::Mailbox::b();
+        let (text, words) = if module.reader.is_empty() {
+            (0, 0)
+        } else {
+            (slot(SLOT_READER), module.reader.len() as u32)
+        };
+        let generation = device.launch(mb, text, words, ARGS_AT, enables)?;
+        launched.push((*tile, generation));
     }
-    // Write both arrays before the first core starts, not only as a side effect
-    // of a mover run.
-    for (at, words) in [(ARGS_AT, &args), (ARGS_WRITER, &writer_args)] {
-        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        device.l1_write(u64::from(at), &bytes)?;
-    }
-    // The semaphore and unpacker setup runs on T0 first and to completion, as
-    // BRISC initialises the semaphores before it releases the TRISCs. A launch
-    // with no compute program has no semaphores to set up.
-    if compute && !module.setup.is_empty() {
-        stage_role(device, 0, &module.setup, ARGS_AT)?;
-        let mb = mailbox::launch::Mailbox::of(0);
-        let generation = device.start(mb)?;
+    // Every tile is running; join them all.
+    let mb = mailbox::launch::Mailbox::b();
+    for (tile, generation) in launched {
+        device.select(tile);
         device.await_launch(mb, generation)?;
     }
-
-    // Name every program of the launch, then hand the whole launch to RISCV B:
-    // it invalidates every cache, starts the enabled cores and joins them. The
-    // reader on B and the writer on NC therefore run with the compute cores,
-    // not before or after them (tt-metal's launch message and go message).
-    let mut enables = 0u32;
-    if !module.reader.is_empty() {
-        device.place(slot(SLOT_READER), &module.reader)?;
-        device.prepare(
-            mailbox::launch::Mailbox::b(),
-            slot(SLOT_READER),
-            module.reader.len() as u32,
-            ARGS_AT,
-        )?;
-        enables |= mailbox::launch::ENABLE_B;
-    }
-    if !module.writer.is_empty() {
-        device.place(slot(SLOT_WRITER), &module.writer)?;
-        device.prepare(
-            mailbox::launch::Mailbox::nc(),
-            slot(SLOT_WRITER),
-            module.writer.len() as u32,
-            ARGS_WRITER,
-        )?;
-        enables |= mailbox::launch::ENABLE_NC;
-    }
-    for (thread, words) in module.cores.iter().enumerate() {
-        if words.is_empty() {
-            continue;
-        }
-        stage_role(device, thread, words, ARGS_AT)?;
-        enables |= ROLE_ENABLE[thread];
-    }
-    let mb = mailbox::launch::Mailbox::b();
-    let (text, words) = if module.reader.is_empty() {
-        (0, 0)
-    } else {
-        (slot(SLOT_READER), module.reader.len() as u32)
-    };
-    let generation = device.launch(mb, text, words, ARGS_AT, enables)?;
-    device.await_launch(mb, generation)?;
     Ok(())
 }
 
@@ -301,8 +412,8 @@ mod tests {
 
     fn module(reader: Vec<u32>) -> Module {
         Module {
-            grid: [1, 1],
-            params: 0,
+            grid: Default::default(),
+            params: Vec::new(),
             reader,
             writer: Vec::new(),
             cores: Default::default(),

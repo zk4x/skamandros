@@ -277,14 +277,16 @@ pub unsafe extern "C" fn ttMemcpyD2H(
     }
 }
 
-/// Run a module over its grid. `params` holds one DRAM address per kernel
-/// parameter, in program order; `nparams` must equal the module's count.
+/// Run a module over its grid. `params` holds one launch argument per kernel
+/// parameter, in program order: a DRAM address for a tensor parameter and the
+/// value itself for a scalar one (CUDA's kernel parameter buffer). `nparams`
+/// must equal the module's count.
 ///
 /// The launch is synchronous: every program has finished when this returns.
 ///
 /// # Safety
 ///
-/// `module` must be a live handle; `params` readable for `nparams` addresses;
+/// `module` must be a live handle; `params` readable for `nparams` arguments;
 /// `err` writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ttLaunch(
@@ -311,7 +313,7 @@ pub unsafe extern "C" fn ttLaunch(
     };
     // The count is the caller's contract, not the device's business: refuse it
     // before anything is touched.
-    if m.params as usize != addresses.len() {
+    if m.params.len() != addresses.len() {
         return fail(ttStatus::TT_ERROR_ARGUMENT, err);
     }
     match runtime::launch(m, addresses) {

@@ -14,7 +14,7 @@
 //! stride or a `Dst` address.
 
 use crate::ir::Error;
-use crate::mir::{CmpOp, Machine, MirOp, SfpOp};
+use crate::mir::{CmpOp, IOp, Machine, MirOp, SfpOp};
 use crate::riscv::{self as rv, Asm, reg};
 use tt_isa::backend::{
     self, Before, ConfigWords, ThreadConfigEntry, block, cond, wait_for_packer, wait_for_unpacker0,
@@ -161,6 +161,52 @@ fn close_loop(out: &mut Stream, loops: &mut Vec<OpenLoop>) -> Result<(), Error> 
     Ok(())
 }
 
+/// Open a loop whose count is already in `reg` (a dynamic bound). The branch
+/// and the counter are the same as [`open_loop`]'s; only the `li` is missing.
+fn open_loop_reg(out: &mut Stream, loops: &mut Vec<OpenLoop>, reg: u8) -> Result<(), Error> {
+    if loops.len() >= 2 {
+        return Err(Error::TT_TODO_LOOP_DEPTH);
+    }
+    let skip = out.len();
+    out.rv(rv::beq(reg, reg::ZERO, 0));
+    let top = out.len();
+    loops.push(OpenLoop { reg, top, skip });
+    Ok(())
+}
+
+/// Encode one integer-scratch op. Returns `false` when `op` is not one, so a
+/// role encoder can fall through to its own instruction set.
+///
+/// These are the ops `lower` emits before a [`MirOp::LoopReg`] to compute a
+/// bound that is not a literal: a launch argument (a scalar parameter's value),
+/// this core's coordinate, or arithmetic over them. They are ordinary RISC-V,
+/// the way a C kernel computes its loop bound.
+fn encode_int(op: &MirOp, out: &mut Stream, loops: &mut Vec<OpenLoop>) -> Result<bool, Error> {
+    match *op {
+        MirOp::Li { reg, value } => out.li(reg, value),
+        MirOp::LoadArg { reg, arg } => out.rv(rv::lw(reg, reg::A0, arg)),
+        MirOp::LoadCoord { reg, axis } => {
+            out.li(reg, crate::mir::CORE_INFO + u32::from(axis) * 4);
+            out.rv(rv::lw(reg, reg, 0));
+        }
+        MirOp::IArith { op, d, a, b } => out.rv(match op {
+            IOp::Add => rv::add(d, a, b),
+            IOp::Sub => rv::sub(d, a, b),
+            IOp::Mul => rv::mul(d, a, b),
+            IOp::Div => rv::div(d, a, b),
+            IOp::Rem => rv::rem(d, a, b),
+            IOp::And => rv::and(d, a, b),
+            IOp::Or => rv::or(d, a, b),
+            IOp::Xor => rv::xor(d, a, b),
+            IOp::Sll => rv::sll(d, a, b),
+            IOp::Sra => rv::sra(d, a, b),
+        }),
+        MirOp::LoopReg { reg } => open_loop_reg(out, loops, reg)?,
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
 /// One instruction stream per compute core.
 #[derive(Debug, Clone, Default)]
 pub struct Words {
@@ -284,6 +330,9 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
     let mut state = UnpackState::default();
     let mut loops = Vec::new();
     for op in ops {
+        if encode_int(op, out, &mut loops)? {
+            continue;
+        }
         match *op {
             MirOp::Loop { count } => open_loop(out, &mut loops, count)?,
             MirOp::EndLoop => close_loop(out, &mut loops)?,
@@ -598,6 +647,10 @@ fn encode_math(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
     let mut at = 0usize;
     let mut loops = Vec::new();
     while at < ops.len() {
+        if encode_int(&ops[at], out, &mut loops)? {
+            at += 1;
+            continue;
+        }
         match ops[at] {
             MirOp::Repeat { len, count } => {
                 let body = ops.get(at + 1..at + 1 + len as usize).ok_or_else(|| {
@@ -840,6 +893,9 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
     out.rv(rv::lw(reg::A6, reg::A0, crate::mover::ARG_IFACE as i32 * 4));
     let mut loops = Vec::new();
     for op in ops {
+        if encode_int(op, out, &mut loops)? {
+            continue;
+        }
         match *op {
             MirOp::Loop { count } => open_loop(out, &mut loops, count)?,
             MirOp::EndLoop => close_loop(out, &mut loops)?,

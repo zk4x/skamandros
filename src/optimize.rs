@@ -211,6 +211,18 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                         return Err(Error::TT_TODO_LOOP_DEPTH);
                     }
                 }
+                MirOp::LoopReg { reg } => {
+                    let _ = reg;
+                    depth += 1;
+                    if depth > 2 {
+                        let _ = (name, at, depth);
+                        return Err(Error::TT_TODO_LOOP_DEPTH);
+                    }
+                }
+                MirOp::Li { .. }
+                | MirOp::LoadArg { .. }
+                | MirOp::LoadCoord { .. }
+                | MirOp::IArith { .. } => {}
                 MirOp::EndLoop => {
                     depth = depth.checked_sub(1).ok_or_else(|| {
                         let _ = (name, at);

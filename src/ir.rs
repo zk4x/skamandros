@@ -140,6 +140,8 @@ pub enum ValueKind {
     Const,
     /// A loop's induction value.
     Induction,
+    /// This core's logical coordinate on one grid axis.
+    GridCoord,
     /// A register value.
     Register,
 }
@@ -430,6 +432,9 @@ pub enum Op {
     Loop { value: ValueId, bound: Dim },
     /// `endloop`.
     EndLoop,
+    /// `%x = grid.x` / `%y = grid.y`: this core's logical coordinate on axis 0
+    /// (x) or 1 (y), written by the host before the launch.
+    GridCoord { value: ValueId, axis: u8 },
     /// DRAM into L1, or L1 into DRAM: exactly one side is a parameter, the other
     /// a buffer. Each side has its own datum offset, because a circular buffer
     /// names its page by the ring pointer while the parameter names the access's
@@ -495,6 +500,7 @@ impl Op {
             | Op::Param { value, .. }
             | Op::Buffer { value, .. }
             | Op::Loop { value, .. }
+            | Op::GridCoord { value, .. }
             | Op::Load { value, .. }
             | Op::Cast { value, .. }
             | Op::Unary { value, .. }
@@ -552,7 +558,7 @@ impl Op {
             Op::Loop { bound, .. } => dim(bound).into_iter().collect(),
             Op::Grid { columns, rows } => dim(columns).into_iter().chain(dim(rows)).collect(),
             Op::Param { dims, .. } => dims.iter().filter_map(dim).collect(),
-            Op::Const { .. } | Op::Buffer { .. } | Op::EndLoop => Vec::new(),
+            Op::Const { .. } | Op::Buffer { .. } | Op::EndLoop | Op::GridCoord { .. } => Vec::new(),
         }
     }
 }
@@ -795,6 +801,17 @@ impl Kernel {
                     grid = Some(([columns, rows], at));
                     continue;
                 }
+                Op::GridCoord { axis, .. } => {
+                    if axis > 1 {
+                        let _ = (at, axis);
+                        return Err(Error::TT_ERROR_GRID_AXIS);
+                    }
+                    ValueInfo {
+                        kind: ValueKind::GridCoord,
+                        dtype: INDEX,
+                        shape: RegShape::Scalar,
+                    }
+                }
                 Op::Loop { bound, .. } => {
                     if let Dim::Value(v) = bound {
                         let i = lookup(&values, &visible, v, at)?;
@@ -1011,7 +1028,7 @@ impl Kernel {
                 }
                 Op::Unary { op, a, .. } => {
                     let x = *lookup(&values, &visible, a, at)?;
-                    if !is_value(x.kind) {
+                    if !is_index_operand(x) {
                         let _ = a;
                         return Err(Error::TT_ERROR_UNARY_OPERAND);
                     }
@@ -1047,7 +1064,7 @@ impl Kernel {
                 Op::Binary { op, a, b, .. } => {
                     let x = *lookup(&values, &visible, a, at)?;
                     let y = *lookup(&values, &visible, b, at)?;
-                    if !is_value(x.kind) || !is_value(y.kind) {
+                    if !is_index_operand(x) || !is_index_operand(y) {
                         let _ = (a, b);
                         return Err(Error::TT_ERROR_BINARY_OPERANDS);
                     }
@@ -1178,12 +1195,22 @@ fn is_value(kind: ValueKind) -> bool {
     )
 }
 
+/// Can this value be an operand of index arithmetic? A register value, a
+/// literal, an induction value or a grid coordinate; a scalar parameter is
+/// index arithmetic too, while a tensor parameter is L1 and must be `load`ed.
+fn is_index_operand(info: ValueInfo) -> bool {
+    is_value(info.kind)
+        || info.kind == ValueKind::GridCoord
+        || (info.kind == ValueKind::Param && info.shape == RegShape::Scalar)
+}
+
 fn kind_name(kind: ValueKind) -> &'static str {
     match kind {
         ValueKind::Param => "parameter",
         ValueKind::Buffer => "buffer",
         ValueKind::Const => "constant",
         ValueKind::Induction => "induction value",
+        ValueKind::GridCoord => "grid coordinate",
         ValueKind::Register => "register value",
     }
 }
@@ -1304,6 +1331,11 @@ impl Kernel {
                     put_dim(&mut b, *bound);
                 }
                 Op::EndLoop => b.push(5),
+                Op::GridCoord { value, axis } => {
+                    b.push(14);
+                    put_name(&mut b, &self.names[*value as usize]);
+                    b.push(*axis);
+                }
                 Op::CopyTo {
                     dst,
                     src,
@@ -1440,6 +1472,12 @@ impl Kernel {
                     Op::Loop { value, bound }
                 }
                 5 => Op::EndLoop,
+                14 => {
+                    let name = r.name()?;
+                    let axis = r.u8()?;
+                    let value = define(&mut names, name)?;
+                    Op::GridCoord { value, axis }
+                }
                 6 => Op::CopyTo {
                     dst: r.u32()?,
                     src: r.u32()?,
@@ -1766,6 +1804,10 @@ impl Kernel {
                     ));
                 }
                 Op::EndLoop => s.push_str("endloop\n"),
+                Op::GridCoord { value, axis } => {
+                    let axis = if *axis == 0 { "x" } else { "y" };
+                    s.push_str(&format!("%{} = grid.{}\n", name(*value), axis));
+                }
                 Op::CopyTo {
                     dst,
                     src,
@@ -1950,6 +1992,16 @@ fn parse_definition(t: &mut Tokens, p: &mut Parser) -> Result<Op, Error> {
             t.end()?;
             Op::Loop { value, bound }
         }
+        "grid" => {
+            t.dot()?;
+            let axis = match t.ident()?.as_str() {
+                "x" => 0,
+                "y" => 1,
+                other => return Err(t.err(format!("a grid coordinate is x or y, not `{other}`"))),
+            };
+            t.end()?;
+            Op::GridCoord { value, axis }
+        }
         "load" => {
             let buffer = t.value(&p.symbols)?;
             let offset = t.bracket(&p.symbols)?;
@@ -2131,6 +2183,13 @@ impl<'a> Tokens<'a> {
         }
     }
 
+    fn dot(&mut self) -> Result<(), Error> {
+        match self.next()? {
+            Token::Dot => Ok(()),
+            t => Err(self.err(format!("expected `.`, found `{}`", t.text()))),
+        }
+    }
+
     /// A constant's bits, in its dtype.
     fn literal(&mut self, dtype: DType) -> Result<u32, Error> {
         if dtype == DType::Bf16 {
@@ -2158,6 +2217,7 @@ enum Token {
     Int(i64),
     Float(u32),
     Comma,
+    Dot,
     LBracket,
     RBracket,
     Eq,
@@ -2171,6 +2231,7 @@ impl Token {
             Token::Int(n) => n.to_string(),
             Token::Float(bits) => literal(DType::F32, *bits),
             Token::Comma => ",".to_string(),
+            Token::Dot => ".".to_string(),
             Token::LBracket => "[".to_string(),
             Token::RBracket => "]".to_string(),
             Token::Eq => "=".to_string(),
@@ -2203,6 +2264,10 @@ fn tokenize(line: &str) -> Result<Vec<Token>, String> {
             }
             '=' => {
                 out.push(Token::Eq);
+                i += 1;
+            }
+            '.' => {
+                out.push(Token::Dot);
                 i += 1;
             }
             '%' => {

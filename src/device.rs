@@ -167,22 +167,28 @@ pub struct Device {
     /// The configuration the window is known to hold. The registers are
     /// write-only, so this is the only record of the current mapping.
     shadow: Option<[u32; 3]>,
-    /// The Tensix tile a 1x1 launch runs on.
+    /// The tile the low-level L1 accessors currently target. Everything is
+    /// per tile, so a caller selects one before a per-tile step.
     tile: NocCoord<Noc0>,
+    /// Every Tensix tile the part has, in row-major order (logical order). A
+    /// module's `(x, y)` is an index into this.
+    tiles: Vec<NocCoord<Noc0>>,
+    /// Tensix columns in [`Device::tiles`]: the width of the logical grid.
+    columns: usize,
     /// DRAM channels that can hold data.
     dram: Dram,
     /// First byte of DRAM this device has not handed out.
     dram_used: u64,
     /// Is `exec_b` resident and looping on the tile?
-    exec_started: bool,
+    exec_started: Vec<NocCoord<Noc0>>,
     /// The last generation handed to any core. Device-wide, so a value a core
     /// has run never repeats: the setup program and the launch that follows it
     /// are two different generations even though they are the first two runs.
     launch_seq: u32,
-    /// Programs already placed at their L1 address: `(address, words, hash)`.
-    /// The program cache keeps them, and a launch only names the address; an
-    /// identical program is not rewritten.
-    placed: Vec<(u32, u64, u64)>,
+    /// Programs already placed at their L1 address: `(tile, address, words,
+    /// hash)`. The program cache is per tile, and a launch only names the
+    /// address; an identical program on the same tile is not rewritten.
+    placed: Vec<(NocCoord<Noc0>, u32, u64, u64)>,
 }
 
 impl Device {
@@ -206,17 +212,19 @@ impl Device {
             return Err(Error::TT_ERROR_NOT_BLACKHOLE);
         }
 
-        let tile = tt_isa::noc::grid::Tensix::FULL
-            .tiles::<Noc0>()
-            .next()
-            .ok_or(Error::TT_ERROR_NO_TENSIX_TILE)?;
+        let tiles: Vec<NocCoord<Noc0>> = tt_isa::noc::grid::Tensix::FULL.tiles::<Noc0>().collect();
+        let first = *tiles.first().ok_or(Error::TT_ERROR_NO_TENSIX_TILE)?;
+        let first_y = first.y();
+        let columns = tiles.iter().take_while(|t| t.y() == first_y).count();
         let mut device = Device {
             lib,
             shadow: None,
-            tile,
+            tile: first,
+            tiles,
+            columns,
             dram: Dram::FULL,
             dram_used: 0x10_0000,
-            exec_started: false,
+            exec_started: Vec::new(),
             launch_seq: 0,
             placed: Vec::new(),
         };
@@ -229,9 +237,37 @@ impl Device {
         Ok(device)
     }
 
-    /// The tile a 1x1 launch runs on.
+    /// The tile the low-level accessors currently target.
     pub fn tile(&self) -> NocCoord<Noc0> {
         self.tile
+    }
+
+    /// Target `tile` for the low-level accessors (`l1_write`, `read32`, the
+    /// launch messages, the program cache). One launch selects each of its
+    /// tiles in turn.
+    pub fn select(&mut self, tile: NocCoord<Noc0>) {
+        self.tile = tile;
+    }
+
+    /// Tensix columns in the logical grid (`grid.x` runs `0..columns`).
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
+
+    /// Tensix rows in the logical grid (`grid.y` runs `0..rows`).
+    pub fn rows(&self) -> usize {
+        self.tiles.len() / self.columns
+    }
+
+    /// The physical tile at logical `(x, y)`. `tt_metal`'s logical grid is the
+    /// worker grid: `absolute_logical_x/y` are these coordinates, and the
+    /// physical tile follows the column list.
+    pub fn tile_at(&self, x: u32, y: u32) -> Result<NocCoord<Noc0>, Error> {
+        if x as usize >= self.columns || y as usize >= self.rows() {
+            let _ = (x, y, self.columns, self.rows());
+            return Err(Error::TT_ERROR_GRID);
+        }
+        Ok(self.tiles[y as usize * self.columns + x as usize])
     }
 
     /// A GDDR channel that can hold data.
@@ -429,32 +465,36 @@ impl Device {
     /// failure is returned, so a wedged tile is reported rather than hidden.
     pub fn quiesce(&mut self) -> Result<(), Error> {
         let mut first: Result<(), Error> = Ok(());
-        for core in [Core::B, Core::T0, Core::T1, Core::T2, Core::NC] {
-            if let Err(e) = self.set_core_reset(core, true) {
-                first = first.and(Err(e));
-            }
-        }
-        for mb in Self::launch_mailboxes() {
-            // Generation first: a core released before the rest lands must not
-            // run the named program with a stale start.
-            for at in [
-                mb.generation(),
-                mb.program_addr(),
-                mb.program_len(),
-                mb.args(),
-                mb.ack(),
-                mb.result(),
-                mb.status(),
-                mb.panic_code(),
-            ] {
-                if let Err(e) = self.write32(at, 0) {
+        for i in 0..self.tiles.len() {
+            let tile = self.tiles[i];
+            self.select(tile);
+            for core in [Core::B, Core::T0, Core::T1, Core::T2, Core::NC] {
+                if let Err(e) = self.set_core_reset(core, true) {
                     first = first.and(Err(e));
                 }
             }
+            for mb in Self::launch_mailboxes() {
+                // Generation first: a core released before the rest lands must
+                // not run the named program with a stale start.
+                for at in [
+                    mb.generation(),
+                    mb.program_addr(),
+                    mb.program_len(),
+                    mb.args(),
+                    mb.ack(),
+                    mb.result(),
+                    mb.status(),
+                    mb.panic_code(),
+                ] {
+                    if let Err(e) = self.write32(at, 0) {
+                        first = first.and(Err(e));
+                    }
+                }
+            }
         }
-        // The executor on B is gone with the reset; the next launch stages it
-        // again instead of waiting on a mailbox nobody will write.
-        self.exec_started = false;
+        // The executor on every tile is gone with the reset; the next launch
+        // stages it again instead of waiting on a mailbox nobody will write.
+        self.exec_started.clear();
         self.placed.clear();
         first
     }
@@ -479,7 +519,11 @@ impl Device {
     /// then releases the other four (tt-metal: BRISC's mask store, then
     /// `deassert_all_reset`).
     pub fn start_executors(&mut self) -> Result<(), Error> {
-        if self.exec_started {
+        if self
+            .exec_started
+            .iter()
+            .any(|t| t.x() == self.tile.x() && t.y() == self.tile.y())
+        {
             return Ok(());
         }
         // NC cannot take a reset-PC override (ttsim refuses it), so its image
@@ -507,7 +551,7 @@ impl Device {
         for &(core, _, _) in &crate::images::EXEC_SUBORDINATES {
             self.set_core_reset(core, false)?;
         }
-        self.exec_started = true;
+        self.exec_started.push(self.tile);
         Ok(())
     }
 
@@ -558,17 +602,16 @@ impl Device {
             (h ^ u64::from(*word)).wrapping_mul(0x0000_0100_0000_01b3)
         });
         let len = words.len() as u64;
-        if self
-            .placed
-            .iter()
-            .any(|&(a, l, h)| a == at && l == len && h == hash)
-        {
+        if self.placed.iter().any(|&(t, a, l, h)| {
+            t.x() == self.tile.x() && t.y() == self.tile.y() && a == at && l == len && h == hash
+        }) {
             return Ok(());
         }
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         self.l1_write(u64::from(at), &code)?;
-        self.placed.retain(|&(a, _, _)| a != at);
-        self.placed.push((at, len, hash));
+        self.placed
+            .retain(|&(t, a, _, _)| t.x() != self.tile.x() || t.y() != self.tile.y() || a != at);
+        self.placed.push((self.tile, at, len, hash));
         Ok(())
     }
 

@@ -136,9 +136,11 @@ programs, only the pointer it passes to `ttLaunch` and gives back to
 
 A buffer address is opaque too: what `ttMemAlloc` hands back is what
 `ttMemcpy*` and `ttLaunch` take. A launch is synchronous — every program has
-finished when it returns. `ttRelease` closes the device; the simulator stays
-initialized, so a later `ttInit` opens a fresh device over it, and module
-handles are unaffected.
+finished when it returns. A launch argument is the DRAM address of a tensor
+parameter, and the value itself of a scalar one (`%n = param i32 0`), as CUDA's
+kernel parameter buffer carries pointers and values. `ttRelease` closes the
+device; the simulator stays initialized, so a later `ttInit` opens a fresh
+device over it, and module handles are unaffected.
 
 Every code has one meaning:
 
@@ -215,19 +217,28 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   (`SEMINIT` each semaphore with max 1, as tt-metal's boot sequence does) to
   completion before the three roles are released, so no role depends on another
   role's initialisation having already run.
-- A launch is one Tensix tile: a module whose grid is larger than 1x1 is
-  refused. A symbolic grid parses and verifies but is not lowered.
-- The register datapath lowered today is FP32 (and `i32` for the bitwise ops),
-  straight-line, with literal offsets: `neg`/`abs`, `add`/`sub`/`mul`/`max` on
-  equal shapes, `cmplt`/`cmpgt`/`cmpge` producing a `bool`, `sel` consuming one,
-  and `bitand`/`bitor`/`bitxor`/`bitnot` on `i32`, plus logical `or`/`and` on
-  `bool`. All of them run end to end through the C ABI. A loop with a constant bound is unrolled before lowering,
-  and constant index arithmetic (including the offset of each iteration) folds
-  to a literal.
-- A loop with a symbolic bound, symbolic offsets, `cast`, broadcast, `matmul`,
-  `eq`/`noteq`, the remaining unary and binary ops, the `bool` datapath in a
-  parameter or buffer, and the reduce op are accepted by the format and verifier
-  and refused loudly by lowering, not guessed at.
+- A launch runs the module's whole grid: every tile of it gets the module's
+  programs and arguments, and all of them run concurrently. A symbolic grid
+  (`grid %nx,%ny`) is resolved at launch from the scalar arguments before any
+  core starts. `%x = grid.x` and `%y = grid.y` are this tile's logical
+  coordinate, host-written into the tile's `core_info` like tt-metal's
+  `absolute_logical_x/y`; the logical `(x, y)` maps to the physical worker tile
+  the way tt-metal's worker grid does.
+- The register datapath lowered today is FP32 (and `i32` for the bitwise ops):
+  `neg`/`abs`, `add`/`sub`/`mul`/`max` on equal shapes, `cmplt`/`cmpgt`/`cmpge`
+  producing a `bool`, `sel` consuming one, and
+  `bitand`/`bitor`/`bitxor`/`bitnot` on `i32`, plus logical `or`/`and` on
+  `bool`. All of them run end to end through the C ABI.
+- A loop is a RISC-V branch, in the movers and in every compute role: a
+  constant bound is a literal, a symbolic one is loaded from the launch
+  arguments (or computed from them and `grid.x`/`grid.y` in RISC-V) and
+  branched on. There is no unroll. Offsets may be any index expression: a
+  literal, a loop index, a scalar parameter, a grid coordinate, or arithmetic
+  over them.
+- `cast`, broadcast, `matmul`, `eq`/`noteq`, the remaining unary and binary
+  ops, the `bool` datapath in a parameter or buffer, and the reduce op are
+  accepted by the format and verifier and refused loudly by lowering, not
+  guessed at.
 - Transcendentals are the caller's to unfold. zyx rewrites `Exp2`/`Log2`/`Sin`/
   `Cos` (and `Pow` as `exp2(y * log2 x)`) into primitive arithmetic in
   `tt_unfold`, before the backend sees them, and skamandros does the same by

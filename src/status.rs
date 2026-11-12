@@ -344,6 +344,11 @@ pub enum ttStatus {
     TT_TODO_LOOP_ADDRESS = 147,
     /// A machine program's `endloop` has no matching `loop`.
     TT_ERROR_ENDLOOP_MACHINE = 148,
+    /// A grid coordinate names an axis other than x or y.
+    TT_ERROR_GRID_AXIS = 149,
+    /// A grid term depends on this core's coordinate, which does not exist
+    /// before the grid is dispatched.
+    TT_ERROR_GRID_COORD = 150,
 }
 
 impl ttStatus {
@@ -500,6 +505,8 @@ impl ttStatus {
             ttStatus::TT_TODO_LOOP_DEPTH => "TT_TODO_LOOP_DEPTH",
             ttStatus::TT_TODO_LOOP_ADDRESS => "TT_TODO_LOOP_ADDRESS",
             ttStatus::TT_ERROR_ENDLOOP_MACHINE => "TT_ERROR_ENDLOOP_MACHINE",
+            ttStatus::TT_ERROR_GRID_AXIS => "TT_ERROR_GRID_AXIS",
+            ttStatus::TT_ERROR_GRID_COORD => "TT_ERROR_GRID_COORD",
         }
     }
 }

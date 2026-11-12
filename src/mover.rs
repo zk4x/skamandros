@@ -71,8 +71,16 @@ enum ParamOffset {
 /// a RISC-V branch, not an unroll, so the trip count can be any constant.
 enum Item {
     Copy(Copy),
-    Loop { index: ValueId, count: u32 },
+    Loop { index: ValueId, count: LoopCount },
     EndLoop,
+}
+
+/// A loop's trip count: a literal, or an index expression the program computes
+/// into the limit register before the branch.
+#[derive(Clone, Copy)]
+enum LoopCount {
+    Const(u32),
+    Value(ValueId),
 }
 
 /// The parameter-side offset [`emit_copy`] adds: a literal, or the register an
@@ -328,6 +336,7 @@ fn remap(op: &Op, map: &[ValueId], value: Option<ValueId>) -> Op {
             bound: d(bound),
         },
         Op::EndLoop => Op::EndLoop,
+        Op::GridCoord { axis, .. } => Op::GridCoord { value: own(), axis },
         Op::CopyTo {
             dst,
             src,
@@ -400,6 +409,7 @@ fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
     let sync3 = [reg::T0, reg::T1, reg::T2];
     let sync4 = [reg::T0, reg::T1, reg::T2, reg::T6];
     let def = definitions(k);
+    let param_index = param_indices(k, types);
     let mut loops: Vec<MoverLoop> = Vec::new();
     let mut at = 0usize;
     for item in &items {
@@ -413,7 +423,19 @@ fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
                     _ => return Err(Error::TT_TODO_LOOP_DEPTH),
                 };
                 a.li(index_reg, 0);
-                a.li(limit_reg, count);
+                match count {
+                    LoopCount::Const(n) => a.li(limit_reg, n),
+                    LoopCount::Value(value) => eval_value(
+                        &mut a,
+                        k,
+                        &def,
+                        &param_index,
+                        &loops,
+                        value,
+                        limit_reg,
+                        &mut [reg::T6, reg::T4],
+                    )?,
+                }
                 let top = a.fresh_label();
                 a.label(top.clone());
                 loops.push(MoverLoop {
@@ -442,6 +464,7 @@ fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
                             &mut a,
                             k,
                             &def,
+                            &param_index,
                             &loops,
                             value,
                             reg::A5,
@@ -482,6 +505,19 @@ fn definitions(k: &Kernel) -> Vec<Option<usize>> {
     def
 }
 
+/// The launch argument index of every parameter, in program order.
+fn param_indices(k: &Kernel, types: &Types) -> Vec<Option<u32>> {
+    let mut index: Vec<Option<u32>> = vec![None; types.values.len()];
+    let mut next = 0u32;
+    for op in &k.ops {
+        if let Op::Param { value, .. } = *op {
+            index[value as usize] = Some(next);
+            next += 1;
+        }
+    }
+    index
+}
+
 /// Compute `value` (an `i32` index expression) into `dest` with ordinary
 /// RV32IM, the way a C kernel's loop address is computed by the RISC-V
 /// compiler.
@@ -497,6 +533,7 @@ fn eval_value(
     a: &mut Asm,
     k: &Kernel,
     def: &[Option<usize>],
+    param_index: &[Option<u32>],
     loops: &[MoverLoop],
     value: ValueId,
     dest: u8,
@@ -520,6 +557,19 @@ fn eval_value(
             a.li(dest, bits);
             Ok(())
         }
+        // A scalar parameter's launch argument is its value, not an address:
+        // the array the host wrote holds the value word (`get_arg_val`).
+        Op::Param { ref dims, .. } if dims.is_empty() => {
+            let index = param_index[value as usize].ok_or(Error::TT_TODO_LOOP_ADDRESS)?;
+            a.word(rv::lw(dest, reg::A0, param_arg(index).0));
+            Ok(())
+        }
+        // This core's logical coordinate, host-written in `core_info`.
+        Op::GridCoord { axis, .. } => {
+            a.li(dest, crate::mir::CORE_INFO + u32::from(axis) * 4);
+            a.word(rv::lw(dest, dest, 0));
+            Ok(())
+        }
         Op::Binary {
             op, a: lhs, b: rhs, ..
         } => {
@@ -539,12 +589,12 @@ fn eval_value(
                 let _ = (at, op);
                 return Err(Error::TT_TODO_LOOP_ADDRESS);
             }
-            eval_value(a, k, def, loops, lhs, dest, temps)?;
+            eval_value(a, k, def, param_index, loops, lhs, dest, temps)?;
             let Some((right, rest)) = temps.split_first_mut() else {
                 return Err(Error::TT_TODO_LOOP_ADDRESS);
             };
             let right = *right;
-            eval_value(a, k, def, loops, rhs, right, rest)?;
+            eval_value(a, k, def, param_index, loops, rhs, right, rest)?;
             a.word(match op {
                 BinOp::Add => rv::add(dest, dest, right),
                 BinOp::Sub => rv::sub(dest, dest, right),
@@ -566,16 +616,11 @@ fn eval_value(
 }
 
 fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<Item>, Error> {
-    let mut param_index: Vec<Option<u32>> = vec![None; types.values.len()];
+    let param_index = param_indices(k, types);
     let mut def: Vec<Option<usize>> = vec![None; types.values.len()];
-    let mut next = 0u32;
     for (at, op) in k.ops.iter().enumerate() {
         if let Some(value) = op.defined() {
             def[value as usize] = Some(at);
-        }
-        if let Op::Param { value, .. } = *op {
-            param_index[value as usize] = Some(next);
-            next += 1;
         }
     }
     let mut items = Vec::new();
@@ -583,10 +628,10 @@ fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
         match *op {
             Op::Loop { value, bound } => {
                 let count = match bound {
-                    Dim::Const(n) => n,
+                    Dim::Const(n) => LoopCount::Const(n),
                     Dim::Value(v) => match k.const_i32(v) {
-                        Some(n) if n >= 0 => n as u32,
-                        _ => return Err(Error::TT_ERROR_LOOP_BOUND_SYMBOLIC),
+                        Some(n) if n >= 0 => LoopCount::Const(n as u32),
+                        _ => LoopCount::Value(v),
                     },
                 };
                 items.push(Item::Loop {

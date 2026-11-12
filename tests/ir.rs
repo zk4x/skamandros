@@ -177,7 +177,13 @@ grid 1,1
 ";
     let k = Kernel::parse(COPY).expect("the copy kernel parses");
     let m = TT::compile::compile(&k).expect("the copy kernel compiles");
-    assert_eq!(m.params, 2);
+    assert_eq!(
+        m.params,
+        vec![
+            TT::compile::ParamKind::Tensor,
+            TT::compile::ParamKind::Tensor
+        ]
+    );
     assert!(!m.reader.is_empty(), "two inbound copies");
     assert!(!m.writer.is_empty(), "two outbound copies");
     assert!(m.cores.iter().all(Vec::is_empty), "no compute");
@@ -310,10 +316,10 @@ fn has_backward_branch(words: &[u32]) -> bool {
     })
 }
 
-/// A loop with a symbolic bound cannot become a RISC-V trip count yet, so
-/// lowering refuses it loudly rather than guessing.
+/// A loop whose bound is a launch-bound scalar becomes the same RISC-V branch:
+/// the count is loaded from the arguments in each role, and the movers branch.
 #[test]
-fn a_dynamic_loop_is_still_refused() {
+fn a_dynamic_loop_becomes_a_branch() {
     const DYNAMIC: &str = "\
 version 4
 %n = param i32 0
@@ -331,8 +337,50 @@ endloop
 grid 1,1
 ";
     let k = Kernel::parse(DYNAMIC).expect("the dynamic loop parses");
-    let err = TT::compile::compile(&k).expect_err("a dynamic loop is not lowered");
-    assert_eq!(err, TT::status::ttStatus::TT_ERROR_LOOP_BOUND_SYMBOLIC);
+    let m = TT::compile::compile(&k).expect("a dynamic loop is lowered");
+    assert!(has_backward_branch(&m.reader), "the reader loops");
+    assert!(has_backward_branch(&m.writer), "the writer loops");
+    for (role, words) in ["t0", "t1", "t2"].into_iter().zip(&m.cores) {
+        assert!(has_backward_branch(words), "{role} loops");
+    }
+}
+
+/// `grid.x`/`grid.y` name this core's logical coordinate, and a grid extent may
+/// be a launch-bound scalar.
+#[test]
+fn the_grid_is_symbolic_and_the_coordinate_is_a_value() {
+    const SYMBOLIC: &str = "\
+version 4
+%nx = param i32 0
+%ny = param i32 0
+%in = param f32 2048
+%out = param f32 2048
+%x = grid.x
+%y = grid.y
+%o = mul %x %ny
+%o2 = add %o %y
+%bi = buffer f32 32,32
+%bo = buffer f32 32,32
+copy_to %bi from %in [%o2]
+%v = load %bi [0]
+%n = neg %v
+store_to %bo from %n [0]
+copy_to %out from %bo [%o2]
+grid %nx,%ny
+";
+    let k = Kernel::parse(SYMBOLIC).expect("the symbolic grid parses");
+    assert_eq!(k.to_text(), SYMBOLIC, "the text form is canonical");
+    assert_eq!(Kernel::from_bytes(&k.to_bytes()).unwrap(), k);
+    let m = TT::compile::compile(&k).expect("the symbolic grid compiles");
+    assert_eq!(
+        m.params,
+        vec![
+            TT::compile::ParamKind::Scalar,
+            TT::compile::ParamKind::Scalar,
+            TT::compile::ParamKind::Tensor,
+            TT::compile::ParamKind::Tensor
+        ]
+    );
 }
 
 /// Comparisons produce a `bool`, `sel` takes one, and `relu` is not an op:
