@@ -233,10 +233,7 @@ impl Device {
         let tensix = device.probe_tensix()?;
         device.tiles = tensix.tiles::<Noc0>().collect();
         device.columns = tensix.enabled_column_count();
-        device.tile = *device
-            .tiles
-            .first()
-            .ok_or(Error::TT_ERROR_NO_TENSIX_TILE)?;
+        device.tile = *device.tiles.first().ok_or(Error::TT_ERROR_NO_TENSIX_TILE)?;
         // A previous process (`ttRelease` only drops this struct) leaves its
         // cores running and its mailboxes written. Reopening is the 0 -> 1
         // transition, so it cannot disturb a live caller: hold the five cores
@@ -299,8 +296,7 @@ impl Device {
             enabled = Some(self.arc_word(arc_tile, at)?);
         }
         let mask = enabled.ok_or(Error::TT_ERROR_TELEMETRY)?;
-        tt_isa::noc::grid::Tensix::from_enabled_column_mask(mask)
-            .ok_or(Error::TT_ERROR_TELEMETRY)
+        tt_isa::noc::grid::Tensix::from_enabled_column_mask(mask).ok_or(Error::TT_ERROR_TELEMETRY)
     }
 
     /// One word of the ARC's address space, through the window: its reset-unit

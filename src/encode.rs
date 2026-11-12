@@ -232,9 +232,9 @@ pub fn math(m: &Machine) -> Result<Vec<u32>, Error> {
 /// Encode all three compute programs.
 pub fn encode(m: &Machine) -> Result<Words, Error> {
     let mut out = Words::default();
-    encode_unpack(&m.t0, &mut out.t0)?;
+    encode_unpack(&m.t0, &mut out.t0, m.dst_is_16_bit)?;
     encode_math(&m.t1, &mut out.t1)?;
-    encode_pack(&m.t2, &mut out.t2)?;
+    encode_pack(&m.t2, &mut out.t2, m.dst_is_16_bit)?;
     Ok(out)
 }
 
@@ -316,7 +316,7 @@ struct UnpackState {
     face: u32,
 }
 
-fn encode_unpack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
+fn encode_unpack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(), Error> {
     if ops.is_empty() {
         return Ok(());
     }
@@ -358,7 +358,7 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
                 // after draining the previous unpack.
                 cb_base_unpack(out, cb)?;
                 let mut words = ConfigWords::new();
-                unpack_config(&mut words, count, state.dst_row, dtype);
+                unpack_config(&mut words, count, state.dst_row, dtype, dst_is_16_bit);
                 out.extend(config_program(&words));
                 out.push(stallwait(
                     block::UNPACKER | block::CONFIG,
@@ -549,20 +549,39 @@ fn l1_format(dtype: DType) -> L1Format {
     }
 }
 
+/// The `Dst` format of the whole kernel: the 16-bit bank is a bf16 datum
+/// (`DST_ACCUM_MODE`'s 16-bit half), the 32-bit bank is an opaque 32-bit one.
+/// The unpacker's `Out_data_format`, the packer's `In_data_format` and the
+/// packer's 16-bit read path all follow it.
+fn dst_format(dst_is_16_bit: bool) -> L1Format {
+    if dst_is_16_bit {
+        L1Format::Bf16
+    } else {
+        L1Format::Fp32
+    }
+}
+
 /// The unpacker's `Config` for one unit: base, destination, X dimension, FP32
 /// in and out. The base is `base/16 - 1` because L1 holds the datum block with
 /// no 16-byte tile header, while the unpacker adds one unconditionally.
-fn unpack_config(words: &mut ConfigWords, datums: u32, dst_row: u32, dtype: DType) {
-    // The datum is opaque 32 bits at this layer: `Int32` in the packed output
-    // requires the `Dst` access format to match it, and the role descriptor's is
-    // 32-bit. The lane's own format is `dtype`'s, which decides the conversion.
+fn unpack_config(
+    words: &mut ConfigWords,
+    datums: u32,
+    dst_row: u32,
+    dtype: DType,
+    dst_is_16_bit: bool,
+) {
+    // `In_data_format` is the L1 datum's own format; the `Dst` side is the
+    // kernel's one width. The lane's format (`SFPLOAD`/`SFPSTORE`) is the third
+    // choice and lives in the ops.
     let fmt = l1_format(dtype);
+    let dst = dst_format(dst_is_16_bit);
     words
         .set(thcon::THCON_SEC0_REG7_Offset_address, 0)
         .unwrap()
         .set(thcon::THCON_SEC0_REG5_Tile_x_dim_cntx0, datums)
         .unwrap()
-        .set(thcon::THCON_SEC0_REG2_Out_data_format, fmt.code().unwrap())
+        .set(thcon::THCON_SEC0_REG2_Out_data_format, dst.code().unwrap())
         .unwrap()
         .set(thcon::THCON_SEC0_REG2_Ovrd_data_format, 0)
         .unwrap()
@@ -990,7 +1009,7 @@ fn cast_lanes(from: DType, to: DType, a: u8, d: u8, out: &mut Stream) -> Result<
 // The pack core (T2)
 // ---------------------------------------------------------------------------
 
-fn encode_pack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
+fn encode_pack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(), Error> {
     if ops.is_empty() {
         return Ok(());
     }
@@ -1051,7 +1070,7 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
                 // 16-byte units minus the header unit the packer adds.
                 cb_base_pack(out, cb)?;
                 let mut words = ConfigWords::new();
-                pack_config(&mut words, dtype, row);
+                pack_config(&mut words, dtype, row, dst_is_16_bit);
                 out.extend(config_program(&words));
                 out.push(stallwait(block::PACKER | block::CONFIG, cond::CONFIG_BUSY)?);
                 pack_rows(out, rows, last)?;
@@ -1081,16 +1100,19 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
 /// address counter (`TT_SETADC(PAC, CH_0, SET_W, tile_index)`). The simulator
 /// does not model that counter — a `SETADC` there leaves the pack reading row
 /// 0 — so the row is written here, per pack, which is also what zyx did.
-fn pack_config(words: &mut ConfigWords, dtype: DType, row: u32) {
-    // The datum's own format decides the read path: a bf16 tile is read from a
-    // 16-bit `Dst` (two bytes per datum, so half the row stride) and written as
-    // bf16; every other datum is opaque 32 bits.
-    let fmt = l1_format(dtype);
-    let bf16 = dtype == DType::Bf16;
+fn pack_config(words: &mut ConfigWords, dtype: DType, row: u32, dst_is_16_bit: bool) {
+    // `Out_data_format` is the L1 datum's own format; `In_data_format` is the
+    // kernel's `Dst` width. In 16-bit mode the packer reads a 16-bit `Dst` (two
+    // bytes per datum, so half the row stride) and its conversion is the
+    // identity; in 32-bit mode it reads a 32-bit one and converts, which is how
+    // a bf16 buffer is written out of an f32 `Dst`.
+    let out = l1_format(dtype);
+    let in_ = dst_format(dst_is_16_bit);
+    let narrow = dst_is_16_bit;
     words
-        .set(thcon::THCON_SEC0_REG1_In_data_format, fmt.code().unwrap())
+        .set(thcon::THCON_SEC0_REG1_In_data_format, in_.code().unwrap())
         .unwrap()
-        .set(thcon::THCON_SEC0_REG1_Out_data_format, fmt.code().unwrap())
+        .set(thcon::THCON_SEC0_REG1_Out_data_format, out.code().unwrap())
         .unwrap()
         .set(thcon::THCON_SEC0_REG1_Source_interface_selection, 0)
         .unwrap()
@@ -1124,7 +1146,7 @@ fn pack_config(words: &mut ConfigWords, dtype: DType, row: u32) {
         .unwrap()
         .set(
             pack0::PCK0_ADDR_CTRL_XY_REG_0_Ystride,
-            if bf16 {
+            if narrow {
                 DST_ROW_BYTES / 2
             } else {
                 DST_ROW_BYTES
@@ -1133,7 +1155,7 @@ fn pack_config(words: &mut ConfigWords, dtype: DType, row: u32) {
         .unwrap()
         .set(pack0::PCK0_ADDR_CTRL_ZW_REG_0_Zstride, 0)
         .unwrap()
-        .set(pack0::PCK_DEST_RD_CTRL_Read_32b_data, u32::from(!bf16))
+        .set(pack0::PCK_DEST_RD_CTRL_Read_32b_data, u32::from(!narrow))
         .unwrap()
         .set(pack0::PCK_DEST_RD_CTRL_Read_unsigned, 0)
         .unwrap()
@@ -1149,7 +1171,7 @@ fn pack_config(words: &mut ConfigWords, dtype: DType, row: u32) {
         .unwrap()
         .set(pack0::PCK_EDGE_OFFSET_SEC0_mask, 0xFFFF)
         .unwrap()
-        .set(alu::ALU_ACC_CTRL_Fp32_enabled, u32::from(!bf16))
+        .set(alu::ALU_ACC_CTRL_Fp32_enabled, u32::from(!narrow))
         .unwrap();
 }
 

@@ -75,7 +75,6 @@ pub fn compile(k: &Kernel) -> Result<Module, Error> {
     let k = &k;
     let types = k.verify()?;
     mover::check_roles(k, &types)?;
-    datum_width(k)?;
     let plan = place(k, &types)?;
     let alloc = allocate(k, &types)?;
     let mut machine = lower(k, &types, &plan, &alloc)?;
@@ -104,30 +103,6 @@ pub fn compile(k: &Kernel) -> Result<Module, Error> {
         return Err(Error::TT_ERROR_EMPTY_MODULE);
     }
     Ok(module)
-}
-
-/// The `Dst` bank holds one datum width at a time: a bf16 kernel reads and
-/// writes a 16-bit `Dst` (the packer's and unpacker's formats are set for it),
-/// and every other datum is opaque 32 bits. A module that wants both is refused
-/// rather than encoded as one.
-fn datum_width(k: &Kernel) -> Result<(), Error> {
-    let mut bf16 = false;
-    let mut wide = false;
-    for op in &k.ops {
-        let dtype = match *op {
-            Op::Buffer { dtype, .. } => dtype,
-            _ => continue,
-        };
-        match dtype {
-            crate::ir::DType::Bf16 => bf16 = true,
-            _ => wide = true,
-        }
-    }
-    if bf16 && wide {
-        let _ = (bf16, wide);
-        return Err(Error::TT_ERROR_DATAPATH_DTYPE);
-    }
-    Ok(())
 }
 
 /// One launch argument kind per parameter, in program order.

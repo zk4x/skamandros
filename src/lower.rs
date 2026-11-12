@@ -44,7 +44,40 @@ const SCRATCH: [u8; 6] = [reg::A1, reg::A2, reg::A3, reg::A4, reg::A5, reg::T3];
 
 /// Lower `k` to the three compute programs.
 pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Machine, Error> {
-    let mut m = Machine::default();
+    // The `Dst` bank holds one datum width for the whole kernel: tt-metal's
+    // `DST_ACCUM_MODE` (`fp32_dest_acc_en`, `tt_metal/jit_build/genfiles.cpp`).
+    // A value that needs more than 16 bits forces 32-bit mode; otherwise every
+    // value in `Dst` is bf16 or a `bool` lane and the bank is 16-bit, which is
+    // the native path: the SFPU widens on load and truncates on store, so bf16
+    // arithmetic needs no rounding glue and a unit costs half the rows.
+    //
+    // `bool` does not force 32-bit mode: its lane is the sign-magnitude `-1`,
+    // and the bf16 store keeps exactly that pattern (`0xBF80`), so a comparison
+    // in a bf16 kernel round-trips.
+    let wide = (0..types.values.len()).any(|v| {
+        alloc.place[v].is_some()
+            && matches!(
+                types.values[v].dtype,
+                crate::ir::DType::F32 | crate::ir::DType::I32
+            )
+    });
+    // The dtype a value occupies `Dst` with. 16-bit mode stores every value as
+    // a bf16 datum, the `bool` lane's `-1` pattern included; 32-bit mode holds
+    // bf16 as the f32 it widens to, so the packer is the only thing that rounds
+    // it, at the bf16 buffer it lands in.
+    let storage = |dtype: crate::ir::DType| {
+        if !wide {
+            crate::ir::DType::Bf16
+        } else if dtype == crate::ir::DType::Bf16 {
+            crate::ir::DType::F32
+        } else {
+            dtype
+        }
+    };
+    let mut m = Machine {
+        dst_is_16_bit: !wide,
+        ..Machine::default()
+    };
     let mut def: Vec<Option<usize>> = vec![None; types.values.len()];
     for (at, op) in k.ops.iter().enumerate() {
         if let Some(value) = op.defined() {
@@ -128,6 +161,15 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     let _ = buffer;
                     return Err(Error::TT_ERROR_NOT_A_BUFFER);
                 };
+                // A bf16 page can only be unpacked into a bf16 `Dst`
+                // (`BF16 -> BF16` is the unpacker's only Dst-path conversion for
+                // it), so a bf16 buffer only enters a 16-bit kernel. Reaching one
+                // from a 32-bit kernel needs SrcA/SrcB and the widening
+                // `BF16 -> TF32` path.
+                if wide && dtype == crate::ir::DType::Bf16 {
+                    let _ = (at, buffer);
+                    return Err(Error::TT_ERROR_BF16_WIDEN);
+                }
                 let (unit_shape, _, _) = unit_of(shape, dtype)?;
                 let rows = rows_of(unit_shape, at)?;
                 let cb = plan.cb[buffer as usize].ok_or_else(|| {
@@ -207,33 +249,38 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             Op::Cast { value, src, dtype } => {
                 let from = types.of(src).dtype;
                 let shape = types.of(src).shape;
-                // A bf16 datum lives in a 16-bit `Dst` and an f32 one in a
-                // 32-bit `Dst`, and the bank is one width at a time, so a
-                // conversion between them inside one program is not lowered.
-                if from == crate::ir::DType::Bf16 || dtype == crate::ir::DType::Bf16 {
-                    let _ = at;
-                    return Err(Error::TT_TODO_CAST);
-                }
                 let rows = rows_of(shape, at)?;
                 let s = dst_row(alloc, resolve(&alias, src));
                 let out = dst_row(alloc, resolve(&alias, value));
                 let (la, ld) = alloc.lreg[resolve(&alias, value) as usize];
+                // The conversion happens in the lane. 16-bit mode stores every
+                // value as a bf16 datum, so a `bool` lane *is* `-1.0`/`0.0` there
+                // and an `f32` one is already bf16 precision; 32-bit mode holds
+                // bf16 as the f32 it widens to. Either way the recipe is the
+                // 32-bit lane's, so `cast_lanes` never sees `Bf16`.
+                let lane = |dtype: crate::ir::DType| {
+                    if dtype == crate::ir::DType::Bf16 {
+                        crate::ir::DType::F32
+                    } else {
+                        dtype
+                    }
+                };
                 for row in (0..rows).step_by(2) {
                     m.t1.push(MirOp::Sfpload {
                         lreg: la,
                         row: s + row,
-                        dtype: from,
+                        dtype: storage(from),
                     });
                     m.t1.push(MirOp::Cast {
-                        from,
-                        to: dtype,
+                        from: lane(from),
+                        to: lane(dtype),
                         a: la,
                         d: ld,
                     });
                     m.t1.push(MirOp::Sfpstore {
                         lreg: ld,
                         row: out + row,
-                        dtype,
+                        dtype: storage(dtype),
                     });
                 }
             }
@@ -246,7 +293,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 let out = dst_row(alloc, resolve(&alias, value));
                 let (la, ld) = alloc.lreg[resolve(&alias, value) as usize];
                 let sfp = unary(op, at)?;
-                let dtype = types.of(a).dtype;
+                let dtype = storage(types.of(a).dtype);
                 for row in (0..rows).step_by(2) {
                     m.t1.push(MirOp::Sfpload {
                         lreg: la,
@@ -274,7 +321,11 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     return Err(Error::TT_TODO_BROADCAST);
                 }
                 let dtype = match left.dtype {
-                    crate::ir::DType::F32 => crate::ir::DType::F32,
+                    // bf16 runs the same lane ops as f32: in 16-bit mode the
+                    // SFPU widens on load and the store truncates, so each op
+                    // lands at bf16 precision; in 32-bit mode the value is the
+                    // f32 it widens to and the packer rounds at the buffer.
+                    crate::ir::DType::F32 | crate::ir::DType::Bf16 => storage(left.dtype),
                     crate::ir::DType::I32
                         if matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor) =>
                     {
@@ -300,7 +351,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 // A comparison writes `-1`/`0` lanes, so its result is stored in
                 // the integer format; everything else keeps the operands'.
                 let out_dtype = if matches!(op, BinOp::Cmplt | BinOp::Cmpgt | BinOp::Cmpge) {
-                    crate::ir::DType::Bool
+                    storage(crate::ir::DType::Bool)
                 } else {
                     dtype
                 };
@@ -372,17 +423,17 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     m.t1.push(MirOp::Sfpload {
                         lreg: lc,
                         row: sc + row,
-                        dtype: crate::ir::DType::Bool,
+                        dtype: storage(crate::ir::DType::Bool),
                     });
                     m.t1.push(MirOp::Sfpload {
                         lreg: lt,
                         row: st + row,
-                        dtype: types.of(if_true).dtype,
+                        dtype: storage(types.of(if_true).dtype),
                     });
                     m.t1.push(MirOp::Sfpload {
                         lreg: lf,
                         row: sf + row,
-                        dtype: types.of(if_false).dtype,
+                        dtype: storage(types.of(if_false).dtype),
                     });
                     m.t1.push(MirOp::Select {
                         cond: lc,
@@ -393,7 +444,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     m.t1.push(MirOp::Sfpstore {
                         lreg: ld,
                         row: out + row,
-                        dtype: types.of(value).dtype,
+                        dtype: storage(types.of(value).dtype),
                     });
                 }
             }

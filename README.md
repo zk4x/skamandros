@@ -40,7 +40,10 @@ first. A parameter may be arbitrary-dimensional and symbolic, a scalar parameter
 is the shape `0`, and a buffer is two constant dimensions, each `1` or a multiple
 of 32. There is no implicit dtype conversion: `cast %x to f32` converts a
 value with the C type's rounding, and `bitcast %x to i32` renames the same bits
-between dtypes of equal width. A bf16 datum is two bytes in L1.
+between dtypes of equal width. A bf16 datum is two bytes in L1, and bf16 is the
+compute path the `Dst` is sized for: a kernel whose values are all bf16 runs in
+the 16-bit bank, with bf16 arithmetic and comparisons; a `bool` lane lives there
+too, as the `-1.0`/`0.0` pattern the bf16 store keeps.
 
 The op set is the low-level one and nothing more: zyx's `UOp`
 (`neg`, `not`, `bitnot`, `exp2`, `log2`, `reciprocal`, `sqrt`, `rsqrt`, `sin`,
@@ -259,16 +262,26 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
 - `cast` converts in the lane with the C type's rounding (`(int)f` truncates
   toward zero, `(float)i` rounds to nearest even, `(bool)x` is `x != 0`), and
   `bitcast` is the same bits under another name. Both run end to end through
-  the C ABI; `bitcast` lowers to no instruction at all.
+  the C ABI; `bitcast` lowers to no instruction at all. A conversion *between
+  bf16 and a 32-bit dtype* is a `Dst` boundary, not a lane instruction: the
+  packer narrows into a bf16 buffer, and widening out of one is refused
+  (`TT_ERROR_BF16_WIDEN`) because the hardware has no such path through `Dst`.
 - Broadcast, `matmul`, `eq`/`noteq`, the remaining unary and binary ops, the
   `bool` datapath in a parameter or buffer, and the reduce op are accepted by
   the format and verifier and refused loudly by lowering, not guessed at.
-- bf16 is a real L1 format: a bf16 buffer is two bytes per datum, the unpacker
-  and packer are set to `Bf16` both ways, and the 16-bit `Dst` is read and
-  written with the `BF16` lane format, which widens to FP32 for the op. A
-  module is one width at a time (`datum_width`), and a `cast` to or from bf16
-  is refused: the boundary is the buffer's dtype, not a conversion inside one
-  program.
+- bf16 is a real L1 format and the native compute path. A bf16 buffer is two
+  bytes per datum, and the `Dst` width is one mode for the whole module, as
+  tt-metal's `DST_ACCUM_MODE` (`fp32_dest_acc_en`) is: if every value that
+  enters `Dst` is bf16 or a `bool` lane, the bank is 16-bit, the unpacker and
+  packer are set to `Bf16`, and the SFPU widens on load and truncates on store
+  — so bf16 arithmetic (`neg`, `abs`, `add`, `sub`, `mul`, `max`, comparisons,
+  `sel`) runs in the lane at bf16 precision with no rounding glue, at half the
+  `Dst` rows. A 32-bit value (`f32`, `i32`) makes the module 32-bit instead, and
+  a bf16 buffer written from that bank is the packer's narrowing conversion.
+- A bf16 value cannot *widen* into a 32-bit `Dst`: the unpacker has no
+  `BF16 -> FP32` Dst path and a 16-bit `Dst` cannot pack `f32`/`i32`, so
+  `cast %x to f32` on a bf16 value is `TT_ERROR_BF16_WIDEN` (the conversion
+  exists only on the `SrcA`/`SrcB` path, which this compiler does not place).
 - Transcendentals are the caller's to unfold. zyx rewrites `Exp2`/`Log2`/`Sin`/
   `Cos` (and `Pow` as `exp2(y * log2 x)`) into primitive arithmetic in
   `tt_unfold`, before the backend sees them, and skamandros does the same by

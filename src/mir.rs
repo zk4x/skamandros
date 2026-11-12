@@ -156,6 +156,12 @@ pub struct Machine {
     pub t0: Vec<MirOp>,
     pub t1: Vec<MirOp>,
     pub t2: Vec<MirOp>,
+    /// Is the `Dst` bank in 16-bit mode? The width is one mode for the whole
+    /// kernel, as tt-metal's `DST_ACCUM_MODE` (`fp32_dest_acc_en`) is: every
+    /// value that enters `Dst` is bf16 (or a `bool` lane, which is 16 bits or
+    /// less) in 16-bit mode, and a 32-bit datum forces 32-bit mode. The unpacker,
+    /// the packer and the SFPU's load/store format are picked from it.
+    pub dst_is_16_bit: bool,
 }
 
 impl Machine {

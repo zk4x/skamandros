@@ -49,6 +49,7 @@ const TT_ERROR_PROGRAM: c_int = 2;
 const TT_ERROR_MODULE: c_int = 3;
 const TT_ERROR_PARSE: c_int = 8;
 const TT_ERROR_NOT_TTIR: c_int = 10;
+const TT_ERROR_BF16_WIDEN: c_int = 153;
 
 /// The `libTT.so` this test binary was built next to.
 fn library_path() -> PathBuf {
@@ -1752,4 +1753,410 @@ fn bf16_runs_on_the_simulator() {
         let want = if h & 0x7f80 == 0 { 0 } else { h ^ 0x8000 };
         assert_eq!(got, want, "bf16 neg, datum {i}: {h:#06x}");
     }
+}
+
+/// The bf16 datum a lane value truncates to: the SFPU's `BF16` store keeps the
+/// high half (`0x43058000` becomes `0x4305`), so bf16 arithmetic lands at bf16
+/// precision after every op, which is what a 16-bit `Dst` kernel is for.
+fn truncate_to_bf16(value: f32) -> u16 {
+    (value.to_bits() >> 16) as u16
+}
+
+/// A bf16 datum widened into the 32-bit lane. The SFPU flushes a datum whose
+/// exponent is zero (a subnormal, or a zero of either sign).
+fn widen_bf16(bits: u16) -> f32 {
+    if bits & 0x7f80 == 0 {
+        0.0
+    } else {
+        f32::from_bits(u32::from(bits) << 16)
+    }
+}
+
+/// The packer's f32-to-bf16 conversion: NaN is canonicalized, the value rounds
+/// half up, and a result in the bf16 subnormal range is flushed to zero
+/// (`tensix.cpp`, the `intermediate_format == 5` arm of the packer). This is the
+/// only place a bf16 datum is rounded when the kernel runs a 32-bit `Dst`.
+fn packer_bf16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let bits = if bits & 0x7fff_ffff > 0x7f80_0000 {
+        (bits & 0x8000_0000) | 0x7f80_0000
+    } else {
+        bits
+    };
+    let rounded = bits.wrapping_add(0x8000) >> 16;
+    if rounded & 0x7fff < 0x80 {
+        0
+    } else {
+        rounded as u16
+    }
+}
+
+/// bf16 arithmetic in the 16-bit `Dst`: two tiles in, one out, every datum the
+/// SFPU's widening and truncating round trip.
+const BF16_TWO_LOAD: &str = "\
+version 4
+grid 1,1
+%in = param bf16 2048
+%out = param bf16 1024
+%b0 = buffer bf16 32,64
+%bo = buffer bf16 32,32
+copy_to %b0 from %in [0]
+copy_to %b0 from %in [1024]
+%x = load %b0 [0]
+%y = load %b0 [1024]
+%r = OP %x %y
+store_to %bo from %r [0]
+copy_to %out from %bo [0]
+";
+
+#[test]
+fn bf16_arithmetic_runs_on_the_simulator() {
+    let _device = device();
+    let sim = simulator_path();
+    // SAFETY: no other thread reads the environment concurrently; the library
+    // reads it when it opens the device.
+    unsafe { std::env::set_var("TT_METAL_SIMULATOR", &sim) };
+
+    let lib = library();
+    let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
+    let unload: Symbol<ModuleUnload> =
+        unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
+    let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
+    let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
+    let release: Symbol<Release> = unsafe { lib.get(b"ttRelease\0") }.expect("ttRelease");
+    let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
+    let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
+    let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
+    let launch: Symbol<Launch> = unsafe { lib.get(b"ttLaunch\0") }.expect("ttLaunch");
+
+    let mut err: *mut c_char = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { init(&mut err) },
+        TT_OK,
+        "ttInit: {}",
+        take_error(&free, err)
+    );
+    let (mut input, mut output) = (0u64, 0u64);
+    assert_eq!(
+        unsafe { alloc(4096, &mut input, &mut err) },
+        TT_OK,
+        "input: {}",
+        take_error(&free, err)
+    );
+    assert_eq!(
+        unsafe { alloc(2048, &mut output, &mut err) },
+        TT_OK,
+        "output: {}",
+        take_error(&free, err)
+    );
+
+    // Normals in a range where no result of the operators below under- or
+    // overflows bf16, so the expectation is the truncation alone.
+    let host: Vec<u16> = (0..2048)
+        .map(|i| {
+            let v = (i as f32 - 1024.0) * 0.125;
+            truncate_to_bf16(if i % 3 == 0 { -v } else { v })
+        })
+        .collect();
+    let input_bytes: Vec<u8> = host.iter().flat_map(|h| h.to_le_bytes()).collect();
+    assert_eq!(
+        unsafe { h2d(input, input_bytes.as_ptr(), input_bytes.len(), &mut err) },
+        TT_OK,
+        "upload: {}",
+        take_error(&free, err)
+    );
+    // The exact values the kernel sees, after the widening and its flush.
+    let seen: Vec<f32> = host.iter().map(|h| widen_bf16(*h)).collect();
+
+    let mut run = |program: &str, expected: &dyn Fn(&[f32]) -> Vec<u16>| {
+        let mut module: *mut c_void = std::ptr::null_mut();
+        let code = unsafe {
+            compile(
+                program.as_ptr().cast(),
+                program.len(),
+                &mut module,
+                &mut err,
+            )
+        };
+        assert_eq!(code, TT_OK, "compile: {}", take_error(&free, err));
+        let params = [input, output];
+        let code = unsafe { launch(module, params.as_ptr(), params.len(), &mut err) };
+        assert_eq!(code, TT_OK, "ttLaunch: {}", take_error(&free, err));
+        let mut back = vec![0u8; 2048];
+        assert_eq!(
+            unsafe { d2h(back.as_mut_ptr(), output, back.len(), &mut err) },
+            TT_OK,
+            "download: {}",
+            take_error(&free, err)
+        );
+        let got: Vec<u16> = back
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let want = expected(&seen);
+        for (i, x) in want.iter().enumerate() {
+            assert_eq!(got[i], *x, "{program}: datum {i}");
+        }
+        assert_eq!(
+            unsafe { unload(module, &mut err) },
+            TT_OK,
+            "unload: {}",
+            take_error(&free, err)
+        );
+    };
+
+    for (op, f) in [
+        (
+            "add",
+            (&|h: &[f32]| {
+                h[..1024]
+                    .iter()
+                    .zip(&h[1024..])
+                    .map(|(a, b)| truncate_to_bf16(a + b))
+                    .collect()
+            }) as &dyn Fn(&[f32]) -> Vec<u16>,
+        ),
+        ("sub", &|h: &[f32]| {
+            h[..1024]
+                .iter()
+                .zip(&h[1024..])
+                .map(|(a, b)| truncate_to_bf16(a - b))
+                .collect()
+        }),
+        ("mul", &|h: &[f32]| {
+            h[..1024]
+                .iter()
+                .zip(&h[1024..])
+                .map(|(a, b)| truncate_to_bf16(a * b))
+                .collect()
+        }),
+        ("max", &|h: &[f32]| {
+            h[..1024]
+                .iter()
+                .zip(&h[1024..])
+                .map(|(a, b)| truncate_to_bf16(if a >= b { *a } else { *b }))
+                .collect()
+        }),
+    ] {
+        let program = BF16_TWO_LOAD.replace("OP", op);
+        run(&program, f);
+    }
+
+    assert_eq!(
+        unsafe { release(&mut err) },
+        TT_OK,
+        "ttRelease: {}",
+        take_error(&free, err)
+    );
+}
+
+/// The 32-bit `Dst` kernel's bf16 output: the packer narrows as it writes.
+const CAST_F32_TO_BF16: &str = "\
+version 4
+grid 1,1
+%in = param f32 1024
+%out = param bf16 1024
+%bi = buffer f32 32,32
+%bo = buffer bf16 32,32
+copy_to %bi from %in [0]
+%x = load %bi [0]
+%y = cast %x to bf16
+store_to %bo from %y [0]
+copy_to %out from %bo [0]
+";
+
+/// `i32` to bf16: `(float)i` in the lane, then the same narrowing.
+const CAST_I32_TO_BF16: &str = "\
+version 4
+grid 1,1
+%in = param i32 1024
+%out = param bf16 1024
+%bi = buffer i32 32,32
+%bo = buffer bf16 32,32
+copy_to %bi from %in [0]
+%x = load %bi [0]
+%y = cast %x to bf16
+store_to %bo from %y [0]
+copy_to %out from %bo [0]
+";
+
+/// A comparison's `bool` to bf16: one or zero.
+const CAST_BOOL_TO_BF16: &str = "\
+version 4
+grid 1,1
+%in = param f32 1024
+%out = param bf16 1024
+%bi = buffer f32 32,32
+%bo = buffer bf16 32,32
+copy_to %bi from %in [0]
+%x = load %bi [0]
+%zero = sub %x %x
+%c = cmplt %x %zero
+%y = cast %c to bf16
+store_to %bo from %y [0]
+copy_to %out from %bo [0]
+";
+
+/// bf16 to bf16, the 16-bit `Dst`'s identity: the store truncates what the load
+/// widened, so every normal comes back unchanged.
+const CAST_BF16_TO_BF16: &str = "\
+version 4
+grid 1,1
+%in = param bf16 1024
+%out = param bf16 1024
+%bi = buffer bf16 32,32
+%bo = buffer bf16 32,32
+copy_to %bi from %in [0]
+%x = load %bi [0]
+%y = cast %x to bf16
+store_to %bo from %y [0]
+copy_to %out from %bo [0]
+";
+
+/// bf16 into `f32` has no `Dst` path: the unpacker cannot widen a bf16 page into
+/// a 32-bit `Dst`, and a 16-bit `Dst` cannot pack `f32`.
+const CAST_BF16_TO_F32: &str = "\
+version 4
+grid 1,1
+%in = param bf16 1024
+%out = param f32 1024
+%bi = buffer bf16 32,32
+%bo = buffer f32 32,32
+copy_to %bi from %in [0]
+%x = load %bi [0]
+%y = cast %x to f32
+store_to %bo from %y [0]
+copy_to %out from %bo [0]
+";
+
+/// `sel` on bf16: against `y`, so the `bool` lives in the 16-bit `Dst` as the
+/// `-1.0`/`0.0` lane the comparison writes, and the result is the smaller value.
+const BF16_MIN: &str = "\
+version 4
+grid 1,1
+%in = param bf16 2048
+%out = param bf16 1024
+%b0 = buffer bf16 32,64
+%bo = buffer bf16 32,32
+copy_to %b0 from %in [0]
+copy_to %b0 from %in [1024]
+%x = load %b0 [0]
+%y = load %b0 [1024]
+%c = cmplt %x %y
+%r = sel %c %x %y
+store_to %bo from %r [0]
+copy_to %out from %bo [0]
+";
+
+#[test]
+fn bf16_casts_run_on_the_simulator() {
+    let count = 1024usize;
+
+    // bf16 to itself: the 16-bit `Dst` round trip, exact for a normal.
+    let patterns: Vec<u16> = (0..count)
+        .map(|i| {
+            let v = (i as f32 - 512.0) * 0.375;
+            truncate_to_bf16(v)
+        })
+        .collect();
+    let bf16_bytes: Vec<u8> = patterns.iter().flat_map(|h| h.to_le_bytes()).collect();
+    let out = run_kernel(CAST_BF16_TO_BF16, &bf16_bytes, count * 2);
+    for (i, h) in patterns.iter().enumerate() {
+        let got = u16::from_le_bytes(out[2 * i..2 * i + 2].try_into().unwrap());
+        assert_eq!(got, *h, "bf16 to bf16, datum {i}: {h:#06x}");
+    }
+
+    // A comparison's `bool` and a `sel` over bf16, in the same 16-bit `Dst`:
+    // the smaller operand, exactly (no rounding on this path).
+    let pairs: Vec<u16> = (0..2048)
+        .map(|i| truncate_to_bf16((i as f32 - 1024.0) * 0.125))
+        .collect();
+    let pair_bytes: Vec<u8> = pairs.iter().flat_map(|h| h.to_le_bytes()).collect();
+    let out = run_kernel(BF16_MIN, &pair_bytes, count * 2);
+    for i in 0..count {
+        let (a, b) = (widen_bf16(pairs[i]), widen_bf16(pairs[i + 1024]));
+        let want = truncate_to_bf16(if a < b { a } else { b });
+        let got = u16::from_le_bytes(out[2 * i..2 * i + 2].try_into().unwrap());
+        assert_eq!(got, want, "bf16 cmplt and sel, datum {i}");
+    }
+}
+
+/// Narrowing *into* a bf16 buffer out of a 32-bit `Dst` is the packer's format
+/// conversion, which tt-metal supports (`is_packer_to_L1_early_conversion_supported`:
+/// `Float32 -> Float16_b`) but ttsim does not model: the packer asks for
+/// `pack_fmt_conv_mode=0x105` and the simulator exits with
+/// `UnimplementedFunctionality`. The kernel is still built for silicon; the gate
+/// runs where the conversion exists.
+#[test]
+#[ignore = "ttsim does not model the f32-Dst to bf16-L1 pack (pack_fmt_conv_mode=0x105)"]
+fn narrowing_to_bf16_from_a_32_bit_dst_is_the_packers() {
+    let count = 1024usize;
+
+    // f32 to bf16: the packer's conversion, including its NaN canonicalization
+    // and its flush of the bf16 subnormal range.
+    let mut floats = vec![
+        0.0f32,
+        -0.0,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+        1.0,
+    ];
+    let mut seed = 0x5eed_u32;
+    while floats.len() < count {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        if seed & 0x7f80_0000 == 0 || seed & 0x7f80_0000 == 0x7f80_0000 {
+            continue;
+        }
+        floats.push(f32::from_bits(seed));
+    }
+    let f32_bytes: Vec<u8> = floats.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel(CAST_F32_TO_BF16, &f32_bytes, count * 2);
+    for (i, v) in floats.iter().enumerate() {
+        let got = u16::from_le_bytes(out[2 * i..2 * i + 2].try_into().unwrap());
+        assert_eq!(
+            got,
+            packer_bf16(*v),
+            "f32 to bf16, datum {i}: {v} ({:#010x})",
+            v.to_bits()
+        );
+    }
+
+    // i32 to bf16: `(float)i`, then the packer.
+    let ints: Vec<i32> = (0..count).map(|i| (i as i32 - 512) * 4099).collect();
+    let i32_bytes: Vec<u8> = ints.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel(CAST_I32_TO_BF16, &i32_bytes, count * 2);
+    for (i, v) in ints.iter().enumerate() {
+        let got = u16::from_le_bytes(out[2 * i..2 * i + 2].try_into().unwrap());
+        assert_eq!(got, packer_bf16(*v as f32), "i32 to bf16, datum {i}: {v}");
+    }
+
+    // A bool to bf16: one or zero, through the same narrowing.
+    let out = run_kernel(CAST_BOOL_TO_BF16, &f32_bytes, count * 2);
+    for (i, v) in floats.iter().enumerate() {
+        let got = u16::from_le_bytes(out[2 * i..2 * i + 2].try_into().unwrap());
+        let want = if *v < 0.0 { 0x3f80 } else { 0 };
+        assert_eq!(got, want, "bool to bf16, datum {i}: {v}");
+    }
+}
+
+#[test]
+fn a_bf16_value_cannot_widen_through_dst() {
+    let lib = library();
+    let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
+    let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
+
+    let mut module: *mut c_void = std::ptr::null_mut();
+    let mut err: *mut c_char = std::ptr::null_mut();
+    let code = unsafe {
+        compile(
+            CAST_BF16_TO_F32.as_ptr().cast(),
+            CAST_BF16_TO_F32.len(),
+            &mut module,
+            &mut err,
+        )
+    };
+    assert_eq!(code, TT_ERROR_BF16_WIDEN, "bf16 to f32 is refused");
+    assert!(module.is_null() && !err.is_null());
+    assert_eq!(take_error(&free, err), "TT_ERROR_BF16_WIDEN");
 }

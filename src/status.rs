@@ -357,6 +357,13 @@ pub enum ttStatus {
     /// entry, or a mask that contradicts the specification (holes in the middle,
     /// or more columns than the part has).
     TT_ERROR_TELEMETRY = 152,
+    /// A bf16 value has to cross the `Dst` boundary into or out of a 32-bit
+    /// datum. The unpacker cannot widen bf16 into a 32-bit `Dst`, and a 16-bit
+    /// `Dst` cannot pack `f32`/`i32` (`Unpackers/FormatConversion.md`,
+    /// `tt_llk_*/common/inc/cunpack_common.h` and `cpack_common.h`), so the
+    /// conversion needs `SrcA`/`SrcB` and the Matrix Unit, which this compiler
+    /// does not place.
+    TT_ERROR_BF16_WIDEN = 153,
 }
 
 impl ttStatus {
@@ -517,6 +524,7 @@ impl ttStatus {
             ttStatus::TT_ERROR_GRID_COORD => "TT_ERROR_GRID_COORD",
             ttStatus::TT_ERROR_BITCAST_WIDTH => "TT_ERROR_BITCAST_WIDTH",
             ttStatus::TT_ERROR_TELEMETRY => "TT_ERROR_TELEMETRY",
+            ttStatus::TT_ERROR_BF16_WIDEN => "TT_ERROR_BF16_WIDEN",
         }
     }
 }
