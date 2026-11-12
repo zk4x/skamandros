@@ -401,6 +401,18 @@ pub enum ttStatus {
     /// A machine `SFPSTORE` names an odd `Dst` row. The store's
     /// `dest_reg_addr` names a row pair and the hardware refuses an odd one.
     TT_ERROR_DST_ROW_ODD = 165,
+    /// A reduce's destination is not an `acc` value. A reduce folds into a
+    /// named `Dst` tile, which is accumulated into and packed out.
+    TT_ERROR_REDUCE_ACC = 166,
+    /// A reduce's operand is not a `load` page. The folding happens on the Src
+    /// path, from an L1 page, never from a computed register value.
+    TT_ERROR_REDUCE_OPERAND = 167,
+    /// A reduce's dtypes are outside what the Src path takes: `f32` and `bf16`
+    /// operands of one dtype, an `f32` or `bf16` accumulator, and no `f32`
+    /// operand accumulating into a `bf16` accumulator.
+    TT_ERROR_REDUCE_DTYPE = 168,
+    /// A reduce form that is not lowered yet.
+    TT_TODO_REDUCE = 169,
 }
 
 impl ttStatus {
@@ -572,6 +584,10 @@ impl ttStatus {
             ttStatus::TT_ERROR_ACC_DTYPE => "TT_ERROR_ACC_DTYPE",
             ttStatus::TT_ERROR_ACC_OFFSET => "TT_ERROR_ACC_OFFSET",
             ttStatus::TT_TODO_ACC_STORE => "TT_TODO_ACC_STORE",
+            ttStatus::TT_ERROR_REDUCE_ACC => "TT_ERROR_REDUCE_ACC",
+            ttStatus::TT_ERROR_REDUCE_OPERAND => "TT_ERROR_REDUCE_OPERAND",
+            ttStatus::TT_ERROR_REDUCE_DTYPE => "TT_ERROR_REDUCE_DTYPE",
+            ttStatus::TT_TODO_REDUCE => "TT_TODO_REDUCE",
             ttStatus::TT_ERROR_DST_ROW_ODD => "TT_ERROR_DST_ROW_ODD",
         }
     }

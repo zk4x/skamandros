@@ -117,6 +117,12 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             last_use[v as usize] = Some(at);
             match *op {
                 Op::Matmul { a, b, .. } if v == a || v == b => matmul_use[v as usize] = true,
+                // A reduce's operands are Src operands too: the fold runs on
+                // the Src path from their pages, exactly as `matmul`'s do.
+                Op::Sum { x, scaler, .. } if v == x || v == scaler => {
+                    matmul_use[v as usize] = true;
+                }
+                Op::Max { x, .. } if v == x => matmul_use[v as usize] = true,
                 _ => non_matmul_use[v as usize] = true,
             }
         }
@@ -643,7 +649,27 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     });
                 }
             }
-            Op::Matmul { acc, a, b } => {
+            // `max` is `GMPOOL`, which lands next; the refusal is loud.
+            Op::Max { .. } => return Err(Error::TT_TODO_REDUCE),
+            // `sum row` is the Matrix Unit's `x @ scaler`: tt-metal's
+            // `ReduceDim::ROW` with `PoolType::SUM` is a matmul against the
+            // scaler's column of ones, not a pool instruction, so it shares
+            // this sequence. The other dims are `GAPOOL`.
+            Op::Matmul { .. } | Op::Sum { .. } => {
+                let (acc, a, b) = match *op {
+                    Op::Matmul { acc, a, b } => (acc, a, b),
+                    Op::Sum {
+                        acc,
+                        dim: crate::ir::ReduceDim::Row,
+                        x,
+                        scaler,
+                    } => (acc, x, scaler),
+                    Op::Sum { dim, .. } => {
+                        let _ = dim;
+                        return Err(Error::TT_TODO_REDUCE);
+                    }
+                    _ => unreachable!("the arm pattern is matmul and sum"),
+                };
                 let dt_a = types.of(a).dtype;
                 let dt_b = types.of(b).dtype;
                 let dtype = types.of(acc).dtype;
@@ -1202,7 +1228,7 @@ mod tests {
     #[test]
     fn a_dst_write_after_a_post_waits_for_the_packer() {
         const PROGRAM: &str = "\
-version 6
+version 7
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024

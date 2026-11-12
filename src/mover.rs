@@ -404,6 +404,22 @@ fn remap(op: &Op, map: &[ValueId], value: Option<ValueId>) -> Op {
             a: v(a),
             b: v(b),
         },
+        Op::Sum {
+            acc,
+            dim,
+            x,
+            scaler,
+        } => Op::Sum {
+            acc: v(acc),
+            dim,
+            x: v(x),
+            scaler: v(scaler),
+        },
+        Op::Max { acc, dim, x } => Op::Max {
+            acc: v(acc),
+            dim,
+            x: v(x),
+        },
     }
 }
 

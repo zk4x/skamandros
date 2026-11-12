@@ -18,7 +18,7 @@ values. It names no processor, no `Dst` slot, no `Src` bank, no lane register,
 no semaphore, no unpacker, no packer and no Tensix word:
 
 ```
-version 6
+version 7
 grid 1,1
 %in  = param f32 1024,128
 %out = param f32 1024,128
@@ -50,8 +50,9 @@ The op set is the low-level one and nothing more: zyx's `UOp`
 `cos`, `floor`, `trunc`, `abs`), zyx's `BOp` (`add`, `sub`, `mul`, `div`, `pow`,
 `mod`, `cmplt`, `cmpgt`, `cmpge`, `max`, `or`, `and`, `bitxor`, `bitor`, `bitand`,
 `bitshiftleft`, `bitshiftright`, `noteq`, `eq`), `sel` (`cond ? if_true :
-if_false`, the branchless `v_if`), and the matrix multiply. A comparison produces
-a `bool`, and `sel` takes one. There is no `relu`/`elu`/`sigmoid` op.
+if_false`, the branchless `v_if`), the matrix multiply, and the reduce. A
+comparison produces a `bool`, and `sel` takes one. There is no
+`relu`/`elu`/`sigmoid` op.
 
 The crate decides which machine programs each instruction belongs to, where each
 register value lives, which lane registers its body uses, how a buffer is read
@@ -298,9 +299,22 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   width. A `load` that also feeds a datapath op keeps its `Dst` unpack and is
   unpacked once more into `Src` at the matmul; its page is released after the
   Matrix Unit has read it.
-- Broadcast, `eq`/`noteq`, the remaining unary and binary ops, the `bool`
-  datapath in a parameter or buffer, and the reduce op are accepted by the
-  format and verifier and refused loudly by lowering, not guessed at.
+- `sum` and `max` fold a tile into an `acc`, spelled as tt-metal's `ReduceDim`:
+  `sum row %acc %x %scaler`, `sum col %acc %x %scaler`,
+  `sum scalar %acc %x %scaler`, and `max row|col|scalar %acc %x`. `row` is one
+  value per row, in the result tile's column 0; `col` is one per column, in row
+  0; `scalar` is one datum at face 0's `[0,0]`; everything else in the tile is
+  zero. Both operands are `load` pages, because the fold runs on the Src path.
+  `sum row` is the Matrix Unit's `x @ scaler` — tt-metal's `SUM` with
+  `ReduceDim::ROW` is a matmul against the scaler's column of ones, so the
+  scaler page carries the factor in column 0 and zeros elsewhere, which is also
+  how the result ends up in column 0. `max` takes no scaler: `GMPOOL` applies
+  only the exponent of a non-unity scaler, so tt-metal always reduces `MAX` with
+  1.0 and scales the packed result afterwards. The other dims and `max` lower to
+  `GAPOOL`/`GMPOOL` next; until then they are refused with `TT_TODO_REDUCE`.
+- Broadcast, `eq`/`noteq`, the remaining unary and binary ops, and the `bool`
+  datapath in a parameter or buffer are accepted by the format and verifier and
+  refused loudly by lowering, not guessed at.
 - bf16 is a real L1 format and the native compute path. A bf16 buffer is two
   bytes per datum, and the `Dst` width is one mode for the whole module, as
   tt-metal's `DST_ACCUM_MODE` (`fp32_dest_acc_en`) is: if every value that

@@ -25,8 +25,8 @@ use crate::compile::Module;
 use crate::device::Device;
 use crate::ir::Error;
 use tt_isa::mailbox;
-use tt_isa::noc::niu::Niu;
 use tt_isa::noc::NocCoord;
+use tt_isa::noc::niu::Niu;
 
 /// The one open device, if [`init`] has been called.
 static DEVICE: Mutex<Option<Device>> = Mutex::new(None);

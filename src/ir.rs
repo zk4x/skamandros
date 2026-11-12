@@ -129,6 +129,60 @@ impl RegShape {
     }
 }
 
+/// Which axis a reduce folds, and where its result lands: tt-metal's
+/// `ReduceDim`, and zyx's `TileDim` under the same names.
+///
+/// `Row` folds the columns of each row into column 0 of that row, `Col` folds
+/// the rows of each column into row 0 of that column, and `Scalar` folds the
+/// whole tile into face 0's `[0,0]`. Everything else in the result tile is
+/// zero: the pool writes only the folded values, and a pack out of a reduced
+/// accumulator carries the packer's edge mask so the rest leaves as zeros.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReduceDim {
+    /// One value per row, in the result tile's column 0.
+    Row,
+    /// One value per column, in the result tile's row 0.
+    Col,
+    /// One value, in the result tile's face 0 `[0,0]`.
+    Scalar,
+}
+
+impl ReduceDim {
+    pub fn name(self) -> &'static str {
+        match self {
+            ReduceDim::Row => "row",
+            ReduceDim::Col => "col",
+            ReduceDim::Scalar => "scalar",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<ReduceDim> {
+        Some(match name {
+            "row" => ReduceDim::Row,
+            "col" => ReduceDim::Col,
+            "scalar" => ReduceDim::Scalar,
+            _ => return None,
+        })
+    }
+
+    fn tag(self) -> u8 {
+        match self {
+            ReduceDim::Row => 0,
+            ReduceDim::Col => 1,
+            ReduceDim::Scalar => 2,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Option<ReduceDim> {
+        Some(match tag {
+            0 => ReduceDim::Row,
+            1 => ReduceDim::Col,
+            2 => ReduceDim::Scalar,
+            _ => return None,
+        })
+    }
+}
+
 /// What a value names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueKind {
@@ -512,6 +566,33 @@ pub enum Op {
         a: ValueId,
         b: ValueId,
     },
+    /// `sum <dim> %acc %x %scaler`: fold `x` with an add, into `acc`, scaled
+    /// by the factors in `scaler` (tt-metal's `PoolType::SUM`).
+    ///
+    /// `x` and `scaler` are `load` pages, because the folding happens on the
+    /// Src path: `Row` is the Matrix Unit's `x @ scaler` (tt-metal's split —
+    /// `SUM` with `ReduceDim::ROW` is a matmul against the scaler's column of
+    /// ones), and `Col`/`Scalar` are `GAPOOL`, whose scaler is its `SrcB`
+    /// operand. The scaler's layout follows the hardware: column 0 for `Row`,
+    /// row 0 otherwise.
+    Sum {
+        acc: ValueId,
+        dim: ReduceDim,
+        x: ValueId,
+        scaler: ValueId,
+    },
+    /// `max <dim> %acc %x`: fold `x` with a maximum into `acc` (tt-metal's
+    /// `PoolType::MAX`, `GMPOOL`).
+    ///
+    /// No scaler: `GMPOOL` applies only the exponent of a non-unity scaler
+    /// (`exp2(floor(log2(|s|)))`), so tt-metal always reduces `MAX` with 1.0
+    /// and scales the packed result afterwards with an SFPU multiply. The
+    /// compiler supplies the 1.0 tile this op's `SrcB` still needs.
+    Max {
+        acc: ValueId,
+        dim: ReduceDim,
+        x: ValueId,
+    },
 }
 
 impl Op {
@@ -534,7 +615,9 @@ impl Op {
             | Op::EndLoop
             | Op::CopyTo { .. }
             | Op::StoreTo { .. }
-            | Op::Matmul { .. } => None,
+            | Op::Matmul { .. }
+            | Op::Sum { .. }
+            | Op::Max { .. } => None,
         }
     }
 
@@ -582,6 +665,8 @@ impl Op {
                 ..
             } => vec![*cond, *if_true, *if_false],
             Op::Matmul { acc, a, b } => vec![*acc, *a, *b],
+            Op::Sum { acc, x, scaler, .. } => vec![*acc, *x, *scaler],
+            Op::Max { acc, x, .. } => vec![*acc, *x],
             Op::Loop { bound, .. } => dim(bound).into_iter().collect(),
             Op::Grid { columns, rows } => dim(columns).into_iter().chain(dim(rows)).collect(),
             Op::Param { dims, .. } => dims.iter().filter_map(dim).collect(),
@@ -1245,6 +1330,48 @@ impl Kernel {
                     // The accumulator is written in place: no value is defined.
                     continue;
                 }
+                ref reduce @ (Op::Sum { .. } | Op::Max { .. }) => {
+                    let (acc, x, scaler) = match *reduce {
+                        Op::Sum { acc, x, scaler, .. } => (acc, x, Some(scaler)),
+                        Op::Max { acc, x, .. } => (acc, x, None),
+                        _ => unreachable!("the arm pattern is the two reduce ops"),
+                    };
+                    let c = *lookup(&values, &visible, acc, at)?;
+                    if c.kind != ValueKind::Acc {
+                        let _ = (at, acc);
+                        return Err(Error::TT_ERROR_REDUCE_ACC);
+                    }
+                    // The folding happens on the Src path, from an L1 page:
+                    // both operands must be `load`s, as a `matmul`'s are.
+                    let loaded = |value: ValueId| -> bool {
+                        matches!(self.ops.get(def[value as usize]), Some(Op::Load { .. }))
+                    };
+                    let v = *lookup(&values, &visible, x, at)?;
+                    if !is_value(v.kind) || v.shape != RegShape::Tile || !loaded(x) {
+                        let _ = (at, x);
+                        return Err(Error::TT_ERROR_REDUCE_OPERAND);
+                    }
+                    if !matches!(v.dtype, DType::F32 | DType::Bf16)
+                        || !matches!(c.dtype, DType::F32 | DType::Bf16)
+                        || (v.dtype == DType::F32 && c.dtype == DType::Bf16)
+                    {
+                        let _ = (v.dtype, c.dtype);
+                        return Err(Error::TT_ERROR_REDUCE_DTYPE);
+                    }
+                    if let Some(scaler) = scaler {
+                        let s = *lookup(&values, &visible, scaler, at)?;
+                        if !is_value(s.kind) || s.shape != RegShape::Tile || !loaded(scaler) {
+                            let _ = (at, scaler);
+                            return Err(Error::TT_ERROR_REDUCE_OPERAND);
+                        }
+                        if s.dtype != v.dtype {
+                            let _ = (s.dtype, v.dtype);
+                            return Err(Error::TT_ERROR_REDUCE_DTYPE);
+                        }
+                    }
+                    // The accumulator is written in place: no value is defined.
+                    continue;
+                }
             };
             values.push(info);
             visible.push(true);
@@ -1372,7 +1499,7 @@ fn param_elements(k: &Kernel, def: &[usize], param: ValueId) -> Option<u32> {
 /// The byte form's magic.
 pub const MAGIC: [u8; 4] = *b"TTIR";
 /// The IR version this build reads and writes.
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 
 impl Kernel {
     /// The byte form: the same program as [`Kernel::to_text`], little-endian and
@@ -1500,6 +1627,24 @@ impl Kernel {
                     put_u32(&mut b, *acc);
                     put_u32(&mut b, *a);
                     put_u32(&mut b, *rhs);
+                }
+                Op::Sum {
+                    acc,
+                    dim,
+                    x,
+                    scaler,
+                } => {
+                    b.push(17);
+                    put_u32(&mut b, *acc);
+                    put_u32(&mut b, *x);
+                    put_u32(&mut b, *scaler);
+                    b.push(dim.tag());
+                }
+                Op::Max { acc, dim, x } => {
+                    b.push(18);
+                    put_u32(&mut b, *acc);
+                    put_u32(&mut b, *x);
+                    b.push(dim.tag());
                 }
                 Op::Acc {
                     value,
@@ -1666,6 +1811,26 @@ impl Kernel {
                         if_true,
                         if_false,
                     }
+                }
+                17 => {
+                    let acc = r.u32()?;
+                    let x = r.u32()?;
+                    let scaler = r.u32()?;
+                    let dim =
+                        ReduceDim::from_tag(r.u8()?).ok_or(Error::TT_ERROR_INSTRUCTION_TAG)?;
+                    Op::Sum {
+                        acc,
+                        dim,
+                        x,
+                        scaler,
+                    }
+                }
+                18 => {
+                    let acc = r.u32()?;
+                    let x = r.u32()?;
+                    let dim =
+                        ReduceDim::from_tag(r.u8()?).ok_or(Error::TT_ERROR_INSTRUCTION_TAG)?;
+                    Op::Max { acc, dim, x }
                 }
                 other => {
                     let _ = other;
@@ -1863,6 +2028,27 @@ impl Kernel {
                 p.ops.push(Op::Matmul { acc, a, b });
                 continue;
             }
+            if first == "sum" || first == "max" {
+                let word = t.ident()?;
+                let dim =
+                    ReduceDim::from_name(&word).ok_or_else(|| t.err("no reduce dimension"))?;
+                let acc = t.value(&p.symbols)?;
+                let x = t.value(&p.symbols)?;
+                let op = if first == "sum" {
+                    let scaler = t.value(&p.symbols)?;
+                    Op::Sum {
+                        acc,
+                        dim,
+                        x,
+                        scaler,
+                    }
+                } else {
+                    Op::Max { acc, dim, x }
+                };
+                t.end()?;
+                p.ops.push(op);
+                continue;
+            }
             if first == "endloop" {
                 t.end()?;
                 p.ops.push(Op::EndLoop);
@@ -2055,6 +2241,28 @@ impl Kernel {
                         name(*acc),
                         name(*a),
                         name(*b)
+                    ));
+                }
+                Op::Sum {
+                    acc,
+                    dim,
+                    x,
+                    scaler,
+                } => {
+                    s.push_str(&format!(
+                        "sum {} %{} %{} %{}\n",
+                        dim.name(),
+                        name(*acc),
+                        name(*x),
+                        name(*scaler)
+                    ));
+                }
+                Op::Max { acc, dim, x } => {
+                    s.push_str(&format!(
+                        "max {} %{} %{}\n",
+                        dim.name(),
+                        name(*acc),
+                        name(*x)
                     ));
                 }
             }

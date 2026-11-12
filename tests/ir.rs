@@ -14,7 +14,7 @@ use TT::ir::Kernel;
 #[test]
 fn the_unified_program_round_trips() {
     const PROGRAM: &str = "\
-version 6
+version 7
 grid 4,6
 %p0 = param bf16 1024,132,453
 %p1 = param bf16 1024,232
@@ -56,7 +56,7 @@ matmul %m %a %b
     // Symbolic grid and symbolic parameter dims, with the grid after the values
     // it reads: a scalar parameter is a rank-0 shape.
     const SYMBOLIC: &str = "\
-version 6
+version 7
 %d = param i32 0
 %x = param bf16 1024,%d
 grid %d,8
@@ -70,13 +70,13 @@ grid %d,8
 #[test]
 fn a_buffer_shape_that_is_not_one_or_a_multiple_of_32_is_refused() {
     for shape in ["33,32", "32,33", "16,32"] {
-        let text = format!("version 6\n%x = buffer f32 {shape}\ngrid 1,1\n");
+        let text = format!("version 7\n%x = buffer f32 {shape}\ngrid 1,1\n");
         let err = Kernel::parse(&text).expect_err(shape);
         assert_eq!(err, TT::status::ttStatus::TT_ERROR_BUFFER_SHAPE, "{shape}");
     }
     // A buffer is always two-dimensional and always constant.
     for shape in ["32", "32,%d"] {
-        let text = format!("version 6\n%d = const i32 4\n%x = buffer f32 {shape}\ngrid 1,1\n");
+        let text = format!("version 7\n%d = const i32 4\n%x = buffer f32 {shape}\ngrid 1,1\n");
         assert!(
             Kernel::parse(&text).is_err(),
             "{shape} is not a buffer shape"
@@ -86,7 +86,7 @@ fn a_buffer_shape_that_is_not_one_or_a_multiple_of_32_is_refused() {
 
 #[test]
 fn a_zero_dimension_is_not_the_way_to_write_a_tensor() {
-    let text = "version 6\n%p = param f32 0,32\ngrid 1,1\n";
+    let text = "version 7\n%p = param f32 0,32\ngrid 1,1\n";
     let err = Kernel::parse(text).expect_err("a zero in a dimension list");
     assert_eq!(err, TT::status::ttStatus::TT_ERROR_ZERO_DIMENSION);
 }
@@ -94,7 +94,7 @@ fn a_zero_dimension_is_not_the_way_to_write_a_tensor() {
 #[test]
 fn an_implicit_dtype_conversion_is_refused() {
     let text = "\
-version 6
+version 7
 %a = const f32 1.0
 %b = const i32 1
 %c = add %a %b
@@ -106,7 +106,7 @@ grid 1,1
 
 #[test]
 fn a_use_before_its_definition_is_refused() {
-    let text = "version 6\n%x = add %a %b\n%a = const i32 1\n%b = const i32 2\ngrid 1,1\n";
+    let text = "version 7\n%x = add %a %b\n%a = const i32 1\n%b = const i32 2\ngrid 1,1\n";
     let err = Kernel::parse(text).expect_err("undefined value");
     assert_eq!(err, TT::status::ttStatus::TT_ERROR_PARSE);
 }
@@ -114,7 +114,7 @@ fn a_use_before_its_definition_is_refused() {
 #[test]
 fn a_value_does_not_escape_its_loop() {
     let text = "\
-version 6
+version 7
 %n = const i32 4
 %i = loop %n
 %x = add %i %n
@@ -128,9 +128,9 @@ grid 1,1
 
 #[test]
 fn a_program_needs_exactly_one_grid() {
-    let err = Kernel::parse("version 6\n%x = const i32 1\n").expect_err("no grid");
+    let err = Kernel::parse("version 7\n%x = const i32 1\n").expect_err("no grid");
     assert_eq!(err, TT::status::ttStatus::TT_ERROR_GRID);
-    let err = Kernel::parse("version 6\ngrid 1,1\ngrid 2,2\n").expect_err("two grids");
+    let err = Kernel::parse("version 7\ngrid 1,1\ngrid 2,2\n").expect_err("two grids");
     assert_eq!(err, TT::status::ttStatus::TT_ERROR_GRID);
 }
 
@@ -139,7 +139,7 @@ fn an_unknown_version_is_refused_in_both_forms() {
     let err = Kernel::parse("version 1\ngrid 1,1\n").expect_err("version 1");
     assert_eq!(err, TT::status::ttStatus::TT_ERROR_VERSION);
 
-    let mut bytes = Kernel::parse("version 6\ngrid 1,1\n%x = const i32 1\n")
+    let mut bytes = Kernel::parse("version 7\ngrid 1,1\n%x = const i32 1\n")
         .unwrap()
         .to_bytes();
     assert_eq!(&bytes[..4], b"TTIR");
@@ -153,7 +153,7 @@ fn an_unknown_version_is_refused_in_both_forms() {
         Err(TT::status::ttStatus::TT_ERROR_NOT_TTIR),
         "a wrong magic"
     );
-    let mut bytes = Kernel::parse("version 6\ngrid 1,1\n%x = const i32 1\n")
+    let mut bytes = Kernel::parse("version 7\ngrid 1,1\n%x = const i32 1\n")
         .unwrap()
         .to_bytes();
     bytes.push(0);
@@ -166,7 +166,7 @@ fn an_unknown_version_is_refused_in_both_forms() {
 #[test]
 fn a_copy_kernel_compiles_to_mover_programs_only() {
     const COPY: &str = "\
-version 6
+version 7
 %in = param f32 8192
 %out = param f32 8192
 %b0 = buffer f32 32,64
@@ -195,7 +195,7 @@ grid 1,1
 #[test]
 fn an_elementwise_kernel_compiles_to_all_five_programs() {
     const NEG: &str = "\
-version 6
+version 7
 %in = param f32 4096
 %out = param f32 4096
 %bi = buffer f32 32,32
@@ -223,7 +223,7 @@ grid 1,1
 #[test]
 fn a_direct_parameter_access_gets_its_movers() {
     const DIRECT: &str = "\
-version 6
+version 7
 %in = param f32 4096
 %out = param f32 4096
 %x = load %in [0]
@@ -276,7 +276,7 @@ grid 1,1
 #[test]
 fn a_constant_loop_becomes_a_branch() {
     const LOOP_TWO: &str = "\
-version 6
+version 7
 %in = param f32 2048
 %out = param f32 2048
 %bi = buffer f32 32,64
@@ -322,7 +322,7 @@ fn has_backward_branch(words: &[u32]) -> bool {
 #[test]
 fn a_dynamic_loop_becomes_a_branch() {
     const DYNAMIC: &str = "\
-version 6
+version 7
 %n = param i32 0
 %in = param f32 2048
 %out = param f32 2048
@@ -351,7 +351,7 @@ grid 1,1
 #[test]
 fn the_grid_is_symbolic_and_the_coordinate_is_a_value() {
     const SYMBOLIC: &str = "\
-version 6
+version 7
 %nx = param i32 0
 %ny = param i32 0
 %in = param f32 2048
@@ -389,7 +389,7 @@ grid %nx,%ny
 #[test]
 fn comparisons_make_a_bool_and_sel_takes_one() {
     const SELECT: &str = "\
-version 6
+version 7
 %x = const i32 3
 %y = const i32 5
 %lt = cmplt %x %y
@@ -404,11 +404,11 @@ grid 1,1
     assert_eq!(types.values[3].dtype, TT::ir::DType::I32, "sel is i32");
 
     // A bool condition is required, and a value with no bool is not one.
-    let bad = "version 6\n%x = const i32 3\n%m = sel %x %x %x\ngrid 1,1\n";
+    let bad = "version 7\n%x = const i32 3\n%m = sel %x %x %x\ngrid 1,1\n";
     let err = Kernel::parse(bad).expect_err("an i32 condition is refused");
     assert_eq!(err, TT::status::ttStatus::TT_ERROR_CONDITION_NOT_BOOL);
 
-    let err = Kernel::parse("version 6\n%x = const i32 3\n%y = relu %x\ngrid 1,1\n")
+    let err = Kernel::parse("version 7\n%x = const i32 3\n%y = relu %x\ngrid 1,1\n")
         .expect_err("relu is not an op");
     assert_eq!(err, TT::status::ttStatus::TT_ERROR_PARSE);
 }
@@ -418,7 +418,7 @@ grid 1,1
 #[test]
 fn a_bitcast_is_the_same_bits_under_another_name() {
     const SAME: &str = "\
-version 6
+version 7
 %in = param f32 2048
 %out = param i32 2048
 %bi = buffer f32 32,32
@@ -441,7 +441,7 @@ grid 1,1
 
     // 32 bits do not fit a 16-bit dtype, and a bitcast may not convert.
     const NARROW: &str = "\
-version 6
+version 7
 %b = buffer f32 32,32
 %x = load %b [0]
 %y = bitcast %x to bf16
@@ -455,7 +455,7 @@ grid 1,1
 /// be `load`s, because the Matrix Unit's `SrcA`/`SrcB` are filled by the
 /// unpacker from a CB page.
 const MATMUL: &str = "\
-version 6
+version 7
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -497,7 +497,7 @@ fn a_matmul_is_refused_for_what_the_matrix_unit_cannot_take() {
     case(
         "a negated operand",
         "\
-version 6
+version 7
 grid 1,1
 %pa = param f32 1024
 %out = param f32 1024
@@ -524,7 +524,7 @@ copy_to %out from %bo [0]
     case(
         "a buffer where the accumulator goes",
         "\
-version 6
+version 7
 grid 1,1
 %pa = param f32 1024
 %out = param f32 1024
@@ -546,7 +546,7 @@ copy_to %out from %bo [0]
     case(
         "bf16 accumulation beside an f32 value",
         "\
-version 6
+version 7
 grid 1,1
 %pa = param bf16 1024
 %pf = param f32 1024
@@ -581,7 +581,7 @@ copy_to %out from %bo [0]
     case(
         "f32 operands, bf16 accumulator",
         "\
-version 6
+version 7
 grid 1,1
 %pa = param f32 1024
 %out = param bf16 1024
@@ -607,7 +607,7 @@ copy_to %out from %bo [0]
     case(
         "i32 operands",
         "\
-version 6
+version 7
 grid 1,1
 %pa = param i32 1024
 %out = param i32 1024
@@ -635,12 +635,12 @@ fn an_acc_is_one_32x32_tile_of_an_accumulating_dtype() {
     };
     case(
         "a 16x16 accumulator",
-        "version 6\n%m = acc f32 16,16\ngrid 1,1\n",
+        "version 7\n%m = acc f32 16,16\ngrid 1,1\n",
         S::TT_ERROR_ACC_SHAPE,
     );
     case(
         "an i32 accumulator",
-        "version 6\n%m = acc i32 32,32\ngrid 1,1\n",
+        "version 7\n%m = acc i32 32,32\ngrid 1,1\n",
         S::TT_ERROR_ACC_DTYPE,
     );
     // A store into an accumulator names no offset, and only a constant fills
@@ -648,7 +648,7 @@ fn an_acc_is_one_32x32_tile_of_an_accumulating_dtype() {
     case(
         "an offset on an accumulator store",
         "\
-version 6
+version 7
 grid 1,1
 %m = acc f32 32,32
 %zero = const f32 0
@@ -659,7 +659,7 @@ store_to %m from %zero [1024]
     case(
         "a tile stored into an accumulator",
         "\
-version 6
+version 7
 grid 1,1
 %p = param f32 1024
 %b = buffer f32 32,32
@@ -669,5 +669,160 @@ copy_to %b from %p [0]
 store_to %m from %x
 ",
         S::TT_TODO_ACC_STORE,
+    );
+}
+
+/// One tile in and one tile out, with `body` as the reduce: the program a
+/// reduce gate is written as. `with_scaler` adds the second operand, which
+/// `max` does not name.
+fn reduce_program(body: &str, with_scaler: bool) -> String {
+    let mut s = String::from("version 7\ngrid 1,1\n%px = param f32 1024\n");
+    if with_scaler {
+        s.push_str("%ps = param f32 1024\n");
+    }
+    s.push_str("%out = param f32 1024\n%bx = buffer f32 32,32\n");
+    if with_scaler {
+        s.push_str("%bs = buffer f32 32,32\n");
+    }
+    s.push_str("%bo = buffer f32 32,32\ncopy_to %bx from %px [0]\n");
+    if with_scaler {
+        s.push_str("copy_to %bs from %ps [0]\n");
+    }
+    s.push_str(
+        "%m = acc f32 32,32\n%zero = const f32 0\nstore_to %m from %zero\n%x = load %bx [0]\n",
+    );
+    if with_scaler {
+        s.push_str("%s = load %bs [0]\n");
+    }
+    s.push_str(body);
+    s.push_str("\nstore_to %bo from %m [0]\ncopy_to %out from %bo [0]\n");
+    s
+}
+
+/// The three dimensions and both folds, spelled as tt-metal spells them
+/// (`ReduceDim::{ROW, COL, SCALAR}`), round-trip through both forms. `sum`
+/// names the scaler; `max` does not, because `GMPOOL` applies only the
+/// exponent of a non-unity scaler.
+#[test]
+fn the_reduce_forms_round_trip_through_text_and_bytes() {
+    for (body, with_scaler) in [
+        ("sum row %m %x %s", true),
+        ("sum col %m %x %s", true),
+        ("sum scalar %m %x %s", true),
+        ("max row %m %x", false),
+        ("max col %m %x", false),
+        ("max scalar %m %x", false),
+    ] {
+        let text = reduce_program(body, with_scaler);
+        let k = Kernel::parse(&text).unwrap_or_else(|e| panic!("{body} parses: {e}"));
+        assert!(
+            k.to_text().contains(body),
+            "{body} keeps its own spelling:\n{}",
+            k.to_text()
+        );
+        assert_eq!(
+            Kernel::parse(&k.to_text()).expect("the text round-trips"),
+            k,
+            "{body}"
+        );
+        assert_eq!(
+            Kernel::from_bytes(&k.to_bytes()).expect("the bytes round-trip"),
+            k,
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn a_sum_row_compiles_to_the_matrix_unit() {
+    let k = Kernel::parse(&reduce_program("sum row %m %x %s", true)).expect("it parses");
+    let m = TT::compile::compile(&k).unwrap_or_else(|e| panic!("it compiles: {e}"));
+    assert_eq!(m.params.len(), 3);
+}
+
+#[test]
+fn a_reduce_is_refused_for_what_the_src_path_cannot_take() {
+    use TT::status::ttStatus as S;
+    let case = |what: &str, text: &str, want: S| {
+        let err = match Kernel::parse(text) {
+            Ok(k) => TT::compile::compile(&k).expect_err(what),
+            Err(e) => e,
+        };
+        assert_eq!(err, want, "{what}");
+    };
+
+    // An operand the datapath computed has no page to unpack into `Src`.
+    case(
+        "a negated operand",
+        &reduce_program("%n = neg %x\nsum row %m %n %s", true),
+        S::TT_ERROR_REDUCE_OPERAND,
+    );
+    // The destination is not an accumulator.
+    case(
+        "a buffer where the accumulator goes",
+        &reduce_program("sum row %bo %x %s", true),
+        S::TT_ERROR_REDUCE_ACC,
+    );
+    // The scaler must be the operand's dtype: `SrcB` takes the same format.
+    case(
+        "an f32 tile with a bf16 scaler",
+        "\
+version 7
+grid 1,1
+%px = param f32 1024
+%ps = param bf16 1024
+%out = param f32 1024
+%bx = buffer f32 32,32
+%bs = buffer bf16 32,32
+%bo = buffer f32 32,32
+copy_to %bx from %px [0]
+copy_to %bs from %ps [0]
+%m = acc f32 32,32
+%zero = const f32 0
+store_to %m from %zero
+%x = load %bx [0]
+%s = load %bs [0]
+sum row %m %x %s
+store_to %bo from %m [0]
+copy_to %out from %bo [0]
+",
+        S::TT_ERROR_REDUCE_DTYPE,
+    );
+    // 32-bit operands cannot accumulate into a 16-bit `Dst`.
+    case(
+        "f32 operands into a bf16 accumulator",
+        "\
+version 7
+grid 1,1
+%px = param f32 1024
+%ps = param f32 1024
+%out = param f32 1024
+%bx = buffer f32 32,32
+%bs = buffer f32 32,32
+%bo = buffer f32 32,32
+copy_to %bx from %px [0]
+copy_to %bs from %ps [0]
+%m = acc bf16 32,32
+%zero = const f32 0
+store_to %m from %zero
+%x = load %bx [0]
+%s = load %bs [0]
+sum row %m %x %s
+store_to %bo from %m [0]
+copy_to %out from %bo [0]
+",
+        S::TT_ERROR_REDUCE_DTYPE,
+    );
+    // The forms whose lowering lands next are refused loudly, never lowered
+    // as something else.
+    case(
+        "sum col",
+        &reduce_program("sum col %m %x %s", true),
+        S::TT_TODO_REDUCE,
+    );
+    case(
+        "max row",
+        &reduce_program("max row %m %x", false),
+        S::TT_TODO_REDUCE,
     );
 }

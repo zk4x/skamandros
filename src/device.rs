@@ -25,8 +25,8 @@ use crate::ir::Error;
 use tt_isa::dram::{CHANNEL_BYTES, Dram, DramChannel};
 use tt_isa::l1;
 use tt_isa::mailbox::{self, status};
-use tt_isa::noc::niu::Endpoint;
 use tt_isa::noc::NocCoord;
+use tt_isa::noc::niu::Endpoint;
 use tt_isa::tensix::{self, Core};
 
 /// The environment variable that names the simulator's shared object:
@@ -792,12 +792,7 @@ impl Device {
         Ok(())
     }
 
-    fn window_write(
-        &mut self,
-        tile: NocCoord,
-        address: u64,
-        bytes: &[u8],
-    ) -> Result<(), Error> {
+    fn window_write(&mut self, tile: NocCoord, address: u64, bytes: &[u8]) -> Result<(), Error> {
         let mut done = 0usize;
         while done < bytes.len() {
             let at = address + done as u64;
@@ -814,12 +809,7 @@ impl Device {
         Ok(())
     }
 
-    fn window_read(
-        &mut self,
-        tile: NocCoord,
-        address: u64,
-        out: &mut [u8],
-    ) -> Result<(), Error> {
+    fn window_read(&mut self, tile: NocCoord, address: u64, out: &mut [u8]) -> Result<(), Error> {
         let mut done = 0usize;
         while done < out.len() {
             let at = address + done as u64;

@@ -470,6 +470,22 @@ impl Build<'_> {
                 a: self.map_of(a),
                 b: self.map_of(b),
             },
+            Op::Sum {
+                acc,
+                dim,
+                x,
+                scaler,
+            } => Op::Sum {
+                acc: self.map_of(acc),
+                dim,
+                x: self.map_of(x),
+                scaler: self.map_of(scaler),
+            },
+            Op::Max { acc, dim, x } => Op::Max {
+                acc: self.map_of(acc),
+                dim,
+                x: self.map_of(x),
+            },
         };
         self.push(op);
     }
@@ -487,7 +503,7 @@ mod tests {
     use super::*;
 
     const LOG2: &str = "\
-version 6
+version 7
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
