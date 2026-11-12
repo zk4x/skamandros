@@ -378,8 +378,6 @@ pub enum ttStatus {
     /// `SrcA`/`SrcB`, which the unpacker fills straight from a CB page; a value
     /// the datapath computed lives in `Dst` and has no page to unpack.
     TT_ERROR_MATMUL_OPERAND = 156,
-    /// A `Config` word the program seeds is outside the `Config` address space.
-    TT_ERROR_CONFIG_WORD = 157,
     /// A machine `MVMUL` names an address-modifier entry the Matrix Unit does
     /// not have (three bits on Blackhole).
     TT_ERROR_ADDR_MOD = 158,
@@ -549,7 +547,6 @@ impl ttStatus {
             ttStatus::TT_ERROR_MATMUL_DTYPE => "TT_ERROR_MATMUL_DTYPE",
             ttStatus::TT_ERROR_MATMUL_ACCUM_WIDE => "TT_ERROR_MATMUL_ACCUM_WIDE",
             ttStatus::TT_ERROR_MATMUL_OPERAND => "TT_ERROR_MATMUL_OPERAND",
-            ttStatus::TT_ERROR_CONFIG_WORD => "TT_ERROR_CONFIG_WORD",
             ttStatus::TT_ERROR_ADDR_MOD => "TT_ERROR_ADDR_MOD",
             ttStatus::TT_ERROR_SETRWC => "TT_ERROR_SETRWC",
         }
