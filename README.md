@@ -235,6 +235,11 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   mover on RISCV B, the three compute cores (unpack on T0, math on T1, pack on
   T2) released together as RISC-V programs, and the outbound mover. A 32x32 FP32
   tile of inputs comes back negated, every datum.
+- A `gate_proj`-shaped GEMM runs over the whole grid: tiled bf16 operands, an
+  f32 accumulator, one K loop inside one output-tile loop, the tile count per
+  core derived from the grid at launch (`%per = div %ntiles %nsites`). 240 output
+  tiles over the simulator's 12 x 10 tiles, every datum checked against a host
+  GEMM (`tests/e2e.rs::gate_proj_runs_over_a_full_grid`).
 - The three compute programs are paced as a ring by three semaphores: the
   packer hands a `Dst` slot back, the unpacker publishes each loaded unit, and
   the math core publishes each stored one. Thread 0 runs the setup program

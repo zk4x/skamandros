@@ -1530,6 +1530,17 @@ fn run_kernel(program: &str, input: &[u8], out_bytes: usize) -> Vec<u8> {
 /// The same launch with `inputs.len()` tensor parameters, in order, followed by
 /// the output parameter.
 fn run_kernel_tensors(program: &str, inputs: &[&[u8]], out_bytes: usize) -> Vec<u8> {
+    run_kernel_scalars(program, &[], inputs, out_bytes)
+}
+
+/// A launch with leading scalar arguments (`%n = param i32 0`, in program
+/// order), then `inputs.len()` tensor parameters, then the output parameter.
+fn run_kernel_scalars(
+    program: &str,
+    scalars: &[u64],
+    inputs: &[&[u8]],
+    out_bytes: usize,
+) -> Vec<u8> {
     let _device = device();
     let sim = simulator_path();
     // SAFETY: no other thread reads the environment concurrently; the library
@@ -1590,8 +1601,10 @@ fn run_kernel_tensors(program: &str, inputs: &[&[u8]], out_bytes: usize) -> Vec<
     };
     assert_eq!(code, TT_OK, "compile: {}", take_error(&free, err));
 
-    tensors.push(output_at);
-    let code = unsafe { launch(module, tensors.as_ptr(), tensors.len(), &mut err) };
+    let mut params: Vec<u64> = scalars.to_vec();
+    params.extend_from_slice(&tensors);
+    params.push(output_at);
+    let code = unsafe { launch(module, params.as_ptr(), params.len(), &mut err) };
     assert_eq!(code, TT_OK, "ttLaunch: {}", take_error(&free, err));
 
     let mut back = vec![0u8; out_bytes];
@@ -2547,5 +2560,142 @@ fn an_acc_is_reused_after_it_has_been_packed() {
     for i in 0..1024 {
         assert_eq!(got[i], want_ab[i], "first product, datum {i}");
         assert_eq!(got[1024 + i], want_ac[i], "second product, datum {i}");
+    }
+}
+
+/// `gate_proj` the way a real grid runs it: a tiled bf16 `[M, K]` activation
+/// times a tiled bf16 `[N, K]` weight, accumulated in an f32 `Dst` over a K
+/// loop, one output tile per loop iteration, spread over the whole grid.
+///
+/// The shape is the prefill projection cut down to what the simulator runs in a
+/// second: M = 128 (4 tile rows), N = 1920 (60 tile columns), K = 128 (4 tile
+/// steps). That is 240 output tiles over the simulator's 12 x 10 grid — two
+/// tiles per core, so both loops are real: the outer one walks this core's
+/// tiles, the inner one walks K. Every core reads its own slices, and the tile
+/// count per core is derived from the grid at launch
+/// (`%per = div %ntiles %nsites`).
+const GATE_PROJ: &str = "\
+version 6
+%nx = param i32 0
+%ny = param i32 0
+%ntiles = param i32 0
+%ktiles = param i32 0
+%ncols = param i32 0
+%pa = param bf16 16384
+%pw = param bf16 245760
+%pc = param f32 245760
+%ba = buffer bf16 32,32
+%bb = buffer bf16 32,32
+%bc = buffer f32 32,32
+%acc = acc f32 32,32
+%zero = const f32 0
+%tile = const i32 1024
+%x = grid.x
+%y = grid.y
+%nsites = mul %nx %ny
+%sitey = mul %y %nx
+%site = add %sitey %x
+%per = div %ntiles %nsites
+%i = loop %per
+%step = mul %i %nsites
+%t = add %site %step
+%m = div %t %ncols
+%n = mod %t %ncols
+%arow = mul %m %ktiles
+%brow = mul %n %ktiles
+store_to %acc from %zero
+%j = loop %ktiles
+%ka = add %arow %j
+%kb = add %brow %j
+%oa = mul %ka %tile
+%ob = mul %kb %tile
+copy_to %ba from %pa [%oa]
+copy_to %bb from %pw [%ob]
+%a = load %ba [0]
+%b = load %bb [0]
+matmul %acc %a %b
+endloop
+store_to %bc from %acc [0]
+%coff = mul %t %tile
+copy_to %pc from %bc [%coff]
+endloop
+grid %nx,%ny
+";
+
+/// A tensor parameter's bytes: page-major over the 32x32 tile grid, each page
+/// the four-16x16-face layout `tile_index` names.
+fn tiled(rows: usize, cols: usize, values: &[f32]) -> Vec<f32> {
+    let (cols_tiles, page) = (cols / 32, 1024);
+    let mut out = vec![0f32; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            let at = (r / 32) * cols_tiles + c / 32;
+            out[at * page + tile_index(r % 32, c % 32)] = values[r * cols + c];
+        }
+    }
+    out
+}
+
+#[test]
+fn gate_proj_runs_over_a_full_grid() {
+    // The simulator's part: 12 Tensix columns enabled, 10 rows.
+    const NX: u64 = 12;
+    const NY: u64 = 10;
+    const M: usize = 128;
+    const N: usize = 1920;
+    const K: usize = 128;
+    let (mt, nt, kt) = (M / 32, N / 32, K / 32);
+    let ntiles = mt * nt;
+
+    // Small integers: exact in bf16, and their products and the f32 sum that
+    // follows are exact too, so the reference has no rounding budget.
+    let a_vals: Vec<f32> = (0..M * K).map(|i| (i % 7) as f32 - 3.0).collect();
+    let w_vals: Vec<f32> = (0..N * K).map(|i| (i % 5) as f32 - 2.0).collect();
+    let a = tiled(M, K, &a_vals);
+    let w = tiled(N, K, &w_vals);
+    let a_bf16: Vec<u16> = a.iter().map(|v| truncate_to_bf16(*v)).collect();
+    let w_bf16: Vec<u16> = w.iter().map(|v| truncate_to_bf16(*v)).collect();
+
+    // The reference: per output tile, the sum over K tiles of the tile product,
+    // all in the page layout the kernel writes.
+    let mut want = vec![0f32; ntiles * 1024];
+    for m in 0..mt {
+        for n in 0..nt {
+            let out = &mut want[(m * nt + n) * 1024..][..1024];
+            for k in 0..kt {
+                let at = (m * kt + k) * 1024;
+                let bt = (n * kt + k) * 1024;
+                let p = tile_matmul(&a[at..at + 1024], &w[bt..bt + 1024]);
+                for i in 0..1024 {
+                    out[i] += p[i];
+                }
+            }
+        }
+    }
+
+    let bytes = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|h| h.to_le_bytes()).collect() };
+    let scalars = [NX, NY, ntiles as u64, kt as u64, nt as u64];
+    let out = run_kernel_scalars(
+        GATE_PROJ,
+        &scalars,
+        &[&bytes(&a_bf16), &bytes(&w_bf16)],
+        ntiles * 1024 * 4,
+    );
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for m in 0..mt {
+        for n in 0..nt {
+            for i in 0..1024 {
+                let at = (m * nt + n) * 1024 + i;
+                assert_eq!(
+                    got[at],
+                    want[at],
+                    "gate_proj tile ({m}, {n}), datum {i} at {:?}",
+                    tile_rc(i)
+                );
+            }
+        }
     }
 }

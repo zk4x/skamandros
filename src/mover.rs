@@ -418,6 +418,11 @@ fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
     // initiator) and `a6` (the interface) alone.
     let sync3 = [reg::T0, reg::T1, reg::T2];
     let sync4 = [reg::T0, reg::T1, reg::T2, reg::T6];
+    // Temporaries for an index expression. An expression's right spine needs one
+    // per level (`%t = add %site %step`, `%step = mul %i %nsites`, `%nsites =
+    // mul %nx %ny` is three), and at this point the CB counters are in memory and
+    // the sync scratch has been dropped, so the three sync words are free again.
+    const EVAL_TEMPS: [u8; 5] = [reg::T6, reg::T4, reg::T0, reg::T1, reg::T2];
     let def = definitions(k);
     let param_index = param_indices(k, types);
     let mut loops: Vec<MoverLoop> = Vec::new();
@@ -443,7 +448,7 @@ fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
                         &loops,
                         value,
                         limit_reg,
-                        &mut [reg::T6, reg::T4],
+                        &mut EVAL_TEMPS,
                     )?,
                 }
                 let top = a.fresh_label();
@@ -478,7 +483,7 @@ fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
                             &loops,
                             value,
                             reg::A5,
-                            &mut [reg::T6, reg::T4],
+                            &mut EVAL_TEMPS,
                         )?;
                         if dtype_bytes != 1 {
                             a.li(reg::T4, dtype_bytes);
