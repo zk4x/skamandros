@@ -13,14 +13,20 @@ use tt_isa::tensix::{RiscvT1, TensixThread, Thread1};
 #[no_mangle]
 pub extern "Rust" fn firmware_main() -> ! {
     // SAFETY: aligned mailbox words staged before this core was released.
-    let (seed, len, thread) = unsafe {
+    let (seed, len, thread, program) = unsafe {
         (
             l1_read32(mailbox::OPERAND_A),
             l1_read32(mailbox::PROGRAM_LEN),
             l1_read32(mailbox::THREAD_INDEX),
+            l1_read32(mailbox::PROGRAM_ADDR),
         )
     };
-    if thread != Thread1::INDEX || len == 0 || len > mailbox::PROGRAM_MAX {
+    if thread != Thread1::INDEX
+        || len == 0
+        || len > mailbox::MAX_WORDS
+        || program == 0
+        || !tt_isa::l1::PROGRAM_CACHE.contains(u64::from(program), u64::from(len) * 4)
+    {
         fail(panic_code::EXPLICIT);
     }
     // SAFETY: the host released the backend; this image owns T1 and no
@@ -47,7 +53,7 @@ pub extern "Rust" fn firmware_main() -> ! {
             // SAFETY: the checked length stays in the staged program region;
             // RiscvT1 may push to Thread1 and the backend is released.
             unsafe {
-                push_word::<RiscvT1, Thread1>(l1_read32(mailbox::PROGRAM + u64::from(i) * 4));
+                push_word::<RiscvT1, Thread1>(l1_read32(u64::from(program) + u64::from(i) * 4));
             }
         }
         wait_for_coprocessor();

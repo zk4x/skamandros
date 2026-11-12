@@ -5,7 +5,7 @@
 
 use tt_firmware::{l1_read32, l1_write32, mailbox_word, noc, publish};
 use tt_isa::dm::{self, encoded, op, record, Descriptor, Entry, Transform};
-use tt_isa::mailbox::role::Mailbox;
+use tt_isa::mailbox::launch::Mailbox;
 use tt_isa::mailbox::{offset, status};
 use tt_isa::noc::niu::{Command, DramMove, Niu, TxnId};
 

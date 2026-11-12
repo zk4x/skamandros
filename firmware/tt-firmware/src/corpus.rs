@@ -14,59 +14,21 @@ use crate::tensix::{load_mop_config, push_word, read_dst32, wait_for_coprocessor
 use crate::{fail, finish, l1_read32, l1_write32, publish, spin};
 use tt_isa::cfg::ConfigBank;
 use tt_isa::mailbox::guard::{self, Guard};
-use tt_isa::mailbox::role::Mailbox;
+use tt_isa::mailbox::launch::Mailbox;
 use tt_isa::mailbox::{self, panic_code, status};
 use tt_isa::sfpu::dst32_address;
 use tt_isa::tensix::{PushesTo, TensixThread};
-
-/// The hooks the `.ttinsn` experiment image (`bin/ttinsn_t1.rs`) installs
-/// (`docs/plans/ttinsn-push-experiment.md`). Single-threaded: one core runs
-/// this, and the image sets them before the runner starts.
-#[cfg(feature = "ttinsn-experiment")]
-pub mod experiment {
-    /// Push the staged program by other means, returning whether it did.
-    /// Arguments: the program's address, its length in words and its block
-    /// repeats, as the runner holds them.
-    pub type TryPush = unsafe fn(code: u64, code_len: u32, loops: &[(u32, u32, u32)]) -> bool;
-    /// Called once the coprocessor has retired the program, before the `Dst`
-    /// dump.
-    pub type AfterRetire = fn();
-
-    pub static mut TRY_PUSH: Option<TryPush> = None;
-    pub static mut AFTER_RETIRE: Option<AfterRetire> = None;
-    /// Leave instruction gathering on, as the core boots, instead of turning it
-    /// off as every shipped image does (`crate::disable_gathering`): what the
-    /// experiment's gathering measurements compare against.
-    pub static mut KEEP_GATHERING: bool = false;
-
-    pub(super) fn try_push(code: u64, code_len: u32, loops: &[(u32, u32, u32)]) -> bool {
-        // SAFETY: written once before the runner starts, by this core.
-        match unsafe { TRY_PUSH } {
-            // SAFETY: the hook's own contract; the arguments are the runner's
-            // checked program.
-            Some(f) => unsafe { f(code, code_len, loops) },
-            None => false,
-        }
-    }
-
-    pub(super) fn after_retire() {
-        // SAFETY: as above.
-        if let Some(f) = unsafe { AFTER_RETIRE } {
-            f()
-        }
-    }
-}
 
 pub fn run<Riscv, Thread>() -> !
 where
     Thread: TensixThread,
     Riscv: PushesTo<Thread>,
 {
-    run_in::<Riscv, Thread>(Mailbox::single_core(), false)
+    run_in::<Riscv, Thread>(Mailbox::single_core())
 }
 
 /// The same runner, reporting through a role mailbox: one of three cores each
-/// running its own part of a kernel (`tt_isa::mailbox::role`).
+/// running its own part of a kernel (`tt_isa::mailbox::launch`).
 ///
 /// A role also translates a program with block repeats into looping code when
 /// the exchange pays ([`translate`]): each role runs on the core whose Tensix
@@ -77,116 +39,69 @@ where
     Thread: TensixThread,
     Riscv: PushesTo<Thread>,
 {
-    run_in::<Riscv, Thread>(Mailbox::of(Thread::INDEX), true)
+    run_in::<Riscv, Thread>(Mailbox::of(Thread::INDEX))
 }
 
-/// Run a role's program as RISC-V code, the way tt-metal's kernels run: the
-/// firmware reads the program address, word count and arguments base from the
-/// role mailbox, invalidates the instruction cache for the last written word,
-/// calls the program with `a0` at the arguments, and publishes the return.
+/// Run a launch's program as RISC-V code, the way tt-metal's kernels run: the
+/// launch message names the program (an L1 address in the program cache), its
+/// word count and the arguments base; the core invalidates the instruction
+/// cache, calls it with `a0` at the arguments, and publishes `RESULT` and `ACK`.
 ///
-/// The program is a leaf of RV32IM with the Tensix words inline (`.ttinsn`);
-/// like tt-metal's kernels it ends in `ret` and uses the caller-saved registers
-/// only. There is no push and no MOP/replay setup: the core executes the stream.
-pub fn run_exec<Thread>() -> !
-where
-    Thread: TensixThread,
-{
-    let mb = Mailbox::of(Thread::INDEX);
+/// Resident: after acknowledging one generation it waits for the next, so the
+/// host does not reload this image per launch (tt-metal's TRISC main loop). The
+/// program is a leaf of RV32IM with the Tensix words inline (`.ttinsn`), ends
+/// in `ret`, and uses the caller-saved registers only.
+pub fn run_exec(mb: Mailbox, icache_mask: u32) -> ! {
     crate::disable_gathering();
-    // SAFETY: fixed aligned mailbox words inside L1; the host wrote the
-    // descriptor before this core left reset.
+    // SAFETY: fixed aligned mailbox words inside L1; the host wrote the launch
+    // message before this core left reset.
     unsafe { l1_write32(mb.status(), status::RUNNING) };
     publish();
-    let mut program = unsafe { l1_read32(mb.program_addr()) } as u64;
-    let words = unsafe { l1_read32(mb.program_len()) };
-    let args = unsafe { l1_read32(mb.args()) };
-    if program == 0 {
-        program = mb.program();
-    }
-    // A bad address would execute whatever lies there, so the range is checked
-    // here rather than trusted: the fixed slot, or the program cache.
-    let bytes = u64::from(words) * 4;
-    let in_slot = program >= mailbox::PROGRAM_REGION
-        && program % 4 == 0
-        && program + bytes <= mailbox::PROGRAM_REGION_END;
-    let in_cache = program % 16 == 0 && tt_isa::l1::PROGRAM_CACHE.contains(program, bytes);
-    if words == 0 || words > mailbox::PROGRAM_MAX || !(in_slot || in_cache) {
-        fail_in(mb, mailbox::panic_code::EXPLICIT);
-    }
-    // SAFETY: the range was checked above, and the host published the words
-    // before starting this core. The mask is this core's cache bit.
-    unsafe {
-        crate::ttinsn::invalidate_icache(program + 4 * (u64::from(words) - 1), 1 << (Thread::INDEX + 1));
-        let ret = crate::ttinsn::call_with(program, args);
-        l1_write32(mb.result(), ret);
-    }
-    publish();
-    // SAFETY: fixed aligned mailbox word inside L1.
-    unsafe { l1_write32(mb.status(), status::DONE) };
-    publish();
-    spin()
-}
-
-/// Words of expanded program per stored word the translation must save before it
-/// is worth doing: `expanded * 2.1 > stored * 22 + 330`, the measured break-even
-/// for one launch with no translation cache (`docs/plans/ttinsn-push-experiment.md`).
-/// Ten times each term, in integers: the runner saves about 2.1 cycles a pushed
-/// word, and translating costs 13-22 a stored word plus ~330 fixed.
-const TRANSLATE_GAIN: u64 = 21;
-const TRANSLATE_COST: u64 = 220;
-const TRANSLATE_FIXED: u64 = 3_300;
-
-/// Where a role writes translated code: spare L1 in the image area's tail, above
-/// NC's two-word reset stub (`0x1_2000`) and below the mover's list (`0x1_4000`).
-/// The role images fill their slots (9.5-9.9 KiB of a 10 KiB slot), so a window
-/// cannot live inside one.
-const CODE_WINDOW: [u64; 3] = [0x1_2010, 0x1_2A10, 0x1_3410];
-/// Words one window holds (2.5 KiB).
-const CODE_WORDS: usize = 0x0A00 / 4;
-
-/// Push the staged program at `code` by translating it into looping `.ttinsn`
-/// code in this role's code window and calling it, and say whether it did: false
-/// means the caller pushes it the ordinary way.
-///
-/// The code replaces the loop table with a real branch, which is what makes a
-/// long-expanded, short-stored program (an SFPU row body repeated per tile)
-/// cheap. It is left in the window: the next translated program overwrites it.
-fn translate<Thread: TensixThread>(code: u64, code_len: u32, loops: &[(u32, u32, u32)]) -> bool {
-    // A staged word that steps an address is the translator's own (it becomes
-    // `sw`/`addi`, never an instruction of the machine), so a program holding
-    // one is translated whether or not the exchange pays: pushing it as it is
-    // would push a word the coprocessor cannot decode.
-    let mut stepped = false;
-    for i in 0..code_len {
-        // SAFETY: inside the runner's checked program.
-        if unsafe { crate::l1_read32(code + 4 * u64::from(i)) } & crate::ttinsn::STEP_MASK == crate::ttinsn::STEP_STORE {
-            stepped = true;
-            break;
+    let mut generation = unsafe { l1_read32(mb.generation()) };
+    loop {
+        if generation != 0 {
+            let program = unsafe { l1_read32(mb.program_addr()) } as u64;
+            let words = unsafe { l1_read32(mb.program_len()) };
+            let args = unsafe { l1_read32(mb.args()) };
+            // A bad address would execute whatever lies there, so the range is
+            // checked here rather than trusted.
+            let bytes = u64::from(words) * 4;
+            if program == 0
+                || program % 16 != 0
+                || words == 0
+                || words > mailbox::MAX_WORDS
+                || !tt_isa::l1::PROGRAM_CACHE.contains(program, bytes)
+            {
+                fail_in(mb, mailbox::panic_code::EXPLICIT);
+            }
+            // SAFETY: the range was checked above, and the host published the
+            // words before writing this generation.
+            unsafe {
+                crate::ttinsn::invalidate_icache(program + 4 * (u64::from(words) - 1), icache_mask);
+                let ret = crate::ttinsn::call_with(program, args);
+                l1_write32(mb.result(), ret);
+            }
+            publish();
+            // SAFETY: fixed aligned mailbox words inside L1.
+            unsafe {
+                l1_write32(mb.status(), status::DONE);
+                l1_write32(mb.ack(), generation);
+            }
+            publish();
         }
+        loop {
+            publish();
+            // SAFETY: as above.
+            let next = unsafe { l1_read32(mb.generation()) };
+            if next != 0 && next != generation {
+                generation = next;
+                break;
+            }
+        }
+        // SAFETY: as above.
+        unsafe { l1_write32(mb.status(), status::RUNNING) };
+        publish();
     }
-    let stored = u64::from(code_len);
-    let mut expanded = stored;
-    for &(_, len, count) in loops {
-        expanded += u64::from(len) * u64::from(count.saturating_sub(1));
-    }
-    if !stepped && expanded * TRANSLATE_GAIN <= stored * TRANSLATE_COST + TRANSLATE_FIXED {
-        return false;
-    }
-    let window = CODE_WINDOW[Thread::INDEX as usize];
-    // SAFETY: the runner's checked program, and a window this role owns.
-    let Some(n) =
-        (unsafe { crate::ttinsn::translate(code, code_len, loops, Some(&crate::ttinsn::OPCODES), window, CODE_WORDS) })
-    else {
-        return false;
-    };
-    // SAFETY: the last word just written; this core's own bit in the mask is
-    // `1 << (INDEX + 1)` (B is bit 0, then T0, T1, T2, NC).
-    unsafe { crate::ttinsn::invalidate_icache(window + 4 * (n as u64 - 1), 1 << (Thread::INDEX + 1)) };
-    // SAFETY: valid code ending in a return, translated above, its lines
-    // invalidated after it was written.
-    unsafe { crate::ttinsn::call(window) };
-    true
 }
 
 /// Stop, having said why in `mb` as well as in the single-core mailbox the
@@ -522,30 +437,21 @@ fn guard_wait(mb: Mailbox, run: &GuardRun) {
     crumb(g, stage::DRAINED);
 }
 
-/// `translate_programs`: this core is a role's own core, so a program it pushes
-/// may be translated into code in that role's window and called ([`translate`]).
-fn run_in<Riscv, Thread>(mb: Mailbox, translate_programs: bool) -> !
+/// Run the staged-program runner over `mb`; a role's own core reports there.
+fn run_in<Riscv, Thread>(mb: Mailbox) -> !
 where
     Thread: TensixThread,
     Riscv: PushesTo<Thread>,
 {
-    // Gathering off before anything is pushed (`crate::disable_gathering`); the
-    // `.ttinsn` experiment may ask to measure with it left on.
     // SAFETY: written once before the runner starts, by this core.
-    #[cfg(feature = "ttinsn-experiment")]
-    let keep_gathering = unsafe { experiment::KEEP_GATHERING };
-    #[cfg(not(feature = "ttinsn-experiment"))]
-    let keep_gathering = false;
-    if !keep_gathering {
-        crate::disable_gathering();
-    }
+    crate::disable_gathering();
     // SAFETY: fixed aligned mailbox locations inside L1.
     unsafe { l1_write32(mb.status(), status::RUNNING) };
     publish();
     // SAFETY: as above; written by the host before this core left reset.
     let mut generation = unsafe { l1_read32(mb.generation()) };
     loop {
-        let program_len = run_once::<Riscv, Thread>(mb, translate_programs);
+        let program_len = run_once::<Riscv, Thread>(mb);
         if generation == 0 {
             // The dump is what carries the result; this only says it is complete.
             if mb == Mailbox::single_core() {
@@ -588,7 +494,7 @@ where
 
 /// One run of the staged program: read the descriptor, push the program, wait
 /// for it to retire, dump `Dst`. Returns the program's length.
-fn run_once<Riscv, Thread>(mb: Mailbox, translate_programs: bool) -> u32
+fn run_once<Riscv, Thread>(mb: Mailbox) -> u32
 where
     Thread: TensixThread,
     Riscv: PushesTo<Thread>,
@@ -632,23 +538,21 @@ where
     // this image somewhere it did not intend, which would otherwise show up as a
     // wrong result from a correctly-executed program.
     if thread != Thread::INDEX
-        || program_len > mailbox::PROGRAM_MAX
+        || program_len > mailbox::MAX_WORDS
         || dump_rows > mailbox::DUMP_MAX_ROWS
     {
         fail_in(mb, panic_code::EXPLICIT);
     }
-    // A resident program (`mailbox::PROGRAM_ADDR`) must lie in the program
-    // cache, so a stale or corrupt address cannot push arbitrary L1.
-    let program = if program_addr == 0 {
-        mb.program()
-    } else {
-        if program_addr % 16 != 0
-            || !tt_isa::l1::PROGRAM_CACHE.contains(program_addr, program_len as u64 * 4)
-        {
-            fail_in(mb, panic_code::EXPLICIT);
-        }
-        program_addr
-    };
+    // The program (`mailbox::PROGRAM_ADDR`) must lie in the program cache, so a
+    // stale or corrupt address cannot push arbitrary L1. There is no slot
+    // fallback: the launch message names the text, it does not carry it.
+    if program_addr == 0
+        || program_addr % 16 != 0
+        || !tt_isa::l1::PROGRAM_CACHE.contains(program_addr, program_len as u64 * 4)
+    {
+        fail_in(mb, panic_code::EXPLICIT);
+    }
+    let program = program_addr;
 
     // Set the shape of the Dst mapping deliberately rather than inheriting whatever
     // reset left behind, exactly as the step 4 firmware does.
@@ -747,18 +651,7 @@ where
     }
 
     trace(tracing, Thread::INDEX, mailbox::trace::START);
-    // The `.ttinsn` experiment's only change to this path: the image may push a
-    // program it was built with instead of reading it from L1
-    // (`experiment::try_push`). Without the feature this is the line it was.
-    #[cfg(feature = "ttinsn-experiment")]
-    let fused = experiment::try_push(code, code_len, &loops[..n]);
-    #[cfg(not(feature = "ttinsn-experiment"))]
-    let fused = false;
-    // A role's program with block repeats is translated into looping code when
-    // the exchange pays: the loops become branches instead of the body written
-    // out, which is what keeps a long expanded program out of the push stream.
-    let fused = fused || (translate_programs && translate::<Thread>(code, code_len, &loops[..n]));
-    if !fused {
+    {
         let mut push = Pusher::<Riscv, Thread> {
             program: code,
             push_window,
@@ -779,8 +672,6 @@ where
         wait_for_coprocessor();
     }
     trace(tracing, Thread::INDEX, mailbox::trace::RETIRED);
-    #[cfg(feature = "ttinsn-experiment")]
-    experiment::after_retire();
 
     let mut row = 0;
     while row < dump_rows {

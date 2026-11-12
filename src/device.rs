@@ -175,8 +175,10 @@ pub struct Device {
     dram_used: u64,
     /// Is `exec_b` resident and looping on the tile?
     exec_started: bool,
-    /// Last generation handed to `exec_b`.
-    exec_seq: u32,
+    /// Programs already placed at their L1 address: `(address, words, hash)`.
+    /// The program cache keeps them, and a launch only names the address; an
+    /// identical program is not rewritten.
+    placed: Vec<(u32, u64, u64)>,
 }
 
 impl Device {
@@ -211,7 +213,7 @@ impl Device {
             dram: Dram::FULL,
             dram_used: 0x10_0000,
             exec_started: false,
-            exec_seq: 0,
+            placed: Vec::new(),
         };
         // A previous process (`ttRelease` only drops this struct) leaves its
         // cores running and its mailboxes written. Reopening is the 0 -> 1
@@ -427,37 +429,47 @@ impl Device {
                 first = first.and(Err(e));
             }
         }
-        // SEQ first: a core released before the rest lands must not run the
-        // staged program with a stale generation.
-        for at in [
-            mailbox::exec::SEQ,
-            mailbox::exec::PROGRAM,
-            mailbox::exec::LEN,
-            mailbox::exec::ARGS,
-            mailbox::exec::DONE,
-            mailbox::exec::RET,
-            mailbox::exec::ERROR,
-            mailbox::STATUS,
-            mailbox::PANIC_CODE,
-        ] {
-            if let Err(e) = self.write32(at, 0) {
-                first = first.and(Err(e));
-            }
-        }
-        for thread in 0..3u32 {
-            let mb = mailbox::role::Mailbox::of(thread);
-            if let Err(e) = self.write32(mb.status(), 0) {
-                first = first.and(Err(e));
+        for mb in Self::launch_mailboxes() {
+            // Generation first: a core released before the rest lands must not
+            // run the named program with a stale start.
+            for at in [
+                mb.generation(),
+                mb.program_addr(),
+                mb.program_len(),
+                mb.args(),
+                mb.ack(),
+                mb.result(),
+                mb.status(),
+                mb.panic_code(),
+            ] {
+                if let Err(e) = self.write32(at, 0) {
+                    first = first.and(Err(e));
+                }
             }
         }
         // The executor on B is gone with the reset; the next launch stages it
         // again instead of waiting on a mailbox nobody will write.
         self.exec_started = false;
-        self.exec_seq = 0;
+        self.placed.clear();
         first
     }
 
-    /// Boot the staged-program executor on RISCV B, once.
+    /// The four launch mailboxes: RISCV B and the three Tensix threads.
+    fn launch_mailboxes() -> [mailbox::launch::Mailbox; 4] {
+        [
+            mailbox::launch::Mailbox::b(),
+            mailbox::launch::Mailbox::of(0),
+            mailbox::launch::Mailbox::of(1),
+            mailbox::launch::Mailbox::of(2),
+        ]
+    }
+
+    /// Hold `core` in reset, stopping whatever it is running.
+    pub fn hold(&mut self, core: Core) -> Result<(), Error> {
+        self.set_core_reset(core, true)
+    }
+
+    /// Boot the launch executor on RISCV B, once.
     pub fn start_executor(&mut self) -> Result<(), Error> {
         if self.exec_started {
             return Ok(());
@@ -467,28 +479,105 @@ impl Device {
             crate::images::EXEC_B,
             u64::from(Core::B.default_reset_pc()),
         )?;
-        self.wait_for(mailbox::STATUS, |s| s == status::RUNNING)?;
-        // A previous process leaves its program staged and its generation set.
-        // A new executor must not replay it: `exec_b` runs whenever
-        // `SEQ != DONE`, so SEQ is cleared first and the rest of the control
-        // block with it.
-        self.write32(mailbox::exec::SEQ, 0)?;
-        for at in [
-            mailbox::exec::PROGRAM,
-            mailbox::exec::LEN,
-            mailbox::exec::ARGS,
-            mailbox::exec::DONE,
-            mailbox::exec::RET,
-            mailbox::exec::ERROR,
-        ] {
-            self.write32(at, 0)?;
-        }
+        let mb = mailbox::launch::Mailbox::b();
+        self.wait_for(mb.status(), |s| s == status::RUNNING)?;
+        // A previous process leaves a program named and a generation set; a new
+        // executor must not replay it.
+        self.clear_launch(mb)?;
         self.exec_started = true;
-        self.exec_seq = 0;
         Ok(())
     }
 
-    /// Stage a RISC-V program and its launch arguments, run it on RISCV B to
+    /// Clear one launch message: the generation first, then the program and
+    /// control words.
+    fn clear_launch(&mut self, mb: mailbox::launch::Mailbox) -> Result<(), Error> {
+        self.write32(mb.generation(), 0)?;
+        for at in [
+            mb.program_addr(),
+            mb.program_len(),
+            mb.args(),
+            mb.ack(),
+            mb.result(),
+            mb.status(),
+            mb.panic_code(),
+        ] {
+            self.write32(at, 0)?;
+        }
+        Ok(())
+    }
+
+    /// Place `words` at `at` in the program cache, unless this device put the
+    /// same words there already. The launch message names the address; it does
+    /// not carry the program (tt-metal's `kernel_text_offset`).
+    pub fn place(&mut self, at: u32, words: &[u32]) -> Result<(), Error> {
+        if words.is_empty() {
+            return Err(Error::TT_ERROR_EMPTY_PROGRAM);
+        }
+        if words.len() as u64 > u64::from(mailbox::MAX_WORDS) {
+            let _ = words.len();
+            return Err(Error::TT_ERROR_PROGRAM_TOO_LONG);
+        }
+        // FNV-1a: enough to skip rewriting an unchanged program, not a
+        // correctness check on the words.
+        let hash = words.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, word| {
+            (h ^ u64::from(*word)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+        let len = words.len() as u64;
+        if self
+            .placed
+            .iter()
+            .any(|&(a, l, h)| a == at && l == len && h == hash)
+        {
+            return Ok(());
+        }
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        self.l1_write(u64::from(at), &code)?;
+        self.placed.retain(|&(a, _, _)| a != at);
+        self.placed.push((at, len, hash));
+        Ok(())
+    }
+
+    /// Write one launch message and start it: the text address, its length, the
+    /// arguments base, then a fresh generation. Returns that generation.
+    pub fn launch(
+        &mut self,
+        mb: mailbox::launch::Mailbox,
+        text: u32,
+        words: u32,
+        args: u32,
+    ) -> Result<u32, Error> {
+        self.write32(mb.program_addr(), text)?;
+        self.write32(mb.program_len(), words)?;
+        self.write32(mb.args(), args)?;
+        self.write32(mb.ack(), 0)?;
+        let generation = self.read32(mb.generation())?.wrapping_add(1).max(1);
+        self.write32(mb.generation(), generation)?;
+        Ok(generation)
+    }
+
+    /// Wait for a launch's `ACK`, or report its panic or a timeout.
+    pub fn await_launch(
+        &mut self,
+        mb: mailbox::launch::Mailbox,
+        generation: u32,
+    ) -> Result<(), Error> {
+        let mut waited = 0u64;
+        loop {
+            if self.read32(mb.ack())? == generation {
+                return Ok(());
+            }
+            if self.read32(mb.status())? == status::PANICKED {
+                return Err(Error::TT_ERROR_PROGRAM_REFUSED);
+            }
+            if waited >= BUDGET {
+                return Err(Error::TT_ERROR_FIRMWARE_TIMEOUT);
+            }
+            self.clock(CYCLES_PER_POLL);
+            waited += u64::from(CYCLES_PER_POLL);
+        }
+    }
+
+    /// Place a RISC-V program and its launch arguments, run it on RISCV B to
     /// completion, and report a refusal.
     pub fn run_program(
         &mut self,
@@ -500,32 +589,17 @@ impl Device {
         if words.is_empty() {
             return Err(Error::TT_ERROR_EMPTY_PROGRAM);
         }
-        if words.len() as u64 > mailbox::exec::MAX_WORDS {
-            let _ = words.len();
-            return Err(Error::TT_ERROR_PROGRAM_TOO_LONG);
-        }
         if (program_at as u64) + 4 * words.len() as u64 > args_at as u64 {
             let _ = (program_at, args_at);
             return Err(Error::TT_ERROR_PROGRAM_OVERLAPS_ARGS);
         }
-        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        self.l1_write(u64::from(program_at), &code)?;
+        self.place(program_at, words)?;
         let args_bytes: Vec<u8> = args.iter().flat_map(|w| w.to_le_bytes()).collect();
         self.l1_write(u64::from(args_at), &args_bytes)?;
-        self.write32(mailbox::exec::PROGRAM, program_at)?;
-        self.write32(mailbox::exec::LEN, words.len() as u32)?;
-        self.write32(mailbox::exec::ARGS, args_at)?;
-        self.write32(mailbox::exec::ERROR, 0)?;
-        self.exec_seq = self.exec_seq.wrapping_add(1).max(1);
-        let seq = self.exec_seq;
-        self.write32(mailbox::exec::SEQ, seq)?;
-        self.wait_for(mailbox::exec::DONE, |d| d == seq)?;
-        let error = self.read32(mailbox::exec::ERROR)?;
-        if error != 0 {
-            let _ = error;
-            return Err(Error::TT_ERROR_PROGRAM_REFUSED);
-        }
-        self.read32(mailbox::exec::RET)
+        let mb = mailbox::launch::Mailbox::b();
+        let generation = self.launch(mb, program_at, words.len() as u32, args_at)?;
+        self.await_launch(mb, generation)?;
+        self.read32(mb.result())
     }
 
     /// Point the window at `address` in `tile`, unless it already is.

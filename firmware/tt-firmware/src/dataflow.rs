@@ -17,7 +17,7 @@ pub fn check() -> Result<(), u32> {
         return Err(abort);
     }
     for role in 0..3 {
-        if read(mailbox::role::Mailbox::of(role).status()) == mailbox::status::PANICKED {
+        if read(mailbox::launch::Mailbox::of(role).status()) == mailbox::status::PANICKED {
             abort_with(dm::error::ROLE);
             return Err(dm::error::ROLE);
         }

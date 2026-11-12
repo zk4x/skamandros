@@ -6,9 +6,9 @@
 #![no_main]
 
 use tt_firmware::corpus;
-use tt_isa::tensix::Thread1;
+use tt_isa::mailbox::launch::Mailbox;
 
 #[no_mangle]
 pub extern "Rust" fn firmware_main() -> ! {
-    corpus::run_exec::<Thread1>()
+    corpus::run_exec(Mailbox::of(1), 1 << 2)
 }

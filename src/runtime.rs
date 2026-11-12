@@ -13,14 +13,28 @@ use std::sync::Mutex;
 use crate::compile::Module;
 use crate::device::Device;
 use crate::ir::Error;
-use tt_isa::mailbox::{self, status};
+use tt_isa::mailbox;
 use tt_isa::noc::{Noc0, NocCoord};
+use tt_isa::tensix::Core;
 
 /// The one open device, if [`init`] has been called.
 static DEVICE: Mutex<Option<Device>> = Mutex::new(None);
 
-/// Bytes of the staged-program area a program may use before its arguments.
-const PROGRAM_BYTES: u32 = 0x2000;
+/// First byte of `l1::PROGRAM_CACHE`, where every program is placed once.
+const PROGRAM_AREA: u32 = crate::device::PROGRAM_AREA as u32;
+/// Bytes in one program-cache slot: `mailbox::MAX_WORDS` words.
+const SLOT_BYTES: u32 = 0x8000;
+/// Slot 0 and 1: RISCV B's reader and writer. 3..6: T0/T1/T2. The arguments
+/// follow the last slot.
+const SLOT_READER: u32 = 0;
+const SLOT_WRITER: u32 = 1;
+const ROLE_SLOT: [u32; 3] = [3, 4, 5];
+const ARGS_AT: u32 = PROGRAM_AREA + 6 * SLOT_BYTES;
+
+/// `index`'s slot in the program cache.
+const fn slot(index: u32) -> u32 {
+    PROGRAM_AREA + index * SLOT_BYTES
+}
 
 /// Open the device. Idempotent; the simulator is initialized once per process.
 pub fn init() -> Result<(), Error> {
@@ -100,14 +114,15 @@ fn launch_steps(device: &mut Device, module: &Module, params: &[u64]) -> Result<
         args.push(hi);
     }
 
-    let program_at =
-        u32::try_from(crate::device::PROGRAM_AREA).map_err(|_| Error::TT_ERROR_PROGRAM_AREA)?;
-    let args_at = program_at + PROGRAM_BYTES;
+    if (ARGS_AT as u64) + 4 * args.len() as u64 > tt_isa::l1::PROGRAM_CACHE.end {
+        let _ = args.len();
+        return Err(Error::TT_ERROR_PROGRAM_AREA_SIZE);
+    }
     for (name, words) in [("reader", &module.reader), ("writer", &module.writer)] {
         if words.is_empty() {
             continue;
         }
-        if 4 * words.len() as u32 > PROGRAM_BYTES {
+        if 4 * words.len() as u32 > SLOT_BYTES {
             let _ = (name, words.len());
             return Err(Error::TT_ERROR_PROGRAM_AREA_SIZE);
         }
@@ -134,84 +149,85 @@ fn launch_steps(device: &mut Device, module: &Module, params: &[u64]) -> Result<
     // Every core of the launch reads the same arguments array; write it before
     // the first core starts, not only as a side effect of a mover run.
     let arg_bytes: Vec<u8> = args.iter().flat_map(|w| w.to_le_bytes()).collect();
-    device.l1_write(u64::from(args_at), &arg_bytes)?;
+    device.l1_write(u64::from(ARGS_AT), &arg_bytes)?;
     if !module.reader.is_empty() {
-        device.run_program(program_at, args_at, &module.reader, &args)?;
+        device.run_program(slot(SLOT_READER), ARGS_AT, &module.reader, &args)?;
     }
     if module.cores.iter().any(|words| !words.is_empty()) {
-        run_compute(device, module, args_at)?;
+        run_compute(device, module, ARGS_AT)?;
     }
     if !module.writer.is_empty() {
-        device.run_program(program_at, args_at, &module.writer, &args)?;
+        device.run_program(slot(SLOT_WRITER), ARGS_AT, &module.writer, &args)?;
     }
     Ok(())
 }
 
-/// Stage the three compute programs in their role slots, release T0/T1/T2
-/// together, and wait for every started role to finish.
+/// Stage the three compute programs in the program cache, release T0/T1/T2
+/// together, and wait for every started role to acknowledge.
 ///
 /// The backend is released first, while the cores are still held: no Tensix
 /// instruction may be pushed into a held backend. Then thread 0 runs the setup
 /// program (the semaphore initialisation) to completion, and only after that are
-/// the three roles released together — the order tt-metal uses, where BRISC
+/// the three roles released together -- the order tt-metal uses, where BRISC
 /// initialises the semaphores before it releases the TRISCs.
 fn run_compute(device: &mut Device, module: &Module, args_at: u32) -> Result<(), Error> {
     device.release_tensix_backend()?;
-    stage_role(device, 0, &module.setup, args_at)?;
+    let setup = stage_role(device, 0, &module.setup, args_at)?;
     let (core, image, at) = crate::images::EXEC_ROLES[0];
     device.load_and_start(core, image, at)?;
-    device.wait_for(mailbox::role::Mailbox::of(0).status(), |s| {
-        s == status::DONE
-    })?;
+    device.await_launch(mailbox::launch::Mailbox::of(0), setup)?;
+    // The setup executor is resident and would pick up the real program as soon
+    // as its generation lands. Hold T0; `load_and_start_together` reloads it
+    // with the other two.
+    device.hold(Core::T0)?;
 
     let mut images = Vec::new();
+    let mut launched = Vec::new();
     for (thread, words) in module.cores.iter().enumerate() {
         if words.is_empty() {
             continue;
         }
-        stage_role(device, thread, words, args_at)?;
+        let generation = stage_role(device, thread, words, args_at)?;
         images.push(crate::images::EXEC_ROLES[thread]);
+        launched.push((thread, generation));
     }
     device.load_and_start_together(&images)?;
-    for (thread, words) in module.cores.iter().enumerate() {
-        if words.is_empty() {
-            continue;
-        }
-        let mb = mailbox::role::Mailbox::of(thread as u32);
-        device.wait_for(mb.status(), |s| s == status::DONE)?;
+    for (thread, generation) in launched {
+        device.await_launch(mailbox::launch::Mailbox::of(thread as u32), generation)?;
     }
     Ok(())
 }
 
-/// Stage `words` in `thread`'s role slot and write its descriptor.
+/// Place `words` at `thread`'s fixed cache slot and write its launch message
+/// (thread index, text address, length, arguments), returning the generation
+/// that starts it.
 fn stage_role(
     device: &mut Device,
     thread: usize,
     words: &[u32],
     args_at: u32,
-) -> Result<(), Error> {
-    if words.len() as u32 > mailbox::PROGRAM_MAX {
+) -> Result<u32, Error> {
+    if words.is_empty() || words.len() as u32 > mailbox::MAX_WORDS {
         let _ = (thread, words.len());
         return Err(Error::TT_ERROR_ROLE_PROGRAM_SIZE);
     }
-    let mb = mailbox::role::Mailbox::of(thread as u32);
-    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    device.l1_write(mb.program(), &code)?;
-    device.write32(mb.status(), 0)?;
-    let descriptor = mailbox::Descriptor {
-        thread_index: thread as u32,
-        dst_access_fmt: 0,
-        program_len: words.len() as u32,
-        // An executor calls the program; there is nothing to push and no push
-        // window. The program lives in the fixed slot (`program_addr` 0).
-        push_window: 0,
-        args: args_at,
-        ..Default::default()
-    };
-    for (at, value) in descriptor.writes(mb) {
-        device.write32(at, value)?;
+    if 4 * words.len() as u32 > SLOT_BYTES {
+        let _ = (thread, words.len());
+        return Err(Error::TT_ERROR_PROGRAM_AREA_SIZE);
     }
-    Ok(())
+    let mb = mailbox::launch::Mailbox::of(thread as u32);
+    let text = slot(ROLE_SLOT[thread]);
+    device.place(text, words)?;
+    device.write32(mb.thread_index(), thread as u32)?;
+    device.write32(mb.dst_access_fmt(), 0)?;
+    device.write32(mb.dump_row_first(), 0)?;
+    device.write32(mb.dump_row_count(), 0)?;
+    device.write32(mb.trace(), 0)?;
+    device.write32(mb.push_window(), 0)?;
+    device.write32(mb.unwedge(), 0)?;
+    device.write32(mb.mop_cfg_valid(), 0)?;
+    device.write32(mb.status(), 0)?;
+    device.launch(mb, text, words.len() as u32, args_at)
 }
 
 /// This tile's NOC address-high word: the coordinate packed as `x | y << 6`.

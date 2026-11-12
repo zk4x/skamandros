@@ -1,9 +1,10 @@
 //! The unpack role's executor: T0 / Tensix thread 0.
 //!
-//! Linked at the role slot (`build.rs`), so the same launch path runs it: the
-//! host stages a program and its arguments, writes the role descriptor and
-//! releases the core. The program is RISC-V with the Tensix words inline and
-//! ends in `ret`; [`tt_firmware::corpus::run_exec`] calls it.
+//! Linked at the role slot (`build.rs`). The host writes a launch message
+//! naming the program's address in the program cache, its length and the
+//! arguments base, then bumps the generation; [`tt_firmware::corpus::run_exec`]
+//! calls it and acknowledges. The program is RISC-V with the Tensix words
+//! inline and ends in `ret`.
 //!
 //! This replaces the staged-program pusher (`role_t0`) for a compiler that
 //! emits the RISC-V itself, as zyx's NOTES describes and tt-metal does.
@@ -12,9 +13,9 @@
 #![no_main]
 
 use tt_firmware::corpus;
-use tt_isa::tensix::Thread0;
+use tt_isa::mailbox::launch::Mailbox;
 
 #[no_mangle]
 pub extern "Rust" fn firmware_main() -> ! {
-    corpus::run_exec::<Thread0>()
+    corpus::run_exec(Mailbox::of(0), 1 << 1)
 }
