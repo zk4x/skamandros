@@ -38,9 +38,9 @@ Parameters and buffers are mutable, not SSA. A shape is a comma-separated list o
 terms, and a term is a literal or an `i32` value; a product is built by an op
 first. A parameter may be arbitrary-dimensional and symbolic, a scalar parameter
 is the shape `0`, and a buffer is two constant dimensions, each `1` or a multiple
-of 32. There is no implicit dtype conversion: `cast %x to bf16` converts a
+of 32. There is no implicit dtype conversion: `cast %x to f32` converts a
 value with the C type's rounding, and `bitcast %x to i32` renames the same bits
-between dtypes of equal width.
+between dtypes of equal width. A bf16 datum is two bytes in L1.
 
 The op set is the low-level one and nothing more: zyx's `UOp`
 (`neg`, `not`, `bitnot`, `exp2`, `log2`, `reciprocal`, `sqrt`, `rsqrt`, `sin`,
@@ -258,9 +258,14 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   `bitcast` is the same bits under another name. Both run end to end through
   the C ABI; `bitcast` lowers to no instruction at all.
 - Broadcast, `matmul`, `eq`/`noteq`, the remaining unary and binary ops, the
-  `bool` datapath in a parameter or buffer, bf16 in L1, and the reduce op are
-  accepted by the format and verifier and refused loudly by lowering, not
-  guessed at.
+  `bool` datapath in a parameter or buffer, and the reduce op are accepted by
+  the format and verifier and refused loudly by lowering, not guessed at.
+- bf16 is a real L1 format: a bf16 buffer is two bytes per datum, the unpacker
+  and packer are set to `Bf16` both ways, and the 16-bit `Dst` is read and
+  written with the `BF16` lane format, which widens to FP32 for the op. A
+  module is one width at a time (`datum_width`), and a `cast` to or from bf16
+  is refused: the boundary is the buffer's dtype, not a conversion inside one
+  program.
 - Transcendentals are the caller's to unfold. zyx rewrites `Exp2`/`Log2`/`Sin`/
   `Cos` (and `Pow` as `exp2(y * log2 x)`) into primitive arithmetic in
   `tt_unfold`, before the backend sees them, and skamandros does the same by

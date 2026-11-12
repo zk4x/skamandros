@@ -51,11 +51,12 @@ pub const CORE_INFO: u32 = tt_isa::mailbox::MAILBOX_BASE as u32 + 0x100;
 /// One instruction of a compute core's program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MirOp {
-    /// `SFPLOAD`: `Dst` row into a lane register. `int` selects the `INT32`
-    /// format instead of `FP32`, which is what a `bool` or `i32` value needs.
-    Sfpload { lreg: u8, row: u32, int: bool },
+    /// `SFPLOAD`: `Dst` row into a lane register. `dtype` picks the lane's
+    /// format: `INT32` for a `bool` or `i32` value, `BF16` for a 16-bit `Dst`
+    /// datum, `FP32` otherwise.
+    Sfpload { lreg: u8, row: u32, dtype: DType },
     /// `SFPSTORE`: lane register into a `Dst` row.
-    Sfpstore { lreg: u8, row: u32, int: bool },
+    Sfpstore { lreg: u8, row: u32, dtype: DType },
     /// One SFPU arithmetic instruction; `b` is `None` for a unary op.
     Sfp {
         op: SfpOp,
@@ -79,13 +80,14 @@ pub enum MirOp {
     /// The lanewise maximum, through the SFPU lane flags.
     Max { a: u8, b: u8, d: u8 },
     /// `UNPACR`: the page at the head of `cb`'s ring into unpacker `unit`'s
-    /// destination. `int` selects the `Int32` L1 format instead of `Fp32`.
-    /// The base is read from the ring's read pointer at run time.
+    /// destination. `dtype` picks the L1 format: `Bf16` for a 16-bit datum,
+    /// `Fp32` otherwise (an `i32` datum is opaque 32 bits). The base is read
+    /// from the ring's read pointer at run time.
     Unpacr {
         cb: u32,
         unit: u8,
         count: u32,
-        int: bool,
+        dtype: DType,
     },
     /// `SETADCZW`: which face the unpacker reads next.
     Setadczw { unit: u8, face: u32 },
@@ -95,13 +97,14 @@ pub enum MirOp {
     Setdst { row: u32 },
     /// The packer drains into the page at the tail of `cb`'s ring. The base is
     /// read from the ring's write pointer at run time; `row` is the `Dst` row
-    /// the first packed row comes from, the packer's `W` counter.
+    /// the first packed row comes from, the packer's `W` counter. `dtype` picks
+    /// the read path: `Bf16` reads a 16-bit `Dst`, everything else 32-bit.
     Pack {
         cb: u32,
         rows: u32,
         row: u32,
         last: bool,
-        int: bool,
+        dtype: DType,
     },
     /// `cb_wait_front`: wait for a page to be published on this ring.
     CbWait { cb: u32 },

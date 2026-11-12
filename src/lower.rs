@@ -128,14 +128,6 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     let _ = buffer;
                     return Err(Error::TT_ERROR_NOT_A_BUFFER);
                 };
-                let int = match dtype {
-                    crate::ir::DType::F32 => false,
-                    crate::ir::DType::I32 => true,
-                    other => {
-                        let _ = other;
-                        return Err(Error::TT_ERROR_DATAPATH_DTYPE);
-                    }
-                };
                 let (unit_shape, _, _) = unit_of(shape, dtype)?;
                 let rows = rows_of(unit_shape, at)?;
                 let cb = plan.cb[buffer as usize].ok_or_else(|| {
@@ -163,7 +155,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     cb,
                     unit: 0,
                     count: unit_shape.datums(),
-                    int,
+                    dtype,
                 });
                 m.t0.push(MirOp::CbPop { cb });
                 m.t0.push(MirOp::SemPost { sem: SEM_UNPACKED });
@@ -185,14 +177,6 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     let _ = buffer;
                     return Err(Error::TT_ERROR_NOT_A_BUFFER);
                 };
-                let int = match dtype {
-                    crate::ir::DType::F32 => false,
-                    crate::ir::DType::I32 => true,
-                    other => {
-                        let _ = other;
-                        return Err(Error::TT_ERROR_DATAPATH_DTYPE);
-                    }
-                };
                 let (unit_shape, _, _) = unit_of(shape, dtype)?;
                 let rows = rows_of(unit_shape, at)?;
                 let cb = plan.cb[buffer as usize].ok_or_else(|| {
@@ -212,7 +196,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     rows,
                     row: dst_row(alloc, resolve(&alias, value)),
                     last: true,
-                    int,
+                    dtype,
                 });
                 m.t2.push(MirOp::SemGet { sem: SEM_READY });
                 m.t2.push(MirOp::CbPush { cb });
@@ -223,8 +207,9 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             Op::Cast { value, src, dtype } => {
                 let from = types.of(src).dtype;
                 let shape = types.of(src).shape;
-                // bf16 has no lane yet: neither the L1 format it would be read
-                // from nor the register datapath it would run on is lowered.
+                // A bf16 datum lives in a 16-bit `Dst` and an f32 one in a
+                // 32-bit `Dst`, and the bank is one width at a time, so a
+                // conversion between them inside one program is not lowered.
                 if from == crate::ir::DType::Bf16 || dtype == crate::ir::DType::Bf16 {
                     let _ = at;
                     return Err(Error::TT_TODO_CAST);
@@ -233,16 +218,11 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 let s = dst_row(alloc, resolve(&alias, src));
                 let out = dst_row(alloc, resolve(&alias, value));
                 let (la, ld) = alloc.lreg[resolve(&alias, value) as usize];
-                // The lane is 32 bits, so `bool`, `i32` and the two float
-                // formats are all one lane: the `SFPLOAD`/`SFPSTORE` format only
-                // decides whether the lane is converted on the way in or out.
-                let int_in = matches!(from, crate::ir::DType::I32 | crate::ir::DType::Bool);
-                let int_out = matches!(dtype, crate::ir::DType::I32 | crate::ir::DType::Bool);
                 for row in (0..rows).step_by(2) {
                     m.t1.push(MirOp::Sfpload {
                         lreg: la,
                         row: s + row,
-                        int: int_in,
+                        dtype: from,
                     });
                     m.t1.push(MirOp::Cast {
                         from,
@@ -253,7 +233,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     m.t1.push(MirOp::Sfpstore {
                         lreg: ld,
                         row: out + row,
-                        int: int_out,
+                        dtype,
                     });
                 }
             }
@@ -266,12 +246,12 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 let out = dst_row(alloc, resolve(&alias, value));
                 let (la, ld) = alloc.lreg[resolve(&alias, value) as usize];
                 let sfp = unary(op, at)?;
-                let int = types.of(a).dtype == crate::ir::DType::I32;
+                let dtype = types.of(a).dtype;
                 for row in (0..rows).step_by(2) {
                     m.t1.push(MirOp::Sfpload {
                         lreg: la,
                         row: src + row,
-                        int,
+                        dtype,
                     });
                     m.t1.push(MirOp::Sfp {
                         op: sfp,
@@ -282,7 +262,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     m.t1.push(MirOp::Sfpstore {
                         lreg: ld,
                         row: out + row,
-                        int,
+                        dtype,
                     });
                 }
             }
@@ -293,17 +273,19 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     let _ = (left.shape, right.shape);
                     return Err(Error::TT_TODO_BROADCAST);
                 }
-                let int = match left.dtype {
-                    crate::ir::DType::F32 => false,
+                let dtype = match left.dtype {
+                    crate::ir::DType::F32 => crate::ir::DType::F32,
                     crate::ir::DType::I32
                         if matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor) =>
                     {
-                        true
+                        crate::ir::DType::I32
                     }
                     // A bool lane is `-1`/`0`, so the bitwise and/or *is* the
                     // logical one (this is what zyx's `tt_sfp_integer` does for
                     // `BOp::And`/`Or` too).
-                    crate::ir::DType::Bool if matches!(op, BinOp::And | BinOp::Or) => true,
+                    crate::ir::DType::Bool if matches!(op, BinOp::And | BinOp::Or) => {
+                        crate::ir::DType::Bool
+                    }
                     other => {
                         let _ = (op, other);
                         return Err(Error::TT_TODO_BINARY_DTYPE);
@@ -316,18 +298,22 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 let (la, ld) = alloc.lreg[resolve(&alias, value) as usize];
                 let lb = 2u8;
                 // A comparison writes `-1`/`0` lanes, so its result is stored in
-                // the integer format; everything else here is FP32.
-                let int_out = int || matches!(op, BinOp::Cmplt | BinOp::Cmpgt | BinOp::Cmpge);
+                // the integer format; everything else keeps the operands'.
+                let out_dtype = if matches!(op, BinOp::Cmplt | BinOp::Cmpgt | BinOp::Cmpge) {
+                    crate::ir::DType::Bool
+                } else {
+                    dtype
+                };
                 for row in (0..rows).step_by(2) {
                     m.t1.push(MirOp::Sfpload {
                         lreg: la,
                         row: sa + row,
-                        int,
+                        dtype,
                     });
                     m.t1.push(MirOp::Sfpload {
                         lreg: lb,
                         row: sb + row,
-                        int,
+                        dtype,
                     });
                     match op {
                         BinOp::Cmplt | BinOp::Cmpgt | BinOp::Cmpge => {
@@ -358,7 +344,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     m.t1.push(MirOp::Sfpstore {
                         lreg: ld,
                         row: out + row,
-                        int: int_out,
+                        dtype: out_dtype,
                     });
                 }
             }
@@ -386,17 +372,17 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     m.t1.push(MirOp::Sfpload {
                         lreg: lc,
                         row: sc + row,
-                        int: true,
+                        dtype: crate::ir::DType::Bool,
                     });
                     m.t1.push(MirOp::Sfpload {
                         lreg: lt,
                         row: st + row,
-                        int: false,
+                        dtype: types.of(if_true).dtype,
                     });
                     m.t1.push(MirOp::Sfpload {
                         lreg: lf,
                         row: sf + row,
-                        int: false,
+                        dtype: types.of(if_false).dtype,
                     });
                     m.t1.push(MirOp::Select {
                         cond: lc,
@@ -407,7 +393,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     m.t1.push(MirOp::Sfpstore {
                         lreg: ld,
                         row: out + row,
-                        int: false,
+                        dtype: types.of(value).dtype,
                     });
                 }
             }

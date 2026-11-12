@@ -1704,3 +1704,52 @@ fn casts_and_bitcasts_run_on_the_simulator() {
         assert_eq!(got, i32::from(*v < 0.0), "bool to i32, datum {i}: {v}");
     }
 }
+
+/// bf16 through the same datapath: the unpacker reads a 16-bit page into a
+/// 16-bit `Dst` (`Bf16` in and out), the lane widens to FP32 for the op, and
+/// the packer writes 16-bit datums back. A negation only flips the sign bit, so
+/// every pattern -- zeros, subnormals, infinities, NaN payloads -- is exact.
+const NEG_BF16: &str = "\
+version 4
+grid 1,1
+%in = param bf16 1024
+%out = param bf16 1024
+%bi = buffer bf16 32,32
+%bo = buffer bf16 32,32
+copy_to %bi from %in [0]
+%x = load %bi [0]
+%y = neg %x
+store_to %bo from %y [0]
+copy_to %out from %bo [0]
+";
+
+#[test]
+fn bf16_runs_on_the_simulator() {
+    let count = 1024usize;
+    // Every sign and exponent with a few mantissas, then noise.
+    let mut patterns = Vec::new();
+    for sign in [0u16, 0x8000] {
+        for exp in 0..256u16 {
+            for mant in [0u16, 1, 0x20, 0x40, 0x7f] {
+                patterns.push(sign | exp << 7 | mant);
+            }
+        }
+    }
+    let mut seed = 0xdead_beefu32;
+    while patterns.len() < count {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        patterns.push((seed >> 8) as u16);
+    }
+    patterns.truncate(count);
+    let input: Vec<u8> = patterns.iter().flat_map(|h| h.to_le_bytes()).collect();
+
+    let out = run_kernel(NEG_BF16, &input, count * 2);
+    for (i, h) in patterns.iter().enumerate() {
+        let got = u16::from_le_bytes(out[2 * i..2 * i + 2].try_into().unwrap());
+        // The lane is FP32 and the SFPU flushes denormals, so a bf16 with a
+        // zero exponent (a subnormal, or a zero of either sign) comes back as
+        // +0; every normal, infinity and NaN just flips its sign bit.
+        let want = if h & 0x7f80 == 0 { 0 } else { h ^ 0x8000 };
+        assert_eq!(got, want, "bf16 neg, datum {i}: {h:#06x}");
+    }
+}

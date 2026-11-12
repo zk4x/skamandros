@@ -345,7 +345,9 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
                 state.x1 = first + count - 1;
             }
             MirOp::Setadczw { face, .. } => state.face = face,
-            MirOp::Unpacr { cb, count, int, .. } => {
+            MirOp::Unpacr {
+                cb, count, dtype, ..
+            } => {
                 if count == 0 {
                     return Err(Error::TT_ERROR_UNPACK_ZERO_DATUMS);
                 }
@@ -356,7 +358,7 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
                 // after draining the previous unpack.
                 cb_base_unpack(out, cb)?;
                 let mut words = ConfigWords::new();
-                unpack_config(&mut words, count, state.dst_row, int);
+                unpack_config(&mut words, count, state.dst_row, dtype);
                 out.extend(config_program(&words));
                 out.push(stallwait(
                     block::UNPACKER | block::CONFIG,
@@ -528,17 +530,33 @@ fn stallwait(block_mask: u32, condition: u32) -> Result<Instruction, Error> {
     })
 }
 
+/// The `SFPLOAD`/`SFPSTORE` lane format of one datum: the conversion the lane
+/// makes on the way in or out.
+fn lane_format(dtype: DType) -> u32 {
+    match dtype {
+        DType::F32 => tt_isa::sfpu::mod0_fmt::FP32,
+        DType::I32 | DType::Bool => tt_isa::sfpu::mod0_fmt::INT32,
+        DType::Bf16 => tt_isa::sfpu::mod0_fmt::BF16,
+    }
+}
+
+/// The L1 format of one buffer datum: a bf16 datum is two bytes in L1, every
+/// other datum is carried as 32 opaque bits.
+fn l1_format(dtype: DType) -> L1Format {
+    match dtype {
+        DType::Bf16 => L1Format::Bf16,
+        _ => L1Format::Fp32,
+    }
+}
+
 /// The unpacker's `Config` for one unit: base, destination, X dimension, FP32
 /// in and out. The base is `base/16 - 1` because L1 holds the datum block with
 /// no 16-byte tile header, while the unpacker adds one unconditionally.
-fn unpack_config(words: &mut ConfigWords, datums: u32, dst_row: u32, int: bool) {
-    // The datum is opaque 32 bits at this layer: `Int32` in the packer's
-    // `Out_data_format` requires the `Dst` access format to match it, and the
-    // role descriptor's is 32-bit. The `int` flag instead selects the
-    // `SFPLOAD`/`SFPSTORE` format, which is what decides whether the lane is
-    // converted.
-    let _ = int;
-    let fmt = L1Format::Fp32;
+fn unpack_config(words: &mut ConfigWords, datums: u32, dst_row: u32, dtype: DType) {
+    // The datum is opaque 32 bits at this layer: `Int32` in the packed output
+    // requires the `Dst` access format to match it, and the role descriptor's is
+    // 32-bit. The lane's own format is `dtype`'s, which decides the conversion.
+    let fmt = l1_format(dtype);
     words
         .set(thcon::THCON_SEC0_REG7_Offset_address, 0)
         .unwrap()
@@ -694,32 +712,14 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
     }
     let bad_isa = |e: tt_isa::isa::EncodeError| bad(e, op);
     match *op {
-        MirOp::Sfpload { lreg, row, int } => {
-            let i = encode::sfpload(
-                u32::from(lreg),
-                if int {
-                    tt_isa::sfpu::mod0_fmt::INT32
-                } else {
-                    tt_isa::sfpu::mod0_fmt::FP32
-                },
-                0,
-                row + row_delta,
-            )
-            .map_err(bad_isa)?;
+        MirOp::Sfpload { lreg, row, dtype } => {
+            let i = encode::sfpload(u32::from(lreg), lane_format(dtype), 0, row + row_delta)
+                .map_err(bad_isa)?;
             out.push(i);
         }
-        MirOp::Sfpstore { lreg, row, int } => {
-            let i = encode::sfpstore(
-                u32::from(lreg),
-                if int {
-                    tt_isa::sfpu::mod0_fmt::INT32
-                } else {
-                    tt_isa::sfpu::mod0_fmt::FP32
-                },
-                0,
-                row + row_delta,
-            )
-            .map_err(bad_isa)?;
+        MirOp::Sfpstore { lreg, row, dtype } => {
+            let i = encode::sfpstore(u32::from(lreg), lane_format(dtype), 0, row + row_delta)
+                .map_err(bad_isa)?;
             out.push(i);
         }
         MirOp::Sfp {
@@ -1042,7 +1042,7 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
                 rows,
                 row,
                 last,
-                int,
+                dtype,
             } => {
                 if rows == 0 {
                     return Err(Error::TT_ERROR_PACK_ZERO_ROWS);
@@ -1051,7 +1051,7 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
                 // 16-byte units minus the header unit the packer adds.
                 cb_base_pack(out, cb)?;
                 let mut words = ConfigWords::new();
-                pack_config(&mut words, int, row);
+                pack_config(&mut words, dtype, row);
                 out.extend(config_program(&words));
                 out.push(stallwait(block::PACKER | block::CONFIG, cond::CONFIG_BUSY)?);
                 pack_rows(out, rows, last)?;
@@ -1081,14 +1081,12 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
 /// address counter (`TT_SETADC(PAC, CH_0, SET_W, tile_index)`). The simulator
 /// does not model that counter — a `SETADC` there leaves the pack reading row
 /// 0 — so the row is written here, per pack, which is also what zyx did.
-fn pack_config(words: &mut ConfigWords, int: bool, row: u32) {
-    // The datum is opaque 32 bits at this layer: `Int32` in the packer's
-    // `Out_data_format` requires the `Dst` access format to match it, and the
-    // role descriptor's is 32-bit. The `int` flag instead selects the
-    // `SFPLOAD`/`SFPSTORE` format, which is what decides whether the lane is
-    // converted.
-    let _ = int;
-    let fmt = L1Format::Fp32;
+fn pack_config(words: &mut ConfigWords, dtype: DType, row: u32) {
+    // The datum's own format decides the read path: a bf16 tile is read from a
+    // 16-bit `Dst` (two bytes per datum, so half the row stride) and written as
+    // bf16; every other datum is opaque 32 bits.
+    let fmt = l1_format(dtype);
+    let bf16 = dtype == DType::Bf16;
     words
         .set(thcon::THCON_SEC0_REG1_In_data_format, fmt.code().unwrap())
         .unwrap()
@@ -1124,11 +1122,18 @@ fn pack_config(words: &mut ConfigWords, int: bool, row: u32) {
         .unwrap()
         .set(pack0::PCK0_ADDR_CTRL_XY_REG_0_Xstride, 0)
         .unwrap()
-        .set(pack0::PCK0_ADDR_CTRL_XY_REG_0_Ystride, DST_ROW_BYTES)
+        .set(
+            pack0::PCK0_ADDR_CTRL_XY_REG_0_Ystride,
+            if bf16 {
+                DST_ROW_BYTES / 2
+            } else {
+                DST_ROW_BYTES
+            },
+        )
         .unwrap()
         .set(pack0::PCK0_ADDR_CTRL_ZW_REG_0_Zstride, 0)
         .unwrap()
-        .set(pack0::PCK_DEST_RD_CTRL_Read_32b_data, 1)
+        .set(pack0::PCK_DEST_RD_CTRL_Read_32b_data, u32::from(!bf16))
         .unwrap()
         .set(pack0::PCK_DEST_RD_CTRL_Read_unsigned, 0)
         .unwrap()
@@ -1144,7 +1149,7 @@ fn pack_config(words: &mut ConfigWords, int: bool, row: u32) {
         .unwrap()
         .set(pack0::PCK_EDGE_OFFSET_SEC0_mask, 0xFFFF)
         .unwrap()
-        .set(alu::ALU_ACC_CTRL_Fp32_enabled, 1)
+        .set(alu::ALU_ACC_CTRL_Fp32_enabled, u32::from(!bf16))
         .unwrap();
 }
 

@@ -71,7 +71,7 @@ fn same_shifted(body: &[MirOp; 3], following: &[MirOp; 3]) -> bool {
                 MirOp::Sfpload {
                     lreg: la,
                     row: ra,
-                    int: ia,
+                    dtype: ia,
                 },
                 MirOp::Sfp {
                     op: oa,
@@ -82,14 +82,14 @@ fn same_shifted(body: &[MirOp; 3], following: &[MirOp; 3]) -> bool {
                 MirOp::Sfpstore {
                     lreg: sa,
                     row: sa_row,
-                    int: isa,
+                    dtype: isa,
                 },
             ],
             [
                 MirOp::Sfpload {
                     lreg: lb,
                     row: rb,
-                    int: ib,
+                    dtype: ib,
                 },
                 MirOp::Sfp {
                     op: ob,
@@ -100,7 +100,7 @@ fn same_shifted(body: &[MirOp; 3], following: &[MirOp; 3]) -> bool {
                 MirOp::Sfpstore {
                     lreg: sb,
                     row: sb_row,
-                    int: isb,
+                    dtype: isb,
                 },
             ],
         ) => {
@@ -290,7 +290,7 @@ copy_to %out from %b0 [0]
             MirOp::Sfpload {
                 lreg: 0,
                 row: 0,
-                int: false
+                dtype: crate::ir::DType::F32
             }
         ));
         assert_eq!(m.t1.len(), before - (32 - 1) * 3 + 1);
@@ -341,7 +341,7 @@ copy_to %out from %b0 [0]
         m.t1.push(MirOp::Sfpload {
             lreg: 9,
             row: 0,
-            int: false,
+            dtype: crate::ir::DType::F32,
         });
         assert!(verify(&m).is_err());
     }
@@ -352,7 +352,7 @@ copy_to %out from %b0 [0]
         m.t1.push(MirOp::Sfpstore {
             lreg: 0,
             row: 8 * DST_ROWS,
-            int: false,
+            dtype: crate::ir::DType::F32,
         });
         assert!(verify(&m).is_err());
     }
