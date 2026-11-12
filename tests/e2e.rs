@@ -1521,3 +1521,188 @@ fn a_symbolic_grid_runs_each_tiles_own_slice() {
         take_error(&free, err)
     );
 }
+
+/// Compile `program`, upload `input`, launch it once over one tile and return
+/// the output bytes. Two parameters, in then out.
+fn run_kernel(program: &str, input: &[u8], out_bytes: usize) -> Vec<u8> {
+    let _device = device();
+    let sim = simulator_path();
+    // SAFETY: no other thread reads the environment concurrently; the library
+    // reads it when it opens the device.
+    unsafe { std::env::set_var("TT_TTSIM_LIB", &sim) };
+
+    let lib = library();
+    let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
+    let unload: Symbol<ModuleUnload> =
+        unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
+    let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
+    let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
+    let release: Symbol<Release> = unsafe { lib.get(b"ttRelease\0") }.expect("ttRelease");
+    let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
+    let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
+    let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
+    let launch: Symbol<Launch> = unsafe { lib.get(b"ttLaunch\0") }.expect("ttLaunch");
+
+    let mut err: *mut c_char = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { init(&mut err) },
+        TT_OK,
+        "ttInit: {}",
+        take_error(&free, err)
+    );
+    let (mut input_at, mut output_at) = (0u64, 0u64);
+    assert_eq!(
+        unsafe { alloc(input.len(), &mut input_at, &mut err) },
+        TT_OK,
+        "input: {}",
+        take_error(&free, err)
+    );
+    assert_eq!(
+        unsafe { alloc(out_bytes, &mut output_at, &mut err) },
+        TT_OK,
+        "output: {}",
+        take_error(&free, err)
+    );
+    assert_eq!(
+        unsafe { h2d(input_at, input.as_ptr(), input.len(), &mut err) },
+        TT_OK,
+        "upload: {}",
+        take_error(&free, err)
+    );
+
+    let mut module: *mut c_void = std::ptr::null_mut();
+    let code = unsafe {
+        compile(
+            program.as_ptr().cast(),
+            program.len(),
+            &mut module,
+            &mut err,
+        )
+    };
+    assert_eq!(code, TT_OK, "compile: {}", take_error(&free, err));
+
+    let params = [input_at, output_at];
+    let code = unsafe { launch(module, params.as_ptr(), params.len(), &mut err) };
+    assert_eq!(code, TT_OK, "ttLaunch: {}", take_error(&free, err));
+
+    let mut back = vec![0u8; out_bytes];
+    assert_eq!(
+        unsafe { d2h(back.as_mut_ptr(), output_at, out_bytes, &mut err) },
+        TT_OK,
+        "download: {}",
+        take_error(&free, err)
+    );
+    assert_eq!(
+        unsafe { unload(module, &mut err) },
+        TT_OK,
+        "unload: {}",
+        take_error(&free, err)
+    );
+    assert_eq!(
+        unsafe { release(&mut err) },
+        TT_OK,
+        "ttRelease: {}",
+        take_error(&free, err)
+    );
+    back
+}
+
+/// `(int)f`: truncation toward zero, in two's complement.
+const CAST_F32_TO_I32: &str = "\
+version 4
+grid 1,1
+%in = param f32 1024
+%out = param i32 1024
+%bi = buffer f32 32,32
+%bo = buffer i32 32,32
+copy_to %bi from %in [0]
+%x = load %bi [0]
+%y = cast %x to i32
+store_to %bo from %y [0]
+copy_to %out from %bo [0]
+";
+
+/// `(float)i`: two's complement to FP32, round to nearest even.
+const CAST_I32_TO_F32: &str = "\
+version 4
+grid 1,1
+%in = param i32 1024
+%out = param f32 1024
+%bi = buffer i32 32,32
+%bo = buffer f32 32,32
+copy_to %bi from %in [0]
+%x = load %bi [0]
+%y = cast %x to f32
+store_to %bo from %y [0]
+copy_to %out from %bo [0]
+";
+
+/// The same bits under another name: no instruction at all.
+const BITCAST_F32_TO_I32: &str = "\
+version 4
+grid 1,1
+%in = param f32 1024
+%out = param i32 1024
+%bi = buffer f32 32,32
+%bo = buffer i32 32,32
+copy_to %bi from %in [0]
+%x = load %bi [0]
+%y = bitcast %x to i32
+store_to %bo from %y [0]
+copy_to %out from %bo [0]
+";
+
+/// A comparison writes `-1`/`0` in the lane; a cast to an integer is the C
+/// value, one or zero.
+const CAST_BOOL_TO_I32: &str = "\
+version 4
+grid 1,1
+%in = param f32 1024
+%out = param i32 1024
+%bi = buffer f32 32,32
+%bo = buffer i32 32,32
+copy_to %bi from %in [0]
+%x = load %bi [0]
+%zero = sub %x %x
+%c = cmplt %x %zero
+%y = cast %c to i32
+store_to %bo from %y [0]
+copy_to %out from %bo [0]
+";
+
+#[test]
+fn casts_and_bitcasts_run_on_the_simulator() {
+    let count = 1024usize;
+    let floats: Vec<f32> = (0..count).map(|i| (i as f32 - 512.0) * 0.375).collect();
+    let f32_bytes: Vec<u8> = floats.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    // `(int)f` truncates: `-2.625` is `-2`, not `-3`.
+    let out = run_kernel(CAST_F32_TO_I32, &f32_bytes, count * 4);
+    for (i, v) in floats.iter().enumerate() {
+        let got = i32::from_le_bytes(out[4 * i..4 * i + 4].try_into().unwrap());
+        assert_eq!(got, *v as i32, "f32 to i32, datum {i}: {v}");
+    }
+
+    // `(float)i` rounds to nearest even.
+    let ints: Vec<i32> = (0..count).map(|i| (i as i32 - 512) * 7).collect();
+    let i32_bytes: Vec<u8> = ints.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel(CAST_I32_TO_F32, &i32_bytes, count * 4);
+    for (i, v) in ints.iter().enumerate() {
+        let got = f32::from_le_bytes(out[4 * i..4 * i + 4].try_into().unwrap());
+        assert_eq!(got, *v as f32, "i32 to f32, datum {i}: {v}");
+    }
+
+    // A bitcast leaves every bit alone.
+    let out = run_kernel(BITCAST_F32_TO_I32, &f32_bytes, count * 4);
+    for (i, v) in floats.iter().enumerate() {
+        let got = i32::from_le_bytes(out[4 * i..4 * i + 4].try_into().unwrap());
+        assert_eq!(got, v.to_bits() as i32, "bitcast, datum {i}: {v}");
+    }
+
+    // A bool lane is `-1`/`0`; the C value is one or zero.
+    let out = run_kernel(CAST_BOOL_TO_I32, &f32_bytes, count * 4);
+    for (i, v) in floats.iter().enumerate() {
+        let got = i32::from_le_bytes(out[4 * i..4 * i + 4].try_into().unwrap());
+        assert_eq!(got, i32::from(*v < 0.0), "bool to i32, datum {i}: {v}");
+    }
+}

@@ -411,3 +411,41 @@ grid 1,1
         .expect_err("relu is not an op");
     assert_eq!(err, TT::status::ttStatus::TT_ERROR_PARSE);
 }
+
+/// A bitcast is a reinterpretation, not a conversion: the bits are the value, so
+/// the two dtypes must be the same width. It lowers to nothing at all.
+#[test]
+fn a_bitcast_is_the_same_bits_under_another_name() {
+    const SAME: &str = "\
+version 4
+%in = param f32 2048
+%out = param i32 2048
+%bi = buffer f32 32,32
+%bo = buffer i32 32,32
+copy_to %bi from %in [0]
+%x = load %bi [0]
+%y = bitcast %x to i32
+store_to %bo from %y [0]
+copy_to %out from %bo [0]
+grid 1,1
+";
+    let k = Kernel::parse(SAME).expect("a bitcast between 32-bit dtypes");
+    assert_eq!(k.to_text(), SAME, "the text form is canonical");
+    assert_eq!(Kernel::from_bytes(&k.to_bytes()).unwrap(), k);
+    let m = TT::compile::compile(&k).expect("a bitcast lowers to nothing");
+    assert!(
+        m.cores.iter().all(|c| !c.is_empty()),
+        "unpack, math and pack"
+    );
+
+    // 32 bits do not fit a 16-bit dtype, and a bitcast may not convert.
+    const NARROW: &str = "\
+version 4
+%b = buffer f32 32,32
+%x = load %b [0]
+%y = bitcast %x to bf16
+grid 1,1
+";
+    let err = Kernel::parse(NARROW).expect_err("a narrower dtype cannot hold the bits");
+    assert_eq!(err, TT::status::ttStatus::TT_ERROR_BITCAST_WIDTH);
+}

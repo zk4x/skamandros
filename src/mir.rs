@@ -3,6 +3,8 @@
 
 //! The machine IR: what each of the three compute cores executes.
 
+use crate::ir::DType;
+
 /// One SFPU instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SfpOp {
@@ -63,6 +65,15 @@ pub enum MirOp {
     },
     /// A lanewise comparison, `-1`/`0` into `d`.
     Compare { op: CmpOp, a: u8, b: u8, d: u8 },
+    /// A lanewise conversion from `from` to `to`, in the SFPU's 32-bit lane,
+    /// with the rounding the C type has: `(int)f` truncates, `i32` to `f32`
+    /// rounds to nearest, `(bool)x` is `x != 0`.
+    Cast {
+        from: DType,
+        to: DType,
+        a: u8,
+        d: u8,
+    },
     /// `cond ? t : f`, lanewise, through the SFPU lane flags.
     Select { cond: u8, t: u8, f: u8, d: u8 },
     /// The lanewise maximum, through the SFPU lane flags.

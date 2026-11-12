@@ -64,6 +64,14 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
     // The induction value of every loop being lowered, innermost last: a bound
     // may name an outer loop's index, whose value is its counter register.
     let mut loops: Vec<crate::ir::ValueId> = Vec::new();
+    // A bitcast is the same bits under another name, so it has no program of its
+    // own and no `Dst` slot: every reader of the bitcast reads its source.
+    let mut alias: Vec<Option<crate::ir::ValueId>> = vec![None; types.values.len()];
+    for op in &k.ops {
+        if let Op::Bitcast { value, src, .. } = *op {
+            alias[value as usize] = Some(resolve(&alias, src));
+        }
+    }
     for (at, op) in k.ops.iter().enumerate() {
         match *op {
             Op::Const { .. }
@@ -76,6 +84,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             // nothing here has to produce one.
             Op::GridCoord { .. } => {}
             Op::Cast { value, .. }
+            | Op::Bitcast { value, .. }
             | Op::Unary { value, .. }
             | Op::Binary { value, .. }
             | Op::Select { value, .. }
@@ -133,9 +142,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     let _ = buffer;
                     Error::TT_ERROR_BUFFER_NOT_PLACED
                 })?;
-                let row = match alloc.place_of(value) {
-                    crate::alloc::Place::Dst(slot) => u32::from(slot) * DST_ROWS,
-                };
+                let row = dst_row(alloc, resolve(&alias, value));
                 // The unpacker writes `Dst`: it waits for a slot the packer has
                 // given back, so the first unit's result cannot be overwritten
                 // before it has been packed. The page itself comes from the ring:
@@ -203,7 +210,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 m.t2.push(MirOp::Pack {
                     cb,
                     rows,
-                    row: dst_row(alloc, value),
+                    row: dst_row(alloc, resolve(&alias, value)),
                     last: true,
                     int,
                 });
@@ -213,16 +220,51 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 m.t2.push(MirOp::SemPost { sem: SEM_SLOT });
                 let _ = offset;
             }
-            Op::Cast { .. } => {
-                let _ = at;
-                return Err(Error::TT_TODO_CAST);
+            Op::Cast { value, src, dtype } => {
+                let from = types.of(src).dtype;
+                let shape = types.of(src).shape;
+                // bf16 has no lane yet: neither the L1 format it would be read
+                // from nor the register datapath it would run on is lowered.
+                if from == crate::ir::DType::Bf16 || dtype == crate::ir::DType::Bf16 {
+                    let _ = at;
+                    return Err(Error::TT_TODO_CAST);
+                }
+                let rows = rows_of(shape, at)?;
+                let s = dst_row(alloc, resolve(&alias, src));
+                let out = dst_row(alloc, resolve(&alias, value));
+                let (la, ld) = alloc.lreg[resolve(&alias, value) as usize];
+                // The lane is 32 bits, so `bool`, `i32` and the two float
+                // formats are all one lane: the `SFPLOAD`/`SFPSTORE` format only
+                // decides whether the lane is converted on the way in or out.
+                let int_in = matches!(from, crate::ir::DType::I32 | crate::ir::DType::Bool);
+                let int_out = matches!(dtype, crate::ir::DType::I32 | crate::ir::DType::Bool);
+                for row in (0..rows).step_by(2) {
+                    m.t1.push(MirOp::Sfpload {
+                        lreg: la,
+                        row: s + row,
+                        int: int_in,
+                    });
+                    m.t1.push(MirOp::Cast {
+                        from,
+                        to: dtype,
+                        a: la,
+                        d: ld,
+                    });
+                    m.t1.push(MirOp::Sfpstore {
+                        lreg: ld,
+                        row: out + row,
+                        int: int_out,
+                    });
+                }
             }
+            // A bitcast is resolved, not lowered: every reader reads the source.
+            Op::Bitcast { .. } => {}
             Op::Unary { value, op, a } => {
                 let shape = types.of(a).shape;
                 let rows = rows_of(shape, at)?;
-                let src = dst_row(alloc, a);
-                let out = dst_row(alloc, value);
-                let (la, ld) = alloc.lreg[value as usize];
+                let src = dst_row(alloc, resolve(&alias, a));
+                let out = dst_row(alloc, resolve(&alias, value));
+                let (la, ld) = alloc.lreg[resolve(&alias, value) as usize];
                 let sfp = unary(op, at)?;
                 let int = types.of(a).dtype == crate::ir::DType::I32;
                 for row in (0..rows).step_by(2) {
@@ -268,10 +310,10 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     }
                 };
                 let rows = rows_of(left.shape, at)?;
-                let sa = dst_row(alloc, a);
-                let sb = dst_row(alloc, b);
-                let out = dst_row(alloc, value);
-                let (la, ld) = alloc.lreg[value as usize];
+                let sa = dst_row(alloc, resolve(&alias, a));
+                let sb = dst_row(alloc, resolve(&alias, b));
+                let out = dst_row(alloc, resolve(&alias, value));
+                let (la, ld) = alloc.lreg[resolve(&alias, value) as usize];
                 let lb = 2u8;
                 // A comparison writes `-1`/`0` lanes, so its result is stored in
                 // the integer format; everything else here is FP32.
@@ -328,11 +370,11 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             } => {
                 let shape = types.of(if_true).shape;
                 let rows = rows_of(shape, at)?;
-                let sc = dst_row(alloc, cond);
-                let st = dst_row(alloc, if_true);
-                let sf = dst_row(alloc, if_false);
-                let out = dst_row(alloc, value);
-                let ld = alloc.lreg[value as usize].1;
+                let sc = dst_row(alloc, resolve(&alias, cond));
+                let st = dst_row(alloc, resolve(&alias, if_true));
+                let sf = dst_row(alloc, resolve(&alias, if_false));
+                let out = dst_row(alloc, resolve(&alias, value));
+                let ld = alloc.lreg[resolve(&alias, value) as usize].1;
                 let lc = 3u8;
                 let lt = 0u8;
                 let lf = 2u8;
@@ -518,6 +560,12 @@ fn dst_row(alloc: &Alloc, value: crate::ir::ValueId) -> u32 {
     match alloc.place_of(value) {
         crate::alloc::Place::Dst(slot) => u32::from(slot) * DST_ROWS,
     }
+}
+
+/// Follow a bitcast to the value that owns the `Dst` slot. The alias table is
+/// fully resolved when it is built, so one lookup is enough.
+fn resolve(alias: &[Option<crate::ir::ValueId>], value: crate::ir::ValueId) -> crate::ir::ValueId {
+    alias[value as usize].unwrap_or(value)
 }
 
 fn unary(op: UnOp, at: usize) -> Result<SfpOp, Error> {

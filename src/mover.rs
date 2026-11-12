@@ -367,6 +367,11 @@ fn remap(op: &Op, map: &[ValueId], value: Option<ValueId>) -> Op {
             src: v(src),
             dtype,
         },
+        Op::Bitcast { src, dtype, .. } => Op::Bitcast {
+            value: own(),
+            src: v(src),
+            dtype,
+        },
         Op::Unary { op, a, .. } => Op::Unary {
             value: own(),
             op,

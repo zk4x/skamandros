@@ -145,6 +145,14 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                         }
                     }
                 }
+                MirOp::Cast { a, d, .. } => {
+                    for lreg in [a, d] {
+                        if lreg >= crate::alloc::LREGS {
+                            let _ = (name, at, lreg);
+                            return Err(Error::TT_ERROR_LANE_REGISTER);
+                        }
+                    }
+                }
                 MirOp::Setdst { row } => {
                     if row >= u32::from(DST_SLOTS) * DST_ROWS {
                         let _ = (name, at, row);

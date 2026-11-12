@@ -463,6 +463,12 @@ pub enum Op {
         src: ValueId,
         dtype: DType,
     },
+    /// The same bits under another name, between dtypes of equal width.
+    Bitcast {
+        value: ValueId,
+        src: ValueId,
+        dtype: DType,
+    },
     /// One unary register op.
     Unary {
         value: ValueId,
@@ -503,6 +509,7 @@ impl Op {
             | Op::GridCoord { value, .. }
             | Op::Load { value, .. }
             | Op::Cast { value, .. }
+            | Op::Bitcast { value, .. }
             | Op::Unary { value, .. }
             | Op::Binary { value, .. }
             | Op::Select { value, .. }
@@ -545,7 +552,7 @@ impl Op {
                 v.extend(dim(offset));
                 v
             }
-            Op::Cast { src, .. } => vec![*src],
+            Op::Cast { src, .. } | Op::Bitcast { src, .. } => vec![*src],
             Op::Unary { a, .. } => vec![*a],
             Op::Binary { a, b, .. } => vec![*a, *b],
             Op::Select {
@@ -1017,8 +1024,26 @@ impl Kernel {
                         let _ = src;
                         return Err(Error::TT_ERROR_CAST_SOURCE);
                     }
-                    if s.dtype == DType::Bool || dtype == DType::Bool {
-                        todo!("op {at}: a cast to or from bool is not implemented");
+                    // Every pair converts, C-style (`(int)f`, `(bool)f`,
+                    // `__float2bfloat16`): a scalar of one dtype to another, in
+                    // the lane, with the rounding the C type has.
+                    ValueInfo {
+                        kind: ValueKind::Register,
+                        dtype,
+                        shape: s.shape,
+                    }
+                }
+                Op::Bitcast { src, dtype, .. } => {
+                    let s = *lookup(&values, &visible, src, at)?;
+                    if !is_value(s.kind) {
+                        let _ = src;
+                        return Err(Error::TT_ERROR_CAST_SOURCE);
+                    }
+                    // A reinterpretation, not a conversion: the bits are the
+                    // value, so the two dtypes must be the same width.
+                    if s.dtype.bytes() != dtype.bytes() {
+                        let _ = (s.dtype, dtype);
+                        return Err(Error::TT_ERROR_BITCAST_WIDTH);
                     }
                     ValueInfo {
                         kind: ValueKind::Register,
@@ -1410,6 +1435,12 @@ impl Kernel {
                     put_u32(&mut b, *a);
                     put_u32(&mut b, *rhs);
                 }
+                Op::Bitcast { value, src, dtype } => {
+                    b.push(15);
+                    put_name(&mut b, &self.names[*value as usize]);
+                    put_u32(&mut b, *src);
+                    b.push(dtype.tag());
+                }
             }
         }
         b
@@ -1506,6 +1537,13 @@ impl Kernel {
                     let dtype = r.dtype()?;
                     let value = define(&mut names, name)?;
                     Op::Cast { value, src, dtype }
+                }
+                15 => {
+                    let name = r.name()?;
+                    let src = r.u32()?;
+                    let dtype = r.dtype()?;
+                    let value = define(&mut names, name)?;
+                    Op::Bitcast { value, src, dtype }
                 }
                 10 => {
                     let name = r.name()?;
@@ -1857,6 +1895,14 @@ impl Kernel {
                         dtype.name()
                     ));
                 }
+                Op::Bitcast { value, src, dtype } => {
+                    s.push_str(&format!(
+                        "%{} = bitcast %{} to {}\n",
+                        name(*value),
+                        name(*src),
+                        dtype.name()
+                    ));
+                }
                 Op::Unary { value, op, a } => {
                     s.push_str(&format!(
                         "%{} = {} %{}\n",
@@ -2018,6 +2064,13 @@ fn parse_definition(t: &mut Tokens, p: &mut Parser) -> Result<Op, Error> {
             let dtype = t.dtype()?;
             t.end()?;
             Op::Cast { value, src, dtype }
+        }
+        "bitcast" => {
+            let src = t.value(&p.symbols)?;
+            t.expect("to")?;
+            let dtype = t.dtype()?;
+            t.end()?;
+            Op::Bitcast { value, src, dtype }
         }
         "matmul" => {
             let a = t.value(&p.symbols)?;

@@ -13,7 +13,7 @@
 //! `UNPACR`/`PACR` itself. Nothing above this module names a descriptor, a
 //! stride or a `Dst` address.
 
-use crate::ir::Error;
+use crate::ir::{DType, Error};
 use crate::mir::{CmpOp, IOp, Machine, MirOp, SfpOp};
 use crate::riscv::{self as rv, Asm, reg};
 use tt_isa::backend::{
@@ -844,6 +844,9 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
             out.push(encode::sfpmov(u32::from(t), u32::from(d), 0).map_err(bad_isa)?);
             out.push(cc_mask(false).map_err(bad_isa)?);
         }
+        MirOp::Cast { from, to, a, d } => {
+            cast_lanes(from, to, a, d, out)?;
+        }
         MirOp::Max { a, b, d } => {
             out.push(encode::sfpmov(u32::from(b), u32::from(d), 0).map_err(bad_isa)?);
             out.push(cc_mask(true).map_err(bad_isa)?);
@@ -872,6 +875,111 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
         other => {
             let _ = other;
             return Err(Error::TT_ERROR_NOT_MATH);
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Conversions
+// ---------------------------------------------------------------------------
+
+/// Push one conversion word. The immediate and register fields are in range by
+/// construction, so an encoding failure is a bug, not a caller's mistake.
+fn place<E: std::fmt::Display>(out: &mut Stream, instruction: Result<Instruction, E>) {
+    out.push(instruction.unwrap_or_else(|e| panic!("a conversion's word encodes: {e}")));
+}
+
+/// One lanewise conversion in the SFPU's 32-bit lane, with the rounding the C
+/// type has: `(int)f` truncates toward zero, `(float)i` rounds to nearest even,
+/// `(bool)x` is `x != 0`. `bool`'s true is `-1.0f` (`0xBF80_0000`), the value a
+/// comparison writes; a cast *from* `bool` reads any negative lane as true.
+///
+/// `f32` to `i32` is tt-metal's `_calculate_typecast_fp32_to_int32_`: the
+/// exponent picks the mantissa's shift, the bits below the binary point are
+/// dropped (truncation), and a negative input is negated into two's complement.
+/// A magnitude of `2^31` or more saturates to `INT_MIN`, as that kernel does;
+/// CUDA leaves the result undefined there.
+fn cast_lanes(from: DType, to: DType, a: u8, d: u8, out: &mut Stream) -> Result<(), Error> {
+    use tt_isa::sfpu::{LREG_ZERO, loadi, loadi_mode};
+    let a = u32::from(a);
+    let d = u32::from(d);
+    // Mod1 values from the vendored `sfpi_constants.h` (Blackhole).
+    const EXEXP_CC_SGN_COMP: u32 = 2 | 8;
+    const IADD_ARG_IMM: u32 = 1;
+    const IADD_2SCOMP_LREG_DST: u32 = 2;
+    const IADD_CC_NONE: u32 = 4;
+    const SETCC_NE0: u32 = 2;
+    const ENCC_ALL: u32 = 0;
+    const SHFT_IMM_USE_VC: u32 = 1 | 4;
+    const CAST_INT32_TO_FP32_RNE: u32 = 0;
+    let scratch = (0u8..crate::alloc::LREGS)
+        .find(|r| u32::from(*r) != a && u32::from(*r) != d)
+        .ok_or(Error::TT_ERROR_LANE_REGISTER)?;
+    let t = u32::from(scratch);
+    match (from, to) {
+        (DType::F32, DType::F32) | (DType::I32, DType::I32) | (DType::Bool, DType::Bool) => {
+            place(out, encode::sfpmov(a, d, 0))
+        }
+        (DType::I32, DType::F32) => {
+            // Two's complement to sign-magnitude, then sign-magnitude to FP32
+            // (round to nearest even) -- the pair tt-metal's
+            // `_calculate_typecast_int32_to_fp32_` splits into abs/cast/setsgn.
+            place(out, encode::sfpcast(a, t, 3));
+            place(out, encode::sfpcast(t, d, CAST_INT32_TO_FP32_RNE));
+        }
+        (DType::F32, DType::I32) => {
+            // Lanes come in with nothing to be conditional on.
+            place(out, encode::sfpencc(0, 0, ENCC_ALL));
+            place(out, loadi(d, loadi_mode::USHORT, 0));
+            place(out, encode::sfpexexp(a, t, EXEXP_CC_SGN_COMP));
+            // Saturated lanes keep `INT_MIN` (`0x8000_0000`).
+            place(out, loadi(d, loadi_mode::FLOATB, 0x8000));
+            place(
+                out,
+                encode::sfpiadd((-31i32 & 0xfff) as u32, t, t, IADD_ARG_IMM),
+            );
+            place(out, encode::sfpiadd(8, t, t, IADD_ARG_IMM | IADD_CC_NONE));
+            place(out, encode::sfpexman(a, d, 0));
+            place(out, encode::sfpshft(0, t, d, 0));
+            place(out, encode::sfpencc(0, 0, ENCC_ALL));
+            place(out, encode::sfpsetcc(0, a, 0, 0));
+            place(
+                out,
+                encode::sfpiadd(0, LREG_ZERO, d, IADD_2SCOMP_LREG_DST | IADD_CC_NONE),
+            );
+            place(out, encode::sfpencc(0, 0, ENCC_ALL));
+        }
+        // A comparison's true has the sign bit set and its false is zero, so a
+        // logical shift by 31 is the C value: one or zero.
+        (DType::Bool, DType::I32) => place(
+            out,
+            encode::sfpshft((-31i32 & 0xfff) as u32, a, d, SHFT_IMM_USE_VC),
+        ),
+        (DType::Bool, DType::F32) => {
+            place(
+                out,
+                encode::sfpshft((-31i32 & 0xfff) as u32, a, d, SHFT_IMM_USE_VC),
+            );
+            place(out, encode::sfpcast(d, d, CAST_INT32_TO_FP32_RNE));
+        }
+        (from, DType::Bool) => {
+            place(out, encode::sfpencc(0, 0, ENCC_ALL));
+            if from == DType::F32 {
+                // `|x|` first: `-0.0` is zero and a NaN is not.
+                place(out, encode::sfpabs(a, t, 0));
+            }
+            place(out, encode::sfpmov(LREG_ZERO, d, 0));
+            place(
+                out,
+                encode::sfpsetcc(0, if from == DType::F32 { t } else { a }, 0, SETCC_NE0),
+            );
+            place(out, loadi(d, loadi_mode::UPPER, 0xBF80));
+            place(out, encode::sfpencc(0, 0, ENCC_ALL));
+        }
+        (DType::Bf16, _) | (_, DType::Bf16) => {
+            let _ = (from, to);
+            return Err(Error::TT_TODO_CAST);
         }
     }
     Ok(())

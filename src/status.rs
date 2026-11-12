@@ -349,6 +349,9 @@ pub enum ttStatus {
     /// A grid term depends on this core's coordinate, which does not exist
     /// before the grid is dispatched.
     TT_ERROR_GRID_COORD = 150,
+    /// A bitcast names a dtype of a different width: the bits would not all be
+    /// the value.
+    TT_ERROR_BITCAST_WIDTH = 151,
 }
 
 impl ttStatus {
@@ -507,6 +510,7 @@ impl ttStatus {
             ttStatus::TT_ERROR_ENDLOOP_MACHINE => "TT_ERROR_ENDLOOP_MACHINE",
             ttStatus::TT_ERROR_GRID_AXIS => "TT_ERROR_GRID_AXIS",
             ttStatus::TT_ERROR_GRID_COORD => "TT_ERROR_GRID_COORD",
+            ttStatus::TT_ERROR_BITCAST_WIDTH => "TT_ERROR_BITCAST_WIDTH",
         }
     }
 }

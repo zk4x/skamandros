@@ -38,7 +38,9 @@ Parameters and buffers are mutable, not SSA. A shape is a comma-separated list o
 terms, and a term is a literal or an `i32` value; a product is built by an op
 first. A parameter may be arbitrary-dimensional and symbolic, a scalar parameter
 is the shape `0`, and a buffer is two constant dimensions, each `1` or a multiple
-of 32. There is no implicit dtype conversion: `cast %x to bf16` is the only one.
+of 32. There is no implicit dtype conversion: `cast %x to bf16` converts a
+value with the C type's rounding, and `bitcast %x to i32` renames the same bits
+between dtypes of equal width.
 
 The op set is the low-level one and nothing more: zyx's `UOp`
 (`neg`, `not`, `bitnot`, `exp2`, `log2`, `reciprocal`, `sqrt`, `rsqrt`, `sin`,
@@ -235,8 +237,12 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   branched on. There is no unroll. Offsets may be any index expression: a
   literal, a loop index, a scalar parameter, a grid coordinate, or arithmetic
   over them.
-- `cast`, broadcast, `matmul`, `eq`/`noteq`, the remaining unary and binary
-  ops, the `bool` datapath in a parameter or buffer, and the reduce op are
+- `cast` converts in the lane with the C type's rounding (`(int)f` truncates
+  toward zero, `(float)i` rounds to nearest even, `(bool)x` is `x != 0`), and
+  `bitcast` is the same bits under another name. Both run end to end through
+  the C ABI; `bitcast` lowers to no instruction at all.
+- Broadcast, `matmul`, `eq`/`noteq`, the remaining unary and binary ops, the
+  `bool` datapath in a parameter or buffer, bf16 in L1, and the reduce op are
   accepted by the format and verifier and refused loudly by lowering, not
   guessed at.
 - Transcendentals are the caller's to unfold. zyx rewrites `Exp2`/`Log2`/`Sin`/

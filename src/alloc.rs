@@ -58,6 +58,18 @@ pub fn allocate(k: &Kernel, types: &Types) -> Result<Alloc, Error> {
             last_use[v as usize] = Some(at);
         }
     }
+    // A bitcast has no `Dst` slot: its readers read its source, so the source
+    // stays live until the last reader of the bitcast. Walking backwards lets a
+    // chain of bitcasts settle in one pass.
+    for op in k.ops.iter().rev() {
+        if let Op::Bitcast { value, src, .. } = *op {
+            let Some(end) = last_use[value as usize] else {
+                continue;
+            };
+            let use_at = &mut last_use[src as usize];
+            *use_at = Some(use_at.map_or(end, |u| u.max(end)));
+        }
+    }
 
     for (at, op) in k.ops.iter().enumerate() {
         // Free the homes of values that died before this instruction, so an
