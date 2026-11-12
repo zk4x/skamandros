@@ -26,7 +26,7 @@ use crate::device::Device;
 use crate::ir::Error;
 use tt_isa::mailbox;
 use tt_isa::noc::niu::Niu;
-use tt_isa::noc::{Noc0, NocCoord};
+use tt_isa::noc::NocCoord;
 
 /// The one open device, if [`init`] has been called.
 static DEVICE: Mutex<Option<Device>> = Mutex::new(None);
@@ -198,7 +198,7 @@ fn args_for(
     module: &Module,
     params: &[u64],
     grid: [u32; 2],
-    tile: NocCoord<Noc0>,
+    tile: NocCoord,
 ) -> Result<[(Niu, Vec<u32>); 2], Error> {
     let mut arrays = [(Niu::Noc0, Vec::new()), (Niu::Noc1, Vec::new())];
     for (niu, args) in arrays.iter_mut() {
@@ -251,7 +251,7 @@ fn launch_steps(
 
     // Every tile is staged, then all of them are started and joined, so the
     // grid runs concurrently rather than one core at a time.
-    let mut launched: Vec<(NocCoord<Noc0>, u32)> = Vec::new();
+    let mut launched: Vec<(NocCoord, u32)> = Vec::new();
     for ((x, y), tile) in &tiles {
         device.select(*tile);
         // The CB interface is host state: tt-metal's
@@ -387,7 +387,7 @@ fn stage_role(
 }
 
 /// This tile's NOC address-high word: the coordinate packed as `x | y << 6`.
-fn me_hi(tile: NocCoord<Noc0>) -> u32 {
+fn me_hi(tile: NocCoord) -> u32 {
     (tile.x() as u32 & 0x3F) | ((tile.y() as u32 & 0x3F) << 6)
 }
 

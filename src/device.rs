@@ -26,7 +26,7 @@ use tt_isa::dram::{CHANNEL_BYTES, Dram, DramChannel};
 use tt_isa::l1;
 use tt_isa::mailbox::{self, status};
 use tt_isa::noc::niu::Endpoint;
-use tt_isa::noc::{Noc0, NocCoord};
+use tt_isa::noc::NocCoord;
 use tt_isa::tensix::{self, Core};
 
 /// The environment variable that names the simulator's shared object:
@@ -171,10 +171,10 @@ pub struct Device {
     shadow: Option<[u32; 3]>,
     /// The tile the low-level L1 accessors currently target. Everything is
     /// per tile, so a caller selects one before a per-tile step.
-    tile: NocCoord<Noc0>,
+    tile: NocCoord,
     /// Every Tensix tile the part has, in row-major order (logical order). A
     /// module's `(x, y)` is an index into this.
-    tiles: Vec<NocCoord<Noc0>>,
+    tiles: Vec<NocCoord>,
     /// Tensix columns in [`Device::tiles`]: the width of the logical grid.
     columns: usize,
     /// DRAM channels that can hold data.
@@ -182,7 +182,7 @@ pub struct Device {
     /// First byte of DRAM this device has not handed out.
     dram_used: u64,
     /// Is `exec_b` resident and looping on the tile?
-    exec_started: Vec<NocCoord<Noc0>>,
+    exec_started: Vec<NocCoord>,
     /// The last generation handed to any core. Device-wide, so a value a core
     /// has run never repeats: the setup program and the launch that follows it
     /// are two different generations even though they are the first two runs.
@@ -190,7 +190,7 @@ pub struct Device {
     /// Programs already placed at their L1 address: `(tile, address, words,
     /// hash)`. The program cache is per tile, and a launch only names the
     /// address; an identical program on the same tile is not rewritten.
-    placed: Vec<(NocCoord<Noc0>, u32, u64, u64)>,
+    placed: Vec<(NocCoord, u32, u64, u64)>,
 }
 
 impl Device {
@@ -231,7 +231,7 @@ impl Device {
             placed: Vec::new(),
         };
         let tensix = device.probe_tensix()?;
-        device.tiles = tensix.tiles::<Noc0>().collect();
+        device.tiles = tensix.tiles().collect();
         device.columns = tensix.enabled_column_count();
         device.tile = *device.tiles.first().ok_or(Error::TT_ERROR_NO_TENSIX_TILE)?;
         // A previous process (`ttRelease` only drops this struct) leaves its
@@ -244,7 +244,7 @@ impl Device {
     }
 
     /// The tile the low-level accessors currently target.
-    pub fn tile(&self) -> NocCoord<Noc0> {
+    pub fn tile(&self) -> NocCoord {
         self.tile
     }
 
@@ -301,7 +301,7 @@ impl Device {
 
     /// One word of the ARC's address space, through the window: its reset-unit
     /// scratch and its CSM are ordinary tile addresses.
-    fn arc_word(&mut self, arc_tile: NocCoord<Noc0>, address: u64) -> Result<u32, Error> {
+    fn arc_word(&mut self, arc_tile: NocCoord, address: u64) -> Result<u32, Error> {
         let mut bytes = [0u8; 4];
         self.window_read(arc_tile, address, &mut bytes)?;
         Ok(u32::from_le_bytes(bytes))
@@ -310,7 +310,7 @@ impl Device {
     /// Target `tile` for the low-level accessors (`l1_write`, `read32`, the
     /// launch messages, the program cache). One launch selects each of its
     /// tiles in turn.
-    pub fn select(&mut self, tile: NocCoord<Noc0>) {
+    pub fn select(&mut self, tile: NocCoord) {
         self.tile = tile;
     }
 
@@ -327,7 +327,7 @@ impl Device {
     /// The physical tile at logical `(x, y)`. `tt_metal`'s logical grid is the
     /// worker grid: `absolute_logical_x/y` are these coordinates, and the
     /// physical tile follows the column list.
-    pub fn tile_at(&self, x: u32, y: u32) -> Result<NocCoord<Noc0>, Error> {
+    pub fn tile_at(&self, x: u32, y: u32) -> Result<NocCoord, Error> {
         if x as usize >= self.columns || y as usize >= self.rows() {
             let _ = (x, y, self.columns, self.rows());
             return Err(Error::TT_ERROR_GRID);
@@ -780,7 +780,7 @@ impl Device {
     }
 
     /// Point the window at `address` in `tile`, unless it already is.
-    fn retarget(&mut self, tile: NocCoord<Noc0>, address: u64) -> Result<(), Error> {
+    fn retarget(&mut self, tile: NocCoord, address: u64) -> Result<(), Error> {
         let words = tlb_words(address, tile)?;
         if self.shadow == Some(words) {
             return Ok(());
@@ -794,7 +794,7 @@ impl Device {
 
     fn window_write(
         &mut self,
-        tile: NocCoord<Noc0>,
+        tile: NocCoord,
         address: u64,
         bytes: &[u8],
     ) -> Result<(), Error> {
@@ -816,7 +816,7 @@ impl Device {
 
     fn window_read(
         &mut self,
-        tile: NocCoord<Noc0>,
+        tile: NocCoord,
         address: u64,
         out: &mut [u8],
     ) -> Result<(), Error> {
@@ -842,7 +842,7 @@ impl Device {
         Ok(())
     }
 
-    fn channel_endpoint(&self, channel: DramChannel, niu: tt_isa::noc::niu::Niu) -> NocCoord<Noc0> {
+    fn channel_endpoint(&self, channel: DramChannel, niu: tt_isa::noc::niu::Niu) -> NocCoord {
         channel
             .endpoint(niu, channel.port_for(niu, 0))
             .expect("the NIU's first endpoint")
@@ -897,7 +897,7 @@ fn check_bar0(offset: u64, len: usize) -> Result<(), Error> {
 }
 
 /// Encode the three dwords of a 2 MiB unicast window on NoC #0, strict ordering.
-fn tlb_words(base_address: u64, tile: NocCoord<Noc0>) -> Result<[u32; 3], Error> {
+fn tlb_words(base_address: u64, tile: NocCoord) -> Result<[u32; 3], Error> {
     if base_address % WINDOW_SIZE != 0 {
         let _ = base_address;
         return Err(Error::TT_ERROR_WINDOW_ALIGNMENT);
