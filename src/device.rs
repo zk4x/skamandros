@@ -204,7 +204,7 @@ impl Device {
             .tiles::<Noc0>()
             .next()
             .ok_or(Error::TT_ERROR_NO_TENSIX_TILE)?;
-        Ok(Device {
+        let mut device = Device {
             lib,
             shadow: None,
             tile,
@@ -212,7 +212,14 @@ impl Device {
             dram_used: 0x10_0000,
             exec_started: false,
             exec_seq: 0,
-        })
+        };
+        // A previous process (`ttRelease` only drops this struct) leaves its
+        // cores running and its mailboxes written. Reopening is the 0 -> 1
+        // transition, so it cannot disturb a live caller: hold the five cores
+        // and clear the launch state here, making the next launch start from a
+        // known tile.
+        device.quiesce()?;
+        Ok(device)
     }
 
     /// The tile a 1x1 launch runs on.
@@ -420,11 +427,13 @@ impl Device {
                 first = first.and(Err(e));
             }
         }
+        // SEQ first: a core released before the rest lands must not run the
+        // staged program with a stale generation.
         for at in [
+            mailbox::exec::SEQ,
             mailbox::exec::PROGRAM,
             mailbox::exec::LEN,
             mailbox::exec::ARGS,
-            mailbox::exec::SEQ,
             mailbox::exec::DONE,
             mailbox::exec::RET,
             mailbox::exec::ERROR,
@@ -459,7 +468,21 @@ impl Device {
             u64::from(Core::B.default_reset_pc()),
         )?;
         self.wait_for(mailbox::STATUS, |s| s == status::RUNNING)?;
-        self.write32(mailbox::exec::DONE, 0)?;
+        // A previous process leaves its program staged and its generation set.
+        // A new executor must not replay it: `exec_b` runs whenever
+        // `SEQ != DONE`, so SEQ is cleared first and the rest of the control
+        // block with it.
+        self.write32(mailbox::exec::SEQ, 0)?;
+        for at in [
+            mailbox::exec::PROGRAM,
+            mailbox::exec::LEN,
+            mailbox::exec::ARGS,
+            mailbox::exec::DONE,
+            mailbox::exec::RET,
+            mailbox::exec::ERROR,
+        ] {
+            self.write32(at, 0)?;
+        }
         self.exec_started = true;
         self.exec_seq = 0;
         Ok(())
