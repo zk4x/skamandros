@@ -981,6 +981,77 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
         } => {
             out.push(encode::sfpnot(u32::from(a), u32::from(d)).map_err(bad_isa)?);
         }
+        MirOp::Sfp {
+            op: SfpOp::Shl,
+            a,
+            b: Some(b),
+            d,
+        } => {
+            // `SFPSHFT` shifts its destination in place, so the value is moved
+            // in first and the amount's lane is the `VC` operand.
+            out.push(encode::sfpmov(u32::from(a), u32::from(d), 0).map_err(bad_isa)?);
+            out.push(encode::sfpshft(0, u32::from(b), u32::from(d), 0).map_err(bad_isa)?);
+        }
+        MirOp::Sfp {
+            op: SfpOp::Shr,
+            a,
+            b: Some(b),
+            d,
+        } => {
+            out.push(encode::sfpmov(u32::from(a), u32::from(d), 0).map_err(bad_isa)?);
+            // A negative amount is the logical right shift; `SFPIADD`'s
+            // two's-complement form negates the amount in its own lane
+            // (`VC - VD`, with `VC` the integer zero), the same step zyx's
+            // `tt_sfp_integer` takes.
+            out.push(
+                encode::sfpiadd(0, tt_isa::sfpu::LREG_ZERO, u32::from(b), 6).map_err(bad_isa)?,
+            );
+            out.push(encode::sfpshft(0, u32::from(b), u32::from(d), 0).map_err(bad_isa)?);
+        }
+        MirOp::Sfp {
+            op: SfpOp::IAdd,
+            a,
+            b: Some(b),
+            d,
+        } => {
+            // `SFPIADD` adds into its destination, so one operand is moved in:
+            // `VC + VD`. Modifier 4 is `CC_NONE`: the lane flags are not this
+            // instruction's business.
+            out.push(encode::sfpmov(u32::from(b), u32::from(d), 0).map_err(bad_isa)?);
+            out.push(encode::sfpiadd(0, u32::from(a), u32::from(d), 4).map_err(bad_isa)?);
+        }
+        MirOp::Sfp {
+            op: SfpOp::ISub,
+            a,
+            b: Some(b),
+            d,
+        } => {
+            // `VC - VD` in two's complement, with the flags left alone (6 is
+            // `ARG_2SCOMP_LREG_DST | CC_NONE`).
+            out.push(encode::sfpmov(u32::from(b), u32::from(d), 0).map_err(bad_isa)?);
+            out.push(encode::sfpiadd(0, u32::from(a), u32::from(d), 6).map_err(bad_isa)?);
+        }
+        MirOp::Sfp {
+            op: SfpOp::Exexp,
+            a,
+            b: None,
+            d,
+        } => {
+            // `SFPEXEXP`'s `NODEBIAS`: the exponent as it sits in the word, not
+            // minus 127 (tt-metal's `ExponentMode::NoDebias`).
+            out.push(encode::sfpexexp(u32::from(a), u32::from(d), 1).map_err(bad_isa)?);
+        }
+        MirOp::Sfp {
+            op: SfpOp::Setexp,
+            a,
+            b: Some(b),
+            d,
+        } => {
+            // The exponent comes from the destination lane's low eight bits, so
+            // it is moved in first; the sign and mantissa then come from `a`.
+            out.push(encode::sfpmov(u32::from(b), u32::from(d), 0).map_err(bad_isa)?);
+            out.push(encode::sfpsetexp(0, u32::from(a), u32::from(d), 0).map_err(bad_isa)?);
+        }
         MirOp::Sfp { .. } => {
             let _ = op;
             return Err(Error::TT_ERROR_NO_ENCODING);

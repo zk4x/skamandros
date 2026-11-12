@@ -422,7 +422,7 @@ fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
     // per level (`%t = add %site %step`, `%step = mul %i %nsites`, `%nsites =
     // mul %nx %ny` is three), and at this point the CB counters are in memory and
     // the sync scratch has been dropped, so the three sync words are free again.
-    const EVAL_TEMPS: [u8; 5] = [reg::T6, reg::T4, reg::T0, reg::T1, reg::T2];
+    let mut eval_temps: [u8; 5] = [reg::T6, reg::T4, reg::T0, reg::T1, reg::T2];
     let def = definitions(k);
     let param_index = param_indices(k, types);
     let mut loops: Vec<MoverLoop> = Vec::new();
@@ -448,7 +448,7 @@ fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
                         &loops,
                         value,
                         limit_reg,
-                        &mut EVAL_TEMPS,
+                        &mut eval_temps,
                     )?,
                 }
                 let top = a.fresh_label();
@@ -483,7 +483,7 @@ fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
                             &loops,
                             value,
                             reg::A5,
-                            &mut EVAL_TEMPS,
+                            &mut eval_temps,
                         )?;
                         if dtype_bytes != 1 {
                             a.li(reg::T4, dtype_bytes);

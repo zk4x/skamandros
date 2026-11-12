@@ -17,6 +17,30 @@ pub enum SfpOp {
     BitOr,
     BitXor,
     BitNot,
+    /// `d = a << b`, the logical left shift by the amount in lane `b`
+    /// (`SFPSHFT`; its amount is signed, so `b` is non-negative here and
+    /// [`SfpOp::Shr`] is the one that negates it).
+    Shl,
+    /// `d = a >> b`, the logical right shift by the amount in lane `b`. The
+    /// encoding negates the amount in `b`'s own lane (`SFPSHFT` shifts left for
+    /// a positive count and right for a negative one), so `b` is scratch: a
+    /// caller that wants the amount to survive must re-load it.
+    Shr,
+    /// `d = a + b` over two's complement integers (`SFPIADD`'s add form). The
+    /// SFPU's `SfpOp::Add` is `SFPMAD`'s float add, so a lane holding integer
+    /// bits needs this one.
+    IAdd,
+    /// `d = a - b` over two's complement integers (`SFPIADD`'s two's
+    /// complement form). `SfpOp::Sub` is the float subtract.
+    ISub,
+    /// `d = the exponent field of a`, as a two's complement integer and
+    /// without the 127 bias (`SFPEXEXP`, tt-metal's
+    /// `ckernel_sfpu_exp2.h`'s `exexp(·, NoDebias)`).
+    Exexp,
+    /// `d = a` with `d`'s exponent field replaced by `b & 0xff`: the sign and
+    /// mantissa of `a`, the exponent of `b` (`SFPSETEXP`'s integer form,
+    /// tt-metal's `setexp`). `d` must not be `a` or `b`.
+    Setexp,
 }
 
 /// A comparison a [`MirOp::Compare`] performs; the result is `-1` for true

@@ -16,6 +16,7 @@ use crate::lower::lower;
 use crate::mover;
 use crate::optimize;
 use crate::planner::place;
+use crate::unfold;
 
 /// What a launch argument for one parameter is: a value or an address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +70,12 @@ pub struct Module {
 /// Compile one program. Every refusal is an error, never a partial module.
 pub fn compile(k: &Kernel) -> Result<Module, Error> {
     k.verify()?;
+    let types = k.verify()?;
+    // The transcendentals become primitives here, before anything is placed:
+    // every value the unfold creates gets its own `Dst` slot, which is correct
+    // and slow, and the allocator pass in `TODO.md` is what fuses the chain.
+    let k = unfold::unfold(k, &types)?;
+    let k = &k;
     let types = k.verify()?;
     // `tt_add_movers`: a direct parameter access gets its staging and copy.
     let k = mover::add_movers(k, &types)?;

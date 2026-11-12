@@ -378,8 +378,15 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 let src = dst_row(alloc, resolve(&alias, a));
                 let out = dst_row(alloc, resolve(&alias, value));
                 let (la, ld) = alloc.lreg[resolve(&alias, value) as usize];
-                let sfp = unary(op, at)?;
                 let dtype = storage(types.of(a).dtype);
+                // `exp2` is the one transcendental no IR op spells: its
+                // exponent assembly is `SFPEXEXP`/`SFPSETEXP`, so it is a body
+                // here rather than a line in `src/unfold.rs`.
+                if op == UnOp::Exp2 {
+                    exp2_body(&mut m.t1, src, out, rows, la, dtype);
+                    continue;
+                }
+                let sfp = unary(op, at)?;
                 for row in (0..rows).step_by(2) {
                     m.t1.push(MirOp::Sfpload {
                         lreg: la,
@@ -402,18 +409,52 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             Op::Binary { value, op, a, b } => {
                 let left = *types.of(a);
                 let right = *types.of(b);
-                if left.shape != right.shape {
+                // A scalar constant operand is a lane immediate, not a tile:
+                // every coefficient and mask `src/unfold.rs` writes is a
+                // literal, and a lane load is two instructions where a filled
+                // tile would be a `Dst` slot and a sweep. Any other scalar
+                // (an index expression) still has no lane and is refused.
+                let ca = scalar_const(k, &def, a);
+                let cb = scalar_const(k, &def, b);
+                if left.shape != right.shape
+                    && !(left.shape == RegShape::Scalar && ca.is_some())
+                    && !(right.shape == RegShape::Scalar && cb.is_some())
+                {
                     let _ = (left.shape, right.shape);
                     return Err(Error::TT_TODO_BROADCAST);
                 }
+                let shape = if left.shape == RegShape::Scalar {
+                    right.shape
+                } else {
+                    left.shape
+                };
                 let dtype = match left.dtype {
                     // bf16 runs the same lane ops as f32: in 16-bit mode the
                     // SFPU widens on load and the store truncates, so each op
                     // lands at bf16 precision; in 32-bit mode the value is the
                     // f32 it widens to and the packer rounds at the buffer.
                     crate::ir::DType::F32 | crate::ir::DType::Bf16 => storage(left.dtype),
+                    // The bit and shift ops are raw 32-bit words, and the
+                    // comparisons order sign-magnitude, which an `i32` lane is
+                    // only where its datum is non-negative (TODO.md's recorded
+                    // integer-comparison gap). The unfold's `!= 0` tests a
+                    // masked 0/1, so that is exact.
                     crate::ir::DType::I32
-                        if matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor) =>
+                        if matches!(
+                            op,
+                            BinOp::Add
+                                | BinOp::Sub
+                                | BinOp::BitAnd
+                                | BinOp::BitOr
+                                | BinOp::BitXor
+                                | BinOp::BitShiftLeft
+                                | BinOp::BitShiftRight
+                                | BinOp::Cmplt
+                                | BinOp::Cmpgt
+                                | BinOp::Cmpge
+                                | BinOp::Eq
+                                | BinOp::NotEq
+                        ) =>
                     {
                         crate::ir::DType::I32
                     }
@@ -428,30 +469,54 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         return Err(Error::TT_TODO_BINARY_DTYPE);
                     }
                 };
-                let rows = rows_of(left.shape, at)?;
-                let sa = dst_row(alloc, resolve(&alias, a));
-                let sb = dst_row(alloc, resolve(&alias, b));
+                let rows = rows_of(shape, at)?;
                 let out = dst_row(alloc, resolve(&alias, value));
                 let (la, ld) = alloc.lreg[resolve(&alias, value) as usize];
                 let lb = 2u8;
                 // A comparison writes `-1`/`0` lanes, so its result is stored in
                 // the integer format; everything else keeps the operands'.
-                let out_dtype = if matches!(op, BinOp::Cmplt | BinOp::Cmpgt | BinOp::Cmpge) {
+                let out_dtype = if matches!(
+                    op,
+                    BinOp::Cmplt | BinOp::Cmpgt | BinOp::Cmpge | BinOp::Eq | BinOp::NotEq
+                ) {
                     storage(crate::ir::DType::Bool)
                 } else {
                     dtype
                 };
+                // The constant lanes live for the whole sweep, so they are set
+                // once, before the first row. The one exception is a right
+                // shift's amount: its encoding negates the amount in its own
+                // lane (there is no other way to ask `SFPSHFT` for the other
+                // direction), so it is re-loaded per row.
+                let reload_amount = matches!(op, BinOp::BitShiftRight);
+                if let Some(bits) = ca {
+                    m.t1.push(MirOp::LaneConst { lreg: la, bits });
+                }
+                if let Some(bits) = cb
+                    && !reload_amount
+                {
+                    m.t1.push(MirOp::LaneConst { lreg: lb, bits });
+                }
                 for row in (0..rows).step_by(2) {
-                    m.t1.push(MirOp::Sfpload {
-                        lreg: la,
-                        row: sa + row,
-                        dtype,
-                    });
-                    m.t1.push(MirOp::Sfpload {
-                        lreg: lb,
-                        row: sb + row,
-                        dtype,
-                    });
+                    if ca.is_none() {
+                        m.t1.push(MirOp::Sfpload {
+                            lreg: la,
+                            row: dst_row(alloc, resolve(&alias, a)) + row,
+                            dtype,
+                        });
+                    }
+                    if cb.is_none() {
+                        m.t1.push(MirOp::Sfpload {
+                            lreg: lb,
+                            row: dst_row(alloc, resolve(&alias, b)) + row,
+                            dtype,
+                        });
+                    } else if reload_amount {
+                        m.t1.push(MirOp::LaneConst {
+                            lreg: lb,
+                            bits: cb.expect("a re-loaded amount is a constant"),
+                        });
+                    }
                     match op {
                         BinOp::Cmplt | BinOp::Cmpgt | BinOp::Cmpge => {
                             let cmp = match op {
@@ -466,13 +531,57 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                                 d: ld,
                             });
                         }
+                        // `a == b` is `!(a > b || a < b)`, two of the ordered
+                        // tests this compiler already has, combined as
+                        // sign-magnitude `-1`/`0` lanes. This is zyx's
+                        // `tt_sfp_compare` shape without its NaN and `-0`
+                        // specials, which the ordered tests do not carry either.
+                        BinOp::Eq | BinOp::NotEq => {
+                            m.t1.push(MirOp::Compare {
+                                op: CmpOp::Gt,
+                                a: la,
+                                b: lb,
+                                d: 3,
+                            });
+                            m.t1.push(MirOp::Compare {
+                                op: CmpOp::Lt,
+                                a: la,
+                                b: lb,
+                                d: 4,
+                            });
+                            m.t1.push(MirOp::Sfp {
+                                op: SfpOp::BitOr,
+                                a: 3,
+                                b: Some(4),
+                                d: ld,
+                            });
+                            if matches!(op, BinOp::Eq) {
+                                m.t1.push(MirOp::Sfp {
+                                    op: SfpOp::BitNot,
+                                    a: ld,
+                                    b: None,
+                                    d: ld,
+                                });
+                            }
+                        }
                         BinOp::Max => m.t1.push(MirOp::Max {
                             a: la,
                             b: lb,
                             d: ld,
                         }),
                         _ => m.t1.push(MirOp::Sfp {
-                            op: binary(op, at)?,
+                            // An `i32` lane is a raw 32-bit word, so its add and
+                            // subtract are the integer instruction rather than
+                            // `SFPMAD`'s float ones.
+                            op: if left.dtype == crate::ir::DType::I32 {
+                                match op {
+                                    BinOp::Add => SfpOp::IAdd,
+                                    BinOp::Sub => SfpOp::ISub,
+                                    other => binary(other, at)?,
+                                }
+                            } else {
+                                binary(op, at)?
+                            },
                             a: la,
                             b: Some(lb),
                             d: ld,
@@ -887,6 +996,149 @@ fn int_op(op: BinOp) -> Option<IOp> {
     })
 }
 
+/// The bits a scalar constant operand carries, if `v` is one: `lower` puts
+/// them in a lane instead of reading a `Dst` tile, which is what lets the
+/// unfold write its coefficients and masks as ordinary `const` values.
+fn scalar_const(k: &Kernel, def: &[Option<usize>], v: crate::ir::ValueId) -> Option<u32> {
+    match k.ops[def[v as usize]?] {
+        Op::Const { bits, .. } => Some(bits),
+        _ => None,
+    }
+}
+
+/// `2^x` for one tile of `Dst` rows, in lane registers.
+///
+/// tt-metal's `ckernel_sfpu_exp2.h` with zyx's polynomial: `x = n + f` by the
+/// `1.5 * 2^23` rounding trick, `2^f` by the `exp(f ln 2)` Horner chain, and
+/// the exponent assembled by `SFPEXEXP`/`SFPSETEXP` — `n` is added to the
+/// exponent field, which is the step no IR op spells.
+///
+/// Lanes: `la` holds the input, 2 the rounding constant, 3 a temporary, 4 the
+/// fractional part and then the polynomial, 5 the product (and the result), 6
+/// `-bits(1.5 * 2^23)` for the integer subtraction that produces `n`, 7 the
+/// coefficient of the moment. Constants are re-loaded per row, which is what
+/// the allocator pass will fold.
+fn exp2_body(
+    role: &mut Vec<MirOp>,
+    src: u32,
+    out: u32,
+    rows: u32,
+    la: u8,
+    dtype: crate::ir::DType,
+) {
+    const C231: u32 = 0x4B40_0000; // 1.5 * 2^23, exact
+    const NEG_C231: u32 = 0xB4C0_0000; // the same bits, two's complement negated
+    debug_assert!(la < 2, "the body's scratch lanes start at 2");
+    // `n = bits(x + c231) - bits(c231)`: the integer subtraction tt-metal's
+    // `_sfpu_round_to_nearest_int32_` does, and the exponent it adds.
+    role.push(MirOp::LaneConst {
+        lreg: 2,
+        bits: C231,
+    });
+    role.push(MirOp::LaneConst {
+        lreg: 6,
+        bits: NEG_C231,
+    });
+    for row in (0..rows).step_by(2) {
+        role.push(MirOp::Sfpload {
+            lreg: la,
+            row: src + row,
+            dtype,
+        });
+        // tmp = x + c231, nf = tmp - c231, f = x - nf.
+        role.push(MirOp::Sfp {
+            op: SfpOp::Add,
+            a: la,
+            b: Some(2),
+            d: 3,
+        });
+        role.push(MirOp::Sfp {
+            op: SfpOp::Sub,
+            a: 3,
+            b: Some(2),
+            d: 4,
+        });
+        role.push(MirOp::Sfp {
+            op: SfpOp::Sub,
+            a: la,
+            b: Some(4),
+            d: 5,
+        });
+        // n = bits(tmp) - bits(c231), as a two's complement integer.
+        role.push(MirOp::Sfp {
+            op: SfpOp::IAdd,
+            a: 3,
+            b: Some(6),
+            d: la,
+        });
+        // s = f ln 2, then the Horner chain into lane 4.
+        role.push(MirOp::LaneConst {
+            lreg: 7,
+            bits: std::f32::consts::LN_2.to_bits(),
+        });
+        role.push(MirOp::Sfp {
+            op: SfpOp::Mul,
+            a: 5,
+            b: Some(7),
+            d: 3,
+        });
+        role.push(MirOp::LaneConst {
+            lreg: 4,
+            bits: (1.0f32 / 5040.0).to_bits(),
+        });
+        for c in [
+            1.0f32 / 720.0,
+            1.0 / 120.0,
+            1.0 / 24.0,
+            1.0 / 6.0,
+            0.5,
+            1.0,
+            1.0,
+        ] {
+            role.push(MirOp::LaneConst {
+                lreg: 7,
+                bits: c.to_bits(),
+            });
+            role.push(MirOp::Sfp {
+                op: SfpOp::Mul,
+                a: 4,
+                b: Some(3),
+                d: 5,
+            });
+            role.push(MirOp::Sfp {
+                op: SfpOp::Add,
+                a: 5,
+                b: Some(7),
+                d: 4,
+            });
+        }
+        // The result's exponent is the polynomial's plus n.
+        role.push(MirOp::Sfp {
+            op: SfpOp::Exexp,
+            a: 4,
+            b: None,
+            d: 3,
+        });
+        role.push(MirOp::Sfp {
+            op: SfpOp::IAdd,
+            a: 3,
+            b: Some(la),
+            d: 5,
+        });
+        role.push(MirOp::Sfp {
+            op: SfpOp::Setexp,
+            a: 4,
+            b: Some(5),
+            d: 5,
+        });
+        role.push(MirOp::Sfpstore {
+            lreg: 5,
+            row: out + row,
+            dtype,
+        });
+    }
+}
+
 fn rows_of(shape: RegShape, at: usize) -> Result<u32, Error> {
     match shape {
         RegShape::Scalar => {
@@ -930,6 +1182,8 @@ fn binary(op: BinOp, at: usize) -> Result<SfpOp, Error> {
         BinOp::And | BinOp::BitAnd => Ok(SfpOp::BitAnd),
         BinOp::Or | BinOp::BitOr => Ok(SfpOp::BitOr),
         BinOp::BitXor => Ok(SfpOp::BitXor),
+        BinOp::BitShiftLeft => Ok(SfpOp::Shl),
+        BinOp::BitShiftRight => Ok(SfpOp::Shr),
         other => {
             let _ = (at, other);
             Err(Error::TT_TODO_BINARY_SFPU)

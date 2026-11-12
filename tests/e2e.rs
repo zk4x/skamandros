@@ -2699,3 +2699,158 @@ fn gate_proj_runs_over_a_full_grid() {
         }
     }
 }
+
+/// `2^x` lowered straight into the machine IR: the `1.5 * 2^23` rounding
+/// trick for the integer part, zyx's `exp(f ln 2)` Horner chain for `2^f`,
+/// and the exponent assembled by `SFPEXEXP`/`SFPSETEXP` — the step no IR op
+/// spells, which is why `exp2` stays an IR op and is lowered here.
+#[test]
+fn exp2_runs_on_the_simulator() {
+    const PROGRAM: &str = "\
+version 6
+grid 1,1
+%in = param f32 1024
+%out = param f32 1024
+%b0 = buffer f32 32,32
+%bo = buffer f32 32,32
+copy_to %b0 from %in [0]
+%x = load %b0 [0]
+%r = exp2 %x
+store_to %bo from %r [0]
+copy_to %out from %bo [0]
+";
+    let host: Vec<f32> = (0..1024).map(|i| (i as f32 - 512.0) / 32.0).collect();
+    let input: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel(PROGRAM, &input, 1024 * 4);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (i, (x, y)) in host.iter().zip(&got).enumerate() {
+        let want = x.exp2();
+        let err = (y - want).abs() / want.abs().max(1.0);
+        assert!(
+            err < 1e-5,
+            "datum {i}: 2^{x} = {y}, wanted {want} (rel {err})"
+        );
+    }
+}
+
+/// One loaded tile through a unary op and back, every datum compared against a
+/// host reference within `tol` relative error (denominated by `max(1, |want|)`).
+fn check_unary(program: &str, host: &[f32], want: impl Fn(f32) -> f32, tol: f32, what: &str) {
+    let input: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel(program, &input, host.len() * 4);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (i, (x, y)) in host.iter().zip(&got).enumerate() {
+        let want = want(*x);
+        let err = (y - want).abs() / want.abs().max(1.0);
+        assert!(
+            err <= tol,
+            "{what}: datum {i}: f({x}) = {y}, wanted {want} (rel {err} > {tol})"
+        );
+    }
+}
+
+const ONE_LOAD: &str = "\
+version 6
+grid 1,1
+%in = param f32 1024
+%out = param f32 1024
+%b0 = buffer f32 32,32
+%bo = buffer f32 32,32
+copy_to %b0 from %in [0]
+%x = load %b0 [0]
+%r = OP %x
+store_to %bo from %r [0]
+copy_to %out from %bo [0]
+";
+
+/// `log2` as `src/unfold.rs` writes it: Juffa's reduction, the LLK's degree-9
+/// `log1p` chain and one `log2 e` multiply, with no `log2` op left in the
+/// lowered program.
+#[test]
+fn log2_is_unfolded_into_primitives() {
+    let host: Vec<f32> = (0..1024).map(|i| 0.01 * (1.0 + i as f32 * 1.1)).collect();
+    check_unary(
+        &ONE_LOAD.replace("OP", "log2"),
+        &host,
+        f32::log2,
+        1e-5,
+        "log2",
+    );
+}
+
+/// `sin`/`cos`: the two-limb `pi/2` reduction and the five-term Taylor cores,
+/// with the quadrant and sign from `n & 3` — `bitshiftright` and `noteq`
+/// included, which is what the lowering gained for this pass.
+#[test]
+fn sin_and_cos_are_unfolded_into_primitives() {
+    let host: Vec<f32> = (0..1024).map(|i| (i as f32 - 512.0) / 64.0).collect();
+    check_unary(&ONE_LOAD.replace("OP", "sin"), &host, f32::sin, 1e-5, "sin");
+    check_unary(&ONE_LOAD.replace("OP", "cos"), &host, f32::cos, 1e-5, "cos");
+}
+
+/// `pow` on floats: `exp2(y log2 x)`, so the program the caller writes has no
+/// `pow` in it after the pass and the answer still lands on the host's.
+#[test]
+fn pow_is_unfolded_into_exp2_and_log2() {
+    const POW: &str = "\
+version 6
+grid 1,1
+%in = param f32 1024
+%out = param f32 1024
+%b0 = buffer f32 32,32
+%bo = buffer f32 32,32
+copy_to %b0 from %in [0]
+%x = load %b0 [0]
+%p = const f32 1.75
+%r = pow %x %p
+store_to %bo from %r [0]
+copy_to %out from %bo [0]
+";
+    let host: Vec<f32> = (0..1024).map(|i| 0.05 * (1.0 + i as f32 * 2.0)).collect();
+    check_unary(POW, &host, |x| x.powf(1.75), 1e-4, "pow");
+}
+
+/// `div` as `src/unfold.rs` writes it: `x * (1/y)`, the reciprocal being the
+/// quadratic estimate plus two Newton steps (one in a bf16 kernel) and the
+/// sign copied from the divisor.
+#[test]
+fn div_is_unfolded_into_a_reciprocal() {
+    const DIV: &str = "\
+version 6
+grid 1,1
+%in = param f32 2048
+%out = param f32 1024
+%b0 = buffer f32 32,64
+%bo = buffer f32 32,32
+copy_to %b0 from %in [0]
+copy_to %b0 from %in [1024]
+%x = load %b0 [0]
+%y = load %b0 [1024]
+%r = div %x %y
+store_to %bo from %r [0]
+copy_to %out from %bo [0]
+";
+    let x: Vec<f32> = (0..1024).map(|i| (i as f32 - 500.0) / 7.0).collect();
+    let y: Vec<f32> = (0..1024).map(|i| 0.25 + (i % 97) as f32 * 0.5).collect();
+    let host: Vec<f32> = x.iter().zip(&y).map(|(a, b)| a / b).collect();
+    let mut input: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+    input.extend(y.iter().flat_map(|v| v.to_le_bytes()));
+    let out = run_kernel(DIV, &input, 1024 * 4);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (i, (want, y)) in host.iter().zip(&got).enumerate() {
+        let err = (y - want).abs() / want.abs().max(1.0);
+        assert!(
+            err <= 1e-6,
+            "div: datum {i} = {y}, wanted {want} (rel {err})"
+        );
+    }
+}
