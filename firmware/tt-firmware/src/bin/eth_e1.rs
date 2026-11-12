@@ -38,10 +38,7 @@ fn txq_idle() {
 /// TT-link-write `len` bytes of local `src` to the partner's `dst`, in chunks.
 fn tt_link(src: u64, dst: u64, len: u32) {
     let q = eth::txq_base(eth::DATA_QUEUE);
-    let cmd = match eth::TxCommand::L1Write.word(eth::DATA_QUEUE) {
-        Some(c) => c,
-        None => unreachable!(),
-    };
+    let cmd = eth::txq::CMD_START_DATA;
     let mut done = 0u32;
     while done < len {
         let n = (len - done).min(mover::TT_LINK_CHUNK);
