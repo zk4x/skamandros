@@ -218,7 +218,7 @@ pub extern "Rust" fn firmware_main() -> ! {
             unsafe {
                 write_volatile(
                     reg(niu, niu::CLEAR_OUTSTANDING),
-                    tt_isa::noc::multicast::clear_outstanding(txn),
+                    tt_isa::noc::clear_outstanding(txn),
                 );
                 let _ = read_volatile(reg(niu, ini + initiator::CMD_CTRL));
             }
