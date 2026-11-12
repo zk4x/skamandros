@@ -175,6 +175,10 @@ pub struct Device {
     dram_used: u64,
     /// Is `exec_b` resident and looping on the tile?
     exec_started: bool,
+    /// The last generation handed to any core. Device-wide, so a value a core
+    /// has run never repeats: the setup program and the launch that follows it
+    /// are two different generations even though they are the first two runs.
+    launch_seq: u32,
     /// Programs already placed at their L1 address: `(address, words, hash)`.
     /// The program cache keeps them, and a launch only names the address; an
     /// identical program is not rewritten.
@@ -213,6 +217,7 @@ impl Device {
             dram: Dram::FULL,
             dram_used: 0x10_0000,
             exec_started: false,
+            launch_seq: 0,
             placed: Vec::new(),
         };
         // A previous process (`ttRelease` only drops this struct) leaves its
@@ -255,9 +260,9 @@ impl Device {
     }
 
     /// The endpoint high word a program names for DRAM on channel 0.
-    pub fn dram_hi(&self) -> u32 {
+    pub fn dram_hi_for(&self, niu: tt_isa::noc::niu::Niu) -> u32 {
         let channel = self.dram_channel();
-        let ep = self.channel_endpoint(channel);
+        let ep = self.channel_endpoint(channel, niu);
         Endpoint {
             x: ep.x(),
             y: ep.y(),
@@ -273,7 +278,7 @@ impl Device {
             let _ = (bytes.len(), offset);
             Error::TT_ERROR_DRAM_RANGE
         })?;
-        let ep = self.channel_endpoint(channel);
+        let ep = self.channel_endpoint(channel, tt_isa::noc::niu::Niu::Noc0);
         self.window_write(ep, range.offset(), bytes)?;
         // A write is visible through the port it went out of; a reader may use
         // any endpoint NoC #0 owns, so read the last word back through each.
@@ -296,7 +301,7 @@ impl Device {
             let _ = out.len();
             Error::TT_ERROR_DRAM_RANGE
         })?;
-        let ep = self.channel_endpoint(channel);
+        let ep = self.channel_endpoint(channel, tt_isa::noc::niu::Niu::Noc0);
         self.window_read(ep, offset, out)
     }
 
@@ -424,7 +429,7 @@ impl Device {
     /// failure is returned, so a wedged tile is reported rather than hidden.
     pub fn quiesce(&mut self) -> Result<(), Error> {
         let mut first: Result<(), Error> = Ok(());
-        for core in [Core::B, Core::T0, Core::T1, Core::T2] {
+        for core in [Core::B, Core::T0, Core::T1, Core::T2, Core::NC] {
             if let Err(e) = self.set_core_reset(core, true) {
                 first = first.and(Err(e));
             }
@@ -454,25 +459,38 @@ impl Device {
         first
     }
 
-    /// The four launch mailboxes: RISCV B and the three Tensix threads.
-    fn launch_mailboxes() -> [mailbox::launch::Mailbox; 4] {
+    /// The five launch mailboxes: RISCV B, NC and the three Tensix threads.
+    fn launch_mailboxes() -> [mailbox::launch::Mailbox; 5] {
         [
             mailbox::launch::Mailbox::b(),
+            mailbox::launch::Mailbox::nc(),
             mailbox::launch::Mailbox::of(0),
             mailbox::launch::Mailbox::of(1),
             mailbox::launch::Mailbox::of(2),
         ]
     }
 
-    /// Hold `core` in reset, stopping whatever it is running.
-    pub fn hold(&mut self, core: Core) -> Result<(), Error> {
-        self.set_core_reset(core, true)
-    }
-
-    /// Boot the launch executor on RISCV B, once.
-    pub fn start_executor(&mut self) -> Result<(), Error> {
+    /// Boot the resident executors, once: all five, the way tt-metal starts a
+    /// tile's firmware.
+    ///
+    /// The four subordinates are loaded while held; RISCV B is started and its
+    /// executor invalidates every instruction cache before it publishes
+    /// `RUNNING`, so the images are fetched through clean caches when the host
+    /// then releases the other four (tt-metal: BRISC's mask store, then
+    /// `deassert_all_reset`).
+    pub fn start_executors(&mut self) -> Result<(), Error> {
         if self.exec_started {
             return Ok(());
+        }
+        // NC cannot take a reset-PC override (ttsim refuses it), so its image
+        // starts through a two-word jump at its reset PC, as every NC image
+        // has since the mover.
+        for &(core, image, at) in &crate::images::EXEC_SUBORDINATES {
+            if core == Core::NC {
+                self.load_held_nc(image, at)?;
+            } else {
+                self.load_held(core, image, at)?;
+            }
         }
         self.load_and_start(
             Core::B,
@@ -481,10 +499,26 @@ impl Device {
         )?;
         let mb = mailbox::launch::Mailbox::b();
         self.wait_for(mb.status(), |s| s == status::RUNNING)?;
-        // A previous process leaves a program named and a generation set; a new
-        // executor must not replay it.
-        self.clear_launch(mb)?;
+        // A previous process leaves programs named and generations set; a new
+        // executor must not replay them.
+        for mb in Self::launch_mailboxes() {
+            self.clear_launch(mb)?;
+        }
+        for &(core, _, _) in &crate::images::EXEC_SUBORDINATES {
+            self.set_core_reset(core, false)?;
+        }
         self.exec_started = true;
+        Ok(())
+    }
+
+    /// Load NC's image at `at` and leave NC held, with the jump that starts it
+    /// at its reset PC.
+    fn load_held_nc(&mut self, image: &[u8], at: u64) -> Result<(), Error> {
+        self.set_core_reset(Core::NC, true)?;
+        self.l1_write(at, image)?;
+        let stub = tt_isa::dm::nc::stub(at);
+        let words: Vec<u8> = stub.iter().flat_map(|w| w.to_le_bytes()).collect();
+        self.l1_write(tt_isa::dm::nc::STUB_AT, &words)?;
         Ok(())
     }
 
@@ -496,6 +530,7 @@ impl Device {
             mb.program_addr(),
             mb.program_len(),
             mb.args(),
+            mb.enables(),
             mb.ack(),
             mb.result(),
             mb.status(),
@@ -537,22 +572,50 @@ impl Device {
         Ok(())
     }
 
+    /// Write a launch message without starting it: the text address, its length,
+    /// the arguments base, and a cleared generation and `ACK`. The dispatcher
+    /// names a subordinate's program this way, then writes the generation that
+    /// starts it.
+    pub fn prepare(
+        &mut self,
+        mb: mailbox::launch::Mailbox,
+        text: u32,
+        words: u32,
+        args: u32,
+    ) -> Result<(), Error> {
+        self.write32(mb.program_addr(), text)?;
+        self.write32(mb.program_len(), words)?;
+        self.write32(mb.args(), args)?;
+        self.write32(mb.ack(), 0)?;
+        self.write32(mb.generation(), 0)?;
+        Ok(())
+    }
+
+    /// Start whatever launch message `mb` holds with a fresh generation, and
+    /// return it. Device-wide and monotonic, so a core never sees a value equal
+    /// to the one it last ran.
+    pub fn start(&mut self, mb: mailbox::launch::Mailbox) -> Result<u32, Error> {
+        self.launch_seq = self.launch_seq.wrapping_add(1).max(1);
+        let generation = self.launch_seq;
+        self.write32(mb.ack(), 0)?;
+        self.write32(mb.generation(), generation)?;
+        Ok(generation)
+    }
+
     /// Write one launch message and start it: the text address, its length, the
-    /// arguments base, then a fresh generation. Returns that generation.
+    /// arguments base, which processors it enables, then a fresh generation.
+    /// Only RISCV B's enables word is read, because B dispatches to the rest.
     pub fn launch(
         &mut self,
         mb: mailbox::launch::Mailbox,
         text: u32,
         words: u32,
         args: u32,
+        enables: u32,
     ) -> Result<u32, Error> {
-        self.write32(mb.program_addr(), text)?;
-        self.write32(mb.program_len(), words)?;
-        self.write32(mb.args(), args)?;
-        self.write32(mb.ack(), 0)?;
-        let generation = self.read32(mb.generation())?.wrapping_add(1).max(1);
-        self.write32(mb.generation(), generation)?;
-        Ok(generation)
+        self.prepare(mb, text, words, args)?;
+        self.write32(mb.enables(), enables)?;
+        self.start(mb)
     }
 
     /// Wait for a launch's `ACK`, or report its panic or a timeout.
@@ -597,7 +660,13 @@ impl Device {
         let args_bytes: Vec<u8> = args.iter().flat_map(|w| w.to_le_bytes()).collect();
         self.l1_write(u64::from(args_at), &args_bytes)?;
         let mb = mailbox::launch::Mailbox::b();
-        let generation = self.launch(mb, program_at, words.len() as u32, args_at)?;
+        let generation = self.launch(
+            mb,
+            program_at,
+            words.len() as u32,
+            args_at,
+            mailbox::launch::ENABLE_B,
+        )?;
         self.await_launch(mb, generation)?;
         self.read32(mb.result())
     }
@@ -665,13 +734,10 @@ impl Device {
         Ok(())
     }
 
-    fn channel_endpoint(&self, channel: DramChannel) -> NocCoord<Noc0> {
+    fn channel_endpoint(&self, channel: DramChannel, niu: tt_isa::noc::niu::Niu) -> NocCoord<Noc0> {
         channel
-            .endpoint(
-                tt_isa::noc::niu::Niu::Noc0,
-                channel.port_for(tt_isa::noc::niu::Niu::Noc0, 0),
-            )
-            .expect("NoC #0's first endpoint")
+            .endpoint(niu, channel.port_for(niu, 0))
+            .expect("the NIU's first endpoint")
     }
 
     fn check_l1(&self, address: u64, len: usize) -> Result<(), Error> {

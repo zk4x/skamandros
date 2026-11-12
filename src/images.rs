@@ -67,6 +67,21 @@ pub const EXEC_ROLES: [Image; 3] = [
     ),
 ];
 
+/// RISCV NC's executor: the writer's program, called the way the TRISCs call
+/// theirs. NC cannot invalidate its own cache, so `exec_b` invalidates it before
+/// each launch; the image runs from `dm_nc`'s slot behind a jump at NC's reset
+/// PC.
+pub const EXEC_NC: &[u8] = include_bytes!(env!("FIRMWARE_EXEC_NC"));
+
+/// The four subordinate executors, loaded held and released together after
+/// RISCV B has invalidated every instruction cache.
+pub const EXEC_SUBORDINATES: [Image; 4] = [
+    EXEC_ROLES[0],
+    EXEC_ROLES[1],
+    EXEC_ROLES[2],
+    (Core::NC, EXEC_NC, tt_isa::dm::nc::IMAGE_BASE),
+];
+
 /// RISCV NC's mover image (`tt_isa::dm::nc`), reached through the stub at NC's
 /// reset PC.
 pub const DM_NC: &[u8] = include_bytes!(env!("FIRMWARE_DM_NC"));
@@ -84,6 +99,7 @@ pub fn all() -> Vec<(&'static str, &'static [u8])> {
         ("exec_t0", EXEC_ROLES[0].1),
         ("exec_t1", EXEC_ROLES[1].1),
         ("exec_t2", EXEC_ROLES[2].1),
+        ("exec_nc", EXEC_NC),
         ("dm_nc", DM_NC),
         ("dm_b", DM_B),
         ("role_t0", ROLES[0].1),

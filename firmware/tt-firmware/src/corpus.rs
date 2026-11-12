@@ -14,7 +14,7 @@ use crate::tensix::{load_mop_config, push_word, read_dst32, wait_for_coprocessor
 use crate::{fail, finish, l1_read32, l1_write32, publish, spin};
 use tt_isa::cfg::ConfigBank;
 use tt_isa::mailbox::guard::{self, Guard};
-use tt_isa::mailbox::launch::Mailbox;
+use tt_isa::mailbox::launch::{self, Mailbox};
 use tt_isa::mailbox::{self, panic_code, status};
 use tt_isa::sfpu::dst32_address;
 use tt_isa::tensix::{PushesTo, TensixThread};
@@ -39,15 +39,32 @@ where
 
 /// Run a launch's program as RISC-V code, the way tt-metal's kernels run: the
 /// launch message names the program (an L1 address in the program cache), its
-/// word count and the arguments base; the core invalidates the instruction
-/// cache, calls it with `a0` at the arguments, and publishes `RESULT` and `ACK`.
+/// word count and the arguments base; the core calls it with `a0` at the
+/// arguments and publishes `RESULT` and `ACK`.
 ///
-/// Resident: after acknowledging one generation it waits for the next, so the
-/// host does not reload this image per launch (tt-metal's TRISC main loop). The
-/// program is a leaf of RV32IM with the Tensix words inline (`.ttinsn`), ends
-/// in `ret`, and uses the caller-saved registers only.
+/// RISCV B is the dispatcher (`tt_isa::mailbox::launch::Mailbox::b`), as
+/// tt-metal's BRISC is: on a generation it invalidates every instruction cache
+/// with `icache_mask` (`ENABLE_ALL`), starts each subordinate the launch
+/// enables by writing that generation to its mailbox, runs its own program,
+/// then joins those cores before acknowledging. The host signals B alone and
+/// waits for its single `ACK`.
+///
+/// Resident: after acknowledging one generation a core waits for the next, so
+/// the host does not reload this image per launch (tt-metal's main loops). The
+/// program is a leaf of RV32IM, ends in `ret`, and uses the caller-saved
+/// registers only.
 pub fn run_exec(mb: Mailbox, icache_mask: u32) -> ! {
+    let dispatch = mb == Mailbox::b();
     crate::disable_gathering();
+    // B invalidates every cache at boot, before the host releases the cores
+    // whose images it has just written (tt-metal: BRISC's mask store, then
+    // `deassert_all_reset`). The host waits for `RUNNING` after this.
+    if dispatch {
+        // SAFETY: the documented invalidate register, written from the core
+        // that owns the mask; the backend is out of reset before this image
+        // runs.
+        unsafe { crate::ttinsn::invalidate_icache(mb.status(), icache_mask) };
+    }
     // SAFETY: fixed aligned mailbox words inside L1; the host wrote the launch
     // message before this core left reset.
     unsafe { l1_write32(mb.status(), status::RUNNING) };
@@ -55,28 +72,62 @@ pub fn run_exec(mb: Mailbox, icache_mask: u32) -> ! {
     let mut generation = unsafe { l1_read32(mb.generation()) };
     loop {
         if generation != 0 {
+            let enables = unsafe { l1_read32(mb.enables()) };
             let program = unsafe { l1_read32(mb.program_addr()) } as u64;
             let words = unsafe { l1_read32(mb.program_len()) };
             let args = unsafe { l1_read32(mb.args()) };
             // A bad address would execute whatever lies there, so the range is
-            // checked here rather than trusted.
-            let bytes = u64::from(words) * 4;
-            if program == 0
-                || program % 16 != 0
-                || words == 0
-                || words > mailbox::MAX_WORDS
-                || !tt_isa::l1::PROGRAM_CACHE.contains(program, bytes)
-            {
-                fail_in(mb, mailbox::panic_code::EXPLICIT);
+            // checked here rather than trusted. The dispatcher may be enabled
+            // with no program of its own (a launch with no reader on B).
+            let runs_own = !dispatch || enables & launch::ENABLE_B != 0;
+            if runs_own {
+                let bytes = u64::from(words) * 4;
+                if program == 0
+                    || program % 16 != 0
+                    || words == 0
+                    || words > mailbox::MAX_WORDS
+                    || !tt_isa::l1::PROGRAM_CACHE.contains(program, bytes)
+                {
+                    fail_in(mb, mailbox::panic_code::EXPLICIT);
+                }
             }
-            // SAFETY: the range was checked above, and the host published the
-            // words before writing this generation.
-            unsafe {
-                crate::ttinsn::invalidate_icache(program + 4 * (u64::from(words) - 1), icache_mask);
-                let ret = crate::ttinsn::call_with(program, args);
-                l1_write32(mb.result(), ret);
+            // Every cache is invalidated before any core is told to run, so the
+            // programs the host has just placed are fetched, not old ones
+            // (tt-metal's `run_triscs` follows the same mask store).
+            if dispatch {
+                // SAFETY: as above; the mask covers every core, so the program
+                // the host placed is what each one fetches.
+                unsafe { crate::ttinsn::invalidate_icache(mb.status(), icache_mask) };
+                for (enable, subordinate) in SUBORDINATES {
+                    if enables & enable != 0 {
+                        // SAFETY: a fixed aligned mailbox word of another core
+                        // in the same L1.
+                        unsafe { l1_write32(subordinate.generation(), generation) };
+                    }
+                }
+                publish();
+            } else if icache_mask != 0 {
+                // SAFETY: the range was checked above, and the host published
+                // the words before writing this generation.
+                unsafe {
+                    crate::ttinsn::invalidate_icache(
+                        program + 4 * (u64::from(words) - 1),
+                        icache_mask,
+                    )
+                };
             }
-            publish();
+            if runs_own {
+                // SAFETY: the range was checked above, and the host published
+                // the words before writing this generation.
+                unsafe {
+                    let ret = crate::ttinsn::call_with(program, args);
+                    l1_write32(mb.result(), ret);
+                }
+                publish();
+            }
+            if dispatch {
+                join(mb, generation, enables);
+            }
             // SAFETY: fixed aligned mailbox words inside L1.
             unsafe {
                 l1_write32(mb.status(), status::DONE);
@@ -98,6 +149,40 @@ pub fn run_exec(mb: Mailbox, icache_mask: u32) -> ! {
         publish();
     }
 }
+
+/// The cores the dispatcher starts, with the [`mailbox::launch`] enable bit that
+/// selects each (tt-metal's `subordinate_sync`: NC and the three Tensix
+/// threads).
+const SUBORDINATES: [(u32, Mailbox); 4] = [
+    (launch::ENABLE_NC, Mailbox::nc()),
+    (launch::ENABLE_T0, Mailbox::of(0)),
+    (launch::ENABLE_T1, Mailbox::of(1)),
+    (launch::ENABLE_T2, Mailbox::of(2)),
+];
+
+/// Wait for every enabled subordinate to acknowledge `generation`, the way
+/// BRISC's `wait_ncrisc_trisc` does; a subordinate that panicked stops this
+/// core too, so the host sees one panicked core rather than a timeout.
+fn join(mb: Mailbox, generation: u32, enables: u32) {
+    for (enable, subordinate) in SUBORDINATES {
+        if enables & enable == 0 {
+            continue;
+        }
+        loop {
+            publish();
+            // SAFETY: fixed aligned mailbox words inside L1.
+            let ack = unsafe { l1_read32(subordinate.ack()) };
+            if ack == generation {
+                break;
+            }
+            // SAFETY: as above.
+            if unsafe { l1_read32(subordinate.status()) } == status::PANICKED {
+                fail_in(mb, mailbox::panic_code::EXPLICIT);
+            }
+        }
+    }
+}
+
 
 /// Stop, having said why in `mb` as well as in the single-core mailbox the
 /// panic path always uses.

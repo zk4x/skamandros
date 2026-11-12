@@ -863,8 +863,11 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream) -> Result<(), Error> {
             }
             MirOp::CbPush { cb } => {
                 // The page is only visible to the writer once the pack has
-                // written it.
+                // written it: the `STALLWAIT` holds back later pushed work, and
+                // the coprocessor check holds this core's store back until the
+                // packer has retired and its L1 writes have landed.
                 out.push(wait_for_packer(Before::EVERYTHING).expect("named bits"));
+                out.asm(rv::coprocessor_done)?;
                 out.asm(|a| {
                     rv::cb::push_back(a, reg::A6, cb, 1, [reg::T0, reg::T1, reg::T2, reg::T6])
                 })?;

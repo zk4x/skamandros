@@ -41,6 +41,7 @@ const BINARIES: &[&str] = &[
     "noc_probe_b",
     "read_loop_b",
     "exec_b",
+    "exec_nc",
 ];
 
 #[cfg(feature = "tenstorrent")]

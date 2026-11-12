@@ -62,6 +62,13 @@ fn main() {
             tt_isa::mailbox::launch::BASE + t * tt_isa::mailbox::launch::STRIDE,
         );
     }
+    // RISCV NC's executor: the writer's launch mailbox, in the image slot the
+    // NC mover uses (the host leaves a jump at NC's reset PC).
+    link(
+        "exec_nc",
+        "link_nc.x",
+        tt_isa::mailbox::launch::BASE + 3 * tt_isa::mailbox::launch::STRIDE,
+    );
 
     for f in [
         "link.x",

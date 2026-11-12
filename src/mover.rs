@@ -394,7 +394,7 @@ fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
         return Ok(Vec::new());
     }
     let mut a = Asm::new();
-    prologue(&mut a);
+    prologue(&mut a, if inbound { Niu::Noc0 } else { Niu::Noc1 });
     // The sync scratch leaves `t3` (this tile's high word), `t5` (the NOC
     // initiator) and `a6` (the interface) alone.
     let sync3 = [reg::T0, reg::T1, reg::T2];
@@ -680,8 +680,14 @@ fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
 
 /// `t5` = this NIU's base, `t3` = this tile's NOC high word (the launch's third
 /// argument pair, read from `a0`), `a6` = the CB interface table (argument 2).
-fn prologue(a: &mut Asm) {
-    a.li(reg::T5, Niu::Noc0.base() as u32);
+///
+/// The reader runs on RISCV B and the writer on RISCV NC, and the two data
+/// movers use opposite NoCs -- tt-metal's `brisc_noc_id = 1 - ncrisc's`
+/// (`program.cpp`). On one NoC they would share the initiator's registers: NC's
+/// requests are programmed through B's (`ttsim-divergence.md` row 73), so a
+/// reader and a writer in flight would overwrite each other's command.
+fn prologue(a: &mut Asm, niu: Niu) {
+    a.li(reg::T5, niu.base() as u32);
     a.word(rv::lw(reg::T3, reg::A0, 12));
     a.word(rv::lw(reg::A6, reg::A0, ARG_IFACE as i32 * 4));
 }

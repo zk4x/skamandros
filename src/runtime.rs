@@ -3,10 +3,15 @@
 
 //! The runtime: a device, DRAM buffers, host transfers, and a launch.
 //!
-//! A launch is synchronous: the inbound mover runs on RISCV B to completion, then
-//! the three compute cores are staged and released together, then the outbound
-//! mover runs on RISCV B. A module without compute programs skips the middle
-//! step, and a module with neither mover runs only the compute cores.
+//! A launch is one dispatch: RISCV B starts the reader (on B), the writer (on
+//! NC) and the three compute cores together, then joins them, and the host waits
+//! for B. That is tt-metal's shape -- BRISC runs the reader, NCRISC the writer,
+//! the TRISCs the compute, all from one launch message -- and it is what lets
+//! the movers overlap the compute instead of running before and after it.
+//!
+//! The reader and the writer use opposite NoCs (tt-metal's `brisc_noc_id = 1 -
+//! ncrisc's`), so each is handed its own arguments array: a DRAM address in an
+//! argument names that NoC's endpoint of the channel.
 //!
 //! Every core has a launch message (`mailbox::launch::Mailbox`): the program's
 //! address in `l1::PROGRAM_CACHE`, its length, the arguments base and a
@@ -20,8 +25,8 @@ use crate::compile::Module;
 use crate::device::Device;
 use crate::ir::Error;
 use tt_isa::mailbox;
+use tt_isa::noc::niu::Niu;
 use tt_isa::noc::{Noc0, NocCoord};
-use tt_isa::tensix::Core;
 
 /// The one open device, if [`init`] has been called.
 static DEVICE: Mutex<Option<Device>> = Mutex::new(None);
@@ -36,6 +41,9 @@ const SLOT_READER: u32 = 0;
 const SLOT_WRITER: u32 = 1;
 const ROLE_SLOT: [u32; 3] = [3, 4, 5];
 const ARGS_AT: u32 = PROGRAM_AREA + 6 * SLOT_BYTES;
+/// The writer's array, one kilobyte after the reader's: its DRAM endpoints are
+/// NoC #1's.
+const ARGS_WRITER: u32 = ARGS_AT + 0x400;
 
 /// `index`'s slot in the program cache.
 const fn slot(index: u32) -> u32 {
@@ -109,21 +117,35 @@ fn run(device: &mut Device, module: &Module, params: &[u64]) -> Result<(), Error
 
 fn launch_steps(device: &mut Device, module: &Module, params: &[u64]) -> Result<(), Error> {
     let tile: NocCoord<Noc0> = device.tile();
-    let mut args: Vec<u32> = vec![module.grid[0], module.grid[1], module.iface, me_hi(tile)];
-    let hi = device.dram_hi();
-    for &address in params {
-        let low = u32::try_from(address).map_err(|_| {
-            let _ = address;
-            Error::TT_ERROR_PARAMETER_ADDRESS
-        })?;
-        args.push(low);
-        args.push(hi);
+    // One arguments array per data mover: a DRAM endpoint is a NoC coordinate,
+    // and the reader on B and the writer on NC use opposite NoCs (tt-metal's
+    // BRISC NoC #0, NCRISC NoC #1). The compute cores read the reader's array;
+    // they never name a DRAM endpoint.
+    let args_at = |niu| {
+        if niu == Niu::Noc1 {
+            ARGS_WRITER
+        } else {
+            ARGS_AT
+        }
+    };
+    let mut arrays = [(Niu::Noc0, Vec::new()), (Niu::Noc1, Vec::new())];
+    for (niu, args) in arrays.iter_mut() {
+        *args = vec![module.grid[0], module.grid[1], module.iface, me_hi(tile)];
+        let hi = device.dram_hi_for(*niu);
+        for &address in params {
+            let low = u32::try_from(address).map_err(|_| {
+                let _ = address;
+                Error::TT_ERROR_PARAMETER_ADDRESS
+            })?;
+            args.push(low);
+            args.push(hi);
+        }
+        if (args_at(*niu) as u64) + 4 * args.len() as u64 > tt_isa::l1::PROGRAM_CACHE.end {
+            let _ = args.len();
+            return Err(Error::TT_ERROR_PROGRAM_AREA_SIZE);
+        }
     }
-
-    if (ARGS_AT as u64) + 4 * args.len() as u64 > tt_isa::l1::PROGRAM_CACHE.end {
-        let _ = args.len();
-        return Err(Error::TT_ERROR_PROGRAM_AREA_SIZE);
-    }
+    let [args, writer_args] = arrays.map(|(_, v)| v);
     for (name, words) in [("reader", &module.reader), ("writer", &module.writer)] {
         if words.is_empty() {
             continue;
@@ -134,7 +156,11 @@ fn launch_steps(device: &mut Device, module: &Module, params: &[u64]) -> Result<
         }
     }
 
-    device.start_executor()?;
+    let compute = module.cores.iter().any(|words| !words.is_empty());
+    if compute {
+        device.release_tensix_backend()?;
+    }
+    device.start_executors()?;
     // The CB interface is host state: tt-metal's `setup_local_cb_read_write_interfaces`
     // writes each `LocalCBInterface` before the roles start, and every mover and
     // compute role reads its ring pointers from there. Bytes, not tt-metal's
@@ -152,67 +178,80 @@ fn launch_steps(device: &mut Device, module: &Module, params: &[u64]) -> Result<
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         device.l1_write(u64::from(module.iface), &bytes)?;
     }
-    // Every core of the launch reads the same arguments array; write it before
-    // the first core starts, not only as a side effect of a mover run.
-    let arg_bytes: Vec<u8> = args.iter().flat_map(|w| w.to_le_bytes()).collect();
-    device.l1_write(u64::from(ARGS_AT), &arg_bytes)?;
-    if !module.reader.is_empty() {
-        device.run_program(slot(SLOT_READER), ARGS_AT, &module.reader, &args)?;
+    // Write both arrays before the first core starts, not only as a side effect
+    // of a mover run.
+    for (at, words) in [(ARGS_AT, &args), (ARGS_WRITER, &writer_args)] {
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        device.l1_write(u64::from(at), &bytes)?;
     }
-    if module.cores.iter().any(|words| !words.is_empty()) {
-        run_compute(device, module, ARGS_AT)?;
+    // The semaphore and unpacker setup runs on T0 first and to completion, as
+    // BRISC initialises the semaphores before it releases the TRISCs. A launch
+    // with no compute program has no semaphores to set up.
+    if compute && !module.setup.is_empty() {
+        stage_role(device, 0, &module.setup, ARGS_AT)?;
+        let mb = mailbox::launch::Mailbox::of(0);
+        let generation = device.start(mb)?;
+        device.await_launch(mb, generation)?;
+    }
+
+    // Name every program of the launch, then hand the whole launch to RISCV B:
+    // it invalidates every cache, starts the enabled cores and joins them. The
+    // reader on B and the writer on NC therefore run with the compute cores,
+    // not before or after them (tt-metal's launch message and go message).
+    let mut enables = 0u32;
+    if !module.reader.is_empty() {
+        device.place(slot(SLOT_READER), &module.reader)?;
+        device.prepare(
+            mailbox::launch::Mailbox::b(),
+            slot(SLOT_READER),
+            module.reader.len() as u32,
+            ARGS_AT,
+        )?;
+        enables |= mailbox::launch::ENABLE_B;
     }
     if !module.writer.is_empty() {
-        device.run_program(slot(SLOT_WRITER), ARGS_AT, &module.writer, &args)?;
+        device.place(slot(SLOT_WRITER), &module.writer)?;
+        device.prepare(
+            mailbox::launch::Mailbox::nc(),
+            slot(SLOT_WRITER),
+            module.writer.len() as u32,
+            ARGS_WRITER,
+        )?;
+        enables |= mailbox::launch::ENABLE_NC;
     }
-    Ok(())
-}
-
-/// Stage the three compute programs in the program cache, release T0/T1/T2
-/// together, and wait for every started role to acknowledge.
-///
-/// The backend is released first, while the cores are still held: no Tensix
-/// instruction may be pushed into a held backend. Then thread 0 runs the setup
-/// program (the semaphore initialisation) to completion, and only after that are
-/// the three roles released together -- the order tt-metal uses, where BRISC
-/// initialises the semaphores before it releases the TRISCs.
-fn run_compute(device: &mut Device, module: &Module, args_at: u32) -> Result<(), Error> {
-    device.release_tensix_backend()?;
-    let setup = stage_role(device, 0, &module.setup, args_at)?;
-    let (core, image, at) = crate::images::EXEC_ROLES[0];
-    device.load_and_start(core, image, at)?;
-    device.await_launch(mailbox::launch::Mailbox::of(0), setup)?;
-    // The setup executor is resident and would pick up the real program as soon
-    // as its generation lands. Hold T0; `load_and_start_together` reloads it
-    // with the other two.
-    device.hold(Core::T0)?;
-
-    let mut images = Vec::new();
-    let mut launched = Vec::new();
     for (thread, words) in module.cores.iter().enumerate() {
         if words.is_empty() {
             continue;
         }
-        let generation = stage_role(device, thread, words, args_at)?;
-        images.push(crate::images::EXEC_ROLES[thread]);
-        launched.push((thread, generation));
+        stage_role(device, thread, words, ARGS_AT)?;
+        enables |= ROLE_ENABLE[thread];
     }
-    device.load_and_start_together(&images)?;
-    for (thread, generation) in launched {
-        device.await_launch(mailbox::launch::Mailbox::of(thread as u32), generation)?;
-    }
+    let mb = mailbox::launch::Mailbox::b();
+    let (text, words) = if module.reader.is_empty() {
+        (0, 0)
+    } else {
+        (slot(SLOT_READER), module.reader.len() as u32)
+    };
+    let generation = device.launch(mb, text, words, ARGS_AT, enables)?;
+    device.await_launch(mb, generation)?;
     Ok(())
 }
 
-/// Place `words` at `thread`'s fixed cache slot and write its launch message
-/// (thread index, text address, length, arguments), returning the generation
-/// that starts it.
+/// The enables bit of each role, in thread order.
+const ROLE_ENABLE: [u32; 3] = [
+    mailbox::launch::ENABLE_T0,
+    mailbox::launch::ENABLE_T1,
+    mailbox::launch::ENABLE_T2,
+];
+
+/// Place `words` at `thread`'s fixed cache slot and name it in that role's
+/// launch message, with no generation: RISCV B writes the one that starts it.
 fn stage_role(
     device: &mut Device,
     thread: usize,
     words: &[u32],
     args_at: u32,
-) -> Result<u32, Error> {
+) -> Result<(), Error> {
     if words.is_empty() || words.len() as u32 > mailbox::MAX_WORDS {
         let _ = (thread, words.len());
         return Err(Error::TT_ERROR_ROLE_PROGRAM_SIZE);
@@ -233,7 +272,7 @@ fn stage_role(
     device.write32(mb.unwedge(), 0)?;
     device.write32(mb.mop_cfg_valid(), 0)?;
     device.write32(mb.status(), 0)?;
-    device.launch(mb, text, words.len() as u32, args_at)
+    device.prepare(mb, text, words.len() as u32, args_at)
 }
 
 /// This tile's NOC address-high word: the coordinate packed as `x | y << 6`.

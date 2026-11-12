@@ -200,6 +200,26 @@ pub fn ret() -> u32 {
     0x0000_8067
 }
 
+/// Block this core until the Tensix coprocessor has finished every instruction
+/// the thread has pushed, so that what it wrote to L1 is visible to this core
+/// and to the NoC (`ManualTTSync.md`).
+///
+/// A pushed `STALLWAIT` does not do this for a core store: it holds back later
+/// *pushed* instructions, and the core runs straight on to its next `sw`/`sh`.
+/// The circular-buffer push after a pack is such a store, and the consumer on
+/// another core polls that counter, so the push has to wait here.
+///
+/// The sequence is the firmware's: start the manual sync with a store, then the
+/// load that blocks until it completes, consumed by an `and` so it cannot be
+/// dropped (`ManualTTSync.md`; no other load in the PC buffer range may start
+/// until this one finishes).
+pub fn coprocessor_done(a: &mut Asm) {
+    a.li(reg::T0, tt_isa::tensix::COPROCESSOR_DONE_CHECK as u32);
+    a.word(sw(reg::ZERO, reg::T0, 0));
+    a.word(lw(reg::T1, reg::T0, 0));
+    a.word(and(reg::T1, reg::T1, reg::ZERO));
+}
+
 /// Inline circular-buffer sync: the four tt-metal `dataflow_api.h` operations as
 /// straight-line RISC-V over a [`LocalCBInterface`] table in L1.
 ///
