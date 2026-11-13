@@ -158,14 +158,66 @@ unsafe extern "C" fn dma_read_unexpected(paddr: u64, _dst: *mut c_void, size: u3
     std::process::abort()
 }
 
+/// Which transport a [`Device`] sits on.
+///
+/// The two differ in four calls — configuration read, window read, window write
+/// and a clock step — and in nothing else, so the choice is one field rather
+/// than two device types. The driver variant is the `tt-kmd` port recorded in
+/// `TODO.md`; until that lands it cannot be constructed, and the four arms say
+/// so.
+enum Link {
+    /// The simulator: `dlopen`ed `libttsim_bh.so`, entry points resolved once.
+    Sim(&'static Lib),
+    /// `/dev/tenstorrent/N` through the driver. Not written yet, and nothing
+    /// constructs it until [`Device::open_hardware`] does.
+    #[allow(dead_code)]
+    Driver,
+}
+
+impl Link {
+    fn config_rd32(&self, bdf: u32, offset: u32) -> u32 {
+        match self {
+            Link::Sim(lib) => lib.config_rd32(bdf, offset),
+            Link::Driver => todo!("the tt-kmd link is not written yet (TODO.md)"),
+        }
+    }
+
+    fn mem_write(&self, paddr: u64, bytes: &[u8]) {
+        match self {
+            Link::Sim(lib) => lib.mem_write(paddr, bytes),
+            Link::Driver => todo!("the tt-kmd link is not written yet (TODO.md)"),
+        }
+    }
+
+    fn mem_read(&self, paddr: u64, out: &mut [u8]) {
+        match self {
+            Link::Sim(lib) => lib.mem_read(paddr, out),
+            Link::Driver => todo!("the tt-kmd link is not written yet (TODO.md)"),
+        }
+    }
+
+    fn clock(&self, n: u32) {
+        match self {
+            Link::Sim(lib) => lib.clock(n),
+            // The simulator advances time with a call; silicon waits, so the
+            // driver arm will be a no-op and every wait a real poll.
+            Link::Driver => todo!("the tt-kmd link is not written yet (TODO.md)"),
+        }
+    }
+}
+
 unsafe extern "C" fn dma_write_unexpected(paddr: u64, _src: *const c_void, size: u32) {
     eprintln!("libTT: the device attempted a DMA write of {size} bytes at host address {paddr:#x}");
     std::process::abort()
 }
 
-/// One simulated Blackhole, reached through a TLB window.
+/// One Blackhole, reached through a TLB window.
+///
+/// The transport is one field: [`Link::Sim`] is the `dlopen`ed simulator, and
+/// [`Link::Driver`] will be `/dev/tenstorrent/N`. Everything else here is device
+/// state, discovered through the same window either way.
 pub struct Device {
-    lib: &'static Lib,
+    link: Link,
     /// The configuration the window is known to hold. The registers are
     /// write-only, so this is the only record of the current mapping.
     shadow: Option<[u32; 3]>,
@@ -201,9 +253,11 @@ impl Device {
             .unwrap_or_else(|| PathBuf::from("libttsim_bh.so"));
         let lib = Lib::open(path.as_os_str())?;
 
+        let link = Link::Sim(lib);
+
         // Chip 0 must answer configuration space, and it must be a Blackhole:
         // every address constant above is Blackhole's.
-        let id = lib.config_rd32(0, 0);
+        let id = link.config_rd32(0, 0);
         if id == u32::MAX {
             return Err(Error::TT_ERROR_NO_DEVICE);
         }
@@ -219,7 +273,7 @@ impl Device {
         // to a fused-off tile's registers, and a guessed full grid writes
         // exactly there.
         let mut device = Device {
-            lib,
+            link,
             shadow: None,
             tile: tt_isa::arc::arc_tile(),
             tiles: Vec::new(),
@@ -243,11 +297,21 @@ impl Device {
         Ok(device)
     }
 
+    /// Take the hardware device through `/dev/tenstorrent/N`.
+    ///
+    /// The port is recorded in `TODO.md` with six open questions — the window
+    /// layout, how the device is selected, which error variants the driver needs,
+    /// what of `tt-mapping`/`tt-host` carries over, the wall-clock budget, and the
+    /// DRAM base — so this refuses rather than quietly opening the simulator under
+    /// a second name.
+    pub fn open_hardware() -> Result<Device, Error> {
+        Err(Error::TT_ERROR_UNSUPPORTED)
+    }
+
     /// The tile the low-level accessors currently target.
     pub fn tile(&self) -> NocCoord {
         self.tile
     }
-
     /// This chip's live Tensix columns, from the ARC's telemetry table.
     ///
     /// tt-metal's `ArcTelemetryReader` (`umd/device/arc/arc_telemetry_reader.cpp`)
@@ -436,7 +500,7 @@ impl Device {
 
     /// Advance simulated time. Nothing happens on the device outside this.
     pub fn clock(&self, n: u32) {
-        self.lib.clock(n);
+        self.link.clock(n);
     }
 
     /// Load `image` into L1 and start `core` on it.
@@ -802,7 +866,7 @@ impl Device {
             self.retarget(tile, base)?;
             let bar = window_bar_offset() + offset;
             check_bar0(bar, here)?;
-            self.lib
+            self.link
                 .mem_write(BAR0_BASE + bar, &bytes[done..done + here]);
             done += here;
         }
@@ -819,7 +883,7 @@ impl Device {
             self.retarget(tile, base)?;
             let bar = window_bar_offset() + offset;
             check_bar0(bar, here)?;
-            self.lib
+            self.link
                 .mem_read(BAR0_BASE + bar, &mut out[done..done + here]);
             done += here;
         }
@@ -828,7 +892,8 @@ impl Device {
 
     fn bar_write32(&self, offset: u64, value: u32) -> Result<(), Error> {
         check_bar0(offset, 4)?;
-        self.lib.mem_write(BAR0_BASE + offset, &value.to_le_bytes());
+        self.link
+            .mem_write(BAR0_BASE + offset, &value.to_le_bytes());
         Ok(())
     }
 
