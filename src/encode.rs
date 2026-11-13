@@ -1437,13 +1437,6 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
             let s = semaphore(sem)?;
             out.extend(sync::take(s, Before::EVERYTHING));
         }
-        MirOp::SemWaitData { sem } => {
-            let s = semaphore(sem)?;
-            out.push(sync::wait_nonzero(s, Before::EVERYTHING));
-        }
-        MirOp::SemGet { sem } => {
-            out.push(sync::get(semaphore(sem)?));
-        }
         other => {
             let _ = other;
             return Err(Error::TT_ERROR_NOT_MATH);
@@ -1582,15 +1575,6 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(
             MirOp::EndLoop => close_loop(out, &mut loops)?,
             MirOp::SemWait { sem, .. } => {
                 out.extend(sync::take(semaphore(sem)?, Before::EVERYTHING));
-            }
-            MirOp::SemWaitData { sem } => {
-                out.push(sync::wait_nonzero(semaphore(sem)?, Before::EVERYTHING));
-            }
-            MirOp::SemGet { sem } => {
-                // The claim is released only once the pack has read `Dst`, the
-                // order `_llk_pack_dest_section_done_` uses.
-                out.push(wait_for_packer(Before::EVERYTHING).expect("named bits"));
-                out.push(sync::get(semaphore(sem)?));
             }
             MirOp::SemPost { sem } => {
                 out.extend(sync::post_after(sync::Unit::Packer, semaphore(sem)?));

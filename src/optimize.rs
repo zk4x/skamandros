@@ -598,9 +598,7 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                 }
                 MirOp::SemPost { sem }
                 | MirOp::SemWait { sem, .. }
-                | MirOp::SemWaitFree { sem }
-                | MirOp::SemWaitData { sem }
-                | MirOp::SemGet { sem } => {
+                | MirOp::SemWaitFree { sem } => {
                     if tt_isa::sync::Semaphore::new(sem).is_none()
                         || !sems.iter().any(|(s, _)| *s == sem)
                     {
