@@ -644,40 +644,6 @@ fn stallwait(block_mask: u32, condition: u32) -> Result<Instruction, Error> {
     })
 }
 
-/// `MOVB2D_BH` from its diagram fields, in the order the diagram draws them.
-///
-/// The instruction set's own table is the encoding; this places the five
-/// operands and names the failure as the project's status, so a value that does
-/// not fit its field is a `TT_ERROR_ENCODE` at the call site rather than a
-/// second error type.
-fn movb2d(
-    use_dst32b_lo: bool,
-    src_row: u32,
-    addr_mod: u32,
-    move4_rows: bool,
-    dst_row: u32,
-) -> Result<Instruction, Error> {
-    let def = &defs::MOVB2D;
-    let operands = [
-        (0usize, u32::from(use_dst32b_lo)),
-        (1, src_row),
-        (2, addr_mod),
-        (3, u32::from(move4_rows)),
-        // `Broadcast1RowTo8` and `BroadcastCol0` stay clear: nothing in the
-        // compiler uses them.
-        (6, dst_row),
-    ];
-    let mut word = def.skeleton();
-    for (index, value) in operands {
-        let field = def.fields()[index];
-        if !field.fits(value) {
-            return Err(Error::TT_ERROR_ENCODE);
-        }
-        word |= field.place(value);
-    }
-    Ok(Instruction::new(word, def))
-}
-
 /// The `SFPLOAD`/`SFPSTORE` lane format of one datum: the conversion the lane
 /// makes on the way in or out.
 fn lane_format(dtype: DType) -> u32 {
@@ -1289,13 +1255,16 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
             move4_rows,
             dst_row,
         } => {
-            out.push(movb2d(
-                use_dst32b_lo,
-                src_row,
-                addr_mod,
-                move4_rows,
-                dst_row + row_delta,
-            )?);
+            out.push(
+                encode::Movb2D::ZERO
+                    .use_dst32b_lo(u32::from(use_dst32b_lo))
+                    .src_row(src_row)
+                    .addr_mod(addr_mod)
+                    .move4_rows(u32::from(move4_rows))
+                    .dst_row(dst_row + row_delta)
+                    .encode()
+                    .map_err(bad_isa)?,
+            );
         }
         MirOp::Movb2a {
             src_a_row,
