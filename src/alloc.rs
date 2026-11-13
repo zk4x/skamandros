@@ -100,7 +100,7 @@ pub fn allocate(k: &Kernel, types: &Types) -> Result<Alloc, Error> {
         let Some(value) = op.defined() else { continue };
         if !matches!(
             op,
-            Op::Acc { .. }
+            Op::Tile { .. }
                 | Op::Load { .. }
                 | Op::Cast { .. }
                 | Op::Unary { .. }
@@ -113,7 +113,7 @@ pub fn allocate(k: &Kernel, types: &Types) -> Result<Alloc, Error> {
         // value: the movers evaluate it in RISC-V and it has no `Dst` home. An
         // `acc` is the exception: a `1,1` acc still folds in a whole `Dst` tile
         // region and is packed from it.
-        if types.of(value).shape == crate::ir::RegShape::Scalar && !matches!(op, Op::Acc { .. }) {
+        if types.of(value).shape == crate::ir::RegShape::Scalar && !matches!(op, Op::Tile { .. }) {
             continue;
         }
         let Some(slot) = free.iter().position(|in_use| !in_use) else {

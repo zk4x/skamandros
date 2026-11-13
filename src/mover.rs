@@ -161,10 +161,11 @@ pub fn add_movers(k: &Kernel, types: &Types) -> Result<Kernel, Error> {
                 let info = *types.of(buffer);
                 let shape = stage_shape(info.shape, buffer)?;
                 let staged = fresh(&mut out, k, &mut stage);
-                out.push(Op::Buffer {
+                out.push(Op::Cb {
                     value: staged,
                     dtype: info.dtype,
-                    shape,
+                    page: shape,
+                    len: 1,
                 });
                 let src = map[&buffer];
                 out.push(Op::CopyTo {
@@ -193,10 +194,11 @@ pub fn add_movers(k: &Kernel, types: &Types) -> Result<Kernel, Error> {
                 let info = *types.of(buffer);
                 let shape = stage_shape(info.shape, buffer)?;
                 let staged = fresh(&mut out, k, &mut stage);
-                out.push(Op::Buffer {
+                out.push(Op::Cb {
                     value: staged,
                     dtype: info.dtype,
-                    shape,
+                    page: shape,
+                    len: 1,
                 });
                 let value = map[&value];
                 out.push(Op::StoreTo {
@@ -292,12 +294,19 @@ fn remap(op: &Op, map: &BTreeMap<OpId, OpId>, value: Option<ValueId>) -> Op {
             dtype,
             dims: dims.iter().map(|x| d(*x)).collect(),
         },
-        Op::Buffer { dtype, shape, .. } => Op::Buffer {
+        Op::Variable { dtype, .. } => Op::Variable {
             value: own(),
             dtype,
-            shape,
         },
-        Op::Acc { dtype, shape, .. } => Op::Acc {
+        Op::Cb {
+            dtype, page, len, ..
+        } => Op::Cb {
+            value: own(),
+            dtype,
+            page,
+            len,
+        },
+        Op::Tile { dtype, shape, .. } => Op::Tile {
             value: own(),
             dtype,
             shape,
@@ -525,9 +534,12 @@ fn param_indices(k: &Kernel) -> BTreeMap<OpId, u32> {
     let mut index: BTreeMap<OpId, u32> = BTreeMap::new();
     let mut next = 0u32;
     for (_, op) in k.ops() {
-        if let Op::Param { value, .. } = *op {
-            index.insert(value, next);
-            next += 1;
+        match *op {
+            Op::Param { value, .. } | Op::Variable { value, .. } => {
+                index.insert(value, next);
+                next += 1;
+            }
+            _ => {}
         }
     }
     index
@@ -574,7 +586,7 @@ fn eval_value(
         }
         // A scalar parameter's launch argument is its value, not an address:
         // the array the host wrote holds the value word (`get_arg_val`).
-        Op::Param { ref dims, .. } if dims.is_empty() => {
+        Op::Variable { .. } => {
             let index = *param_index.get(&value).ok_or(Error::TT_TODO_LOOP_ADDRESS)?;
             a.word(rv::lw(dest, reg::A0, param_arg(index).0));
             Ok(())
@@ -636,7 +648,7 @@ fn eval_value(
             buffer, ref offset, ..
         } => {
             let dtype = match k.at(buffer) {
-                Op::Buffer { dtype, .. } => *dtype,
+                Op::Cb { dtype, .. } => *dtype,
                 _ => {
                     let _ = buffer;
                     return Err(Error::TT_ERROR_NOT_A_BUFFER);
@@ -735,7 +747,7 @@ fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
                         }
                     };
                 let dtype = match k.at(buffer) {
-                    Op::Buffer { dtype, .. } => *dtype,
+                    Op::Cb { dtype, .. } => *dtype,
                     _ => unreachable!("the type says it is a buffer"),
                 };
                 let cb = *plan.cb.get(&buffer).ok_or_else(|| {
@@ -889,7 +901,7 @@ fn lane_page(k: &Kernel, plan: &Plan, load: ValueId, at: usize) -> Result<(u32, 
         return Err(Error::TT_TODO_MULTI_LANE);
     };
     let dtype = match k.at(buffer) {
-        Op::Buffer { dtype, .. } => *dtype,
+        Op::Cb { dtype, .. } => *dtype,
         _ => {
             let _ = buffer;
             return Err(Error::TT_ERROR_NOT_A_BUFFER);

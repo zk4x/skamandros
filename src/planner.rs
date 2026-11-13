@@ -75,16 +75,23 @@ pub fn place(k: &Kernel, types: &Types) -> Result<Plan, Error> {
     let mut cbs: Vec<Cb> = Vec::new();
     let mut at = tt_isa::l1::DATA.base as u32;
     for (op_at, op) in k.ops() {
-        let Op::Buffer {
+        let Op::Cb {
             value,
             dtype,
-            shape,
+            page,
+            len,
             ..
         } = *op
         else {
             continue;
         };
-        let (unit, units, bytes) = unit_of(shape, dtype)?;
+        let (unit, _, _) = unit_of(page, dtype)?;
+        let units = u32::from(len);
+        let bytes = unit
+            .datums()
+            .checked_mul(dtype.bytes())
+            .and_then(|page| page.checked_mul(units))
+            .ok_or(Error::TT_ERROR_L1_OVERFLOW)?;
         let base = at.div_ceil(ALIGN) * ALIGN;
         let end = base.checked_add(bytes).ok_or_else(|| {
             let _ = (op_at, value);

@@ -213,7 +213,7 @@ grid 1,1
     let staged = crate::mover::add_movers(&k, &types).expect("the access is staged");
     let buffers = staged
         .ops()
-        .filter(|(_, op)| matches!(op, Op::Buffer { .. }))
+        .filter(|(_, op)| matches!(op, Op::Cb { .. }))
         .count();
     let copies = staged
         .ops()

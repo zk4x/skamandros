@@ -83,9 +83,12 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
     let mut param: BTreeMap<crate::ir::OpId, u32> = BTreeMap::new();
     let mut next = 0u32;
     for (_, op) in k.ops() {
-        if let Op::Param { value, .. } = *op {
-            param.insert(value, next);
-            next += 1;
+        match *op {
+            Op::Param { value, .. } | Op::Variable { value, .. } => {
+                param.insert(value, next);
+                next += 1;
+            }
+            _ => {}
         }
     }
     // The induction value of every loop being lowered, innermost last: a bound
@@ -169,10 +172,13 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             _ => None,
         };
         match *op {
+            // A scalar parameter is one launch-argument word: the movers read
+            // it and the datapath never does.
+            Op::Variable { .. } => {}
             Op::Const { .. }
             | Op::Param { .. }
-            | Op::Buffer { .. }
-            | Op::Acc { .. }
+            | Op::Cb { .. }
+            | Op::Tile { .. }
             | Op::Grid { .. }
             | Op::CopyTo { .. } => {}
             // A scalar is index arithmetic: it names a `Dim`, and the mover
@@ -245,7 +251,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 }
                 let info = types.of(buffer);
                 let dtype = match k.at(buffer) {
-                    Op::Buffer { dtype, .. } => *dtype,
+                    Op::Cb { dtype, .. } => *dtype,
                     _ => {
                         let _ = buffer;
                         return Err(Error::TT_ERROR_NOT_A_BUFFER);
@@ -379,7 +385,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     continue;
                 }
                 let dtype = match k.at(buffer) {
-                    Op::Buffer { dtype, .. } => *dtype,
+                    Op::Cb { dtype, .. } => *dtype,
                     _ => {
                         let _ = buffer;
                         return Err(Error::TT_ERROR_NOT_A_BUFFER);
@@ -2042,8 +2048,8 @@ fn eval(
             });
             Ok(())
         }
-        Op::Param { value: p, .. } if types.of(p).shape == RegShape::Scalar => {
-            let index = *param.get(&p).ok_or(Error::TT_TODO_LOOP_ADDRESS)?;
+        Op::Variable { .. } => {
+            let index = *param.get(&value).ok_or(Error::TT_TODO_LOOP_ADDRESS)?;
             role.push(MirOp::LoadArg {
                 reg: dest,
                 arg: crate::mover::param_arg(index).0,

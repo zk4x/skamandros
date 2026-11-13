@@ -73,12 +73,16 @@ pub fn compile(k: &Kernel) -> Result<Module, Error> {
 fn parameter_kinds(k: &Kernel, types: &crate::ir::Types) -> Vec<ParamKind> {
     let mut kinds = Vec::new();
     for (_, op) in k.ops() {
-        if let Op::Param { value, .. } = *op {
-            kinds.push(if types.of(value).shape == crate::ir::RegShape::Scalar {
-                ParamKind::Scalar
-            } else {
-                ParamKind::Tensor
-            });
+        match *op {
+            Op::Param { value, .. } => {
+                kinds.push(if types.of(value).shape == crate::ir::RegShape::Scalar {
+                    ParamKind::Scalar
+                } else {
+                    ParamKind::Tensor
+                })
+            }
+            Op::Variable { .. } => kinds.push(ParamKind::Scalar),
+            _ => {}
         }
     }
     kinds
@@ -91,9 +95,12 @@ fn grid_term(k: &Kernel, dim: Dim) -> Result<GridTerm, Error> {
     let mut param: BTreeMap<OpId, u32> = BTreeMap::new();
     let mut next = 0u32;
     for (_, op) in k.ops() {
-        if let Op::Param { value, .. } = *op {
-            param.insert(value, next);
-            next += 1;
+        match *op {
+            Op::Param { value, .. } | Op::Variable { value, .. } => {
+                param.insert(value, next);
+                next += 1;
+            }
+            _ => {}
         }
     }
     match dim {
@@ -119,9 +126,7 @@ fn grid_value(
             bits,
             ..
         } => Ok(GridTerm::Const(bits)),
-        Op::Param {
-            value: p, ref dims, ..
-        } if dims.is_empty() => Ok(GridTerm::Param(
+        Op::Variable { value: p, .. } => Ok(GridTerm::Param(
             *param.get(&p).ok_or(Error::TT_ERROR_ARGUMENT)?,
         )),
         Op::Binary { op, a, b, .. } if grid_op(op) => Ok(GridTerm::Binary(

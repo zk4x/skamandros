@@ -402,26 +402,32 @@ pub enum Op {
         dtype: DType,
         bits: u32,
     },
-    /// A DRAM parameter. Empty `dims` is the scalar shape `0`.
+    /// A tensor parameter in DRAM, with its logical shape.
     Param {
         value: ValueId,
         dtype: DType,
         dims: Vec<Dim>,
     },
-    /// An L1 buffer: two constant dimensions.
-    Buffer {
+    /// A scalar parameter: one word in DRAM, the value a launch argument
+    /// carries (the shape `0` in the text form).
+    Variable { value: ValueId, dtype: DType },
+    /// A CB ring in L1: a page shape and the number of pages.
+    Cb {
         value: ValueId,
         dtype: DType,
-        shape: [u32; 2],
+        /// One page's shape: a tile, a row or a column.
+        page: [u32; 2],
+        /// Pages in the ring.
+        len: u8,
     },
-    /// A named `Dst` accumulator: one tile region that `matmul`, `sum`/`max` and
+    /// A named tile register: one `Dst` region that `matmul`, `sum`/`max` and
     /// `store_to` write, read back by `store_to` into a buffer. It is mutable —
     /// the whole point of it is that a K loop adds into the same rows, and a
     /// reduce's fold accumulates — and it starts unspecified: a program that
     /// needs zeros stores them (`store_to %acc from %zero`). Its shape is which
     /// part of the region the program means, and for a reduce it is the fold:
     /// `1,32`, `32,1` or `1,1`, while `32,32` is `matmul`'s.
-    Acc {
+    Tile {
         value: ValueId,
         dtype: DType,
         shape: [u32; 2],
@@ -544,8 +550,9 @@ impl Op {
         match *self {
             Op::Const { value, .. }
             | Op::Param { value, .. }
-            | Op::Buffer { value, .. }
-            | Op::Acc { value, .. }
+            | Op::Variable { value, .. }
+            | Op::Cb { value, .. }
+            | Op::Tile { value, .. }
             | Op::Loop { value, .. }
             | Op::GridCoord { value, .. }
             | Op::Load { value, .. }
@@ -616,8 +623,9 @@ impl Op {
             Op::Grid { columns, rows } => dim(columns).into_iter().chain(dim(rows)).collect(),
             Op::Param { dims, .. } => dims.iter().filter_map(dim).collect(),
             Op::Const { .. }
-            | Op::Buffer { .. }
-            | Op::Acc { .. }
+            | Op::Variable { .. }
+            | Op::Cb { .. }
+            | Op::Tile { .. }
             | Op::EndLoop
             | Op::GridCoord { .. } => Vec::new(),
         }
@@ -965,30 +973,42 @@ impl Kernel {
                             }
                         }
                     }
+                    // A tensor parameter's logical shape lives in the op; only
+                    // the scalar/tensor distinction matters here.
                     ValueInfo {
                         kind: ValueKind::Param,
                         dtype,
-                        // A tensor parameter's logical shape lives in the op;
-                        // only the scalar/tensor distinction matters here.
-                        shape: if dims.is_empty() {
-                            RegShape::Scalar
-                        } else {
-                            RegShape::Tile
-                        },
+                        shape: RegShape::Tile,
                     }
                 }
-                Op::Buffer { dtype, shape, .. } => {
+                Op::Variable { dtype, .. } => {
+                    if dtype == DType::Bool {
+                        todo!("op {at}: a bool parameter is not implemented");
+                    }
+                    ValueInfo {
+                        kind: ValueKind::Param,
+                        dtype,
+                        shape: RegShape::Scalar,
+                    }
+                }
+                Op::Cb {
+                    dtype, page, len, ..
+                } => {
                     if dtype == DType::Bool {
                         todo!("op {at}: a bool buffer is not implemented");
                     }
-                    unit_of(shape, dtype)?;
+                    if len == 0 {
+                        let _ = at;
+                        return Err(Error::TT_ERROR_ZERO_DIMENSION);
+                    }
+                    unit_of(page, dtype)?;
                     ValueInfo {
                         kind: ValueKind::Buffer,
                         dtype,
                         shape: RegShape::Tile,
                     }
                 }
-                Op::Acc { dtype, shape, .. } => {
+                Op::Tile { dtype, shape, .. } => {
                     // An `acc` is always one `Dst` tile region; its shape says
                     // which part of it the program means. `32,32` is `matmul`'s,
                     // and a reduce's shape is the vector it leaves (see
@@ -1115,14 +1135,14 @@ impl Kernel {
                     if page != 1 {
                         return Err(Error::TT_TODO_MULTI_LANE);
                     }
-                    let shape = match self.at(def[usize::from(buffer)]) {
-                        Op::Buffer { shape, .. } => *shape,
+                    let (page, len) = match self.at(def[usize::from(buffer)]) {
+                        Op::Cb { page, len, .. } => (*page, *len),
                         _ => {
                             let _ = buffer;
                             return Err(Error::TT_ERROR_NOT_A_BUFFER);
                         }
                     };
-                    let (unit_shape, _, _) = unit_of(shape, b.dtype)?;
+                    let (unit_shape, _, _) = unit_of(page, b.dtype)?;
                     let datums = access[0] * access[1];
                     // One lane moves one unit, and the lanes fill exactly one
                     // L1 page: `page_datums / lanes` datums each.
@@ -1130,7 +1150,7 @@ impl Kernel {
                         let _ = (lanes, datums, unit_shape);
                         return Err(Error::TT_ERROR_COPY_LANES);
                     }
-                    let total = shape[0] * shape[1];
+                    let total = unit_shape.datums() * u32::from(len);
                     check_offset(buffer_offset, total, datums, at)?;
                     if let Some(count) = param_elements(self, &def, param) {
                         check_offset(param_offset, count, datums, at)?;
@@ -1177,16 +1197,19 @@ impl Kernel {
                             let _ = buffer;
                             return Err(Error::TT_ERROR_NOT_A_BUFFER);
                         }
-                        let Op::Buffer { shape, .. } = self.at(def[usize::from(buffer)]) else {
-                            let _ = buffer;
-                            return Err(Error::TT_ERROR_NOT_A_BUFFER);
+                        let (page, len) = match self.at(def[usize::from(buffer)]) {
+                            Op::Cb { page, len, .. } => (*page, *len),
+                            _ => {
+                                let _ = buffer;
+                                return Err(Error::TT_ERROR_NOT_A_BUFFER);
+                            }
                         };
-                        let (unit_shape, _, _) = unit_of(*shape, b.dtype)?;
+                        let (unit_shape, _, _) = unit_of(page, b.dtype)?;
                         if unit_shape.datums() < datums {
                             let _ = (unit_shape, access);
                             return Err(Error::TT_ERROR_ACCESS_SHAPE);
                         }
-                        let total = shape[0] * shape[1];
+                        let total = unit_shape.datums() * u32::from(len);
                         check_offset(offset, total, datums, at)?;
                         let _ = value;
                         ValueInfo {
@@ -1265,14 +1288,14 @@ impl Kernel {
                         let _ = (v.dtype, b.dtype);
                         return Err(Error::TT_ERROR_STORE_BUFFER_CAST);
                     }
-                    let shape = match self.at(def[usize::from(buffer)]) {
-                        Op::Buffer { shape, .. } => *shape,
+                    let (page, len) = match self.at(def[usize::from(buffer)]) {
+                        Op::Cb { page, len, .. } => (*page, *len),
                         _ => {
                             let _ = buffer;
                             return Err(Error::TT_ERROR_NOT_A_BUFFER);
                         }
                     };
-                    let (unit_shape, _, _) = unit_of(shape, b.dtype)?;
+                    let (unit_shape, _, _) = unit_of(page, b.dtype)?;
                     if unit_shape.datums() < datums {
                         let _ = (unit_shape, access);
                         return Err(Error::TT_ERROR_ACCESS_SHAPE);
@@ -1281,7 +1304,7 @@ impl Kernel {
                         let _ = (unit, v.shape);
                         return Err(Error::TT_ERROR_STORE_BUFFER_SHAPE);
                     }
-                    let total = shape[0] * shape[1];
+                    let total = unit_shape.datums() * u32::from(len);
                     check_offset(offset, total, datums, at)?;
                     continue;
                 }
@@ -1697,6 +1720,20 @@ fn check_offset(offset: Dim, total: u32, unit: u32, at: usize) -> Result<(), Err
 }
 
 /// A parameter's element count when every dimension is a literal.
+/// Split a declared buffer shape into a page shape and a page count: a `32,64`
+/// buffer is two `32,32` pages, a `1,64` one is two `1,32` rows.
+fn cb_ring(shape: [u32; 2], dtype: DType) -> Result<([u32; 2], u8), Error> {
+    let (unit, units, _) = unit_of(shape, dtype)?;
+    let page = match unit {
+        RegShape::Tile => [32, 32],
+        RegShape::Row => [1, 32],
+        RegShape::Column => [32, 1],
+        RegShape::Scalar => [1, 1],
+    };
+    let len = u8::try_from(units).map_err(|_| Error::TT_ERROR_BUFFER_SHAPE)?;
+    Ok((page, len))
+}
+
 fn param_elements(k: &Kernel, def: &[OpId], param: ValueId) -> Option<u32> {
     let Op::Param { dims, .. } = k.at(def[usize::from(param)]) else {
         return None;
@@ -1753,17 +1790,23 @@ impl Kernel {
                         dims.push(r.dim()?);
                     }
                     let value = define(&mut names, name)?;
-                    Op::Param { value, dtype, dims }
+                    if dims.is_empty() {
+                        Op::Variable { value, dtype }
+                    } else {
+                        Op::Param { value, dtype, dims }
+                    }
                 }
                 2 => {
                     let name = r.name()?;
                     let dtype = r.dtype()?;
                     let shape = [r.u32()?, r.u32()?];
+                    let (page, len) = cb_ring(shape, dtype)?;
                     let value = define(&mut names, name)?;
-                    Op::Buffer {
+                    Op::Cb {
                         value,
                         dtype,
-                        shape,
+                        page,
+                        len,
                     }
                 }
                 3 => Op::Grid {
@@ -1849,7 +1892,7 @@ impl Kernel {
                     let dtype = r.dtype()?;
                     let shape = [r.u32()?, r.u32()?];
                     let value = define(&mut names, name)?;
-                    Op::Acc {
+                    Op::Tile {
                         value,
                         dtype,
                         shape,
@@ -1941,9 +1984,10 @@ pub(crate) fn renumber(op: &mut Op, map: &BTreeMap<OpId, OpId>) -> Result<(), Er
     }
     match op {
         Op::Const { value, .. }
-        | Op::Acc { value, .. }
+        | Op::Tile { value, .. }
         | Op::GridCoord { value, .. }
-        | Op::Buffer { value, .. } => v(value, map)?,
+        | Op::Variable { value, .. }
+        | Op::Cb { value, .. } => v(value, map)?,
         Op::Cast { value, src, .. } | Op::Bitcast { value, src, .. } => {
             v(value, map)?;
             v(src, map)?;
@@ -2310,7 +2354,11 @@ fn parse_definition(t: &mut Tokens, p: &mut Parser) -> Result<Op, Error> {
                 dims
             };
             t.end()?;
-            Op::Param { value, dtype, dims }
+            if dims.is_empty() {
+                Op::Variable { value, dtype }
+            } else {
+                Op::Param { value, dtype, dims }
+            }
         }
         "buffer" => {
             let dtype = t.dtype()?;
@@ -2318,10 +2366,12 @@ fn parse_definition(t: &mut Tokens, p: &mut Parser) -> Result<Op, Error> {
             t.comma()?;
             let b = t.number_u32()?;
             t.end()?;
-            Op::Buffer {
+            let (page, len) = cb_ring([a, b], dtype)?;
+            Op::Cb {
                 value,
                 dtype,
-                shape: [a, b],
+                page,
+                len,
             }
         }
         "acc" => {
@@ -2330,7 +2380,7 @@ fn parse_definition(t: &mut Tokens, p: &mut Parser) -> Result<Op, Error> {
             t.comma()?;
             let b = t.number_u32()?;
             t.end()?;
-            Op::Acc {
+            Op::Tile {
                 value,
                 dtype,
                 shape: [a, b],
