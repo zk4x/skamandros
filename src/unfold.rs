@@ -413,25 +413,35 @@ impl Build<'_> {
                 src,
                 dst_offset,
                 src_offset,
+                shape,
             } => Op::CopyTo {
                 dst: self.map_of(dst),
                 src: self.map_of(src),
                 dst_offset: self.dim(dst_offset),
                 src_offset: self.dim(src_offset),
+                shape,
             },
-            Op::Load { buffer, offset, .. } => Op::Load {
+            Op::Load {
+                buffer,
+                offset,
+                shape,
+                ..
+            } => Op::Load {
                 value: new.expect("a load defines its value"),
                 buffer: self.map_of(buffer),
                 offset: self.dim(offset),
+                shape,
             },
             Op::StoreTo {
                 value,
                 buffer,
                 offset,
+                shape,
             } => Op::StoreTo {
                 value: self.map_of(value),
                 buffer: self.map_of(buffer),
                 offset: self.dim(offset),
+                shape,
             },
             Op::Cast { src, dtype, .. } => Op::Cast {
                 value: new.expect("a cast defines its value"),
@@ -503,17 +513,17 @@ mod tests {
     use super::*;
 
     const LOG2: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
 %b0 = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %b0 from %in [0]
-%x = load %b0 [0]
+copy 32,32 %b0 [0] = %in [0]
+load 32,32 %x = %b0 [0]
 %r = log2 %x
-store_to %bo from %r [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %r
+copy 32,32 %out [0] = %bo [0]
 ";
 
     #[test]

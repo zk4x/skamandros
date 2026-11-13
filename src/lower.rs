@@ -16,7 +16,7 @@
 //! named none of them.
 
 use crate::alloc::Alloc;
-use crate::ir::{BinOp, Dim, Error, Kernel, Op, RegShape, Types, UnOp, unit_of};
+use crate::ir::{BinOp, Dim, Error, Kernel, Op, RegShape, Types, UnOp, access_shape, unit_of};
 use crate::mir::{CmpOp, IOp, Machine, MirOp, PackMask, SfpOp};
 use crate::planner::Plan;
 use crate::riscv::reg;
@@ -186,6 +186,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 value,
                 buffer,
                 offset,
+                shape: access,
             } => {
                 // A scalar load is an index read: the mover evaluates it from
                 // the page it copied, in RISC-V (see `mover::eval_value`).
@@ -193,12 +194,17 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     continue;
                 }
                 let info = types.of(buffer);
-                let Op::Buffer { shape, dtype, .. } = k.ops[def[buffer as usize].expect("defined")]
-                else {
+                let Op::Buffer { dtype, .. } = k.ops[def[buffer as usize].expect("defined")] else {
                     let _ = buffer;
                     return Err(Error::TT_ERROR_NOT_A_BUFFER);
                 };
-                let (unit_shape, _, _) = unit_of(shape, dtype)?;
+                let unit_shape = access_shape(access)?;
+                // Only a tile (one whole page) is lowered today; a row, a
+                // column or a datum needs the narrowed unpack.
+                if unit_shape != RegShape::Tile {
+                    let _ = (at, access);
+                    return Err(Error::TT_TODO_ACCESS_SHAPE);
+                }
                 let rows = rows_of(unit_shape, at)?;
                 let cb = plan.cb[buffer as usize].ok_or_else(|| {
                     let _ = buffer;
@@ -274,6 +280,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 value,
                 buffer,
                 offset,
+                shape: access,
             } => {
                 // An accumulator is written in place in `Dst`, not packed: the
                 // only form the verifier admits is a fill from an f32 constant,
@@ -314,12 +321,17 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     }
                     continue;
                 }
-                let Op::Buffer { shape, dtype, .. } = k.ops[def[buffer as usize].expect("defined")]
-                else {
+                let Op::Buffer { dtype, .. } = k.ops[def[buffer as usize].expect("defined")] else {
                     let _ = buffer;
                     return Err(Error::TT_ERROR_NOT_A_BUFFER);
                 };
-                let (unit_shape, _, _) = unit_of(shape, dtype)?;
+                let unit_shape = access_shape(access)?;
+                // Only a tile is lowered today; a narrower pack needs the
+                // packer's `SETADCX` narrowing.
+                if unit_shape != RegShape::Tile {
+                    let _ = (at, access);
+                    return Err(Error::TT_TODO_ACCESS_SHAPE);
+                }
                 let rows = rows_of(unit_shape, at)?;
                 let cb = plan.cb[buffer as usize].ok_or_else(|| {
                     let _ = buffer;
@@ -1662,7 +1674,7 @@ mod tests {
     #[test]
     fn a_dst_write_after_a_post_waits_for_the_packer() {
         const PROGRAM: &str = "\
-version 7
+version 8
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -1670,20 +1682,20 @@ grid 1,1
 %ba = buffer f32 32,32
 %bb = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %ba from %pa [0]
-copy_to %bb from %pb [0]
+copy 32,32 %ba [0] = %pa [0]
+copy 32,32 %bb [0] = %pb [0]
 %m = acc f32 32,32
 %zero = const f32 0
-store_to %m from %zero
-%a = load %ba [0]
-%b = load %bb [0]
+store 32,32 %m = %zero
+load 32,32 %a = %ba [0]
+load 32,32 %b = %bb [0]
 matmul %m %a %b
-store_to %bo from %m [0]
-copy_to %out from %bo [0] [0]
-store_to %m from %zero
+store 32,32 %bo [0] = %m
+copy 32,32 %out [0] = %bo [0]
+store 32,32 %m = %zero
 matmul %m %a %b
-store_to %bo from %m [0]
-copy_to %out from %bo [1024] [0]
+store 32,32 %bo [0] = %m
+copy 32,32 %out [1] = %bo [0]
 ";
         let k = Kernel::parse(PROGRAM).expect("it parses");
         let types = k.verify().expect("it verifies");

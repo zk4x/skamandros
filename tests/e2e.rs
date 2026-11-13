@@ -76,13 +76,13 @@ fn library() -> &'static Library {
 }
 
 const COPY: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
 %b0 = buffer f32 32,32
-copy_to %b0 from %in [0]
-copy_to %out from %b0 [0]
+copy 32,32 %b0 [0] = %in [0]
+copy 32,32 %out [0] = %b0 [0]
 ";
 
 /// The byte form of [`COPY`]: the shipping encoding, frozen.
@@ -91,11 +91,12 @@ copy_to %out from %b0 [0]
 /// all, so a real consumer of the `.so` can only hand it bytes it already has.
 /// A change to the encoding's version makes `ttModuleLoad` refuse this, which is
 /// the correct failure — regenerate the fixture.
-const COPY_TTIR: [u8; 112] = [
-    84, 84, 73, 82, 7, 0, 0, 0, 6, 0, 0, 0, 3, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 2, 0, 0, 0, 105,
+const COPY_TTIR: [u8; 128] = [
+    84, 84, 73, 82, 8, 0, 0, 0, 6, 0, 0, 0, 3, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 2, 0, 0, 0, 105,
     110, 0, 1, 0, 0, 0, 0, 0, 4, 0, 0, 1, 3, 0, 0, 0, 111, 117, 116, 0, 1, 0, 0, 0, 0, 0, 4, 0, 0,
     2, 2, 0, 0, 0, 98, 48, 0, 32, 0, 0, 0, 32, 0, 0, 0, 6, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 6, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 32, 0, 0, 0, 32, 0, 0, 0, 6, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 32, 0, 0, 0, 32, 0, 0, 0,
 ];
 
 /// Read and clear the message a failed call left behind.
@@ -171,7 +172,7 @@ fn a_refused_program_comes_back_as_an_error_not_a_crash() {
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
 
-    let bad = "version 7\ngrid 1,1\n%out = param f32 1024\n%x = neg %y\n";
+    let bad = "version 8\ngrid 1,1\n%out = param f32 1024\n%x = neg %y\n";
     let mut module: *mut c_void = std::ptr::null_mut();
     let mut err: *mut c_char = std::ptr::null_mut();
     let code = unsafe { compile(bad.as_ptr().cast(), bad.len(), &mut module, &mut err) };
@@ -250,52 +251,52 @@ fn the_error_codes_are_the_documented_ones() {
 /// A copy kernel over a two-page buffer: DRAM into L1, and the same L1 buffer
 /// back into DRAM, in 32x32 units.
 const COPY_8K: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
 %b0 = buffer f32 32,64
-copy_to %b0 from %in [0]
-copy_to %b0 from %in [1024]
-copy_to %out from %b0 [0]
-copy_to %out from %b0 [1024]
+copy 32,32 %b0 [0] = %in [0]
+copy 32,32 %b0 [1] = %in [1]
+copy 32,32 %out [0] = %b0 [0]
+copy 32,32 %out [1] = %b0 [0]
 ";
 
 /// One 32x32 tile through the datapath: DRAM into L1, unpack, negate, pack,
 /// L1 into DRAM. The program names no core, no `Dst` slot and no unpacker.
 const NEG_TILE: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
 %bi = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %bi from %in [0]
-%x = load %bi [0]
+copy 32,32 %bi [0] = %in [0]
+load 32,32 %x = %bi [0]
 %y = neg %x
-store_to %bo from %y [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
 ";
 
 /// The same elementwise kernel over two tiles, written as a loop. The bound and
 /// the step are constants, so the loop becomes a RISC-V branch in the movers and
 /// each iteration's addresses are computed from the counter.
 const NEG_TWO_TILES: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
 %bi = buffer f32 32,64
 %bo = buffer f32 32,64
 %two = const i32 2
-%step = const i32 1024
+%step = const i32 1
 %i = loop %two
 %o = mul %i %step
-copy_to %bi from %in [%o] [%o]
-%x = load %bi [%o]
+copy 32,32 %bi [%o] = %in [%o]
+load 32,32 %x = %bi [%o]
 %y = neg %x
-store_to %bo from %y [%o]
-copy_to %out from %bo [%o] [%o]
+store 32,32 %bo [%o] = %y
+copy 32,32 %out [%o] = %bo [%o]
 endloop
 ";
 
@@ -304,35 +305,35 @@ endloop
 /// start row is its `W` counter, set per pack (`SETADC`, tt-metal's
 /// `set_dst_write_addr`); a packer stuck on row 0 repeats the first value.
 const NEG_TWO_LIVE: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
 %bi = buffer f32 32,64
 %bo = buffer f32 32,64
-copy_to %bi from %in [0]
-copy_to %bi from %in [1024]
-%a = load %bi [0]
-%b = load %bi [1024]
+copy 32,32 %bi [0] = %in [0]
+copy 32,32 %bi [1] = %in [1]
+load 32,32 %a = %bi [0]
+load 32,32 %b = %bi [1]
 %na = neg %a
 %nb = neg %b
-store_to %bo from %na [0]
-store_to %bo from %nb [1024]
-copy_to %out from %bo [0]
-copy_to %out from %bo [1024]
+store 32,32 %bo [0] = %na
+store 32,32 %bo [1] = %nb
+copy 32,32 %out [0] = %bo [0]
+copy 32,32 %out [1] = %bo [0]
 ";
 
 /// The same elementwise kernel with no buffer and no `copy_to`: the parameter is
 /// named directly and `mover::add_movers` supplies the staging and the traffic,
 /// as zyx's `tt_add_movers` does.
 const NEG_TILE_DIRECT: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
-%x = load %in [0]
+load 32,32 %x = %in [0]
 %y = neg %x
-store_to %out from %y [0]
+store 32,32 %out [0] = %y
 ";
 
 /// Where the simulator is. The library only reads `TT_METAL_SIMULATOR`, so the
@@ -851,32 +852,32 @@ fn a_constant_loop_runs_on_the_simulator() {
 #[test]
 fn arithmetic_ops_run_on_the_simulator() {
     const TWO_LOAD: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
 %b0 = buffer f32 32,64
 %bo = buffer f32 32,32
-copy_to %b0 from %in [0]
-copy_to %b0 from %in [1024]
-%x = load %b0 [0]
-%y = load %b0 [1024]
+copy 32,32 %b0 [0] = %in [0]
+copy 32,32 %b0 [1] = %in [1]
+load 32,32 %x = %b0 [0]
+load 32,32 %y = %b0 [1]
 %r = OP %x %y
-store_to %bo from %r [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %r
+copy 32,32 %out [0] = %bo [0]
 ";
     const ONE_LOAD: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
 %b0 = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %b0 from %in [0]
-%x = load %b0 [0]
+copy 32,32 %b0 [0] = %in [0]
+load 32,32 %x = %b0 [0]
 %r = abs %x
-store_to %bo from %r [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %r
+copy 32,32 %out [0] = %bo [0]
 ";
 
     let _device = device();
@@ -1019,19 +1020,19 @@ copy_to %out from %bo [0]
 #[test]
 fn comparisons_select_and_max_run_on_the_simulator() {
     const TEMPLATE: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
 %b0 = buffer f32 32,64
 %bo = buffer f32 32,32
-copy_to %b0 from %in [0]
-copy_to %b0 from %in [1024]
-%x = load %b0 [0]
-%y = load %b0 [1024]
+copy 32,32 %b0 [0] = %in [0]
+copy 32,32 %b0 [1] = %in [1]
+load 32,32 %x = %b0 [0]
+load 32,32 %y = %b0 [1]
 BODY
-store_to %bo from %r [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %r
+copy 32,32 %out [0] = %bo [0]
 ";
 
     let _device = device();
@@ -1153,32 +1154,32 @@ copy_to %out from %bo [0]
 #[test]
 fn bitwise_ops_run_on_the_simulator() {
     const TWO_LOAD: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param i32 2048
 %out = param i32 2048
 %b0 = buffer i32 32,64
 %bo = buffer i32 32,32
-copy_to %b0 from %in [0]
-copy_to %b0 from %in [1024]
-%x = load %b0 [0]
-%y = load %b0 [1024]
+copy 32,32 %b0 [0] = %in [0]
+copy 32,32 %b0 [1] = %in [1]
+load 32,32 %x = %b0 [0]
+load 32,32 %y = %b0 [1]
 %r = OP %x %y
-store_to %bo from %r [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %r
+copy 32,32 %out [0] = %bo [0]
 ";
     const ONE_LOAD: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param i32 1024
 %out = param i32 1024
 %b0 = buffer i32 32,32
 %bo = buffer i32 32,32
-copy_to %b0 from %in [0]
-%x = load %b0 [0]
+copy 32,32 %b0 [0] = %in [0]
+load 32,32 %x = %b0 [0]
 %r = bitnot %x
-store_to %bo from %r [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %r
+copy 32,32 %out [0] = %bo [0]
 ";
 
     let _device = device();
@@ -1296,21 +1297,21 @@ copy_to %out from %bo [0]
 /// count is a scalar argument, loaded by the movers and by each compute role,
 /// and branched on in RISC-V; both tiles come back negated.
 const NEG_SYMBOLIC_LOOP: &str = "\
-version 7
+version 8
 grid 1,1
 %n = param i32 0
 %in = param f32 2048
 %out = param f32 2048
 %bi = buffer f32 32,64
 %bo = buffer f32 32,64
-%step = const i32 1024
+%step = const i32 1
 %i = loop %n
 %o = mul %i %step
-copy_to %bi from %in [%o] [%o]
-%x = load %bi [%o]
+copy 32,32 %bi [%o] = %in [%o]
+load 32,32 %x = %bi [%o]
 %y = neg %x
-store_to %bo from %y [%o]
-copy_to %out from %bo [%o] [%o]
+store 32,32 %bo [%o] = %y
+copy 32,32 %out [%o] = %bo [%o]
 endloop
 ";
 
@@ -1414,7 +1415,7 @@ fn a_symbolic_loop_bound_runs_on_the_simulator() {
 /// A symbolic `2,2` grid: each of the four tiles negates its own slice, selected
 /// from `grid.x`/`grid.y`. Four executors run and all four slices come back.
 const NEG_GRID: &str = "\
-version 7
+version 8
 %nx = param i32 0
 %ny = param i32 0
 %in = param f32 4096
@@ -1423,15 +1424,15 @@ version 7
 %y = grid.y
 %row = mul %y %nx
 %idx = add %row %x
-%tile = const i32 1024
+%tile = const i32 1
 %o = mul %idx %tile
 %bi = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %bi from %in [%o] [%o]
-%v = load %bi [0]
+copy 32,32 %bi [0] = %in [%o]
+load 32,32 %v = %bi [0]
 %n = neg %v
-store_to %bo from %n [0]
-copy_to %out from %bo [%o] [%o]
+store 32,32 %bo [0] = %n
+copy 32,32 %out [%o] = %bo [0]
 grid %nx,%ny
 ";
 
@@ -1642,65 +1643,65 @@ fn run_kernel_scalars(
 
 /// `(int)f`: truncation toward zero, in two's complement.
 const CAST_F32_TO_I32: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param f32 1024
 %out = param i32 1024
 %bi = buffer f32 32,32
 %bo = buffer i32 32,32
-copy_to %bi from %in [0]
-%x = load %bi [0]
+copy 32,32 %bi [0] = %in [0]
+load 32,32 %x = %bi [0]
 %y = cast %x to i32
-store_to %bo from %y [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
 ";
 
 /// `(float)i`: two's complement to FP32, round to nearest even.
 const CAST_I32_TO_F32: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param i32 1024
 %out = param f32 1024
 %bi = buffer i32 32,32
 %bo = buffer f32 32,32
-copy_to %bi from %in [0]
-%x = load %bi [0]
+copy 32,32 %bi [0] = %in [0]
+load 32,32 %x = %bi [0]
 %y = cast %x to f32
-store_to %bo from %y [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
 ";
 
 /// The same bits under another name: no instruction at all.
 const BITCAST_F32_TO_I32: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param f32 1024
 %out = param i32 1024
 %bi = buffer f32 32,32
 %bo = buffer i32 32,32
-copy_to %bi from %in [0]
-%x = load %bi [0]
+copy 32,32 %bi [0] = %in [0]
+load 32,32 %x = %bi [0]
 %y = bitcast %x to i32
-store_to %bo from %y [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
 ";
 
 /// A comparison writes `-1`/`0` in the lane; a cast to an integer is the C
 /// value, one or zero.
 const CAST_BOOL_TO_I32: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param f32 1024
 %out = param i32 1024
 %bi = buffer f32 32,32
 %bo = buffer i32 32,32
-copy_to %bi from %in [0]
-%x = load %bi [0]
+copy 32,32 %bi [0] = %in [0]
+load 32,32 %x = %bi [0]
 %zero = sub %x %x
 %c = cmplt %x %zero
 %y = cast %c to i32
-store_to %bo from %y [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
 ";
 
 #[test]
@@ -1745,17 +1746,17 @@ fn casts_and_bitcasts_run_on_the_simulator() {
 /// the packer writes 16-bit datums back. A negation only flips the sign bit, so
 /// every pattern -- zeros, subnormals, infinities, NaN payloads -- is exact.
 const NEG_BF16: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param bf16 1024
 %out = param bf16 1024
 %bi = buffer bf16 32,32
 %bo = buffer bf16 32,32
-copy_to %bi from %in [0]
-%x = load %bi [0]
+copy 32,32 %bi [0] = %in [0]
+load 32,32 %x = %bi [0]
 %y = neg %x
-store_to %bo from %y [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
 ";
 
 #[test]
@@ -1828,19 +1829,19 @@ fn packer_bf16(value: f32) -> u16 {
 /// bf16 arithmetic in the 16-bit `Dst`: two tiles in, one out, every datum the
 /// SFPU's widening and truncating round trip.
 const BF16_TWO_LOAD: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param bf16 2048
 %out = param bf16 1024
 %b0 = buffer bf16 32,64
 %bo = buffer bf16 32,32
-copy_to %b0 from %in [0]
-copy_to %b0 from %in [1024]
-%x = load %b0 [0]
-%y = load %b0 [1024]
+copy 32,32 %b0 [0] = %in [0]
+copy 32,32 %b0 [1] = %in [1]
+load 32,32 %x = %b0 [0]
+load 32,32 %y = %b0 [1]
 %r = OP %x %y
-store_to %bo from %r [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %r
+copy 32,32 %out [0] = %bo [0]
 ";
 
 #[test]
@@ -1986,100 +1987,100 @@ fn bf16_arithmetic_runs_on_the_simulator() {
 
 /// The 32-bit `Dst` kernel's bf16 output: the packer narrows as it writes.
 const CAST_F32_TO_BF16: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param f32 1024
 %out = param bf16 1024
 %bi = buffer f32 32,32
 %bo = buffer bf16 32,32
-copy_to %bi from %in [0]
-%x = load %bi [0]
+copy 32,32 %bi [0] = %in [0]
+load 32,32 %x = %bi [0]
 %y = cast %x to bf16
-store_to %bo from %y [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
 ";
 
 /// `i32` to bf16: `(float)i` in the lane, then the same narrowing.
 const CAST_I32_TO_BF16: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param i32 1024
 %out = param bf16 1024
 %bi = buffer i32 32,32
 %bo = buffer bf16 32,32
-copy_to %bi from %in [0]
-%x = load %bi [0]
+copy 32,32 %bi [0] = %in [0]
+load 32,32 %x = %bi [0]
 %y = cast %x to bf16
-store_to %bo from %y [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
 ";
 
 /// A comparison's `bool` to bf16: one or zero.
 const CAST_BOOL_TO_BF16: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param f32 1024
 %out = param bf16 1024
 %bi = buffer f32 32,32
 %bo = buffer bf16 32,32
-copy_to %bi from %in [0]
-%x = load %bi [0]
+copy 32,32 %bi [0] = %in [0]
+load 32,32 %x = %bi [0]
 %zero = sub %x %x
 %c = cmplt %x %zero
 %y = cast %c to bf16
-store_to %bo from %y [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
 ";
 
 /// bf16 to bf16, the 16-bit `Dst`'s identity: the store truncates what the load
 /// widened, so every normal comes back unchanged.
 const CAST_BF16_TO_BF16: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param bf16 1024
 %out = param bf16 1024
 %bi = buffer bf16 32,32
 %bo = buffer bf16 32,32
-copy_to %bi from %in [0]
-%x = load %bi [0]
+copy 32,32 %bi [0] = %in [0]
+load 32,32 %x = %bi [0]
 %y = cast %x to bf16
-store_to %bo from %y [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
 ";
 
 /// bf16 into `f32` has no `Dst` path: the unpacker cannot widen a bf16 page into
 /// a 32-bit `Dst`, and a 16-bit `Dst` cannot pack `f32`.
 const CAST_BF16_TO_F32: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param bf16 1024
 %out = param f32 1024
 %bi = buffer bf16 32,32
 %bo = buffer f32 32,32
-copy_to %bi from %in [0]
-%x = load %bi [0]
+copy 32,32 %bi [0] = %in [0]
+load 32,32 %x = %bi [0]
 %y = cast %x to f32
-store_to %bo from %y [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
 ";
 
 /// `sel` on bf16: against `y`, so the `bool` lives in the 16-bit `Dst` as the
 /// `-1.0`/`0.0` lane the comparison writes, and the result is the smaller value.
 const BF16_MIN: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param bf16 2048
 %out = param bf16 1024
 %b0 = buffer bf16 32,64
 %bo = buffer bf16 32,32
-copy_to %b0 from %in [0]
-copy_to %b0 from %in [1024]
-%x = load %b0 [0]
-%y = load %b0 [1024]
+copy 32,32 %b0 [0] = %in [0]
+copy 32,32 %b0 [1] = %in [1]
+load 32,32 %x = %b0 [0]
+load 32,32 %y = %b0 [1]
 %c = cmplt %x %y
 %r = sel %c %x %y
-store_to %bo from %r [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %r
+copy 32,32 %out [0] = %bo [0]
 ";
 
 #[test]
@@ -2199,7 +2200,7 @@ fn a_bf16_value_cannot_widen_through_dst() {
 /// / `SrcB` path (unpacked straight from their CB pages), the accumulator is the
 /// 32-bit `Dst`, and the packer drains it.
 const MATMUL_F32: &str = "\
-version 7
+version 8
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -2207,22 +2208,22 @@ grid 1,1
 %ba = buffer f32 32,32
 %bb = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %ba from %pa [0]
-copy_to %bb from %pb [0]
+copy 32,32 %ba [0] = %pa [0]
+copy 32,32 %bb [0] = %pb [0]
 %m = acc f32 32,32
 %zero = const f32 0
-store_to %m from %zero
-%a = load %ba [0]
-%b = load %bb [0]
+store 32,32 %m = %zero
+load 32,32 %a = %ba [0]
+load 32,32 %b = %bb [0]
 matmul %m %a %b
-store_to %bo from %m [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %m
+copy 32,32 %out [0] = %bo [0]
 ";
 
 /// The same product, with `%a` also feeding a datapath op: the load keeps its
 /// `Dst` unpack and the matmul unpacks the same page again into `Src`.
 const MATMUL_F32_MIXED: &str = "\
-version 7
+version 8
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -2230,17 +2231,17 @@ grid 1,1
 %ba = buffer f32 32,32
 %bb = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %ba from %pa [0]
-copy_to %bb from %pb [0]
+copy 32,32 %ba [0] = %pa [0]
+copy 32,32 %bb [0] = %pb [0]
 %m = acc f32 32,32
 %zero = const f32 0
-store_to %m from %zero
-%a = load %ba [0]
-%b = load %bb [0]
+store 32,32 %m = %zero
+load 32,32 %a = %ba [0]
+load 32,32 %b = %bb [0]
 %n = neg %a
 matmul %m %a %b
-store_to %bo from %m [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %m
+copy 32,32 %out [0] = %bo [0]
 ";
 
 /// The `(row, column)` of a 32x32 matrix that L1 datum `index` holds. A tile in
@@ -2328,7 +2329,7 @@ fn matmul_runs_on_the_simulator() {
 /// they are, the Matrix Unit accumulates in the 32-bit `Dst`, and the packer
 /// writes the f32 result.
 const MATMUL_BF16_F32: &str = "\
-version 7
+version 8
 grid 1,1
 %pa = param bf16 1024
 %pb = param bf16 1024
@@ -2336,21 +2337,21 @@ grid 1,1
 %ba = buffer bf16 32,32
 %bb = buffer bf16 32,32
 %bo = buffer f32 32,32
-copy_to %ba from %pa [0]
-copy_to %bb from %pb [0]
+copy 32,32 %ba [0] = %pa [0]
+copy 32,32 %bb [0] = %pb [0]
 %m = acc f32 32,32
 %zero = const f32 0
-store_to %m from %zero
-%a = load %ba [0]
-%b = load %bb [0]
+store 32,32 %m = %zero
+load 32,32 %a = %ba [0]
+load 32,32 %b = %bb [0]
 matmul %m %a %b
-store_to %bo from %m [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %m
+copy 32,32 %out [0] = %bo [0]
 ";
 
 /// bf16 operands over a `bf16` accumulator: the 16-bit `Dst`, the native path.
 const MATMUL_BF16: &str = "\
-version 7
+version 8
 grid 1,1
 %pa = param bf16 1024
 %pb = param bf16 1024
@@ -2358,16 +2359,16 @@ grid 1,1
 %ba = buffer bf16 32,32
 %bb = buffer bf16 32,32
 %bo = buffer bf16 32,32
-copy_to %ba from %pa [0]
-copy_to %bb from %pb [0]
+copy 32,32 %ba [0] = %pa [0]
+copy 32,32 %bb [0] = %pb [0]
 %m = acc bf16 32,32
 %zero = const f32 0
-store_to %m from %zero
-%a = load %ba [0]
-%b = load %bb [0]
+store 32,32 %m = %zero
+load 32,32 %a = %ba [0]
+load 32,32 %b = %bb [0]
 matmul %m %a %b
-store_to %bo from %m [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %m
+copy 32,32 %out [0] = %bo [0]
 ";
 
 #[test]
@@ -2412,7 +2413,7 @@ fn bf16_matmul_runs_on_the_simulator() {
 /// this combination (`prepare_reduce_scaler`) — so the product is each row's
 /// sum in column 0 and zeros elsewhere.
 const REDUCE_SUM_ROW: &str = "\
-version 7
+version 8
 grid 1,1
 %px = param f32 1024
 %ps = param f32 1024
@@ -2420,16 +2421,16 @@ grid 1,1
 %bx = buffer f32 32,32
 %bs = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %bx from %px [0]
-copy_to %bs from %ps [0]
+copy 32,32 %bx [0] = %px [0]
+copy 32,32 %bs [0] = %ps [0]
 %acc = acc f32 32,32
 %zero = const f32 0
-store_to %acc from %zero
-%x = load %bx [0]
-%s = load %bs [0]
+store 32,32 %acc = %zero
+load 32,32 %x = %bx [0]
+load 32,32 %s = %bs [0]
 sum row %acc %x %s
-store_to %bo from %acc [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %acc
+copy 32,32 %out [0] = %bo [0]
 ";
 
 #[test]
@@ -2485,7 +2486,7 @@ fn sum_row_runs_on_the_simulator() {
 /// of each face (tt-metal's row-0 fill); `max` carries none and the compiler
 /// moves 1.0 into `SrcB` itself.
 const REDUCE_SUM_COL: &str = "\
-version 7
+version 8
 grid 1,1
 %px = param f32 1024
 %ps = param f32 1024
@@ -2493,89 +2494,89 @@ grid 1,1
 %bx = buffer f32 32,32
 %bs = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %bx from %px [0]
-copy_to %bs from %ps [0]
+copy 32,32 %bx [0] = %px [0]
+copy 32,32 %bs [0] = %ps [0]
 %acc = acc f32 32,32
 %zero = const f32 0
-store_to %acc from %zero
-%x = load %bx [0]
-%s = load %bs [0]
+store 32,32 %acc = %zero
+load 32,32 %x = %bx [0]
+load 32,32 %s = %bs [0]
 sum col %acc %x %s
-store_to %bo from %acc [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %acc
+copy 32,32 %out [0] = %bo [0]
 ";
 
 const REDUCE_MAX_COL: &str = "\
-version 7
+version 8
 grid 1,1
 %px = param f32 1024
 %out = param f32 1024
 %bx = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %bx from %px [0]
+copy 32,32 %bx [0] = %px [0]
 %acc = acc f32 32,32
 %low = const f32 -1000
-store_to %acc from %low
-%x = load %bx [0]
+store 32,32 %acc = %low
+load 32,32 %x = %bx [0]
 max col %acc %x
-store_to %bo from %acc [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %acc
+copy 32,32 %out [0] = %bo [0]
 ";
 
 /// The same, seeded above every datum: the accumulator is the fold's other
 /// operand, so every column keeps the seed.
 const REDUCE_MAX_COL_SEEDED: &str = "\
-version 7
+version 8
 grid 1,1
 %px = param f32 1024
 %out = param f32 1024
 %bx = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %bx from %px [0]
+copy 32,32 %bx [0] = %px [0]
 %acc = acc f32 32,32
 %high = const f32 1000
-store_to %acc from %high
-%x = load %bx [0]
+store 32,32 %acc = %high
+load 32,32 %x = %bx [0]
 max col %acc %x
-store_to %bo from %acc [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %acc
+copy 32,32 %out [0] = %bo [0]
 ";
 
 /// The same, seeded below every datum: the accumulator is the fold's other
 /// operand, so every row's own maximum survives.
 const REDUCE_MAX_ROW: &str = "\
-version 7
+version 8
 grid 1,1
 %px = param f32 1024
 %out = param f32 1024
 %bx = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %bx from %px [0]
+copy 32,32 %bx [0] = %px [0]
 %acc = acc f32 32,32
 %low = const f32 -1000
-store_to %acc from %low
-%x = load %bx [0]
+store 32,32 %acc = %low
+load 32,32 %x = %bx [0]
 max row %acc %x
-store_to %bo from %acc [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %acc
+copy 32,32 %out [0] = %bo [0]
 ";
 
 /// The same with a seed above every datum.
 const REDUCE_MAX_ROW_SEEDED: &str = "\
-version 7
+version 8
 grid 1,1
 %px = param f32 1024
 %out = param f32 1024
 %bx = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %bx from %px [0]
+copy 32,32 %bx [0] = %px [0]
 %acc = acc f32 32,32
 %high = const f32 1000
-store_to %acc from %high
-%x = load %bx [0]
+store 32,32 %acc = %high
+load 32,32 %x = %bx [0]
 max row %acc %x
-store_to %bo from %acc [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %acc
+copy 32,32 %out [0] = %bo [0]
 ";
 
 /// The `row` result: column 0 holds one fold per row, every other datum zero.
@@ -2721,7 +2722,7 @@ fn max_row_runs_on_the_simulator() {
 /// the second one does not clear what the first wrote. No loop — the only thing
 /// exercised is that `acc` holds its value from one `matmul` to the next.
 const MATMUL_ACC: &str = "\
-version 7
+version 8
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -2731,19 +2732,19 @@ grid 1,1
 %bb = buffer f32 32,32
 %bc = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %ba from %pa [0]
-copy_to %bb from %pb [0]
-copy_to %bc from %pc [0]
+copy 32,32 %ba [0] = %pa [0]
+copy 32,32 %bb [0] = %pb [0]
+copy 32,32 %bc [0] = %pc [0]
 %m = acc f32 32,32
 %zero = const f32 0
-store_to %m from %zero
-%a = load %ba [0]
-%b = load %bb [0]
+store 32,32 %m = %zero
+load 32,32 %a = %ba [0]
+load 32,32 %b = %bb [0]
 matmul %m %a %b
-%c = load %bc [0]
+load 32,32 %c = %bc [0]
 matmul %m %b %c
-store_to %bo from %m [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %m
+copy 32,32 %out [0] = %bo [0]
 ";
 
 #[test]
@@ -2774,7 +2775,7 @@ fn matmul_accumulates_into_one_dst() {
 /// into an `acc` declared outside it, and one `store_to` after `endloop` — the
 /// accumulator is visible where it is declared, so the pack happens once.
 const MATMUL_ACC_LOOP: &str = "\
-version 7
+version 8
 grid 1,1
 %pa = param f32 2048
 %pb = param f32 2048
@@ -2784,19 +2785,19 @@ grid 1,1
 %bo = buffer f32 32,32
 %m = acc f32 32,32
 %zero = const f32 0
-store_to %m from %zero
+store 32,32 %m = %zero
 %two = const i32 2
-%step = const i32 1024
+%step = const i32 1
 %i = loop %two
 %o = mul %i %step
-copy_to %ba from %pa [%o]
-copy_to %bb from %pb [%o]
-%a = load %ba [0]
-%b = load %bb [0]
+copy 32,32 %ba [0] = %pa [%o]
+copy 32,32 %bb [0] = %pb [%o]
+load 32,32 %a = %ba [0]
+load 32,32 %b = %bb [0]
 matmul %m %a %b
 endloop
-store_to %bo from %m [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %m
+copy 32,32 %out [0] = %bo [0]
 ";
 
 #[test]
@@ -2834,7 +2835,7 @@ fn a_matmul_accumulates_over_a_k_loop() {
 /// values are what the wait protects on a board; on the simulator they are what
 /// the program produces either way.
 const MATMUL_ACC_REUSED: &str = "\
-version 7
+version 8
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -2844,22 +2845,22 @@ grid 1,1
 %bb = buffer f32 32,32
 %bc = buffer f32 32,32
 %b0 = buffer f32 32,32
-copy_to %ba from %pa [0]
-copy_to %bb from %pb [0]
-copy_to %bc from %pc [0]
+copy 32,32 %ba [0] = %pa [0]
+copy 32,32 %bb [0] = %pb [0]
+copy 32,32 %bc [0] = %pc [0]
 %m = acc f32 32,32
 %zero = const f32 0
-store_to %m from %zero
-%a = load %ba [0]
-%b = load %bb [0]
-%c = load %bc [0]
+store 32,32 %m = %zero
+load 32,32 %a = %ba [0]
+load 32,32 %b = %bb [0]
+load 32,32 %c = %bc [0]
 matmul %m %a %b
-store_to %b0 from %m [0]
-copy_to %out from %b0 [0] [0]
-store_to %m from %zero
+store 32,32 %b0 [0] = %m
+copy 32,32 %out [0] = %b0 [0]
+store 32,32 %m = %zero
 matmul %m %a %c
-store_to %b0 from %m [0]
-copy_to %out from %b0 [1024] [0]
+store 32,32 %b0 [0] = %m
+copy 32,32 %out [1] = %b0 [0]
 ";
 
 #[test]
@@ -2898,7 +2899,7 @@ fn an_acc_is_reused_after_it_has_been_packed() {
 /// count per core is derived from the grid at launch
 /// (`%per = div %ntiles %nsites`).
 const GATE_PROJ: &str = "\
-version 7
+version 8
 %nx = param i32 0
 %ny = param i32 0
 %ntiles = param i32 0
@@ -2912,7 +2913,7 @@ version 7
 %bc = buffer f32 32,32
 %acc = acc f32 32,32
 %zero = const f32 0
-%tile = const i32 1024
+%tile = const i32 1
 %x = grid.x
 %y = grid.y
 %nsites = mul %nx %ny
@@ -2926,21 +2927,21 @@ version 7
 %n = mod %t %ncols
 %arow = mul %m %ktiles
 %brow = mul %n %ktiles
-store_to %acc from %zero
+store 32,32 %acc = %zero
 %j = loop %ktiles
 %ka = add %arow %j
 %kb = add %brow %j
 %oa = mul %ka %tile
 %ob = mul %kb %tile
-copy_to %ba from %pa [%oa]
-copy_to %bb from %pw [%ob]
-%a = load %ba [0]
-%b = load %bb [0]
+copy 32,32 %ba [0] = %pa [%oa]
+copy 32,32 %bb [0] = %pw [%ob]
+load 32,32 %a = %ba [0]
+load 32,32 %b = %bb [0]
 matmul %acc %a %b
 endloop
-store_to %bc from %acc [0]
+store 32,32 %bc [0] = %acc
 %coff = mul %t %tile
-copy_to %pc from %bc [%coff]
+copy 32,32 %pc [%coff] = %bc [0]
 endloop
 grid %nx,%ny
 ";
@@ -3030,17 +3031,17 @@ fn gate_proj_runs_over_a_full_grid() {
 #[test]
 fn exp2_runs_on_the_simulator() {
     const PROGRAM: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
 %b0 = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %b0 from %in [0]
-%x = load %b0 [0]
+copy 32,32 %b0 [0] = %in [0]
+load 32,32 %x = %b0 [0]
 %r = exp2 %x
-store_to %bo from %r [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %r
+copy 32,32 %out [0] = %bo [0]
 ";
     let host: Vec<f32> = (0..1024).map(|i| (i as f32 - 512.0) / 32.0).collect();
     let input: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -3079,17 +3080,17 @@ fn check_unary(program: &str, host: &[f32], want: impl Fn(f32) -> f32, tol: f32,
 }
 
 const ONE_LOAD: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
 %b0 = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %b0 from %in [0]
-%x = load %b0 [0]
+copy 32,32 %b0 [0] = %in [0]
+load 32,32 %x = %b0 [0]
 %r = OP %x
-store_to %bo from %r [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %r
+copy 32,32 %out [0] = %bo [0]
 ";
 
 /// `log2` as `src/unfold.rs` writes it: Juffa's reduction, the LLK's degree-9
@@ -3122,18 +3123,18 @@ fn sin_and_cos_are_unfolded_into_primitives() {
 #[test]
 fn pow_is_unfolded_into_exp2_and_log2() {
     const POW: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
 %b0 = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %b0 from %in [0]
-%x = load %b0 [0]
+copy 32,32 %b0 [0] = %in [0]
+load 32,32 %x = %b0 [0]
 %p = const f32 1.75
 %r = pow %x %p
-store_to %bo from %r [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %r
+copy 32,32 %out [0] = %bo [0]
 ";
     let host: Vec<f32> = (0..1024).map(|i| 0.05 * (1.0 + i as f32 * 2.0)).collect();
     check_unary(POW, &host, |x| x.powf(1.75), 1e-4, "pow");
@@ -3145,19 +3146,19 @@ copy_to %out from %bo [0]
 #[test]
 fn div_is_unfolded_into_a_reciprocal() {
     const DIV: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param f32 2048
 %out = param f32 1024
 %b0 = buffer f32 32,64
 %bo = buffer f32 32,32
-copy_to %b0 from %in [0]
-copy_to %b0 from %in [1024]
-%x = load %b0 [0]
-%y = load %b0 [1024]
+copy 32,32 %b0 [0] = %in [0]
+copy 32,32 %b0 [1] = %in [1]
+load 32,32 %x = %b0 [0]
+load 32,32 %y = %b0 [1]
 %r = div %x %y
-store_to %bo from %r [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %r
+copy 32,32 %out [0] = %bo [0]
 ";
     let x: Vec<f32> = (0..1024).map(|i| (i as f32 - 500.0) / 7.0).collect();
     let y: Vec<f32> = (0..1024).map(|i| 0.25 + (i % 97) as f32 * 0.5).collect();
@@ -3182,20 +3183,18 @@ copy_to %out from %bo [0]
 /// whole row, read back as a scalar, and selects the weight page, which is
 /// copied out. No compute role runs.
 const GATHER: &str = "\
-version 7
+version 8
 grid 1,1
 %ids = param i32 1024
 %w = param f32 32768
 %out = param f32 1024
 %ib = buffer i32 1,32
 %wb = buffer f32 32,32
-copy_to %ib from %ids [0]
+copy 1,32 %ib [0] = %ids [0]
 %i = const i32 0
-%id = load %ib [%i]
-%tile = const i32 1024
-%off = mul %id %tile
-copy_to %wb from %w [0] [%off]
-copy_to %out from %wb [0]
+load 1,1 %id = %ib [%i]
+copy 32,32 %wb [0] = %w [%id]
+copy 32,32 %out [0] = %wb [0]
 ";
 
 #[test]

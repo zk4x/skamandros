@@ -381,16 +381,16 @@ mod tests {
     use crate::planner::place;
 
     const NEG: &str = "\
-version 7
+version 8
 grid 1,1
 %in = param f32 4096
 %out = param f32 4096
 %b0 = buffer f32 32,32
-copy_to %b0 from %in [0]
-%x = load %b0 [0]
+copy 32,32 %b0 [0] = %in [0]
+load 32,32 %x = %b0 [0]
 %y = neg %x
-store_to %b0 from %y [0]
-copy_to %out from %b0 [0]
+store 32,32 %b0 [0] = %y
+copy 32,32 %out [0] = %b0 [0]
 ";
 
     fn machine() -> Machine {

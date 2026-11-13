@@ -17,7 +17,7 @@ use crate::status::ttStatus;
 #[test]
 fn the_unified_program_round_trips() {
     const PROGRAM: &str = "\
-version 7
+version 8
 grid 4,6
 %p0 = param bf16 1024,132,453
 %p1 = param bf16 1024,232
@@ -35,18 +35,18 @@ grid 4,6
 %i6 = bitshiftleft %i5 %two
 %ic = cmplt %i6 %two
 %is = sel %ic %i6 %two
-copy_to %b0 from %p0 [%i6]
-%x = load %b0 [0]
+copy 32,32 %b0 [0] = %p0 [%i6]
+load 32,32 %x = %b0 [0]
 %xf = cast %x to f32
 %y = neg %xf
 %z = mul %y %half
 %w = abs %z
 %c = cast %w to bf16
-store_to %b0 from %c [0]
-copy_to %p1 from %b0 [%i6]
+store 32,32 %b0 [0] = %c
+copy 32,32 %p1 [%i6] = %b0 [0]
 endloop
-%a = load %b0 [1024]
-%b = load %b0 [0]
+load 32,32 %a = %b0 [1]
+load 32,32 %b = %b0 [0]
 %m = acc f32 32,32
 matmul %m %a %b
 ";
@@ -57,7 +57,7 @@ matmul %m %a %b
     // Symbolic grid and symbolic parameter dims, with the grid after the values
     // it reads: a scalar parameter is a rank-0 shape.
     const SYMBOLIC: &str = "\
-version 7
+version 8
 %d = param i32 0
 %x = param bf16 1024,%d
 grid %d,8
@@ -74,13 +74,13 @@ grid %d,8
 #[test]
 fn a_buffer_shape_that_is_not_one_or_a_multiple_of_32_is_refused() {
     for shape in ["33,32", "32,33", "16,32"] {
-        let text = format!("version 7\n%x = buffer f32 {shape}\ngrid 1,1\n");
+        let text = format!("version 8\n%x = buffer f32 {shape}\ngrid 1,1\n");
         let err = Kernel::parse(&text).expect_err(shape);
         assert_eq!(err, ttStatus::TT_ERROR_BUFFER_SHAPE, "{shape}");
     }
     // A buffer is always two-dimensional and always constant.
     for shape in ["32", "32,%d"] {
-        let text = format!("version 7\n%d = const i32 4\n%x = buffer f32 {shape}\ngrid 1,1\n");
+        let text = format!("version 8\n%d = const i32 4\n%x = buffer f32 {shape}\ngrid 1,1\n");
         assert!(
             Kernel::parse(&text).is_err(),
             "{shape} is not a buffer shape"
@@ -90,7 +90,7 @@ fn a_buffer_shape_that_is_not_one_or_a_multiple_of_32_is_refused() {
 
 #[test]
 fn a_zero_dimension_is_not_the_way_to_write_a_tensor() {
-    let text = "version 7\n%p = param f32 0,32\ngrid 1,1\n";
+    let text = "version 8\n%p = param f32 0,32\ngrid 1,1\n";
     let err = Kernel::parse(text).expect_err("a zero in a dimension list");
     assert_eq!(err, ttStatus::TT_ERROR_ZERO_DIMENSION);
 }
@@ -98,7 +98,7 @@ fn a_zero_dimension_is_not_the_way_to_write_a_tensor() {
 #[test]
 fn an_implicit_dtype_conversion_is_refused() {
     let text = "\
-version 7
+version 8
 %a = const f32 1.0
 %b = const i32 1
 %c = add %a %b
@@ -110,7 +110,7 @@ grid 1,1
 
 #[test]
 fn a_use_before_its_definition_is_refused() {
-    let text = "version 7\n%x = add %a %b\n%a = const i32 1\n%b = const i32 2\ngrid 1,1\n";
+    let text = "version 8\n%x = add %a %b\n%a = const i32 1\n%b = const i32 2\ngrid 1,1\n";
     let err = Kernel::parse(text).expect_err("undefined value");
     assert_eq!(err, ttStatus::TT_ERROR_PARSE);
 }
@@ -118,7 +118,7 @@ fn a_use_before_its_definition_is_refused() {
 #[test]
 fn a_value_does_not_escape_its_loop() {
     let text = "\
-version 7
+version 8
 %n = const i32 4
 %i = loop %n
 %x = add %i %n
@@ -132,9 +132,9 @@ grid 1,1
 
 #[test]
 fn a_program_needs_exactly_one_grid() {
-    let err = Kernel::parse("version 7\n%x = const i32 1\n").expect_err("no grid");
+    let err = Kernel::parse("version 8\n%x = const i32 1\n").expect_err("no grid");
     assert_eq!(err, ttStatus::TT_ERROR_GRID);
-    let err = Kernel::parse("version 7\ngrid 1,1\ngrid 2,2\n").expect_err("two grids");
+    let err = Kernel::parse("version 8\ngrid 1,1\ngrid 2,2\n").expect_err("two grids");
     assert_eq!(err, ttStatus::TT_ERROR_GRID);
 }
 
@@ -149,14 +149,14 @@ fn an_unknown_version_is_refused() {
 #[test]
 fn a_copy_kernel_compiles_to_mover_programs_only() {
     const COPY: &str = "\
-version 7
+version 8
 %in = param f32 8192
 %out = param f32 8192
 %b0 = buffer f32 32,64
-copy_to %b0 from %in [0]
-copy_to %b0 from %in [1024]
-copy_to %out from %b0 [0]
-copy_to %out from %b0 [1024]
+copy 32,32 %b0 [0] = %in [0]
+copy 32,32 %b0 [1] = %in [1]
+copy 32,32 %out [0] = %b0 [0]
+copy 32,32 %out [1] = %b0 [0]
 grid 1,1
 ";
     let k = Kernel::parse(COPY).expect("the copy kernel parses");
@@ -172,16 +172,16 @@ grid 1,1
 #[test]
 fn an_elementwise_kernel_compiles_to_all_five_programs() {
     const NEG: &str = "\
-version 7
+version 8
 %in = param f32 4096
 %out = param f32 4096
 %bi = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %bi from %in [0]
-%x = load %bi [0]
+copy 32,32 %bi [0] = %in [0]
+load 32,32 %x = %bi [0]
 %y = neg %x
-store_to %bo from %y [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
 grid 1,1
 ";
     let k = Kernel::parse(NEG).expect("the elementwise kernel parses");
@@ -200,12 +200,12 @@ grid 1,1
 #[test]
 fn a_direct_parameter_access_gets_its_movers() {
     const DIRECT: &str = "\
-version 7
+version 8
 %in = param f32 4096
 %out = param f32 4096
-%x = load %in [0]
+load 32,32 %x = %in [0]
 %y = neg %x
-store_to %out from %y [0]
+store 32,32 %out [0] = %y
 grid 1,1
 ";
     let k = Kernel::parse(DIRECT).expect("the direct kernel parses");
@@ -248,20 +248,20 @@ grid 1,1
     );
 }
 
-/// A vector buffer's unit is 32 datums, but a symbolic offset into it selects
-/// one datum: that is how a mover reads an index out of a row it copied. A
-/// literal offset still reads the whole vector.
+/// A vector buffer's unit is 32 datums, but a `1,1` access selects one datum:
+/// that is how a mover reads an index out of a row it copied. A `1,32` access
+/// still reads the whole vector.
 #[test]
 fn a_symbolic_offset_into_a_row_buffer_reads_one_datum() {
     const ROW: &str = "\
-version 7
+version 8
 grid 1,1
 %ids = param i32 1024
 %ib = buffer i32 1,32
-copy_to %ib from %ids [0]
+copy 1,32 %ib [0] = %ids [0]
 %i = const i32 0
-%x = load %ib [%i]
-%y = load %ib [0]
+load 1,1 %x = %ib [%i]
+load 1,32 %y = %ib [0]
 ";
     let k = Kernel::parse(ROW).expect("the row program parses");
     let types = k.verify().expect("the row program verifies");
@@ -274,12 +274,65 @@ copy_to %ib from %ids [0]
     assert_eq!(
         types.of(value("x")).shape,
         RegShape::Scalar,
-        "a symbolic offset is one datum"
+        "a `1,1` access is one datum"
     );
     assert_eq!(
         types.of(value("y")).shape,
         RegShape::Row,
-        "a literal offset is the whole row"
+        "a `1,32` access is the whole row"
+    );
+}
+
+/// The access shape is the unit: a copy's unit has to be one NoC request, a
+/// shape between the four is refused, and more than one base per access is a
+/// named TODO rather than a silent narrowing.
+#[test]
+fn an_access_shape_is_the_unit_a_copy_moves() {
+    use ttStatus as S;
+    let refused = |text: &str| Kernel::parse(text).expect_err("the program is refused");
+
+    assert_eq!(
+        refused(
+            "\
+version 8
+grid 1,1
+%p = param f32 1024
+%b = buffer f32 1,1
+copy 1,1 %b [0] = %p [0]
+"
+        ),
+        S::TT_ERROR_COPY_UNIT,
+        "one datum is not a NoC request"
+    );
+    assert_eq!(
+        refused(
+            "\
+version 8
+grid 1,1
+%p = param f32 1024
+%b = buffer f32 32,32
+copy 16,16 %b [0] = %p [0]
+"
+        ),
+        S::TT_ERROR_ACCESS_SHAPE,
+        "`16,16` is not one of the four units"
+    );
+    assert_eq!(
+        refused(
+            "\
+version 8
+grid 1,1
+%pid = param i32 1024
+%idxb = buffer i32 1,32
+%w = param f32 32768
+%b = buffer f32 32,32
+copy 1,32 %idxb [0] = %pid [0]
+load 1,32 %i = %idxb [0]
+copy 32,32 %b [0] = %w [%i]
+"
+        ),
+        S::TT_TODO_MULTI_LANE,
+        "a vector index names 32 bases"
     );
 }
 
@@ -288,20 +341,20 @@ copy_to %ib from %ids [0]
 #[test]
 fn a_constant_loop_becomes_a_branch() {
     const LOOP_TWO: &str = "\
-version 7
+version 8
 %in = param f32 2048
 %out = param f32 2048
 %bi = buffer f32 32,64
 %bo = buffer f32 32,64
 %two = const i32 2
-%step = const i32 1024
+%step = const i32 1
 %i = loop %two
 %o = mul %i %step
-copy_to %bi from %in [%o]
-%x = load %bi [%o]
+copy 32,32 %bi [%o] = %in [%o]
+load 32,32 %x = %bi [%o]
 %y = neg %x
-store_to %bo from %y [%o]
-copy_to %out from %bo [%o]
+store 32,32 %bo [%o] = %y
+copy 32,32 %out [%o] = %bo [%o]
 endloop
 grid 1,1
 ";
@@ -334,18 +387,18 @@ fn has_backward_branch(words: &[u32]) -> bool {
 #[test]
 fn a_dynamic_loop_becomes_a_branch() {
     const DYNAMIC: &str = "\
-version 7
+version 8
 %n = param i32 0
 %in = param f32 2048
 %out = param f32 2048
 %bi = buffer f32 32,32
 %bo = buffer f32 32,32
 %i = loop %n
-copy_to %bi from %in [0]
-%x = load %bi [0]
+copy 32,32 %bi [0] = %in [0]
+load 32,32 %x = %bi [0]
 %y = neg %x
-store_to %bo from %y [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
 endloop
 grid 1,1
 ";
@@ -363,7 +416,7 @@ grid 1,1
 #[test]
 fn the_grid_is_symbolic_and_the_coordinate_is_a_value() {
     const SYMBOLIC: &str = "\
-version 7
+version 8
 %nx = param i32 0
 %ny = param i32 0
 %in = param f32 2048
@@ -374,11 +427,11 @@ version 7
 %o2 = add %o %y
 %bi = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %bi from %in [%o2]
-%v = load %bi [0]
+copy 32,32 %bi [0] = %in [%o2]
+load 32,32 %v = %bi [0]
 %n = neg %v
-store_to %bo from %n [0]
-copy_to %out from %bo [%o2]
+store 32,32 %bo [0] = %n
+copy 32,32 %out [%o2] = %bo [0]
 grid %nx,%ny
 ";
     let k = Kernel::parse(SYMBOLIC).expect("the symbolic grid parses");
@@ -399,7 +452,7 @@ grid %nx,%ny
 #[test]
 fn comparisons_make_a_bool_and_sel_takes_one() {
     const SELECT: &str = "\
-version 7
+version 8
 %x = const i32 3
 %y = const i32 5
 %lt = cmplt %x %y
@@ -412,11 +465,11 @@ grid 1,1
     assert_eq!(types.values[3].dtype, DType::I32, "sel is i32");
 
     // A bool condition is required, and a value with no bool is not one.
-    let bad = "version 7\n%x = const i32 3\n%m = sel %x %x %x\ngrid 1,1\n";
+    let bad = "version 8\n%x = const i32 3\n%m = sel %x %x %x\ngrid 1,1\n";
     let err = Kernel::parse(bad).expect_err("an i32 condition is refused");
     assert_eq!(err, ttStatus::TT_ERROR_CONDITION_NOT_BOOL);
 
-    let err = Kernel::parse("version 7\n%x = const i32 3\n%y = relu %x\ngrid 1,1\n")
+    let err = Kernel::parse("version 8\n%x = const i32 3\n%y = relu %x\ngrid 1,1\n")
         .expect_err("relu is not an op");
     assert_eq!(err, ttStatus::TT_ERROR_PARSE);
 }
@@ -426,16 +479,16 @@ grid 1,1
 #[test]
 fn a_bitcast_is_the_same_bits_under_another_name() {
     const SAME: &str = "\
-version 7
+version 8
 %in = param f32 2048
 %out = param i32 2048
 %bi = buffer f32 32,32
 %bo = buffer i32 32,32
-copy_to %bi from %in [0]
-%x = load %bi [0]
+copy 32,32 %bi [0] = %in [0]
+load 32,32 %x = %bi [0]
 %y = bitcast %x to i32
-store_to %bo from %y [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
 grid 1,1
 ";
     let k = Kernel::parse(SAME).expect("a bitcast between 32-bit dtypes");
@@ -447,9 +500,9 @@ grid 1,1
 
     // 32 bits do not fit a 16-bit dtype, and a bitcast may not convert.
     const NARROW: &str = "\
-version 7
+version 8
 %b = buffer f32 32,32
-%x = load %b [0]
+load 32,32 %x = %b [0]
 %y = bitcast %x to bf16
 grid 1,1
 ";
@@ -461,7 +514,7 @@ grid 1,1
 /// be `load`s, because the Matrix Unit's `SrcA`/`SrcB` are filled by the
 /// unpacker from a CB page.
 const MATMUL: &str = "\
-version 7
+version 8
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -469,16 +522,16 @@ grid 1,1
 %ba = buffer f32 32,32
 %bb = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %ba from %pa [0]
-copy_to %bb from %pb [0]
+copy 32,32 %ba [0] = %pa [0]
+copy 32,32 %bb [0] = %pb [0]
 %m = acc f32 32,32
 %zero = const f32 0
-store_to %m from %zero
-%a = load %ba [0]
-%b = load %bb [0]
+store 32,32 %m = %zero
+load 32,32 %a = %ba [0]
+load 32,32 %b = %bb [0]
 matmul %m %a %b
-store_to %bo from %m [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %m
+copy 32,32 %out [0] = %bo [0]
 ";
 
 #[test]
@@ -503,24 +556,24 @@ fn a_matmul_is_refused_for_what_the_matrix_unit_cannot_take() {
     case(
         "a negated operand",
         "\
-version 7
+version 8
 grid 1,1
 %pa = param f32 1024
 %out = param f32 1024
 %ba = buffer f32 32,32
 %bb = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %ba from %pa [0]
-copy_to %bb from %pa [0]
+copy 32,32 %ba [0] = %pa [0]
+copy 32,32 %bb [0] = %pa [0]
 %m = acc f32 32,32
 %zero = const f32 0
-store_to %m from %zero
-%a = load %ba [0]
-%b = load %bb [0]
+store 32,32 %m = %zero
+load 32,32 %a = %ba [0]
+load 32,32 %b = %bb [0]
 %n = neg %a
 matmul %m %n %b
-store_to %bo from %m [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %m
+copy 32,32 %out [0] = %bo [0]
 ",
         S::TT_ERROR_MATMUL_OPERAND,
     );
@@ -530,19 +583,19 @@ copy_to %out from %bo [0]
     case(
         "a buffer where the accumulator goes",
         "\
-version 7
+version 8
 grid 1,1
 %pa = param f32 1024
 %out = param f32 1024
 %ba = buffer f32 32,32
 %bb = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %ba from %pa [0]
-copy_to %bb from %pa [0]
-%a = load %ba [0]
-%b = load %bb [0]
+copy 32,32 %ba [0] = %pa [0]
+copy 32,32 %bb [0] = %pa [0]
+load 32,32 %a = %ba [0]
+load 32,32 %b = %bb [0]
 matmul %bo %a %b
-copy_to %out from %bo [0]
+copy 32,32 %out [0] = %bo [0]
 ",
         S::TT_ERROR_MATMUL_ACC,
     );
@@ -552,7 +605,7 @@ copy_to %out from %bo [0]
     case(
         "bf16 accumulation beside an f32 value",
         "\
-version 7
+version 8
 grid 1,1
 %pa = param bf16 1024
 %pf = param f32 1024
@@ -563,21 +616,21 @@ grid 1,1
 %bf = buffer f32 32,32
 %bg = buffer f32 32,32
 %bo = buffer bf16 32,32
-copy_to %ba from %pa [0]
-copy_to %bb from %pa [0]
-copy_to %bf from %pf [0]
+copy 32,32 %ba [0] = %pa [0]
+copy 32,32 %bb [0] = %pa [0]
+copy 32,32 %bf [0] = %pf [0]
 %m = acc bf16 32,32
 %zero = const f32 0
-store_to %m from %zero
-%a = load %ba [0]
-%b = load %bb [0]
-%f = load %bf [0]
+store 32,32 %m = %zero
+load 32,32 %a = %ba [0]
+load 32,32 %b = %bb [0]
+load 32,32 %f = %bf [0]
 %g = neg %f
-store_to %bg from %g [0]
-copy_to %of from %bg [0]
+store 32,32 %bg [0] = %g
+copy 32,32 %of [0] = %bg [0]
 matmul %m %a %b
-store_to %bo from %m [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %m
+copy 32,32 %out [0] = %bo [0]
 ",
         S::TT_ERROR_MATMUL_ACCUM_WIDE,
     );
@@ -587,23 +640,23 @@ copy_to %out from %bo [0]
     case(
         "f32 operands, bf16 accumulator",
         "\
-version 7
+version 8
 grid 1,1
 %pa = param f32 1024
 %out = param bf16 1024
 %ba = buffer f32 32,32
 %bb = buffer f32 32,32
 %bo = buffer bf16 32,32
-copy_to %ba from %pa [0]
-copy_to %bb from %pa [0]
+copy 32,32 %ba [0] = %pa [0]
+copy 32,32 %bb [0] = %pa [0]
 %m = acc bf16 32,32
 %zero = const f32 0
-store_to %m from %zero
-%a = load %ba [0]
-%b = load %bb [0]
+store 32,32 %m = %zero
+load 32,32 %a = %ba [0]
+load 32,32 %b = %bb [0]
 matmul %m %a %b
-store_to %bo from %m [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %m
+copy 32,32 %out [0] = %bo [0]
 ",
         S::TT_ERROR_MATMUL_DTYPE,
     );
@@ -613,20 +666,20 @@ copy_to %out from %bo [0]
     case(
         "i32 operands",
         "\
-version 7
+version 8
 grid 1,1
 %pa = param i32 1024
 %out = param i32 1024
 %ba = buffer i32 32,32
 %bo = buffer i32 32,32
-copy_to %ba from %pa [0]
+copy 32,32 %ba [0] = %pa [0]
 %m = acc f32 32,32
 %zero = const f32 0
-store_to %m from %zero
-%a = load %ba [0]
+store 32,32 %m = %zero
+load 32,32 %a = %ba [0]
 matmul %m %a %a
-store_to %bo from %m [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %m
+copy 32,32 %out [0] = %bo [0]
 ",
         S::TT_ERROR_MATMUL_DTYPE,
     );
@@ -641,12 +694,12 @@ fn an_acc_is_one_32x32_tile_of_an_accumulating_dtype() {
     };
     case(
         "a 16x16 accumulator",
-        "version 7\n%m = acc f32 16,16\ngrid 1,1\n",
+        "version 8\n%m = acc f32 16,16\ngrid 1,1\n",
         S::TT_ERROR_ACC_SHAPE,
     );
     case(
         "an i32 accumulator",
-        "version 7\n%m = acc i32 32,32\ngrid 1,1\n",
+        "version 8\n%m = acc i32 32,32\ngrid 1,1\n",
         S::TT_ERROR_ACC_DTYPE,
     );
     // A store into an accumulator names no offset, and only a constant fills
@@ -654,25 +707,25 @@ fn an_acc_is_one_32x32_tile_of_an_accumulating_dtype() {
     case(
         "an offset on an accumulator store",
         "\
-version 7
+version 8
 grid 1,1
 %m = acc f32 32,32
 %zero = const f32 0
-store_to %m from %zero [1024]
+store 32,32 %m [1024] = %zero
 ",
         S::TT_ERROR_ACC_OFFSET,
     );
     case(
         "a tile stored into an accumulator",
         "\
-version 7
+version 8
 grid 1,1
 %p = param f32 1024
 %b = buffer f32 32,32
-copy_to %b from %p [0]
+copy 32,32 %b [0] = %p [0]
 %m = acc f32 32,32
-%x = load %b [0]
-store_to %m from %x
+load 32,32 %x = %b [0]
+store 32,32 %m = %x
 ",
         S::TT_TODO_ACC_STORE,
     );
@@ -682,7 +735,7 @@ store_to %m from %x
 /// reduce gate is written as. `with_scaler` adds the second operand, which
 /// `max` does not name.
 fn reduce_program(body: &str, with_scaler: bool) -> String {
-    let mut s = String::from("version 7\ngrid 1,1\n%px = param f32 1024\n");
+    let mut s = String::from("version 8\ngrid 1,1\n%px = param f32 1024\n");
     if with_scaler {
         s.push_str("%ps = param f32 1024\n");
     }
@@ -690,18 +743,18 @@ fn reduce_program(body: &str, with_scaler: bool) -> String {
     if with_scaler {
         s.push_str("%bs = buffer f32 32,32\n");
     }
-    s.push_str("%bo = buffer f32 32,32\ncopy_to %bx from %px [0]\n");
+    s.push_str("%bo = buffer f32 32,32\ncopy 32,32 %bx [0] = %px [0]\n");
     if with_scaler {
-        s.push_str("copy_to %bs from %ps [0]\n");
+        s.push_str("copy 32,32 %bs [0] = %ps [0]\n");
     }
     s.push_str(
-        "%m = acc f32 32,32\n%zero = const f32 0\nstore_to %m from %zero\n%x = load %bx [0]\n",
+        "%m = acc f32 32,32\n%zero = const f32 0\nstore 32,32 %m = %zero\nload 32,32 %x = %bx [0]\n",
     );
     if with_scaler {
-        s.push_str("%s = load %bs [0]\n");
+        s.push_str("load 32,32 %s = %bs [0]\n");
     }
     s.push_str(body);
-    s.push_str("\nstore_to %bo from %m [0]\ncopy_to %out from %bo [0]\n");
+    s.push_str("\nstore 32,32 %bo [0] = %m\ncopy 32,32 %out [0] = %bo [0]\n");
     s
 }
 
@@ -779,7 +832,7 @@ fn a_reduce_is_refused_for_what_the_src_path_cannot_take() {
     case(
         "an f32 tile with a bf16 scaler",
         "\
-version 7
+version 8
 grid 1,1
 %px = param f32 1024
 %ps = param bf16 1024
@@ -787,16 +840,16 @@ grid 1,1
 %bx = buffer f32 32,32
 %bs = buffer bf16 32,32
 %bo = buffer f32 32,32
-copy_to %bx from %px [0]
-copy_to %bs from %ps [0]
+copy 32,32 %bx [0] = %px [0]
+copy 32,32 %bs [0] = %ps [0]
 %m = acc f32 32,32
 %zero = const f32 0
-store_to %m from %zero
-%x = load %bx [0]
-%s = load %bs [0]
+store 32,32 %m = %zero
+load 32,32 %x = %bx [0]
+load 32,32 %s = %bs [0]
 sum row %m %x %s
-store_to %bo from %m [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %m
+copy 32,32 %out [0] = %bo [0]
 ",
         S::TT_ERROR_REDUCE_DTYPE,
     );
@@ -804,7 +857,7 @@ copy_to %out from %bo [0]
     case(
         "f32 operands into a bf16 accumulator",
         "\
-version 7
+version 8
 grid 1,1
 %px = param f32 1024
 %ps = param f32 1024
@@ -812,16 +865,16 @@ grid 1,1
 %bx = buffer f32 32,32
 %bs = buffer f32 32,32
 %bo = buffer f32 32,32
-copy_to %bx from %px [0]
-copy_to %bs from %ps [0]
+copy 32,32 %bx [0] = %px [0]
+copy 32,32 %bs [0] = %ps [0]
 %m = acc bf16 32,32
 %zero = const f32 0
-store_to %m from %zero
-%x = load %bx [0]
-%s = load %bs [0]
+store 32,32 %m = %zero
+load 32,32 %x = %bx [0]
+load 32,32 %s = %bs [0]
 sum row %m %x %s
-store_to %bo from %m [0]
-copy_to %out from %bo [0]
+store 32,32 %bo [0] = %m
+copy 32,32 %out [0] = %bo [0]
 ",
         S::TT_ERROR_REDUCE_DTYPE,
     );

@@ -386,24 +386,31 @@ pub enum Op {
     /// DRAM into L1, or L1 into DRAM: exactly one side is a parameter, the other
     /// a buffer. Each side has its own datum offset, because a circular buffer
     /// names its page by the ring pointer while the parameter names the access's
-    /// own index (zyx's `Op::Copy` carries `src_idx`/`dst_idx`).
+    /// own index (zyx's `Op::Copy` carries `src_idx`/`dst_idx`). `shape` is the
+    /// unit one base moves: `32,32` a tile, `1,32` a row, `32,1` a column, `1,1`
+    /// one datum. A copy's unit has to be a whole NoC request, so it is a tile
+    /// or a row and nothing narrower.
     CopyTo {
         dst: ValueId,
         src: ValueId,
         dst_offset: Dim,
         src_offset: Dim,
+        shape: [u32; 2],
     },
-    /// L1 buffer into a register value.
+    /// L1 buffer into a register value. `shape` is the unit the index's base
+    /// names; the result has that shape.
     Load {
         value: ValueId,
         buffer: ValueId,
         offset: Dim,
+        shape: [u32; 2],
     },
     /// A register value into an L1 buffer.
     StoreTo {
         value: ValueId,
         buffer: ValueId,
         offset: Dim,
+        shape: [u32; 2],
     },
     /// The only conversion.
     Cast {
@@ -517,6 +524,7 @@ impl Op {
                 src,
                 dst_offset,
                 src_offset,
+                ..
             } => {
                 let mut v = vec![*dst, *src];
                 v.extend(dim(dst_offset));
@@ -532,6 +540,7 @@ impl Op {
                 value,
                 buffer,
                 offset,
+                ..
             } => {
                 let mut v = vec![*value, *buffer];
                 v.extend(dim(offset));
@@ -856,6 +865,7 @@ impl Kernel {
                     src,
                     dst_offset,
                     src_offset,
+                    shape: access,
                 } => {
                     let d = *lookup(&values, &visible, dst, at)?;
                     let s = *lookup(&values, &visible, src, at)?;
@@ -877,29 +887,43 @@ impl Kernel {
                         let _ = (b.dtype, p.dtype);
                         return Err(Error::TT_ERROR_COPY_CAST);
                     }
-                    check_dim(
+                    // A copy's unit is one NoC request, so it is a row or a
+                    // tile: a datum or a column is not 64 bytes.
+                    let unit = access_shape(access)?;
+                    if !matches!(unit, RegShape::Row | RegShape::Tile) {
+                        return Err(Error::TT_ERROR_COPY_UNIT);
+                    }
+                    let lanes = check_index(
                         &values,
                         &visible,
                         dst_offset,
                         at,
                         Error::TT_ERROR_OFFSET_NOT_INDEX,
                     )?;
-                    check_dim(
+                    let src_lanes = check_index(
                         &values,
                         &visible,
                         src_offset,
                         at,
                         Error::TT_ERROR_OFFSET_NOT_INDEX,
                     )?;
+                    if lanes != 1 || src_lanes != 1 {
+                        return Err(Error::TT_TODO_MULTI_LANE);
+                    }
                     let Op::Buffer { shape, .. } = self.ops[def[buffer as usize]] else {
                         let _ = buffer;
                         return Err(Error::TT_ERROR_NOT_A_BUFFER);
                     };
                     let (unit_shape, _, _) = unit_of(shape, b.dtype)?;
+                    let datums = access[0] * access[1];
+                    if unit_shape.datums() != datums {
+                        let _ = (unit_shape, access);
+                        return Err(Error::TT_ERROR_ACCESS_SHAPE);
+                    }
                     let total = shape[0] * shape[1];
-                    check_offset(buffer_offset, total, unit_shape.datums(), at)?;
+                    check_offset(buffer_offset, total, datums, at)?;
                     if let Some(count) = param_elements(self, &def, param) {
-                        check_offset(param_offset, count, unit_shape.datums(), at)?;
+                        check_offset(param_offset, count, datums, at)?;
                     }
                     continue;
                 }
@@ -907,22 +931,28 @@ impl Kernel {
                     buffer,
                     offset,
                     value,
+                    shape: access,
                 } => {
                     let b = *lookup(&values, &visible, buffer, at)?;
+                    let unit = access_shape(access)?;
+                    if check_index(
+                        &values,
+                        &visible,
+                        offset,
+                        at,
+                        Error::TT_ERROR_OFFSET_NOT_INDEX,
+                    )? != 1
+                    {
+                        return Err(Error::TT_TODO_MULTI_LANE);
+                    }
+                    let datums = access[0] * access[1];
                     if b.kind == ValueKind::Param {
                         // A direct parameter access: one tile, which
                         // `mover::add_movers` stages through a `32,32` buffer.
-                        if b.shape != RegShape::Tile {
-                            let _ = buffer;
+                        if unit != RegShape::Tile || b.shape != RegShape::Tile {
+                            let _ = (buffer, access);
                             return Err(Error::TT_ERROR_LOAD_PARAM_NOT_TILE);
                         }
-                        check_dim(
-                            &values,
-                            &visible,
-                            offset,
-                            at,
-                            Error::TT_ERROR_OFFSET_NOT_INDEX,
-                        )?;
                         if let Some(count) = param_elements(self, &def, buffer) {
                             check_offset(offset, count, 1024, at)?;
                         }
@@ -937,33 +967,22 @@ impl Kernel {
                             let _ = buffer;
                             return Err(Error::TT_ERROR_NOT_A_BUFFER);
                         }
-                        check_dim(
-                            &values,
-                            &visible,
-                            offset,
-                            at,
-                            Error::TT_ERROR_OFFSET_NOT_INDEX,
-                        )?;
                         let Op::Buffer { shape, .. } = self.ops[def[buffer as usize]] else {
                             let _ = buffer;
                             return Err(Error::TT_ERROR_NOT_A_BUFFER);
                         };
                         let (unit_shape, _, _) = unit_of(shape, b.dtype)?;
+                        if unit_shape.datums() < datums {
+                            let _ = (unit_shape, access);
+                            return Err(Error::TT_ERROR_ACCESS_SHAPE);
+                        }
                         let total = shape[0] * shape[1];
-                        check_offset(offset, total, unit_shape.datums(), at)?;
+                        check_offset(offset, total, datums, at)?;
                         let _ = value;
-                        // A vector buffer's unit is 32 datums; a symbolic offset
-                        // into it selects one datum, which is how a mover reads a
-                        // scalar out of a row it just copied (an index). A tile
-                        // stays whole: its offset is a page number.
-                        let shape = match (unit_shape, offset) {
-                            (RegShape::Row | RegShape::Column, Dim::Value(_)) => RegShape::Scalar,
-                            _ => unit_shape,
-                        };
                         ValueInfo {
                             kind: ValueKind::Register,
                             dtype: b.dtype,
-                            shape,
+                            shape: unit,
                         }
                     }
                 }
@@ -971,13 +990,30 @@ impl Kernel {
                     value,
                     buffer,
                     offset,
+                    shape: access,
                 } => {
                     let v = *lookup(&values, &visible, value, at)?;
                     let b = *lookup(&values, &visible, buffer, at)?;
+                    let unit = access_shape(access)?;
+                    if check_index(
+                        &values,
+                        &visible,
+                        offset,
+                        at,
+                        Error::TT_ERROR_OFFSET_NOT_INDEX,
+                    )? != 1
+                    {
+                        return Err(Error::TT_TODO_MULTI_LANE);
+                    }
+                    let datums = access[0] * access[1];
                     if b.kind == ValueKind::Acc {
                         // An accumulator is one tile and is written in place: the
                         // only form implemented is a fill from an f32 constant,
                         // which is how a program zeroes it.
+                        if unit != RegShape::Tile {
+                            let _ = access;
+                            return Err(Error::TT_ERROR_ACC_SHAPE);
+                        }
                         if !matches!(offset, Dim::Const(0)) {
                             let _ = offset;
                             return Err(Error::TT_ERROR_ACC_OFFSET);
@@ -994,8 +1030,8 @@ impl Kernel {
                     }
                     if b.kind == ValueKind::Param {
                         // The direct form; `mover::add_movers` stages it.
-                        if b.shape != RegShape::Tile {
-                            let _ = buffer;
+                        if unit != RegShape::Tile || b.shape != RegShape::Tile {
+                            let _ = (buffer, access);
                             return Err(Error::TT_ERROR_STORE_PARAM_NOT_TILE);
                         }
                         if v.dtype != b.dtype {
@@ -1006,13 +1042,6 @@ impl Kernel {
                             let _ = v.shape;
                             return Err(Error::TT_ERROR_STORE_PARAM_VALUE_NOT_TILE);
                         }
-                        check_dim(
-                            &values,
-                            &visible,
-                            offset,
-                            at,
-                            Error::TT_ERROR_OFFSET_NOT_INDEX,
-                        )?;
                         if let Some(count) = param_elements(self, &def, buffer) {
                             check_offset(offset, count, 1024, at)?;
                         }
@@ -1031,19 +1060,16 @@ impl Kernel {
                         return Err(Error::TT_ERROR_NOT_A_BUFFER);
                     };
                     let (unit_shape, _, _) = unit_of(shape, b.dtype)?;
-                    if v.shape != unit_shape {
-                        let _ = (unit_shape, v.shape);
+                    if unit_shape.datums() < datums {
+                        let _ = (unit_shape, access);
+                        return Err(Error::TT_ERROR_ACCESS_SHAPE);
+                    }
+                    if v.shape != unit {
+                        let _ = (unit, v.shape);
                         return Err(Error::TT_ERROR_STORE_BUFFER_SHAPE);
                     }
-                    check_dim(
-                        &values,
-                        &visible,
-                        offset,
-                        at,
-                        Error::TT_ERROR_OFFSET_NOT_INDEX,
-                    )?;
                     let total = shape[0] * shape[1];
-                    check_offset(offset, total, unit_shape.datums(), at)?;
+                    check_offset(offset, total, datums, at)?;
                     continue;
                 }
                 Op::Cast { src, dtype, .. } => {
@@ -1356,6 +1382,41 @@ fn check_dim(
     Ok(())
 }
 
+/// An access shape: the unit one base moves, and nothing between the four.
+pub(crate) fn access_shape(shape: [u32; 2]) -> Result<RegShape, Error> {
+    Ok(match shape {
+        [1, 1] => RegShape::Scalar,
+        [1, 32] => RegShape::Row,
+        [32, 1] => RegShape::Column,
+        [32, 32] => RegShape::Tile,
+        _ => return Err(Error::TT_ERROR_ACCESS_SHAPE),
+    })
+}
+
+/// An access's index, and how many bases it names. A literal is one base; a
+/// value is one base per datum of its shape, so a `1,32` vector names 32.
+fn check_index(
+    values: &[ValueInfo],
+    visible: &[bool],
+    dim: Dim,
+    at: usize,
+    bad: Error,
+) -> Result<u32, Error> {
+    let Dim::Value(v) = dim else {
+        return Ok(1);
+    };
+    let i = lookup(values, visible, v, at)?;
+    if i.dtype != INDEX {
+        let _ = i;
+        return Err(bad);
+    }
+    Ok(match i.shape {
+        RegShape::Scalar => 1,
+        RegShape::Row | RegShape::Column => 32,
+        RegShape::Tile => 1024,
+    })
+}
+
 /// A bracket must leave room for one unit. A symbolic offset cannot be checked
 /// here; it is checked at run time.
 fn check_offset(offset: Dim, total: u32, unit: u32, at: usize) -> Result<(), Error> {
@@ -1388,8 +1449,8 @@ fn param_elements(k: &Kernel, def: &[usize], param: ValueId) -> Option<u32> {
 
 /// The byte form's magic.
 pub const MAGIC: [u8; 4] = *b"TTIR";
-/// The IR version this build reads and writes.
-pub const VERSION: u32 = 7;
+/// The IR version this build reads.
+pub const VERSION: u32 = 8;
 
 impl Kernel {
     /// Read the byte form. A wrong magic, an unknown version or a truncated
@@ -1460,22 +1521,26 @@ impl Kernel {
                     src: r.u32()?,
                     dst_offset: r.dim()?,
                     src_offset: r.dim()?,
+                    shape: [r.u32()?, r.u32()?],
                 },
                 7 => {
                     let name = r.name()?;
                     let buffer = r.u32()?;
                     let offset = r.dim()?;
+                    let shape = [r.u32()?, r.u32()?];
                     let value = define(&mut names, name)?;
                     Op::Load {
                         value,
                         buffer,
                         offset,
+                        shape,
                     }
                 }
                 8 => Op::StoreTo {
                     buffer: r.u32()?,
                     value: r.u32()?,
                     offset: r.dim()?,
+                    shape: [r.u32()?, r.u32()?],
                 },
                 9 => {
                     let name = r.name()?;
@@ -1681,11 +1746,12 @@ impl Kernel {
                 p.ops.push(Op::Grid { columns, rows });
                 continue;
             }
-            if first == "copy_to" {
+            if first == "copy" {
+                let shape = t.shape()?;
                 let dst = t.value(&p.symbols)?;
-                t.expect("from")?;
-                let src = t.value(&p.symbols)?;
                 let dst_offset = t.bracket(&p.symbols)?;
+                t.expect_eq()?;
+                let src = t.value(&p.symbols)?;
                 // The second bracket names the source offset. One bracket is
                 // shorthand for both sides carrying the same index.
                 let src_offset = if matches!(t.peek(), Some(Token::LBracket)) {
@@ -1699,13 +1765,13 @@ impl Kernel {
                     src,
                     dst_offset,
                     src_offset,
+                    shape,
                 });
                 continue;
             }
-            if first == "store_to" {
+            if first == "store" {
+                let shape = t.shape()?;
                 let buffer = t.value(&p.symbols)?;
-                t.expect("from")?;
-                let value = t.value(&p.symbols)?;
                 // An `acc` has no offset to name; a buffer's bracket is still
                 // required by every program that has one, and a missing one
                 // reads as zero.
@@ -1714,11 +1780,30 @@ impl Kernel {
                 } else {
                     Dim::Const(0)
                 };
+                t.expect_eq()?;
+                let value = t.value(&p.symbols)?;
                 t.end()?;
                 p.ops.push(Op::StoreTo {
                     value,
                     buffer,
                     offset,
+                    shape,
+                });
+                continue;
+            }
+            if first == "load" {
+                let shape = t.shape()?;
+                let name = t.name()?;
+                t.expect_eq()?;
+                let buffer = t.value(&p.symbols)?;
+                let offset = t.bracket(&p.symbols)?;
+                t.end()?;
+                let value = p.define(name)?;
+                p.ops.push(Op::Load {
+                    value,
+                    buffer,
+                    offset,
+                    shape,
                 });
                 continue;
             }
@@ -1880,16 +1965,6 @@ fn parse_definition(t: &mut Tokens, p: &mut Parser) -> Result<Op, Error> {
             t.end()?;
             Op::GridCoord { value, axis }
         }
-        "load" => {
-            let buffer = t.value(&p.symbols)?;
-            let offset = t.bracket(&p.symbols)?;
-            t.end()?;
-            Op::Load {
-                value,
-                buffer,
-                offset,
-            }
-        }
         "cast" => {
             let src = t.value(&p.symbols)?;
             t.expect("to")?;
@@ -2043,6 +2118,14 @@ impl<'a> Tokens<'a> {
             Token::Int(n) => u32::try_from(n).map_err(|_| self.err(format!("{n} is not a u32"))),
             t => Err(self.err(format!("expected a number, found `{}`", t.text()))),
         }
+    }
+
+    /// An access shape: `<rows>,<cols>`.
+    fn shape(&mut self) -> Result<[u32; 2], Error> {
+        let rows = self.number_u32()?;
+        self.comma()?;
+        let cols = self.number_u32()?;
+        Ok([rows, cols])
     }
 
     fn dtype(&mut self) -> Result<DType, Error> {

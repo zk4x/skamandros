@@ -147,6 +147,7 @@ pub fn add_movers(k: &Kernel, types: &Types) -> Result<Kernel, Error> {
                 value,
                 buffer,
                 offset,
+                shape: _,
             } if types.of(buffer).kind == crate::ir::ValueKind::Param => {
                 let info = *types.of(buffer);
                 let shape = stage_shape(info.shape, buffer)?;
@@ -161,18 +162,21 @@ pub fn add_movers(k: &Kernel, types: &Types) -> Result<Kernel, Error> {
                     src: map[buffer as usize],
                     dst_offset: Dim::Const(0),
                     src_offset: remap_dim(offset, &map),
+                    shape,
                 });
                 let value = define(&mut out, k, value, &mut map);
                 out.ops.push(Op::Load {
                     value,
                     buffer: staged,
                     offset: Dim::Const(0),
+                    shape,
                 });
             }
             Op::StoreTo {
                 value,
                 buffer,
                 offset,
+                shape: _,
             } if types.of(buffer).kind == crate::ir::ValueKind::Param => {
                 let info = *types.of(buffer);
                 let shape = stage_shape(info.shape, buffer)?;
@@ -186,12 +190,14 @@ pub fn add_movers(k: &Kernel, types: &Types) -> Result<Kernel, Error> {
                     value: map[value as usize],
                     buffer: staged,
                     offset: Dim::Const(0),
+                    shape,
                 });
                 out.ops.push(Op::CopyTo {
                     dst: map[buffer as usize],
                     src: staged,
                     dst_offset: remap_dim(offset, &map),
                     src_offset: Dim::Const(0),
+                    shape,
                 });
             }
             _ => {
@@ -347,25 +353,35 @@ fn remap(op: &Op, map: &[ValueId], value: Option<ValueId>) -> Op {
             src,
             dst_offset,
             src_offset,
+            shape,
         } => Op::CopyTo {
             dst: v(dst),
             src: v(src),
             dst_offset: d(dst_offset),
             src_offset: d(src_offset),
+            shape,
         },
-        Op::Load { buffer, offset, .. } => Op::Load {
+        Op::Load {
+            buffer,
+            offset,
+            shape,
+            ..
+        } => Op::Load {
             value: own(),
             buffer: v(buffer),
             offset: d(offset),
+            shape,
         },
         Op::StoreTo {
             value: src,
             buffer,
             offset,
+            shape,
         } => Op::StoreTo {
             value: v(src),
             buffer: v(buffer),
             offset: d(offset),
+            shape,
         },
         Op::Cast { src, dtype, .. } => Op::Cast {
             value: own(),
@@ -735,6 +751,7 @@ fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
                 src,
                 dst_offset,
                 src_offset,
+                shape: access,
             } => {
                 let (param, buffer, param_offset, buffer_offset) =
                     match (types.of(dst).kind, types.of(src).kind) {
@@ -762,28 +779,30 @@ fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
                     let _ = (at, buffer);
                     Error::TT_ERROR_BUFFER_NOT_PLACED
                 })?;
+                // The index is in access units, so one index step is the unit's
+                // bytes: a tile for `32,32`, a row for `1,32`.
+                let unit = (access[0] * access[1])
+                    .checked_mul(dtype.bytes())
+                    .ok_or(Error::TT_ERROR_PARAM_OFFSET_OVERFLOW)?;
                 let offset = match param_offset {
-                    Dim::Const(n) => {
-                        ParamOffset::Const(n.checked_mul(dtype.bytes()).ok_or_else(|| {
-                            let _ = (at, n);
-                            Error::TT_ERROR_PARAM_OFFSET_OVERFLOW
-                        })?)
-                    }
+                    Dim::Const(n) => ParamOffset::Const(n.checked_mul(unit).ok_or_else(|| {
+                        let _ = (at, n);
+                        Error::TT_ERROR_PARAM_OFFSET_OVERFLOW
+                    })?),
                     Dim::Value(value) => match k.const_i32(value) {
                         // A constant written as a value is still a literal.
                         Some(n) if n >= 0 => ParamOffset::Const(
-                            (n as u32).checked_mul(dtype.bytes()).ok_or_else(|| {
-                                let _ = (at, n);
-                                Error::TT_ERROR_PARAM_OFFSET_OVERFLOW
-                            })?,
+                            (n as u32)
+                                .checked_mul(unit)
+                                .ok_or(Error::TT_ERROR_PARAM_OFFSET_OVERFLOW)?,
                         ),
                         _ => {
                             // The value depends on a loop index; the loop
                             // carries it in a register and the copy scales it
-                            // by the datum size.
+                            // by the unit size.
                             ParamOffset::Index {
                                 value,
-                                dtype_bytes: dtype.bytes(),
+                                dtype_bytes: unit,
                             }
                         }
                     },
@@ -793,14 +812,14 @@ fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
                 // is the address (`planner`): a page is one unit and the
                 // pointers advance in program order.
                 if let Dim::Const(n) = buffer_offset {
-                    n.checked_mul(dtype.bytes())
+                    n.checked_mul(unit)
                         .ok_or(Error::TT_ERROR_BUFFER_OFFSET_OVERFLOW)?;
                 }
                 items.push(Item::Copy(Copy {
                     param: param_index[param as usize].expect("a parameter has an index"),
                     offset,
                     cb,
-                    bytes: plan.cbs[cb as usize].page,
+                    bytes: unit,
                 }));
             }
             _ => continue,

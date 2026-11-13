@@ -18,7 +18,7 @@ values. It names no processor, no `Dst` slot, no `Src` bank, no lane register,
 no semaphore, no unpacker, no packer and no Tensix word:
 
 ```
-version 7
+version 8
 grid 1,1
 %in  = param f32 1024,128
 %out = param f32 1024,128
@@ -26,11 +26,11 @@ grid 1,1
 %n   = const i32 2
 %i   = loop %n
 %o   = mul %i %n
-copy_to %b0 from %in [%o]
-%x = load %b0 [%o]
+copy 32,32 %b0 [%o] = %in [%o]
+load 32,32 %x = %b0 [%o]
 %y = neg %x
-store_to %b0 from %y [%o]
-copy_to %out from %b0 [%o]
+store 32,32 %b0 [%o] = %y
+copy 32,32 %out [%o] = %b0 [%o]
 endloop
 ```
 
@@ -38,12 +38,14 @@ Parameters and buffers are mutable, not SSA. A shape is a comma-separated list o
 terms, and a term is a literal or an `i32` value; a product is built by an op
 first. A parameter may be arbitrary-dimensional and symbolic, a scalar parameter
 is the shape `0`, and a buffer is two constant dimensions, each `1` or a multiple
-of 32. There is no implicit dtype conversion: `cast %x to f32` converts a
-value with the C type's rounding, and `bitcast %x to i32` renames the same bits
-between dtypes of equal width. A bf16 datum is two bytes in L1, and bf16 is the
-compute path the `Dst` is sized for: a kernel whose values are all bf16 runs in
-the 16-bit bank, with bf16 arithmetic and comparisons; a `bool` lane lives there
-too, as the `-1.0`/`0.0` pattern the bf16 store keeps.
+of 32. Every `load`, `store` and `copy` names its unit — `32,32` a tile, `1,32` a
+row, `32,1` a column, `1,1` one datum — and its index is that many units. There is
+no implicit dtype conversion: `cast %x to f32` converts a value with the C type's
+rounding, and `bitcast %x to i32` renames the same bits between dtypes of equal
+width. A bf16 datum is two bytes in L1, and bf16 is the compute path the `Dst` is
+sized for: a kernel whose values are all bf16 runs in the 16-bit bank, with bf16
+arithmetic and comparisons; a `bool` lane lives there too, as the `-1.0`/`0.0`
+pattern the bf16 store keeps.
 
 The op set is the low-level one and nothing more: zyx's `UOp`
 (`neg`, `not`, `bitnot`, `exp2`, `log2`, `reciprocal`, `sqrt`, `rsqrt`, `sin`,
@@ -66,20 +68,20 @@ form (`TTIR`).
   in the IR: an instruction is classified by its operands, and the compiler emits
   only the programs that end up non-empty — the inbound mover, the outbound
   mover, and T0/T1/T2.
-- **Unpack and pack are internal.** The IR has `copy_to` between DRAM and L1,
-  `load` from L1 into a register and `store_to` back. The unpacker descriptor,
+- **Unpack and pack are internal.** The IR has `copy` between DRAM and L1,
+  `load` from L1 into a register and `store` back. The unpacker descriptor,
   the packer address generator, the tile order, the base compensation for the
   header the hardware assumes, and the ADCs are all the compiler's.
-- **A parameter can be named directly.** `load %in [%o]` and `store_to %out from
-  %x [%o]` are the CUDA-like form: `mover::add_movers` (zyx's `tt_add_movers`)
-  stages the access through a one-unit L1 buffer and inserts the inbound or
-  outbound copy. `copy_to` is still accepted, but it is not required and names no
-  mover.
-- **A copy has a destination offset and a source offset.** `copy_to %b from %in
-  [d] [s]` — both normal `i32` scalars or literals, destination first; one
-  bracket is shorthand for both. The staged copy above puts the access index on
-  the parameter side and `0` on the buffer side, because a buffer is a ring page
-  while the parameter names the access.
+- **A parameter can be named directly.** `load 32,32 %x = %in [%o]` and
+  `store 32,32 %out [%o] = %x` are the CUDA-like form: `mover::add_movers` (zyx's
+  `tt_add_movers`) stages the access through a one-unit L1 buffer and inserts the
+  inbound or outbound copy. `copy` is still accepted, but it is not required and
+  names no mover.
+- **A copy has a destination offset and a source offset.** `copy 32,32 %b [d] =
+  %in [s]` — both normal `i32` scalars or literals, destination first; the
+  source's bracket is optional and defaults to the destination's. The staged copy
+  above puts the access index on the parameter side and `0` on the buffer side,
+  because a buffer is a ring page while the parameter names the access.
 - **Every buffer has one producer and one consumer**: the reader publishes and
   the unpacker consumes an input buffer; the packer publishes and the writer
   consumes an output buffer; a compute-free DRAM-to-DRAM transfer is one buffer
@@ -257,7 +259,7 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   the section after the pack has retired.
 - A tensor parameter is **tiled**: its bytes are the tile layout below, not a
   row-major matrix, exactly as tt-metal's DRAM tensors are in `TILE_LAYOUT`.
-  `copy_to` moves one page of `page` bytes contiguously, so a kernel never
+  `copy` moves one page of `page` bytes contiguously, so a kernel never
   gathers a tile out of row-major data; the host does that when it fills the
   parameter.
 - A launch runs the module's whole grid: every tile of it gets the module's
@@ -290,7 +292,7 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   `%acc = acc f32 32,32` (or `bf16`). It adds rather than replaces, so a K loop
   is one `matmul` under one `loop` — the accumulator is written every iteration
   and packed once after it. `acc` starts unspecified: a program that needs zeros
-  writes them itself (`store_to %acc from %zero`, a fill from an `f32` constant).
+  writes them itself (`store 32,32 %acc = %zero`, a fill from an `f32` constant).
   Both operands must be `load` values — the unpacker fills `SrcA`/`SrcB` straight
   from their CB pages, in the `Src` format their dtype implies (`TF32` for `f32`,
   `BF16` for bf16) — and they are the same dtype: `bf16`/`bf16`, `bf16`/`f32`

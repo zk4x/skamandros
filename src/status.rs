@@ -416,6 +416,16 @@ pub enum ttStatus {
     /// A machine `MOVD2B` names a `SrcB` row the bank does not have (64 rows of
     /// 16 datums).
     TT_ERROR_SRC_ROW = 170,
+    /// An access's shape is not one of `1,1`, `1,32`, `32,1`, `32,32`.
+    TT_ERROR_ACCESS_SHAPE = 171,
+    /// A `copy` unit is not 64-byte congruent: a datum or a column cannot be a
+    /// NoC request.
+    TT_ERROR_COPY_UNIT = 172,
+    /// More than one base per access (a shaped index) is not lowered yet.
+    TT_TODO_MULTI_LANE = 173,
+    /// A `load`/`store` unit that is not a tile (a row, a column, one datum) is
+    /// not lowered yet.
+    TT_TODO_ACCESS_SHAPE = 174,
 }
 
 impl ttStatus {
@@ -592,6 +602,10 @@ impl ttStatus {
             ttStatus::TT_ERROR_REDUCE_DTYPE => "TT_ERROR_REDUCE_DTYPE",
             ttStatus::TT_TODO_REDUCE => "TT_TODO_REDUCE",
             ttStatus::TT_ERROR_SRC_ROW => "TT_ERROR_SRC_ROW",
+            ttStatus::TT_ERROR_ACCESS_SHAPE => "TT_ERROR_ACCESS_SHAPE",
+            ttStatus::TT_ERROR_COPY_UNIT => "TT_ERROR_COPY_UNIT",
+            ttStatus::TT_TODO_MULTI_LANE => "TT_TODO_MULTI_LANE",
+            ttStatus::TT_TODO_ACCESS_SHAPE => "TT_TODO_ACCESS_SHAPE",
             ttStatus::TT_ERROR_DST_ROW_ODD => "TT_ERROR_DST_ROW_ODD",
         }
     }

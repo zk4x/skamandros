@@ -157,13 +157,13 @@ mod tests {
     use crate::ir::Kernel;
 
     const TWO: &str = "\
-version 7
+version 8
 %in = param f32 2048
 %out = param f32 2048
 %bi = buffer f32 32,64
 %bo = buffer f32 32,32
-copy_to %bi from %in [0]
-copy_to %out from %bo [0]
+copy 32,32 %bi [0] = %in [0]
+copy 32,32 %out [0] = %bo [0]
 grid 1,1
 ";
 
