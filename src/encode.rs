@@ -538,8 +538,8 @@ fn cb_base_pack(out: &mut Stream, cb: u32) -> Result<(), Error> {
 ///
 /// A plain `sw` to `Config` is processed by the LSU, not the Tensix instruction
 /// FIFO, so it overtakes the `UNPACR`/`PACR` already reading the same word; the
-/// role's per-iteration page then lags by one (`firmware/tt-firmware/src/
-/// ttinsn.rs`, `STEP_STORE`). The write has to be a pushed Tensix instruction:
+/// role's per-iteration page then lags by one (`firmware/src/ttinsn.rs`,
+/// `STEP_STORE`). The write has to be a pushed Tensix instruction:
 /// `SETDMAREG` stages the dynamic value, then `WRCFG` copies it, in FIFO order
 /// with the backend. This is tt-metal's `program_packer_destination`
 /// (`SETDMAREG` × 2, `STALLWAIT(STALL_CFG, THCON)`, `WRCFG`, `DMANOP`) and

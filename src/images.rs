@@ -1,7 +1,7 @@
 // Copyright (C) 2025 zk4x
 // SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
 
-//! The firmware images, built from `firmware/tt-firmware` by `build.rs`.
+//! The firmware images, built from `firmware/` by `build.rs`.
 //!
 //! Each image is linked for one core and loaded at that core's reset PC (`link.x`,
 //! or its own slot for the three role images). `build.rs` also disassembles every

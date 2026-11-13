@@ -93,7 +93,7 @@ form (`TTIR`).
   footprint, so a `32,64` buffer is two pages and the program chooses it.
 - **The firmware ships inside the library.** `exec_b`, the three role executors
   (`exec_t0`/`exec_t1`/`exec_t2`), the NC mover and the other images are built
-  from `firmware/tt-firmware` and embedded, so a consumer needs neither the
+  from `firmware/` and embedded, so a consumer needs neither the
   RISC-V target nor `llvm-objcopy`. This is what makes the `.so` self-contained.
 - **A role program is RISC-V code, as in tt-metal.** T0/T1/T2 and the movers are
   programs the firmware calls with the launch arguments in `a0`; the Tensix

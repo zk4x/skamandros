@@ -1,8 +1,8 @@
 // Copyright (C) 2025 zk4x
 // SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
 
-//! The firmware images the driver ships: built from `firmware/tt-firmware` by
-//! `build.rs`, judged instruction by instruction there, and embedded here.
+//! The firmware images the driver ships: built from `firmware/` by `build.rs`,
+//! judged instruction by instruction there, and embedded here.
 
 use TT::images;
 

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "tenstorrent")]
 use std::process::Command;
 
-/// Binaries in `tt-firmware/src/bin` to build and expose.
+/// Binaries in `firmware/src/bin` to build and expose.
 #[cfg(feature = "tenstorrent")]
 const BINARIES: &[&str] = &[
     "heartbeat",
@@ -53,7 +53,7 @@ fn main() {
     #[cfg(feature = "tenstorrent")]
     {
         let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-        let firmware_dir = manifest.join("firmware").join("tt-firmware");
+        let firmware_dir = manifest.join("firmware");
         println!("cargo:rerun-if-changed=build.rs");
         let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
