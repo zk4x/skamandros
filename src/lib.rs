@@ -1,35 +1,30 @@
 // Copyright (C) 2025 zk4x
 // SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
 
-// The artifact is `libTT.so`, so the crate is `TT`.
-#![allow(non_snake_case)]
-
-//! The Tenstorrent kernel compiler and driver.
+//! `libTT.so`: a Tenstorrent kernel compiler and driver for Blackhole.
 //!
-//! One semantic SSA program in ([`ir`]), a set of role programs and a launch
-//! out: the reader/writer RISC-V programs and the T0/T1/T2 Tensix programs are
-//! produced by `emit` from the allocation `alloc` makes, and `runtime` loads and
-//! runs them. The C ABI in `abi` is the only stable surface; every other item is
-//! free to move.
-//!
-//! The IR is a *program format*, not a Rust API: it is accepted as text or as
-//! bytes, and versioned ([`ir::VERSION`]).
+//! The only public module is `abi`, the C ABI. Everything else is private: a
+//! consumer links `libTT.so` and calls `ttCompile`, `ttLaunch` and the transfers
+//! beside them, exactly as the header describes. Nothing in this crate is a Rust
+//! library, and nothing outside it should need to be.
 
 pub mod abi;
-pub mod alloc;
-pub mod compile;
-pub mod device;
-pub mod encode;
-pub mod ir;
-pub mod lower;
-pub mod mir;
-pub mod module;
-pub mod mover;
-pub mod optimize;
-pub mod planner;
-pub mod riscv;
-pub mod runtime;
-pub mod status;
-pub mod unfold;
 
-pub use ir::{DType, Dim, Kernel, Op, RegShape, Types, ValueId};
+mod alloc;
+mod compile;
+mod device;
+mod encode;
+mod ir;
+mod lower;
+mod mir;
+mod module;
+mod mover;
+mod optimize;
+mod planner;
+mod riscv;
+mod runtime;
+mod status;
+mod unfold;
+
+#[cfg(test)]
+mod ir_tests;

@@ -1102,3 +1102,40 @@ fn place(words: &mut [u32; 3], first_bit: u32, count: u32, value: u64) {
 /// Re-exported so the runtime need not depend on the location of the program
 /// arena; this is where every program lives in L1, named by its launch message.
 pub const PROGRAM_AREA: u64 = l1::PROGRAM_CACHE.base;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_image_is_present_and_linked_where_it_is_loaded() {
+        for (name, bytes) in all_images() {
+            assert!(!bytes.is_empty(), "{name} is empty");
+        }
+        let [t0, t1, t2] = ROLES;
+        assert_eq!(t0.0, Core::T0);
+        assert_eq!(t1.0, Core::T1);
+        assert_eq!(t2.0, Core::T2);
+        for (i, (_, bytes, at)) in ROLES.iter().enumerate() {
+            assert_eq!(
+                *at,
+                tt_isa::l1::roles::BASE[i],
+                "role {i} is loaded at its slot"
+            );
+            assert!(
+                bytes.len() as u64 <= tt_isa::l1::roles::SLOT,
+                "role {i} is {} bytes for a {} byte slot",
+                bytes.len(),
+                tt_isa::l1::roles::SLOT
+            );
+        }
+    }
+
+    #[test]
+    fn the_executor_is_the_image_the_mailbox_starts() {
+        // The executor is linked at T0's reset PC, which `link.x` also uses for the
+        // images loaded through a plain reset.
+        assert_eq!(LOAD_ADDRESS, u64::from(Core::T0.default_reset_pc()));
+        assert!(!EXEC_B.is_empty());
+    }
+}

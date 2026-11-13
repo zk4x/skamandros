@@ -4,7 +4,10 @@
 //! The IR as a program format: the text form is the contract, the byte form is
 //! the shipping encoding, and the two are checked against each other.
 
-use TT::ir::Kernel;
+use crate::compile;
+use crate::compile::ParamKind;
+use crate::ir::{DType, Dim, Kernel, Op};
+use crate::status::ttStatus;
 
 /// The unified program: no reader/compute/writer segments, no unpack/pack, no
 /// buffer layouts, no circular-buffer operations. Parameters and buffers are
@@ -72,7 +75,7 @@ fn a_buffer_shape_that_is_not_one_or_a_multiple_of_32_is_refused() {
     for shape in ["33,32", "32,33", "16,32"] {
         let text = format!("version 7\n%x = buffer f32 {shape}\ngrid 1,1\n");
         let err = Kernel::parse(&text).expect_err(shape);
-        assert_eq!(err, TT::status::ttStatus::TT_ERROR_BUFFER_SHAPE, "{shape}");
+        assert_eq!(err, ttStatus::TT_ERROR_BUFFER_SHAPE, "{shape}");
     }
     // A buffer is always two-dimensional and always constant.
     for shape in ["32", "32,%d"] {
@@ -88,7 +91,7 @@ fn a_buffer_shape_that_is_not_one_or_a_multiple_of_32_is_refused() {
 fn a_zero_dimension_is_not_the_way_to_write_a_tensor() {
     let text = "version 7\n%p = param f32 0,32\ngrid 1,1\n";
     let err = Kernel::parse(text).expect_err("a zero in a dimension list");
-    assert_eq!(err, TT::status::ttStatus::TT_ERROR_ZERO_DIMENSION);
+    assert_eq!(err, ttStatus::TT_ERROR_ZERO_DIMENSION);
 }
 
 #[test]
@@ -101,14 +104,14 @@ version 7
 grid 1,1
 ";
     let err = Kernel::parse(text).expect_err("mixed dtypes");
-    assert_eq!(err, TT::status::ttStatus::TT_ERROR_NO_IMPLICIT_CAST);
+    assert_eq!(err, ttStatus::TT_ERROR_NO_IMPLICIT_CAST);
 }
 
 #[test]
 fn a_use_before_its_definition_is_refused() {
     let text = "version 7\n%x = add %a %b\n%a = const i32 1\n%b = const i32 2\ngrid 1,1\n";
     let err = Kernel::parse(text).expect_err("undefined value");
-    assert_eq!(err, TT::status::ttStatus::TT_ERROR_PARSE);
+    assert_eq!(err, ttStatus::TT_ERROR_PARSE);
 }
 
 #[test]
@@ -123,21 +126,21 @@ endloop
 grid 1,1
 ";
     let err = Kernel::parse(text).expect_err("out of scope");
-    assert_eq!(err, TT::status::ttStatus::TT_ERROR_VALUE_OUT_OF_SCOPE);
+    assert_eq!(err, ttStatus::TT_ERROR_VALUE_OUT_OF_SCOPE);
 }
 
 #[test]
 fn a_program_needs_exactly_one_grid() {
     let err = Kernel::parse("version 7\n%x = const i32 1\n").expect_err("no grid");
-    assert_eq!(err, TT::status::ttStatus::TT_ERROR_GRID);
+    assert_eq!(err, ttStatus::TT_ERROR_GRID);
     let err = Kernel::parse("version 7\ngrid 1,1\ngrid 2,2\n").expect_err("two grids");
-    assert_eq!(err, TT::status::ttStatus::TT_ERROR_GRID);
+    assert_eq!(err, ttStatus::TT_ERROR_GRID);
 }
 
 #[test]
 fn an_unknown_version_is_refused_in_both_forms() {
     let err = Kernel::parse("version 1\ngrid 1,1\n").expect_err("version 1");
-    assert_eq!(err, TT::status::ttStatus::TT_ERROR_VERSION);
+    assert_eq!(err, ttStatus::TT_ERROR_VERSION);
 
     let mut bytes = Kernel::parse("version 7\ngrid 1,1\n%x = const i32 1\n")
         .unwrap()
@@ -145,12 +148,12 @@ fn an_unknown_version_is_refused_in_both_forms() {
     assert_eq!(&bytes[..4], b"TTIR");
     bytes[4] = 1;
     let err = Kernel::from_bytes(&bytes).expect_err("byte version 1");
-    assert_eq!(err, TT::status::ttStatus::TT_ERROR_VERSION);
+    assert_eq!(err, ttStatus::TT_ERROR_VERSION);
     bytes[4] = 2;
     bytes[0] = b'X';
     assert_eq!(
         Kernel::from_bytes(&bytes),
-        Err(TT::status::ttStatus::TT_ERROR_NOT_TTIR),
+        Err(ttStatus::TT_ERROR_NOT_TTIR),
         "a wrong magic"
     );
     let mut bytes = Kernel::parse("version 7\ngrid 1,1\n%x = const i32 1\n")
@@ -158,7 +161,7 @@ fn an_unknown_version_is_refused_in_both_forms() {
         .to_bytes();
     bytes.push(0);
     let err = Kernel::from_bytes(&bytes).expect_err("trailing byte");
-    assert_eq!(err, TT::status::ttStatus::TT_ERROR_TRAILING_INPUT);
+    assert_eq!(err, ttStatus::TT_ERROR_TRAILING_INPUT);
 }
 
 /// A copy kernel over a two-page buffer: the compiler derives the mover
@@ -177,14 +180,8 @@ copy_to %out from %b0 [1024]
 grid 1,1
 ";
     let k = Kernel::parse(COPY).expect("the copy kernel parses");
-    let m = TT::compile::compile(&k).expect("the copy kernel compiles");
-    assert_eq!(
-        m.params,
-        vec![
-            TT::compile::ParamKind::Tensor,
-            TT::compile::ParamKind::Tensor
-        ]
-    );
+    let m = compile::compile(&k).expect("the copy kernel compiles");
+    assert_eq!(m.params, vec![ParamKind::Tensor, ParamKind::Tensor]);
     assert!(!m.reader.is_empty(), "two inbound copies");
     assert!(!m.writer.is_empty(), "two outbound copies");
     assert!(m.cores.iter().all(Vec::is_empty), "no compute");
@@ -208,7 +205,7 @@ copy_to %out from %bo [0]
 grid 1,1
 ";
     let k = Kernel::parse(NEG).expect("the elementwise kernel parses");
-    let m = TT::compile::compile(&k).expect("the elementwise kernel compiles");
+    let m = compile::compile(&k).expect("the elementwise kernel compiles");
     assert!(!m.reader.is_empty());
     assert!(!m.writer.is_empty());
     assert!(
@@ -233,16 +230,16 @@ grid 1,1
 ";
     let k = Kernel::parse(DIRECT).expect("the direct kernel parses");
     let types = k.verify().expect("the direct form verifies");
-    let staged = TT::mover::add_movers(&k, &types).expect("the access is staged");
+    let staged = crate::mover::add_movers(&k, &types).expect("the access is staged");
     let buffers = staged
         .ops
         .iter()
-        .filter(|op| matches!(op, TT::Op::Buffer { .. }))
+        .filter(|op| matches!(op, Op::Buffer { .. }))
         .count();
     let copies = staged
         .ops
         .iter()
-        .filter(|op| matches!(op, TT::Op::CopyTo { .. }))
+        .filter(|op| matches!(op, Op::CopyTo { .. }))
         .count();
     assert_eq!(buffers, 2, "one staged buffer per direct access");
     assert_eq!(copies, 2, "one inbound and one outbound copy");
@@ -252,8 +249,8 @@ grid 1,1
             .iter()
             .filter(|op| matches!(
                 op,
-                TT::Op::Load {
-                    offset: TT::Dim::Const(0),
+                Op::Load {
+                    offset: Dim::Const(0),
                     ..
                 }
             ))
@@ -262,7 +259,7 @@ grid 1,1
         "the staged load reads its buffer at zero"
     );
     // The same program still compiles to all five programs.
-    let m = TT::compile::compile(&k).expect("the direct kernel compiles");
+    let m = compile::compile(&k).expect("the direct kernel compiles");
     assert!(!m.reader.is_empty(), "the staged inbound copy");
     assert!(!m.writer.is_empty(), "the staged outbound copy");
     assert!(
@@ -294,7 +291,7 @@ endloop
 grid 1,1
 ";
     let k = Kernel::parse(LOOP_TWO).expect("the loop kernel parses");
-    let m = TT::compile::compile(&k).expect("the loop kernel compiles");
+    let m = compile::compile(&k).expect("the loop kernel compiles");
     assert!(!m.reader.is_empty() && !m.writer.is_empty());
     assert!(m.cores.iter().all(|c| !c.is_empty()));
     // Both movers branch backwards: one body, run twice.
@@ -338,7 +335,7 @@ endloop
 grid 1,1
 ";
     let k = Kernel::parse(DYNAMIC).expect("the dynamic loop parses");
-    let m = TT::compile::compile(&k).expect("a dynamic loop is lowered");
+    let m = compile::compile(&k).expect("a dynamic loop is lowered");
     assert!(has_backward_branch(&m.reader), "the reader loops");
     assert!(has_backward_branch(&m.writer), "the writer loops");
     for (role, words) in ["t0", "t1", "t2"].into_iter().zip(&m.cores) {
@@ -372,14 +369,14 @@ grid %nx,%ny
     let k = Kernel::parse(SYMBOLIC).expect("the symbolic grid parses");
     assert_eq!(k.to_text(), SYMBOLIC, "the text form is canonical");
     assert_eq!(Kernel::from_bytes(&k.to_bytes()).unwrap(), k);
-    let m = TT::compile::compile(&k).expect("the symbolic grid compiles");
+    let m = compile::compile(&k).expect("the symbolic grid compiles");
     assert_eq!(
         m.params,
         vec![
-            TT::compile::ParamKind::Scalar,
-            TT::compile::ParamKind::Scalar,
-            TT::compile::ParamKind::Tensor,
-            TT::compile::ParamKind::Tensor
+            ParamKind::Scalar,
+            ParamKind::Scalar,
+            ParamKind::Tensor,
+            ParamKind::Tensor
         ]
     );
 }
@@ -400,17 +397,17 @@ grid 1,1
     assert_eq!(k.to_text(), SELECT, "the text form is canonical");
     assert_eq!(Kernel::from_bytes(&k.to_bytes()).unwrap(), k);
     let types = k.verify().expect("it verifies");
-    assert_eq!(types.values[2].dtype, TT::ir::DType::Bool, "cmplt is bool");
-    assert_eq!(types.values[3].dtype, TT::ir::DType::I32, "sel is i32");
+    assert_eq!(types.values[2].dtype, DType::Bool, "cmplt is bool");
+    assert_eq!(types.values[3].dtype, DType::I32, "sel is i32");
 
     // A bool condition is required, and a value with no bool is not one.
     let bad = "version 7\n%x = const i32 3\n%m = sel %x %x %x\ngrid 1,1\n";
     let err = Kernel::parse(bad).expect_err("an i32 condition is refused");
-    assert_eq!(err, TT::status::ttStatus::TT_ERROR_CONDITION_NOT_BOOL);
+    assert_eq!(err, ttStatus::TT_ERROR_CONDITION_NOT_BOOL);
 
     let err = Kernel::parse("version 7\n%x = const i32 3\n%y = relu %x\ngrid 1,1\n")
         .expect_err("relu is not an op");
-    assert_eq!(err, TT::status::ttStatus::TT_ERROR_PARSE);
+    assert_eq!(err, ttStatus::TT_ERROR_PARSE);
 }
 
 /// A bitcast is a reinterpretation, not a conversion: the bits are the value, so
@@ -433,7 +430,7 @@ grid 1,1
     let k = Kernel::parse(SAME).expect("a bitcast between 32-bit dtypes");
     assert_eq!(k.to_text(), SAME, "the text form is canonical");
     assert_eq!(Kernel::from_bytes(&k.to_bytes()).unwrap(), k);
-    let m = TT::compile::compile(&k).expect("a bitcast lowers to nothing");
+    let m = compile::compile(&k).expect("a bitcast lowers to nothing");
     assert!(
         m.cores.iter().all(|c| !c.is_empty()),
         "unpack, math and pack"
@@ -448,7 +445,7 @@ version 7
 grid 1,1
 ";
     let err = Kernel::parse(NARROW).expect_err("a narrower dtype cannot hold the bits");
-    assert_eq!(err, TT::status::ttStatus::TT_ERROR_BITCAST_WIDTH);
+    assert_eq!(err, ttStatus::TT_ERROR_BITCAST_WIDTH);
 }
 
 /// `a x b` accumulating into an `acc` over two `f32` tiles: the operands must
@@ -478,16 +475,16 @@ copy_to %out from %bo [0]
 #[test]
 fn a_matmul_compiles_to_the_matrix_unit() {
     let k = Kernel::parse(MATMUL).expect("it parses");
-    let m = TT::compile::compile(&k).unwrap_or_else(|e| panic!("it compiles: {e}"));
+    let m = compile::compile(&k).unwrap_or_else(|e| panic!("it compiles: {e}"));
     assert_eq!(m.params.len(), 3);
 }
 
 #[test]
 fn a_matmul_is_refused_for_what_the_matrix_unit_cannot_take() {
-    use TT::status::ttStatus as S;
+    use ttStatus as S;
     let case = |what: &str, text: &str, want: S| {
         let err = match Kernel::parse(text) {
-            Ok(k) => TT::compile::compile(&k).expect_err(what),
+            Ok(k) => compile::compile(&k).expect_err(what),
             Err(e) => e,
         };
         assert_eq!(err, want, "{what}");
@@ -628,7 +625,7 @@ copy_to %out from %bo [0]
 
 #[test]
 fn an_acc_is_one_32x32_tile_of_an_accumulating_dtype() {
-    use TT::status::ttStatus as S;
+    use ttStatus as S;
     let case = |what: &str, text: &str, want: S| {
         let err = Kernel::parse(text).expect_err(what);
         assert_eq!(err, want, "{what}");
@@ -736,21 +733,21 @@ fn the_reduce_forms_round_trip_through_text_and_bytes() {
 #[test]
 fn a_sum_row_compiles_to_the_matrix_unit() {
     let k = Kernel::parse(&reduce_program("sum row %m %x %s", true)).expect("it parses");
-    let m = TT::compile::compile(&k).unwrap_or_else(|e| panic!("it compiles: {e}"));
+    let m = compile::compile(&k).unwrap_or_else(|e| panic!("it compiles: {e}"));
     assert_eq!(m.params.len(), 3);
 }
 
 #[test]
 fn a_sum_col_compiles_to_the_gapool() {
     let k = Kernel::parse(&reduce_program("sum col %m %x %s", true)).expect("it parses");
-    let m = TT::compile::compile(&k).unwrap_or_else(|e| panic!("it compiles: {e}"));
+    let m = compile::compile(&k).unwrap_or_else(|e| panic!("it compiles: {e}"));
     assert_eq!(m.params.len(), 3);
 }
 
 #[test]
 fn a_max_col_compiles_to_the_gmpool() {
     let k = Kernel::parse(&reduce_program("max col %m %x", false)).expect("it parses");
-    let m = TT::compile::compile(&k).unwrap_or_else(|e| panic!("it compiles: {e}"));
+    let m = compile::compile(&k).unwrap_or_else(|e| panic!("it compiles: {e}"));
     // The compiler owns one extra page for `max`'s 1.0 `SrcB`.
     assert_eq!(m.params.len(), 2);
 }
@@ -758,16 +755,16 @@ fn a_max_col_compiles_to_the_gmpool() {
 #[test]
 fn a_max_row_compiles_to_the_gmpool_and_the_transposes() {
     let k = Kernel::parse(&reduce_program("max row %m %x", false)).expect("it parses");
-    let m = TT::compile::compile(&k).unwrap_or_else(|e| panic!("it compiles: {e}"));
+    let m = compile::compile(&k).unwrap_or_else(|e| panic!("it compiles: {e}"));
     assert_eq!(m.params.len(), 2);
 }
 
 #[test]
 fn a_reduce_is_refused_for_what_the_src_path_cannot_take() {
-    use TT::status::ttStatus as S;
+    use ttStatus as S;
     let case = |what: &str, text: &str, want: S| {
         let err = match Kernel::parse(text) {
-            Ok(k) => TT::compile::compile(&k).expect_err(what),
+            Ok(k) => compile::compile(&k).expect_err(what),
             Err(e) => e,
         };
         assert_eq!(err, want, "{what}");

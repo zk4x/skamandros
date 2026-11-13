@@ -85,6 +85,19 @@ copy_to %b0 from %in [0]
 copy_to %out from %b0 [0]
 ";
 
+/// The byte form of [`COPY`]: the shipping encoding, frozen.
+///
+/// A literal, not something this test builds: the crate is not linked here at
+/// all, so a real consumer of the `.so` can only hand it bytes it already has.
+/// A change to the encoding's version makes `ttModuleLoad` refuse this, which is
+/// the correct failure — regenerate the fixture.
+const COPY_TTIR: [u8; 112] = [
+    84, 84, 73, 82, 7, 0, 0, 0, 6, 0, 0, 0, 3, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 2, 0, 0, 0, 105,
+    110, 0, 1, 0, 0, 0, 0, 0, 4, 0, 0, 1, 3, 0, 0, 0, 111, 117, 116, 0, 1, 0, 0, 0, 0, 0, 4, 0, 0,
+    2, 2, 0, 0, 0, 98, 48, 0, 32, 0, 0, 0, 32, 0, 0, 0, 6, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 6, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
 /// Read and clear the message a failed call left behind.
 fn take_error(free: &Symbol<Free>, err: *mut c_char) -> String {
     if err.is_null() {
@@ -129,10 +142,8 @@ fn the_byte_form_compiles_through_the_c_abi() {
         unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
 
-    // The test builds the byte form with the crate; the compile is the `.so`'s.
-    let bytes = TT::ir::Kernel::parse(COPY)
-        .expect("the fixture parses")
-        .to_bytes();
+    // The fixture is the byte form of `COPY`; the compile is the `.so`'s.
+    let bytes = COPY_TTIR;
     let mut module: *mut c_void = std::ptr::null_mut();
     let mut err: *mut c_char = std::ptr::null_mut();
     let code = unsafe { load(bytes.as_ptr(), bytes.len(), &mut module, &mut err) };
