@@ -358,10 +358,6 @@ enum Fixup {
 }
 
 impl Asm {
-    pub fn new() -> Self {
-        Asm::default()
-    }
-
     /// Append one encoded word.
     pub fn word(&mut self, w: u32) -> usize {
         self.words.push(w);
@@ -475,7 +471,7 @@ mod tests {
 
     #[test]
     fn a_backward_branch_patches() {
-        let mut a = Asm::new();
+        let mut a = Asm::default();
         a.label("top");
         a.word(addi(reg::T0, reg::T0, -1));
         a.bne_label(reg::T0, reg::ZERO, "top");
@@ -487,7 +483,7 @@ mod tests {
 
     #[test]
     fn an_unknown_label_is_an_error() {
-        let mut a = Asm::new();
+        let mut a = Asm::default();
         a.bne_label(reg::T0, reg::ZERO, "nowhere");
         assert!(a.finish().is_err());
     }
@@ -516,7 +512,7 @@ mod tests {
     /// address inside the 32-entry table.
     #[test]
     fn the_four_cb_syncs_assemble() {
-        let mut a = Asm::new();
+        let mut a = Asm::default();
         cb::reserve_back(&mut a, reg::A6, 3, 1, [reg::T0, reg::T1, reg::T2]);
         cb::push_back(&mut a, reg::A6, 3, 1, [reg::T0, reg::T1, reg::T2, reg::T6]);
         cb::wait_front(&mut a, reg::A6, 3, 1, [reg::T0, reg::T1, reg::T2]);

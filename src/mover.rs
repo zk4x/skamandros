@@ -428,7 +428,7 @@ fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
     if !items.iter().any(|item| matches!(item, Item::Copy(_))) {
         return Ok(Vec::new());
     }
-    let mut a = Asm::new();
+    let mut a = Asm::default();
     prologue(&mut a, if inbound { Niu::Noc0 } else { Niu::Noc1 });
     // The sync scratch leaves `t3` (this tile's high word), `t5` (the NOC
     // initiator) and `a6` (the interface) alone.

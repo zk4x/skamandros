@@ -66,7 +66,7 @@ impl Stream {
 
     /// Append an assembled RISC-V sequence.
     fn asm(&mut self, build: impl FnOnce(&mut Asm)) -> Result<(), Error> {
-        let mut a = Asm::new();
+        let mut a = Asm::default();
         build(&mut a);
         for word in a.finish().map_err(|_| Error::TT_ERROR_MOVER_PROGRAM)? {
             self.rv(word);
@@ -1272,14 +1272,14 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
             dst_row,
         } => {
             out.push(
-                encode::movd2_b(
-                    u32::from(use_dst32b_lo),
-                    src_row,
-                    addr_mod,
-                    u32::from(move4_rows),
-                    dst_row + row_delta,
-                )
-                .map_err(bad_isa)?,
+                encode::Movd2B::ZERO
+                    .use_dst32b_lo(u32::from(use_dst32b_lo))
+                    .src_row(src_row)
+                    .addr_mod(addr_mod)
+                    .move4_rows(u32::from(move4_rows))
+                    .dst_row(dst_row + row_delta)
+                    .encode()
+                    .map_err(bad_isa)?,
             );
         }
         MirOp::Movb2d {
