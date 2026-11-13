@@ -350,9 +350,20 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   implied `TF32` has no 16-bit half to move), and the pack's mask keeps column
   0 of every row. A `1,1` accumulator is refused with `TT_TODO_REDUCE` until
   the scalar transposes land.
-- Broadcast, `eq`/`noteq`, the remaining unary and binary ops, and the `bool`
-  datapath in a parameter or buffer are accepted by the format and verifier and
-  refused loudly by lowering, not guessed at.
+- Broadcast is the FPU's: `add`/`sub`/`mul` of a tile with its row (`1,32`),
+  column (`32,1`) or scalar (`1,1`) operand is `ELWADD`/`ELWSUB`/`ELWMUL` with
+  the tile in `SrcA` and the narrow value in `SrcB`, whose row 0 or column 0 the
+  hardware broadcasts. Both operands come from L1 pages — a `load`'s, or the
+  page the compiler stages a computed value or an `acc` into — and a narrow
+  operand's page is read as its own part: faces 0/1 row 0 for a row, faces 0/2
+  column 0 for a column. A narrow value that reaches the SFPU (a `1,32`/`32,1`
+  value read as a datapath value) is `TT_TODO_ACCESS_SHAPE`.
+- Any buffer may be both written and read by any role: a `store` packs a page
+  the unpacker may `load` back (any role may drive either end of a ring), and
+  the page handshake is what keeps it honest.
+- `eq`/`noteq`, the remaining unary and binary ops, and the `bool` datapath in
+  a parameter or buffer are accepted by the format and verifier and refused
+  loudly by lowering, not guessed at.
 - bf16 is a real L1 format and the native compute path. A bf16 buffer is two
   bytes per datum, and the `Dst` width is one mode for the whole module, as
   tt-metal's `DST_ACCUM_MODE` (`fp32_dest_acc_en`) is: if every value that

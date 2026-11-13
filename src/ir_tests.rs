@@ -975,12 +975,11 @@ fn a_reduce_is_refused_for_what_the_src_path_cannot_take() {
         assert_eq!(err, want, "{what}");
     };
 
-    // An operand the datapath computed has no page to unpack into `Src`.
-    case(
-        "a negated operand",
-        &reduce_program("32,1", "%n = neg %x\nsum %m %n %s", true),
-        S::TT_ERROR_REDUCE_OPERAND,
-    );
+    // An operand the datapath computed has no page of its own, so the compiler
+    // stages it: the fold reads a page the compiler owns.
+    let k = Kernel::parse(&reduce_program("32,1", "%n = neg %x\nsum %m %n %s", true))
+        .expect("a negated operand parses");
+    compile::compile(&k).expect("a negated operand is staged");
     // The destination is not an accumulator.
     case(
         "a buffer where the accumulator goes",

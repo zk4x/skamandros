@@ -145,10 +145,7 @@ pub fn place(k: &Kernel, types: &Types) -> Result<Plan, Error> {
         }
     }
     for op in &k.ops {
-        let Op::Matmul { a, b, .. } = *op else {
-            continue;
-        };
-        for operand in [a, b] {
+        for operand in page_operands(types, op) {
             // A bitcast has no page of its own: the value it renames does.
             let value = owner(k, &def, operand);
             if staged[value as usize].is_some() || is_load(k, &def, value) {
@@ -195,6 +192,22 @@ pub fn place(k: &Kernel, types: &Types) -> Result<Plan, Error> {
         ones,
         staged,
     })
+}
+
+/// The values one op reads from an L1 page because its `Src` banks are filled
+/// by the unpacker: a `matmul`'s two operands, a reduce's operand and scaler,
+/// and the two operands of an FPU broadcast. A `load` has a page already (its
+/// buffer's); anything else is staged into one the compiler owns.
+fn page_operands(types: &Types, op: &Op) -> Vec<crate::ir::ValueId> {
+    if let Some((tile, narrow)) = crate::ir::broadcast_pair(types, op) {
+        return vec![tile, narrow];
+    }
+    match *op {
+        Op::Matmul { a, b, .. } => vec![a, b],
+        Op::Sum { x, scaler, .. } => vec![x, scaler],
+        Op::Max { x, .. } => vec![x],
+        _ => Vec::new(),
+    }
 }
 
 /// The value a bitcast chain ends at: a bitcast has no home of its own.

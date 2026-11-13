@@ -34,7 +34,6 @@ pub fn compile(k: &Kernel) -> Result<Module, Error> {
     let k = mover::add_movers(k, &types)?;
     let k = &k;
     let types = k.verify()?;
-    mover::check_roles(k, &types)?;
     let plan = place(k, &types)?;
     let alloc = allocate(k, &types)?;
     let mut machine = lower(k, &types, &plan, &alloc)?;

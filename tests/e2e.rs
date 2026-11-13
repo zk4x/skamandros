@@ -2848,6 +2848,353 @@ fn max_row_runs_on_the_simulator() {
     }
 }
 
+/// A buffer the datapath writes and then reads: `store` packs a page, `load`
+/// unpacks the same page. Any role may drive either end of a buffer.
+const ROUND_TRIP: &str = "\
+version 9
+grid 1,1
+%px = param f32 1024
+%out = param f32 1024
+%bx = buffer f32 32,32
+%bt = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %bx [0] = %px [0]
+load 32,32 %x = %bx [0]
+%n = neg %x
+store 32,32 %bt [0] = %n
+load 32,32 %y = %bt [0]
+%z = neg %y
+store 32,32 %bo [0] = %z
+copy 32,32 %out [0] = %bo [0]
+";
+
+/// The packer writes and the unpacker reads the same L1 buffer: `%bt`'s page is
+/// published by `store` and consumed by `load`, so the value comes back as it
+/// went in.
+#[test]
+fn a_buffer_a_store_wrote_a_load_reads() {
+    let x: Vec<f32> = (0..1024).map(|i| (i % 9) as f32 - 4.0).collect();
+    let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_tensors(ROUND_TRIP, &[&x_bytes], 4096);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for i in 0..1024 {
+        let (row, column) = tile_rc(i);
+        assert_eq!(
+            got[i], x[i],
+            "round trip, datum {i} at ({row}, {column}): got {}, want {}",
+            got[i], x[i]
+        );
+    }
+}
+
+/// `x + row`: the tile is `SrcA`, the narrow value is `SrcB`, and the FPU's
+/// row broadcast reads `SrcB`'s first face row. The narrow value's page is
+/// laid out as a `1,32`: row 0 of faces 0 and 1.
+const BROADCAST_ROW_ADD: &str = "\
+version 9
+grid 1,1
+%px = param f32 1024
+%pm = param f32 1024
+%out = param f32 1024
+%bx = buffer f32 32,32
+%bm = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %bx [0] = %px [0]
+copy 32,32 %bm [0] = %pm [0]
+load 32,32 %x = %bx [0]
+load 1,32 %m = %bm [0]
+%y = add %x %m
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
+";
+
+/// `x * row`, the same shape pair and the multiply's own instruction.
+const BROADCAST_ROW_MUL: &str = "\
+version 9
+grid 1,1
+%px = param f32 1024
+%pm = param f32 1024
+%out = param f32 1024
+%bx = buffer f32 32,32
+%bm = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %bx [0] = %px [0]
+copy 32,32 %bm [0] = %pm [0]
+load 32,32 %x = %bx [0]
+load 1,32 %m = %bm [0]
+%y = mul %x %m
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
+";
+
+/// `x - column`: a `32,1` value is column 0 of faces 0 and 2, and the column
+/// broadcast reads `SrcB`'s column 0. The subtraction has the tile on the left,
+/// which is the order the instruction takes.
+const BROADCAST_COL_SUB: &str = "\
+version 9
+grid 1,1
+%px = param f32 1024
+%pm = param f32 1024
+%out = param f32 1024
+%bx = buffer f32 32,32
+%bm = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %bx [0] = %px [0]
+copy 32,32 %bm [0] = %pm [0]
+load 32,32 %x = %bx [0]
+load 32,1 %m = %bm [0]
+%y = sub %x %m
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
+";
+
+/// `x * column`, the same shape pair and the multiply's own instruction.
+const BROADCAST_COL_MUL: &str = "\
+version 9
+grid 1,1
+%px = param f32 1024
+%pm = param f32 1024
+%out = param f32 1024
+%bx = buffer f32 32,32
+%bm = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %bx [0] = %px [0]
+copy 32,32 %bm [0] = %pm [0]
+load 32,32 %x = %bx [0]
+load 32,1 %m = %bm [0]
+%y = mul %x %m
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
+";
+
+/// `neg x * row`: `SrcA` is a value the datapath computed, so the compiler
+/// stages it into a page the FPU reads, while `SrcB` is the load's own page.
+const BROADCAST_STAGED_A: &str = "\
+version 9
+grid 1,1
+%px = param f32 1024
+%pm = param f32 1024
+%out = param f32 1024
+%bx = buffer f32 32,32
+%bm = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %bx [0] = %px [0]
+copy 32,32 %bm [0] = %pm [0]
+load 32,32 %x = %bx [0]
+load 1,32 %m = %bm [0]
+%n = neg %x
+%y = mul %n %m
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
+";
+
+/// A row and a column broadcast: `ELWADD`/`ELWMUL` with `SrcB`'s row 0, and
+/// `ELWSUB` with its column 0. Every datum is an integer, exact in TF32 and in
+/// the FPU's 32-bit `Dst`, so each result compares equal to the host's.
+#[test]
+fn a_broadcast_reads_its_narrow_page() {
+    let x: Vec<f32> = (0..1024)
+        .map(|i| {
+            let (row, column) = tile_rc(i);
+            ((row as i32 * 3 + column as i32 * 5) % 7) as f32 - 3.0
+        })
+        .collect();
+    let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+    // The narrow page: a full 32x32 tile whose relevant part carries the
+    // value, which is what a `1,32`/`32,1` load names.
+    let row_tile: Vec<f32> = (0..1024)
+        .map(|i| {
+            let (row, column) = tile_rc(i);
+            if row == 0 {
+                (column % 5) as f32 - 2.0
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let col_tile: Vec<f32> = (0..1024)
+        .map(|i| {
+            let (row, column) = tile_rc(i);
+            if column == 0 {
+                (row % 5) as f32 - 2.0
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let row_bytes: Vec<u8> = row_tile.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let col_bytes: Vec<u8> = col_tile.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    for (program, narrow, narrow_bytes, what, staged) in [
+        (
+            BROADCAST_ROW_ADD,
+            row_tile.clone(),
+            row_bytes.as_slice(),
+            "row add",
+            false,
+        ),
+        (
+            BROADCAST_ROW_MUL,
+            row_tile.clone(),
+            row_bytes.as_slice(),
+            "row mul",
+            false,
+        ),
+        (
+            BROADCAST_COL_SUB,
+            col_tile.clone(),
+            col_bytes.as_slice(),
+            "column sub",
+            false,
+        ),
+        (
+            BROADCAST_COL_MUL,
+            col_tile.clone(),
+            col_bytes.as_slice(),
+            "column mul",
+            false,
+        ),
+        (
+            BROADCAST_STAGED_A,
+            row_tile.clone(),
+            row_bytes.as_slice(),
+            "row mul",
+            true,
+        ),
+    ] {
+        let out = run_kernel_tensors(program, &[&x_bytes, narrow_bytes], 4096);
+        let got: Vec<f32> = out
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        for i in 0..1024 {
+            let (row, column) = tile_rc(i);
+            let v = if what.starts_with("column") {
+                narrow[tile_index(row, 0)]
+            } else {
+                narrow[tile_index(0, column)]
+            };
+            let a = if staged { -x[i] } else { x[i] };
+            let want = match what {
+                "row add" => a + v,
+                "row mul" | "column mul" => a * v,
+                _ => a - v,
+            };
+            let label = if staged { "staged A" } else { what };
+            assert_eq!(
+                got[i], want,
+                "{what} ({label}), datum {i} at ({row}, {column}): got {}, want {want}",
+                got[i]
+            );
+        }
+    }
+}
+
+/// Softmax down a tile's rows: `max` folds each column into row 0, the
+/// subtraction broadcasts that row back, `exp2(x · log2 e)` is `exp`, `sum`
+/// folds the exponentials, and the reciprocal goes through L1: the accumulator's
+/// page is loaded as a tile, the tile's reciprocal is stored, and its row is the
+/// broadcast operand of the final multiply.
+const SOFTMAX_COL: &str = "\
+version 9
+grid 1,1
+%px = param f32 1024
+%ps = param f32 1024
+%out = param f32 1024
+%bx = buffer f32 32,32
+%bs = buffer f32 32,32
+%bsum = buffer f32 32,32
+%binv = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %bx [0] = %px [0]
+copy 32,32 %bs [0] = %ps [0]
+%m = acc f32 1,32
+%low = const f32 -1000
+store 32,32 %m = %low
+load 32,32 %x = %bx [0]
+max %m %x
+%d = sub %x %m
+%k = const f32 1.442695
+%p = mul %d %k
+%e = exp2 %p
+%s = acc f32 1,32
+%zero = const f32 0
+store 32,32 %s = %zero
+load 32,32 %ones = %bs [0]
+sum %s %e %ones
+store 32,32 %bsum [0] = %s
+load 32,32 %st = %bsum [0]
+%inv = div %ones %st
+store 32,32 %binv [0] = %inv
+load 1,32 %ri = %binv [0]
+%y = mul %e %ri
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
+";
+
+/// The whole softmax kernel on one tile: every datum against the host's
+/// `exp(x - max) / sum(exp(x - max))` down each column, and every column sums to
+/// one. The arithmetic is the hardware's — TF32 into the FPU, the SFPU's exp2
+/// body and reciprocal, the Matrix Unit's fold — so the comparison is a
+/// tolerance, not an equality.
+#[test]
+fn softmax_runs_on_the_simulator() {
+    let x: Vec<f32> = (0..1024)
+        .map(|i| {
+            let (row, column) = tile_rc(i);
+            ((row as i32 * 7 + column as i32 * 3) % 11) as f32 / 4.0 - 1.25
+        })
+        .collect();
+    let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+    // The sum's scaler: 1.0 in row 0 of each face, the column fold's fill.
+    let mut scaler = vec![0.0f32; 1024];
+    for column in 0..32 {
+        scaler[tile_index(0, column)] = 1.0;
+        scaler[tile_index(16, column)] = 1.0;
+    }
+    let s_bytes: Vec<u8> = scaler.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    // The host reference, column by column.
+    let mut want = vec![0.0f32; 1024];
+    for column in 0..32 {
+        let hi = (0..32)
+            .map(|row| x[tile_index(row, column)])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = (0..32)
+            .map(|row| (x[tile_index(row, column)] - hi).exp())
+            .collect();
+        let sum: f32 = exps.iter().sum();
+        for row in 0..32 {
+            want[tile_index(row, column)] = exps[row] / sum;
+        }
+    }
+
+    let out = run_kernel_tensors(SOFTMAX_COL, &[&x_bytes, &s_bytes], 4096);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for i in 0..1024 {
+        let (row, column) = tile_rc(i);
+        assert!(
+            (got[i] - want[i]).abs() <= 2e-3,
+            "softmax, datum {i} at ({row}, {column}): got {}, want {}",
+            got[i],
+            want[i]
+        );
+    }
+    for column in 0..32 {
+        let sum: f32 = (0..32).map(|row| got[tile_index(row, column)]).sum();
+        assert!(
+            (sum - 1.0).abs() <= 1e-2,
+            "column {column} sums to {sum}, not one"
+        );
+    }
+}
+
 /// Two products into one accumulator: `matmul` adds into the tile it names, so
 /// the second one does not clear what the first wrote. No loop — the only thing
 /// exercised is that `acc` holds its value from one `matmul` to the next.

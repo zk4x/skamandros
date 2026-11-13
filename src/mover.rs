@@ -224,60 +224,6 @@ pub fn add_movers(k: &Kernel, types: &Types) -> Result<Kernel, Error> {
     Ok(out)
 }
 
-/// `tt_add_movers`'s invariant: a circular buffer has one producer and one
-/// consumer. The reader publishes and the unpacker consumes an input buffer; the
-/// packer publishes and the writer consumes an output buffer. A buffer used in
-/// both directions would share one counter pair and one page ring, which the
-/// hardware's CB cannot do, so it is refused rather than guessed at.
-pub fn check_roles(k: &Kernel, types: &Types) -> Result<(), Error> {
-    use crate::ir::ValueKind;
-    let mut producer: Vec<Option<&str>> = vec![None; types.values.len()];
-    let mut consumer: Vec<Option<&str>> = vec![None; types.values.len()];
-    for (at, op) in k.ops.iter().enumerate() {
-        let (buffer, role, publishes) = match *op {
-            Op::CopyTo { dst, src, .. } => match (types.of(dst).kind, types.of(src).kind) {
-                (ValueKind::Buffer, ValueKind::Param) => (dst, "the reader", true),
-                (ValueKind::Param, ValueKind::Buffer) => (src, "the writer", false),
-                _ => continue,
-            },
-            Op::Load { buffer, .. } => (buffer, "the unpacker", false),
-            Op::StoreTo { buffer, .. } => (buffer, "the packer", true),
-            _ => continue,
-        };
-        let slot = if publishes {
-            &mut producer
-        } else {
-            &mut consumer
-        };
-        match slot[buffer as usize] {
-            None => slot[buffer as usize] = Some(role),
-            Some(previous) if previous == role => {}
-            Some(previous) => {
-                let _ = (at, previous, role, publishes);
-                return Err(Error::TT_TODO_MULTI_PRODUCER_OR_CONSUMER);
-            }
-        }
-    }
-    for (value, info) in types.values.iter().enumerate() {
-        if info.kind != ValueKind::Buffer {
-            continue;
-        }
-        let pair = (producer[value], consumer[value]);
-        match pair {
-            (Some("the reader"), Some("the unpacker"))
-            | (Some("the packer"), Some("the writer"))
-            // A pure transfer (DRAM to DRAM through one page) has no compute:
-            // the reader publishes and the writer drains the same buffer.
-            | (Some("the reader"), Some("the writer")) => {}
-            _ => {
-                let _ = (value, pair);
-                return Err(Error::TT_TODO_CIRCULAR_BUFFER_ROLE);
-            }
-        }
-    }
-    Ok(())
-}
-
 /// The staged buffer's shape for a direct parameter access. A tensor parameter
 /// is a tile; a scalar one would need the 64-byte span read, which the movers do
 /// not do yet.

@@ -250,6 +250,9 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                 }
                 | MirOp::Gmpool {
                     dst_row, addr_mod, ..
+                }
+                | MirOp::Elw {
+                    dst_row, addr_mod, ..
                 } => {
                     if dst_row >= u32::from(DST_SLOTS) * DST_ROWS {
                         let _ = (name, at, dst_row);

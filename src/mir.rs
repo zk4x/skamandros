@@ -43,6 +43,26 @@ pub enum SfpOp {
     Setexp,
 }
 
+/// The FPU's elementwise binary set: `ELWADD`, `ELWSUB`, `ELWMUL`. The operand
+/// order is `SrcA op SrcB`, and the result overwrites the `Dst` rows it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElwOp {
+    Add,
+    Sub,
+    Mul,
+}
+
+/// Which part of `SrcB` the FPU broadcasts to every row of `SrcA`'s face:
+/// nothing (the whole face), its row 0, its column 0, or one datum. These are
+/// tt-metal's `BroadcastType` and the instruction's two `BroadcastSrcB` bits
+/// (`p_elwise::SRCB_BCAST_*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bcast {
+    Row,
+    Col,
+    Scalar,
+}
+
 /// A comparison a [`MirOp::Compare`] performs; the result is `-1` for true
 /// and `0` for false, lanewise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +181,16 @@ pub enum MirOp {
         addr_mod: u32,
         flip_a: bool,
         flip_b: bool,
+    },
+    /// `ELWADD`/`ELWSUB`/`ELWMUL`: `SrcA op SrcB` over eight `Dst` rows, which
+    /// is one half-face for a 32x32 tile. `addr_mod` steps the operands for the
+    /// next instruction, `bcast` picks which part of `SrcB` the FPU broadcasts,
+    /// and `dst_row` is the first row the result overwrites.
+    Elw {
+        op: ElwOp,
+        bcast: Bcast,
+        addr_mod: u32,
+        dst_row: u32,
     },
     /// `GAPOOL`: the Matrix Unit folds one 16x16 face over its rows into the
     /// destination row, `SrcB`'s row being the weight — tt-metal's `SUM` with

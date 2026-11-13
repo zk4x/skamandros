@@ -1089,7 +1089,7 @@ impl Kernel {
                 }
                 Op::Cast { src, dtype, .. } => {
                     let s = *lookup(&values, &visible, src, at)?;
-                    if !is_value(s.kind) {
+                    if !is_datapath_operand(s) {
                         let _ = src;
                         return Err(Error::TT_ERROR_CAST_SOURCE);
                     }
@@ -1104,7 +1104,7 @@ impl Kernel {
                 }
                 Op::Bitcast { src, dtype, .. } => {
                     let s = *lookup(&values, &visible, src, at)?;
-                    if !is_value(s.kind) {
+                    if !is_datapath_operand(s) {
                         let _ = src;
                         return Err(Error::TT_ERROR_CAST_SOURCE);
                     }
@@ -1122,7 +1122,7 @@ impl Kernel {
                 }
                 Op::Unary { op, a, .. } => {
                     let x = *lookup(&values, &visible, a, at)?;
-                    if !is_index_operand(x) {
+                    if !is_datapath_operand(x) {
                         let _ = a;
                         return Err(Error::TT_ERROR_UNARY_OPERAND);
                     }
@@ -1158,7 +1158,7 @@ impl Kernel {
                 Op::Binary { op, a, b, .. } => {
                     let x = *lookup(&values, &visible, a, at)?;
                     let y = *lookup(&values, &visible, b, at)?;
-                    if !is_index_operand(x) || !is_index_operand(y) {
+                    if !is_datapath_operand(x) || !is_datapath_operand(y) {
                         let _ = (a, b);
                         return Err(Error::TT_ERROR_BINARY_OPERANDS);
                     }
@@ -1202,7 +1202,8 @@ impl Kernel {
                     let c = *lookup(&values, &visible, cond, at)?;
                     let t = *lookup(&values, &visible, if_true, at)?;
                     let f = *lookup(&values, &visible, if_false, at)?;
-                    if !is_value(c.kind) || !is_value(t.kind) || !is_value(f.kind) {
+                    if !is_datapath_operand(c) || !is_datapath_operand(t) || !is_datapath_operand(f)
+                    {
                         let _ = (cond, if_true, if_false);
                         return Err(Error::TT_ERROR_SELECT_OPERANDS);
                     }
@@ -1278,13 +1279,13 @@ impl Kernel {
                         let _ = (at, acc, c.shape);
                         return Err(Error::TT_ERROR_REDUCE_ACC_SHAPE);
                     }
-                    // The folding happens on the Src path, from an L1 page:
-                    // both operands must be `load`s, as a `matmul`'s are.
-                    let loaded = |value: ValueId| -> bool {
-                        matches!(self.ops.get(def[value as usize]), Some(Op::Load { .. }))
-                    };
+                    // The folding happens on the `Src` path, from an L1 page: a
+                    // `load` already has one, and a value the datapath computed
+                    // is staged into a page the compiler owns, exactly as a
+                    // `matmul`'s operand is. A tensor parameter is L1 but not a
+                    // page, so it is still refused.
                     let v = *lookup(&values, &visible, x, at)?;
-                    if !is_value(v.kind) || v.shape != RegShape::Tile || !loaded(x) {
+                    if !is_datapath_operand(v) || v.shape != RegShape::Tile {
                         let _ = (at, x);
                         return Err(Error::TT_ERROR_REDUCE_OPERAND);
                     }
@@ -1297,7 +1298,7 @@ impl Kernel {
                     }
                     if let Some(scaler) = scaler {
                         let s = *lookup(&values, &visible, scaler, at)?;
-                        if !is_value(s.kind) || s.shape != RegShape::Tile || !loaded(scaler) {
+                        if !is_datapath_operand(s) || s.shape != RegShape::Tile {
                             let _ = (at, scaler);
                             return Err(Error::TT_ERROR_REDUCE_OPERAND);
                         }
@@ -1349,13 +1350,41 @@ fn is_value(kind: ValueKind) -> bool {
     )
 }
 
-/// Can this value be an operand of index arithmetic? A register value, a
-/// literal, an induction value or a grid coordinate; a scalar parameter is
-/// index arithmetic too, while a tensor parameter is L1 and must be `load`ed.
-fn is_index_operand(info: ValueInfo) -> bool {
+/// Can this value be an operand of a datapath op? A register value, a literal,
+/// an induction value or a grid coordinate — or an accumulator: the recorded
+/// acc rule lets an SFPU op read one in place, and for an FPU op the compiler
+/// stages it into a page (an FPU op never reads `Dst`). An acc is not index
+/// arithmetic: an offset is checked by [`check_index`], which takes a scalar
+/// `i32`.
+fn is_datapath_operand(info: ValueInfo) -> bool {
     is_value(info.kind)
         || info.kind == ValueKind::GridCoord
+        || info.kind == ValueKind::Acc
         || (info.kind == ValueKind::Param && info.shape == RegShape::Scalar)
+}
+
+/// The two operands of an FPU broadcast, as `(tile, narrow)`, if this op is
+/// one: `add`/`sub`/`mul` over an `f32`/`bf16` tile and its row, column or
+/// scalar. The FPU reads both from `Src`, so each operand's page is what the
+/// op needs — that is why [`crate::planner`] stages a computed one and why a
+/// `load` that only feeds a broadcast never enters `Dst`.
+pub(crate) fn broadcast_pair(types: &Types, op: &Op) -> Option<(ValueId, ValueId)> {
+    let Op::Binary { op, a, b, .. } = *op else {
+        return None;
+    };
+    if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+        return None;
+    }
+    let (x, y) = (types.of(a), types.of(b));
+    if !matches!(x.dtype, DType::F32 | DType::Bf16) || !matches!(y.dtype, DType::F32 | DType::Bf16)
+    {
+        return None;
+    }
+    match (x.shape, y.shape) {
+        (RegShape::Tile, RegShape::Row | RegShape::Column | RegShape::Scalar) => Some((a, b)),
+        (RegShape::Row | RegShape::Column | RegShape::Scalar, RegShape::Tile) => Some((b, a)),
+        _ => None,
+    }
 }
 
 fn kind_name(kind: ValueKind) -> &'static str {

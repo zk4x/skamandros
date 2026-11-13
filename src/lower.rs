@@ -19,7 +19,7 @@ use crate::alloc::Alloc;
 use crate::ir::{
     BinOp, DType, Dim, Error, Kernel, Op, RegShape, Types, UnOp, access_shape, unit_of,
 };
-use crate::mir::{CmpOp, IOp, Machine, MirOp, PackMask, SfpOp};
+use crate::mir::{Bcast, CmpOp, ElwOp, IOp, Machine, MirOp, PackMask, SfpOp};
 use crate::planner::Plan;
 use crate::riscv::reg;
 use tt_isa::cfg::generated::thread;
@@ -110,9 +110,18 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             alias[value as usize] = Some(resolve(&alias, src));
         }
     }
-    // The edge mask a pack of each accumulator carries: a reduce's result keeps
-    // only its folded positions, everything else leaves as zeros.
-    let mut acc_mask: Vec<PackMask> = vec![PackMask::None; types.values.len()];
+    // The edge mask a pack of each value carries follows the value's shape: a
+    // reduce's result keeps only its folded positions, and every value with the
+    // same narrow shape keeps the same part — a `1,32` row 0, a `32,1` column 0.
+    let mut acc_mask: Vec<PackMask> = types
+        .values
+        .iter()
+        .map(|v| match v.shape {
+            RegShape::Row => PackMask::Col,
+            RegShape::Column => PackMask::Row,
+            _ => PackMask::None,
+        })
+        .collect();
     // Who reads each value, and where it last does: a `matmul` reads its
     // operands' CB pages straight into `SrcA`/`SrcB`, so a page stays reserved
     // until the last of its readers, and only then is popped.
@@ -132,6 +141,13 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 continue;
             }
             other_use[v as usize] = true;
+            if let Some((tile, narrow)) = crate::ir::broadcast_pair(types, op)
+                && (v == tile || v == narrow)
+            {
+                // The FPU's broadcast reads both operands from `Src` pages.
+                matmul_use[v as usize] = true;
+                continue;
+            }
             match *op {
                 Op::Matmul { a, b, .. } if v == a || v == b => matmul_use[v as usize] = true,
                 // A reduce's operands are Src operands too: the fold runs on
@@ -226,9 +242,17 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     return Err(Error::TT_ERROR_NOT_A_BUFFER);
                 };
                 let unit_shape = access_shape(access)?;
-                // Only a tile (one whole page) is lowered today; a row, a
-                // column or a datum needs the narrowed unpack.
-                if unit_shape != RegShape::Tile {
+                let row = dst_row(alloc, resolve(&alias, value));
+                // A value only an `Src` reader consumes never enters `Dst`: the
+                // unpack goes straight into `SrcA`/`SrcB` at the op that reads
+                // it, and this load only reserves the page.
+                let lands_in_dst = non_matmul_use[value as usize] || !matmul_use[value as usize];
+                // Only a tile (one whole page) is lowered into the datapath
+                // today; a row, a column or a datum needs the narrowed unpack,
+                // which is not written. A narrow access that only an `Src`
+                // reader consumes needs no unpack at all: that op reads the
+                // page's own layout.
+                if unit_shape != RegShape::Tile && lands_in_dst {
                     let _ = (at, access);
                     return Err(Error::TT_TODO_ACCESS_SHAPE);
                 }
@@ -237,11 +261,6 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     let _ = buffer;
                     Error::TT_ERROR_BUFFER_NOT_PLACED
                 })?;
-                let row = dst_row(alloc, resolve(&alias, value));
-                // A value only a `matmul` reads never enters `Dst`: the unpack
-                // goes straight into `SrcA`/`SrcB` at the matmul, and this load
-                // only reserves the page.
-                let lands_in_dst = non_matmul_use[value as usize] || !matmul_use[value as usize];
                 if lands_in_dst {
                     // A bf16 page can only be unpacked into a bf16 `Dst`
                     // (`BF16 -> BF16` is the unpacker's only Dst-path conversion
@@ -397,7 +416,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             Op::Cast { value, src, dtype } => {
                 let from = types.of(src).dtype;
                 let shape = types.of(src).shape;
-                let rows = rows_of(shape, at)?;
+                let rows = sfp_rows(shape, at)?;
                 let s = dst_row(alloc, resolve(&alias, src));
                 let out = dst_row(alloc, resolve(&alias, value));
                 let (la, ld) = alloc.lreg[resolve(&alias, value) as usize];
@@ -413,7 +432,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         dtype
                     }
                 };
-                for row in (0..rows).step_by(2) {
+                for row in rows {
                     m.t1.push(MirOp::Sfpload {
                         lreg: la,
                         row: s + row,
@@ -436,7 +455,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             Op::Bitcast { .. } => {}
             Op::Unary { value, op, a } => {
                 let shape = types.of(a).shape;
-                let rows = rows_of(shape, at)?;
+                let rows = sfp_rows(shape, at)?;
                 let src = dst_row(alloc, resolve(&alias, a));
                 let out = dst_row(alloc, resolve(&alias, value));
                 let (la, ld) = alloc.lreg[resolve(&alias, value) as usize];
@@ -445,11 +464,11 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 // exponent assembly is `SFPEXEXP`/`SFPSETEXP`, so it is a body
                 // here rather than a line in `src/unfold.rs`.
                 if op == UnOp::Exp2 {
-                    exp2_body(&mut m.t1, src, out, rows, la, dtype);
+                    exp2_body(&mut m.t1, src, out, &rows, la, dtype);
                     continue;
                 }
                 let sfp = unary(op, at)?;
-                for row in (0..rows).step_by(2) {
+                for row in rows {
                     m.t1.push(MirOp::Sfpload {
                         lreg: la,
                         row: src + row,
@@ -492,8 +511,45 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         let _ = (left.dtype, right.dtype);
                         return Err(Error::TT_TODO_BROADCAST_SFPU);
                     }
-                    let _ = (left.shape, right.shape);
-                    return Err(Error::TT_TODO_BROADCAST);
+                    // The FPU's `ELWADD`/`ELWSUB`/`ELWMUL` broadcast `SrcB`:
+                    // one operand is the tile, the other its row, column or
+                    // scalar. Both come from pages, so each is a `load`'s page
+                    // or the compiler's staged one.
+                    if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+                        let _ = (op, left.shape, right.shape);
+                        return Err(Error::TT_TODO_BROADCAST);
+                    }
+                    let (tile, narrow) = match (left.shape, right.shape) {
+                        (RegShape::Tile, _) => (a, b),
+                        (_, RegShape::Tile) => (b, a),
+                        _ => {
+                            let _ = (left.shape, right.shape);
+                            return Err(Error::TT_TODO_BROADCAST);
+                        }
+                    };
+                    // The instruction is `SrcA op SrcB` and the tile is the
+                    // one that can be `SrcA`, so a difference with the narrow
+                    // value on the left has no lowering.
+                    if op == BinOp::Sub && tile != a {
+                        let _ = (a, b);
+                        return Err(Error::TT_TODO_BROADCAST);
+                    }
+                    let bcast = match types.of(narrow).shape {
+                        RegShape::Row => Bcast::Row,
+                        RegShape::Column => Bcast::Col,
+                        RegShape::Scalar => Bcast::Scalar,
+                        RegShape::Tile => unreachable!("the tile is the other operand"),
+                    };
+                    fpu_broadcast(
+                        &mut m, k, types, plan, alloc, &def, &alias, &acc_mask, value, op, tile,
+                        narrow, bcast, at,
+                    )?;
+                    // A page whose last reader this broadcast was is released
+                    // here; `continue` skips the common block below.
+                    for cb in std::mem::take(&mut pop_here[at]) {
+                        m.t0.push(MirOp::CbPop { cb });
+                    }
+                    continue;
                 }
                 let shape = if left.shape == RegShape::Scalar {
                     right.shape
@@ -541,7 +597,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         return Err(Error::TT_TODO_BINARY_DTYPE);
                     }
                 };
-                let rows = rows_of(shape, at)?;
+                let rows = sfp_rows(shape, at)?;
                 let out = dst_row(alloc, resolve(&alias, value));
                 let (la, ld) = alloc.lreg[resolve(&alias, value) as usize];
                 let lb = 2u8;
@@ -569,7 +625,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 {
                     m.t1.push(MirOp::LaneConst { lreg: lb, bits });
                 }
-                for row in (0..rows).step_by(2) {
+                for row in rows {
                     if ca.is_none() {
                         m.t1.push(MirOp::Sfpload {
                             lreg: la,
@@ -673,7 +729,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 if_false,
             } => {
                 let shape = types.of(if_true).shape;
-                let rows = rows_of(shape, at)?;
+                let rows = sfp_rows(shape, at)?;
                 let sc = dst_row(alloc, resolve(&alias, cond));
                 let st = dst_row(alloc, resolve(&alias, if_true));
                 let sf = dst_row(alloc, resolve(&alias, if_false));
@@ -686,7 +742,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     let _ = at;
                     return Err(Error::TT_ERROR_CONDITION_NOT_BOOL);
                 }
-                for row in (0..rows).step_by(2) {
+                for row in rows {
                     m.t1.push(MirOp::Sfpload {
                         lreg: lc,
                         row: sc + row,
@@ -737,8 +793,10 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     let _ = at;
                     return Err(Error::TT_ERROR_MATMUL_ACCUM_WIDE);
                 }
-                let (cb_a, stage_a) = matmul_page(k, plan, &def, &alias, a, at)?;
-                let (cb_b, stage_b) = matmul_page(k, plan, &def, &alias, b, at)?;
+                let (cb_a, stage_a) =
+                    fpu_page(k, plan, &def, &alias, a, at, Error::TT_ERROR_MATMUL_OPERAND)?;
+                let (cb_b, stage_b) =
+                    fpu_page(k, plan, &def, &alias, b, at, Error::TT_ERROR_MATMUL_OPERAND)?;
                 // A computed operand has no page: the compiler packs it into its
                 // own and the Matrix Unit reads that.
                 if stage_a {
@@ -931,20 +989,20 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     let _ = at;
                     return Err(Error::TT_ERROR_MATMUL_ACCUM_WIDE);
                 }
-                let cb_x = matmul_page(k, plan, &def, &alias, x, at)?;
-                if cb_x.1 {
-                    let _ = (at, x);
-                    return Err(Error::TT_ERROR_REDUCE_OPERAND);
-                }
-                let cb_x = cb_x.0;
-                let (cb_b, dt_b) = match scaler {
+                let (cb_x, stage_x) =
+                    fpu_page(k, plan, &def, &alias, x, at, Error::TT_ERROR_REDUCE_OPERAND)?;
+                let (cb_b, stage_b, dt_b) = match scaler {
                     Some(scaler) => {
-                        let (cb, staged) = matmul_page(k, plan, &def, &alias, scaler, at)?;
-                        if staged {
-                            let _ = (at, scaler);
-                            return Err(Error::TT_ERROR_REDUCE_OPERAND);
-                        }
-                        (cb, types.of(scaler).dtype)
+                        let (cb, staged) = fpu_page(
+                            k,
+                            plan,
+                            &def,
+                            &alias,
+                            scaler,
+                            at,
+                            Error::TT_ERROR_REDUCE_OPERAND,
+                        )?;
+                        (cb, staged, types.of(scaler).dtype)
                     }
                     None => {
                         let ones = plan.ones.ok_or_else(|| {
@@ -955,13 +1013,25 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                             let _ = (ones.dtype, dt_x);
                             return Err(Error::TT_ERROR_REDUCE_DTYPE);
                         }
-                        (ones.cb, ones.dtype)
+                        (ones.cb, false, ones.dtype)
                     }
                 };
                 // The 1.0 page is pushed once at kernel start; a `max` waits
                 // for it before the first face and never pops it, so every
                 // `max` in the program re-reads the same page.
                 if scaler.is_none() {
+                    m.t0.push(MirOp::CbWait { cb: cb_b });
+                }
+                // A computed operand has no page: the compiler stages it, and
+                // the unpacker waits for that page before the first face.
+                if stage_x {
+                    stage(&mut m, types, alloc, &alias, &acc_mask, x, cb_x);
+                    m.t0.push(MirOp::CbWait { cb: cb_x });
+                }
+                if stage_b {
+                    if let Some(scaler) = scaler {
+                        stage(&mut m, types, alloc, &alias, &acc_mask, scaler, cb_b);
+                    }
                     m.t0.push(MirOp::CbWait { cb: cb_b });
                 }
                 let base = dst_row(alloc, acc);
@@ -1279,6 +1349,13 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     });
                     acc_mask[acc as usize] = PackMask::Col;
                 }
+                // A staged operand's page is the compiler's: release it once
+                // the fold has drained it.
+                for (cb, staged) in [(cb_x, stage_x), (cb_b, stage_b)] {
+                    if staged {
+                        m.t0.push(MirOp::CbPop { cb });
+                    }
+                }
             }
             // The arms above cover every `Op`; the matmul/sum-row one is
             // guarded, so the compiler cannot see it does, and a new variant
@@ -1382,21 +1459,23 @@ fn thread_word(fields: &[(tt_isa::cfg::ThreadConfigField, u16)]) -> MirOp {
     }
 }
 
-/// The CB a `matmul` operand or a reduce's `Src` operand reads, and whether it
-/// had to be staged: a `load` already has a page, while a computed value is
-/// packed into the compiler's page for it (see [`stage`]).
-fn matmul_page(
+/// The CB an `Src`-read operand takes, and whether it had to be staged: a
+/// `load` already has a page, while a computed value is packed into the
+/// compiler's page for it (see [`stage`]). `err` is the operand rule the
+/// calling op reports when the value has neither.
+fn fpu_page(
     k: &Kernel,
     plan: &Plan,
     def: &[Option<usize>],
     alias: &[Option<crate::ir::ValueId>],
     value: crate::ir::ValueId,
     at: usize,
+    err: Error,
 ) -> Result<(u32, bool), Error> {
     let id = resolve(alias, value);
     let Some(op_at) = def[id as usize] else {
         let _ = (at, value);
-        return Err(Error::TT_ERROR_MATMUL_OPERAND);
+        return Err(err);
     };
     if let Op::Load { buffer, .. } = k.ops[op_at] {
         return Ok((
@@ -1407,15 +1486,197 @@ fn matmul_page(
             false,
         ));
     }
-    // Not a `load`: the value lives in `Dst` and the Matrix Unit reads `Src`,
-    // so the compiler packs it into a page it owns. The verifier admits only
+    // Not a `load`: the value lives in `Dst` and the `Src` path reads L1, so
+    // the compiler packs it into a page it owns. The verifier admits only
     // f32/bf16 operands, which is also what a staging `Pack` takes.
     let _ = at;
     let cb = plan.staged[id as usize].ok_or_else(|| {
         let _ = (id, value);
-        Error::TT_ERROR_MATMUL_OPERAND
+        err
     })?;
     Ok((cb, true))
+}
+
+/// `SrcA op SrcB -> Dst` with `SrcB` broadcast: tt-metal's
+/// `eltwise_binary_configure_addrmod` and its `ELWADD`/`ELWSUB`/`ELWMUL` MOP.
+/// The tile is `SrcA` and the narrow value `SrcB`; `ADDR_MOD_0` steps `SrcA` and
+/// `Dst` eight rows per instruction and, except for a row or scalar broadcast,
+/// steps `SrcB` too, and the end op hands both banks back.
+///
+/// Both operands are unpacked from L1 pages: a `load`'s page, or the compiler's
+/// staged page for a computed value (or for an `acc`, which an FPU op never
+/// reads from `Dst`).
+#[allow(clippy::too_many_arguments)]
+fn fpu_broadcast(
+    m: &mut Machine,
+    k: &Kernel,
+    types: &Types,
+    plan: &Plan,
+    alloc: &Alloc,
+    def: &[Option<usize>],
+    alias: &[Option<crate::ir::ValueId>],
+    acc_mask: &[PackMask],
+    value: crate::ir::ValueId,
+    op: BinOp,
+    tile: crate::ir::ValueId,
+    narrow: crate::ir::ValueId,
+    bcast: Bcast,
+    at: usize,
+) -> Result<(), Error> {
+    let (cb_a, stage_a) = fpu_page(k, plan, def, alias, tile, at, Error::TT_TODO_BROADCAST)?;
+    let (cb_b, stage_b) = fpu_page(k, plan, def, alias, narrow, at, Error::TT_TODO_BROADCAST)?;
+    if stage_a {
+        stage(m, types, alloc, alias, acc_mask, tile, cb_a);
+    }
+    if stage_b {
+        stage(m, types, alloc, alias, acc_mask, narrow, cb_b);
+    }
+    let dt_a = types.of(tile).dtype;
+    let dt_b = types.of(narrow).dtype;
+    let out = dst_row(alloc, resolve(alias, value));
+    // The `Src` banks are filled from the pages the unpacker owns.
+    for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
+        if staged {
+            m.t0.push(MirOp::CbWait { cb });
+        }
+    }
+    // The counters start at 0 and `ADDR_MOD_0` steps `SrcA` and `Dst` eight
+    // rows per instruction, and `SrcB` too unless the broadcast holds it still.
+    m.t1.push(MirOp::Setrwc {
+        src_a: 0,
+        src_b: 0,
+        dst: 0,
+        flip_src_a: false,
+        flip_src_b: false,
+        dst_cr: false,
+    });
+    m.t1.push(thread_word(&[
+        (thread::ADDR_MOD_AB_SEC0_SrcAIncr, 8),
+        (
+            thread::ADDR_MOD_AB_SEC0_SrcBIncr,
+            match bcast {
+                Bcast::Col => 8u16,
+                Bcast::Row | Bcast::Scalar => 0,
+            },
+        ),
+        (thread::ADDR_MOD_AB_SEC0_SrcBClear, 0),
+        (thread::ADDR_MOD_AB_SEC0_SrcAClear, 0),
+    ]));
+    m.t1.push(thread_word(&[
+        (thread::ADDR_MOD_DST_SEC0_DestIncr, 0),
+        (thread::ADDR_MOD_DST_SEC0_DestCR, 0),
+    ]));
+    // The section is written, never accumulated into.
+    m.t1.push(MirOp::SemWaitFree { sem: SEM_READY });
+    // `ELWMUL`'s word carries bit 21 set, so the hardware accumulates into the
+    // destination (tt-isa's measured encoding; `ELWADD`/`ELWSUB` overwrite).
+    // The result section is zeroed first so the accumulate is the plain product.
+    if matches!(op, BinOp::Mul) {
+        m.t1.push(MirOp::LaneConst {
+            lreg: 0,
+            bits: 0.0f32.to_bits(),
+        });
+        for row in (0..DST_ROWS).step_by(2) {
+            m.t1.push(MirOp::Sfpstore {
+                lreg: 0,
+                row: out + row,
+                dtype: if m.dst_is_16_bit {
+                    crate::ir::DType::Bf16
+                } else {
+                    crate::ir::DType::F32
+                },
+            });
+        }
+    }
+    for face in 0..4u32 {
+        m.t0.push(MirOp::Setadczw { unit: 0, face });
+        m.t0.push(MirOp::UnpackConfig {
+            unit: 0,
+            to_src: true,
+            dtype: dt_a,
+            haloize: false,
+        });
+        m.t0.push(MirOp::Unpacr {
+            cb: cb_a,
+            unit: 0,
+            count: FACE_DATUMS,
+            flip: true,
+        });
+        // `SrcB`: the page face the FPU reads for `SrcA`'s face. A narrow
+        // value's page keeps only its own part, so both halves of the tile read
+        // the same face: a row's faces 0 and 1 (row 0) serve the tile's four
+        // faces two at a time, and a column's faces 0 and 2 (column 0) serve
+        // each pair of face rows.
+        let b_face = match bcast {
+            Bcast::Row => face & 1,
+            Bcast::Col => face & !1,
+            Bcast::Scalar => 0,
+        };
+        m.t0.push(MirOp::Setadczw {
+            unit: 1,
+            face: b_face,
+        });
+        m.t0.push(MirOp::UnpackConfig {
+            unit: 1,
+            to_src: true,
+            dtype: dt_b,
+            haloize: false,
+        });
+        m.t0.push(MirOp::Unpacr {
+            cb: cb_b,
+            unit: 1,
+            count: FACE_DATUMS,
+            flip: true,
+        });
+        m.t0.push(MirOp::SemPost { sem: SEM_UNPACKED });
+        m.t1.push(MirOp::SemWait {
+            sem: SEM_UNPACKED,
+            before: 0,
+        });
+        // One face is two instructions of eight rows.
+        for half in 0..2u32 {
+            m.t1.push(MirOp::Elw {
+                op: match op {
+                    BinOp::Add => ElwOp::Add,
+                    BinOp::Sub => ElwOp::Sub,
+                    BinOp::Mul => ElwOp::Mul,
+                    other => unreachable!("the caller admits add, sub and mul, not {other:?}"),
+                },
+                bcast,
+                addr_mod: 0,
+                dst_row: out + 16 * face + 8 * half,
+            });
+        }
+        // `SETRWC(CLR_AB, .., SET_AB)`: the banks go back before the next
+        // face's unpack, which is the only way the unpacker may refill them
+        // (tt-metal's reduce clears after every face for the same reason). The
+        // unpacker refills each face from the bank's start, so the counters stay
+        // at 0 and the `SFPU` afterwards addresses `Dst` relative to 0.
+        m.t1.push(MirOp::Setrwc {
+            src_a: 0,
+            src_b: 0,
+            dst: 0,
+            flip_src_a: true,
+            flip_src_b: true,
+            dst_cr: false,
+        });
+    }
+    // The counters are back to 0 for the `SFPU`, which addresses `Dst` relative
+    // to them.
+    m.t1.push(MirOp::Setrwc {
+        src_a: 0,
+        src_b: 0,
+        dst: 0,
+        flip_src_a: false,
+        flip_src_b: false,
+        dst_cr: false,
+    });
+    for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
+        if staged {
+            m.t0.push(MirOp::CbPop { cb });
+        }
+    }
+    Ok(())
 }
 
 /// Pack a computed value's `Dst` rows into the compiler's page for it, so the
@@ -1602,7 +1863,7 @@ fn exp2_body(
     role: &mut Vec<MirOp>,
     src: u32,
     out: u32,
-    rows: u32,
+    rows: &[u32],
     la: u8,
     dtype: crate::ir::DType,
 ) {
@@ -1619,7 +1880,7 @@ fn exp2_body(
         lreg: 6,
         bits: NEG_C231,
     });
-    for row in (0..rows).step_by(2) {
+    for &row in rows {
         role.push(MirOp::Sfpload {
             lreg: la,
             row: src + row,
@@ -1717,6 +1978,26 @@ fn exp2_body(
             dtype,
         });
     }
+}
+
+/// The `Dst` rows an SFPU body walks. An instruction covers 32 lanes, two
+/// 16-datum rows, so a tile is its 64 rows two at a time. A narrow value keeps
+/// the acc's narrow part (a `1,32` in rows 0 and 16, a `32,1` in column 0), and
+/// its lane layout in the lane — sixteen meaningful lanes of each — is not
+/// lowered: a value that reaches the datapath with that shape is refused rather
+/// than walked with a tile's addressing.
+fn sfp_rows(shape: RegShape, at: usize) -> Result<Vec<u32>, Error> {
+    Ok(match shape {
+        RegShape::Tile => (0..DST_ROWS).step_by(2).collect(),
+        RegShape::Row | RegShape::Column => {
+            let _ = (at, shape);
+            return Err(Error::TT_TODO_ACCESS_SHAPE);
+        }
+        RegShape::Scalar => {
+            let _ = at;
+            return Err(Error::TT_ERROR_SCALAR_NO_ROWS);
+        }
+    })
 }
 
 fn rows_of(shape: RegShape, at: usize) -> Result<u32, Error> {

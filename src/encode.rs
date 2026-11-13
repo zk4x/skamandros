@@ -14,7 +14,7 @@
 //! stride or a `Dst` address.
 
 use crate::ir::{DType, Error};
-use crate::mir::{CmpOp, IOp, Machine, MirOp, PackMask, SfpOp};
+use crate::mir::{Bcast, CmpOp, ElwOp, IOp, Machine, MirOp, PackMask, SfpOp};
 use crate::riscv::{self as rv, Asm, reg};
 use tt_isa::backend::{
     self, Before, ConfigWords, ThreadConfigEntry, block, cond, wait_for_packer, wait_for_unpacker0,
@@ -292,6 +292,18 @@ fn cc_mask(on: bool) -> Result<Instruction, tt_isa::isa::EncodeError> {
     encode::sfpencc(if on { 3 } else { 2 }, 0, 10)
 }
 
+/// Announce, through `sem`, that every pipeline the condition mask selects has
+/// drained: a `STALLWAIT` that holds every unit of this thread, then the
+/// `SEMPOST`. tt-isa's `sync::post_after` is this for one unit; a role whose
+/// producers are several (`SFPU` and `MATRIX`, unpacker 0 and 1) needs the
+/// combined mask.
+fn post_after_drained(drained: u32, sem: Semaphore) -> [Instruction; 2] {
+    [
+        backend::stallwait(Before::EVERYTHING.mask(), drained).expect("named bits"),
+        sync::post(sem),
+    ]
+}
+
 fn semaphore(index: u8) -> Result<Semaphore, Error> {
     Semaphore::new(index).ok_or_else(|| {
         let _ = index;
@@ -466,7 +478,16 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result
                 })?;
             }
             MirOp::SemPost { sem } => {
-                out.extend(sync::post_after(sync::Unit::Unpacker0, semaphore(sem)?));
+                // The data a post announces must have *finished*, not merely
+                // been issued: `SEMPOST` can run as soon as the Sync Unit sees
+                // it, so the pipelines that write this role's operands drain
+                // first (tt-isa's `post_after`; tt-metal's
+                // `tile_regs_commit`'s `STALLWAIT(PACK, MATH)`). Both unpackers
+                // write `Src` here, so both drain.
+                out.extend(post_after_drained(
+                    cond::UNPACKER0_BUSY | cond::UNPACKER1_BUSY,
+                    semaphore(sem)?,
+                ));
             }
             MirOp::SemWait { sem, .. } => {
                 out.extend(sync::take(semaphore(sem)?, Before::EVERYTHING));
@@ -1187,6 +1208,44 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
                 .map_err(bad_isa)?;
             out.push(i);
         }
+        MirOp::Elw {
+            op,
+            bcast,
+            addr_mod,
+            dst_row,
+        } => {
+            // The two broadcast bits are the instruction's: a row broadcast
+            // reads `SrcB`'s row 0, a column broadcast its column 0, and both
+            // together are the one-datum scalar broadcast.
+            let (row, col) = match bcast {
+                Bcast::Row => (1, 0),
+                Bcast::Col => (0, 1),
+                Bcast::Scalar => (1, 1),
+            };
+            let encoded = match op {
+                ElwOp::Add => encode::Elwadd::ZERO
+                    .add_dst(0)
+                    .broadcast_src_b_row(row)
+                    .broadcast_src_b_col0(col)
+                    .addr_mod(addr_mod)
+                    .dst_row(dst_row + row_delta)
+                    .encode(),
+                ElwOp::Sub => encode::Elwsub::ZERO
+                    .add_dst(0)
+                    .broadcast_src_b_row(row)
+                    .broadcast_src_b_col0(col)
+                    .addr_mod(addr_mod)
+                    .dst_row(dst_row + row_delta)
+                    .encode(),
+                ElwOp::Mul => encode::Elwmul::ZERO
+                    .broadcast_src_b_row(row)
+                    .broadcast_src_b_col0(col)
+                    .addr_mod(addr_mod)
+                    .dst_row(dst_row + row_delta)
+                    .encode(),
+            };
+            out.push(encoded.map_err(bad_isa)?);
+        }
         MirOp::Gapool {
             flip_src_b,
             flip_src_a,
@@ -1363,8 +1422,14 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
             out.push(sync::wait_below_max(semaphore(sem)?, Before::EVERYTHING));
         }
         MirOp::SemPost { sem } => {
-            let s = semaphore(sem)?;
-            out.extend(sync::post_after(sync::Unit::Sfpu, s));
+            // Both the SFPU and the Matrix Unit (the FPU's `ELW`s and the
+            // matmul/pool ops) write `Dst`, so both pipelines drain before the
+            // section is announced; a post waiting on the SFPU alone lets an
+            // `ELW`'s result be packed while it is still in flight.
+            out.extend(post_after_drained(
+                cond::SFPU_BUSY | cond::MATRIX_BUSY,
+                semaphore(sem)?,
+            ));
         }
         MirOp::SemWait { sem, .. } => {
             let s = semaphore(sem)?;
