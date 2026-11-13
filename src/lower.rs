@@ -16,7 +16,9 @@
 //! named none of them.
 
 use crate::alloc::Alloc;
-use crate::ir::{BinOp, Dim, Error, Kernel, Op, RegShape, Types, UnOp, access_shape, unit_of};
+use crate::ir::{
+    BinOp, DType, Dim, Error, Kernel, Op, RegShape, Types, UnOp, access_shape, unit_of,
+};
 use crate::mir::{CmpOp, IOp, Machine, MirOp, PackMask, SfpOp};
 use crate::planner::Plan;
 use crate::riscv::reg;
@@ -471,6 +473,16 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     && !(left.shape == RegShape::Scalar && ca.is_some())
                     && !(right.shape == RegShape::Scalar && cb.is_some())
                 {
+                    // A broadcast is an FPU op, and the FPU's `Src` path takes
+                    // `f32` and `bf16` only. Anything else (`i32`, `bool`) needs
+                    // the SFPU route, which is not lowered: say so rather than
+                    // report the FPU form as merely pending.
+                    if !matches!(left.dtype, DType::F32 | DType::Bf16)
+                        || !matches!(right.dtype, DType::F32 | DType::Bf16)
+                    {
+                        let _ = (left.dtype, right.dtype);
+                        return Err(Error::TT_TODO_BROADCAST_SFPU);
+                    }
                     let _ = (left.shape, right.shape);
                     return Err(Error::TT_TODO_BROADCAST);
                 }
@@ -1743,5 +1755,37 @@ copy 32,32 %out [1] = %bo [0]
         }
         assert_eq!(posts, 2, "one post per pack");
         assert!(writes > 2, "the program writes Dst");
+    }
+
+    /// A broadcast is an FPU op, and the FPU's `Src` path takes `f32` and
+    /// `bf16` only: an integer broadcast has to go through the SFPU, which is
+    /// not lowered. It must be reported as that route's TODO, never routed
+    /// through the FPU.
+    #[test]
+    fn an_integer_broadcast_is_refused_as_an_sfpu_todo() {
+        const PROGRAM: &str = "\
+version 8
+grid 1,1
+%pi = param i32 1024
+%po = param i32 1024
+%bi = buffer i32 32,32
+%bo = buffer i32 32,32
+copy 32,32 %bi [0] = %pi [0]
+load 32,32 %t = %bi [0]
+load 1,1 %s = %bi [0]
+%d = add %t %s
+store 32,32 %bo [0] = %d
+copy 32,32 %po [0] = %bo [0]
+";
+        let k = Kernel::parse(PROGRAM).expect("it parses");
+        let types = k.verify().expect("it verifies");
+        let k = crate::mover::add_movers(&k, &types).expect("the movers are added");
+        let types = k.verify().expect("it verifies");
+        let plan = crate::planner::place(&k, &types).expect("it places");
+        let alloc = crate::alloc::allocate(&k, &types).expect("it allocates");
+        assert_eq!(
+            lower(&k, &types, &plan, &alloc).expect_err("an integer broadcast has no path"),
+            Error::TT_TODO_BROADCAST_SFPU
+        );
     }
 }

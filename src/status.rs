@@ -430,6 +430,10 @@ pub enum ttStatus {
     /// A copy's lanes do not fill one L1 page: every lane moves one unit, and
     /// `lanes` units have to be exactly the page's datums.
     TT_ERROR_COPY_LANES = 175,
+    /// A broadcast whose dtype the FPU's `Src` path cannot take (`i32`), so it
+    /// needs the SFPU route, which is not lowered yet. The FPU takes `f32` and
+    /// `bf16`; anything else must not be routed through it.
+    TT_TODO_BROADCAST_SFPU = 176,
 }
 
 impl ttStatus {
@@ -611,6 +615,7 @@ impl ttStatus {
             ttStatus::TT_TODO_MULTI_LANE => "TT_TODO_MULTI_LANE",
             ttStatus::TT_TODO_ACCESS_SHAPE => "TT_TODO_ACCESS_SHAPE",
             ttStatus::TT_ERROR_COPY_LANES => "TT_ERROR_COPY_LANES",
+            ttStatus::TT_TODO_BROADCAST_SFPU => "TT_TODO_BROADCAST_SFPU",
             ttStatus::TT_ERROR_DST_ROW_ODD => "TT_ERROR_DST_ROW_ODD",
         }
     }
