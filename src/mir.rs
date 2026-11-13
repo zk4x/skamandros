@@ -346,17 +346,45 @@ pub enum MirOp {
     EndLoop,
 }
 
-/// The three compute programs. The movers' RISC-V programs are emitted
-/// separately (`crate::mover`), because they are code, not Tensix instructions.
+/// The core a [`MirOp`] runs on: the unpacker (T0), the math core (T1) or the
+/// packer (T2). The movers' RISC-V programs are not in this IR (`crate::mover`
+/// emits them), so three roles are the whole of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Role {
+    Unpack,
+    Math,
+    Pack,
+}
+
+/// The three compute programs, as **one** IR: every op the lowering emits is
+/// appended in program order with the core it runs on, so a pass can see a
+/// hand-off and the ops on both sides of it in one sequence. The per-core
+/// streams are a filter over this list ([`Machine::stream`]), which is how
+/// `encode` splits them again.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Machine {
-    pub t0: Vec<MirOp>,
-    pub t1: Vec<MirOp>,
-    pub t2: Vec<MirOp>,
+    /// Every op, in the order the lowering met it.
+    pub ops: Vec<(Role, MirOp)>,
     /// Is the `Dst` bank in 16-bit mode? The width is one mode for the whole
     /// kernel, as tt-metal's `DST_ACCUM_MODE` (`fp32_dest_acc_en`) is: every
     /// value that enters `Dst` is bf16 (or a `bool` lane, which is 16 bits or
     /// less) in 16-bit mode, and a 32-bit datum forces 32-bit mode. The unpacker,
     /// the packer and the SFPU's load/store format are picked from it.
     pub dst_is_16_bit: bool,
+}
+
+impl Machine {
+    /// Append `op` to `role`'s program.
+    pub fn push(&mut self, role: Role, op: MirOp) {
+        self.ops.push((role, op));
+    }
+
+    /// One core's program, in program order.
+    pub fn stream(&self, role: Role) -> Vec<MirOp> {
+        self.ops
+            .iter()
+            .filter(|(r, _)| *r == role)
+            .map(|(_, op)| *op)
+            .collect()
+    }
 }

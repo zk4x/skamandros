@@ -13,7 +13,7 @@
 use crate::alloc::DST_SLOTS;
 use crate::ir::Error;
 use crate::lower::DST_ROWS;
-use crate::mir::{Machine, MirOp};
+use crate::mir::{Machine, MirOp, Role};
 
 /// Collapse every run of identical consecutive row triples into one body plus a
 /// [`MirOp::Repeat`].
@@ -22,8 +22,9 @@ use crate::mir::{Machine, MirOp};
 /// `Dst` rows advance by exactly one, so the body is the row-0 form and the
 /// repeat walks the rest.
 pub fn fuse(m: &mut Machine) {
-    for core in [&mut m.t0, &mut m.t1, &mut m.t2] {
-        let ops = std::mem::take(core);
+    let mut fused: Vec<(Role, MirOp)> = Vec::with_capacity(m.ops.len());
+    for role in [Role::Unpack, Role::Math, Role::Pack] {
+        let ops = m.stream(role);
         let mut out: Vec<MirOp> = Vec::with_capacity(ops.len());
         let mut i = 0usize;
         while i < ops.len() {
@@ -49,8 +50,11 @@ pub fn fuse(m: &mut Machine) {
             out.extend_from_slice(&ops[i..i + 3]);
             i = next;
         }
-        *core = out;
+        for op in out {
+            fused.push((role, op));
+        }
     }
+    m.ops = fused;
 }
 
 /// The three ops at `at` if they are a lane-register row body.
@@ -122,7 +126,11 @@ fn same_shifted(body: &[MirOp; 3], following: &[MirOp; 3]) -> bool {
 /// Check every machine-IR invariant. A kernel that fails this must not be
 /// encoded.
 pub fn verify(m: &Machine) -> Result<(), Error> {
-    for (name, ops) in [("t0", &m.t0), ("t1", &m.t1), ("t2", &m.t2)] {
+    for (name, ops) in [
+        ("unpack", m.stream(Role::Unpack)),
+        ("math", m.stream(Role::Math)),
+        ("pack", m.stream(Role::Pack)),
+    ] {
         let mut at = 0usize;
         let mut depth = 0usize;
         while at < ops.len() {
@@ -404,36 +412,53 @@ copy 32,32 %out [0] = %b0 [0]
         lower(&k, &types, &plan, &alloc).unwrap()
     }
 
+    /// The math core's program, which is what the row-body tests look at.
+    fn math(m: &Machine) -> Vec<MirOp> {
+        m.stream(Role::Math)
+    }
+
+    /// The IR index of the `n`th math op.
+    fn math_at(m: &Machine, n: usize) -> usize {
+        m.ops
+            .iter()
+            .enumerate()
+            .filter(|(_, (role, _))| *role == Role::Math)
+            .nth(n)
+            .map(|(i, _)| i)
+            .expect("the math stream has that many ops")
+    }
+
     #[test]
     fn sixty_four_row_triples_become_one_body() {
         let mut m = machine();
-        let before = m.t1.len();
+        let before = math(&m).len();
         fuse(&mut m);
         // One repeat marker plus the body, around the two hand-offs and the
         // packer drain wait.
-        assert_eq!(m.t1.len(), 7, "got {:?}", m.t1);
-        assert!(matches!(m.t1[1], MirOp::Repeat { len: 3, count: 32 }));
+        assert_eq!(math(&m).len(), 7, "got {:?}", math(&m));
+        assert!(matches!(math(&m)[1], MirOp::Repeat { len: 3, count: 32 }));
         assert!(matches!(
-            m.t1[2],
+            math(&m)[2],
             MirOp::Sfpload {
                 lreg: 0,
                 row: 0,
                 dtype: crate::ir::DType::F32
             }
         ));
-        assert_eq!(m.t1.len(), before - (32 - 1) * 3 + 1);
+        assert_eq!(math(&m).len(), before - (32 - 1) * 3 + 1);
     }
 
     #[test]
     fn a_hand_off_breaks_a_run() {
         let mut m = machine();
         // Cut the body: a semaphore in the middle must stop fusion across it.
-        m.t1.insert(3 * 16, MirOp::SemPost { sem: 7 });
+        let at = math_at(&m, 3 * 16);
+        m.ops.insert(at, (Role::Math, MirOp::SemPost { sem: 7 }));
         fuse(&mut m);
-        let repeats =
-            m.t1.iter()
-                .filter(|op| matches!(op, MirOp::Repeat { .. }))
-                .count();
+        let repeats = math(&m)
+            .iter()
+            .filter(|op| matches!(op, MirOp::Repeat { .. }))
+            .count();
         assert_eq!(repeats, 2, "one repeat on each side of the hand-off");
     }
 
@@ -441,17 +466,18 @@ copy 32,32 %out [0] = %b0 [0]
     fn a_different_op_is_not_fused() {
         let mut m = machine();
         // Row 1 negated with a different lane register: not the same body.
-        if let MirOp::Sfp { d, .. } = &mut m.t1[5] {
+        let at = math_at(&m, 5);
+        if let MirOp::Sfp { d, .. } = &mut m.ops[at].1 {
             *d = 5;
         }
         fuse(&mut m);
-        let repeats: Vec<u16> =
-            m.t1.iter()
-                .filter_map(|op| match op {
-                    MirOp::Repeat { count, .. } => Some(*count),
-                    _ => None,
-                })
-                .collect();
+        let repeats: Vec<u16> = math(&m)
+            .iter()
+            .filter_map(|op| match op {
+                MirOp::Repeat { count, .. } => Some(*count),
+                _ => None,
+            })
+            .collect();
         assert_eq!(repeats, vec![30], "the changed row splits the run");
     }
 
@@ -466,22 +492,28 @@ copy 32,32 %out [0] = %b0 [0]
     #[test]
     fn a_bad_lane_register_is_refused() {
         let mut m = machine();
-        m.t1.push(MirOp::Sfpload {
-            lreg: 9,
-            row: 0,
-            dtype: crate::ir::DType::F32,
-        });
+        m.push(
+            Role::Math,
+            MirOp::Sfpload {
+                lreg: 9,
+                row: 0,
+                dtype: crate::ir::DType::F32,
+            },
+        );
         assert!(verify(&m).is_err());
     }
 
     #[test]
     fn a_dst_row_past_the_last_tile_is_refused() {
         let mut m = machine();
-        m.t1.push(MirOp::Sfpstore {
-            lreg: 0,
-            row: 8 * DST_ROWS,
-            dtype: crate::ir::DType::F32,
-        });
+        m.push(
+            Role::Math,
+            MirOp::Sfpstore {
+                lreg: 0,
+                row: 8 * DST_ROWS,
+                dtype: crate::ir::DType::F32,
+            },
+        );
         assert!(verify(&m).is_err());
     }
 
@@ -490,11 +522,14 @@ copy 32,32 %out [0] = %b0 [0]
         // `SFPSTORE`'s address names a row pair; the hardware refuses an odd
         // one, so the machine IR must too, before it reaches the encoder.
         let mut m = machine();
-        m.t1.push(MirOp::Sfpstore {
-            lreg: 0,
-            row: 1,
-            dtype: crate::ir::DType::F32,
-        });
+        m.push(
+            Role::Math,
+            MirOp::Sfpstore {
+                lreg: 0,
+                row: 1,
+                dtype: crate::ir::DType::F32,
+            },
+        );
         assert_eq!(
             verify(&m).expect_err("an odd row"),
             Error::TT_ERROR_DST_ROW_ODD
@@ -504,7 +539,7 @@ copy 32,32 %out [0] = %b0 [0]
     #[test]
     fn a_repeat_that_runs_past_its_program_is_refused() {
         let mut m = machine();
-        m.t1.push(MirOp::Repeat { len: 99, count: 2 });
+        m.push(Role::Math, MirOp::Repeat { len: 99, count: 2 });
         assert!(verify(&m).is_err());
     }
 }

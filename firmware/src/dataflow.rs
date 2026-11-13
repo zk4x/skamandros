@@ -38,7 +38,7 @@ pub fn check() -> Result<(), u32> {
 /// aborting is seen within this many polls.
 const CHECK_EVERY: u32 = 64;
 
-/// A credit wait's failure detection: the abort word on every poll, the full
+/// A CB wait's failure detection: the abort word on every poll, the full
 /// [`check`] on the first and every [`CHECK_EVERY`]th. A countdown, not a
 /// remainder: T2 has no remainder instruction.
 #[derive(Default)]

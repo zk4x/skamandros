@@ -19,7 +19,7 @@ use crate::alloc::Alloc;
 use crate::ir::{
     BinOp, DType, Dim, Error, Kernel, Op, RegShape, Types, UnOp, access_shape, unit_of,
 };
-use crate::mir::{Bcast, CmpOp, ElwOp, IOp, Machine, MirOp, PackMask, SfpOp};
+use crate::mir::{Bcast, CmpOp, ElwOp, IOp, Machine, MirOp, PackMask, Role, SfpOp};
 use crate::planner::Plan;
 use crate::riscv::reg;
 use tt_isa::cfg::generated::thread;
@@ -196,18 +196,31 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 let counter = *COUNTERS.get(depth).ok_or(Error::TT_TODO_LOOP_DEPTH)?;
                 match bound_const(k, bound) {
                     Some(count) => {
-                        m.t0.push(MirOp::Loop { count });
-                        m.t1.push(MirOp::Loop { count });
-                        m.t2.push(MirOp::Loop { count });
+                        m.push(Role::Unpack, MirOp::Loop { count });
+                        m.push(Role::Math, MirOp::Loop { count });
+                        m.push(Role::Pack, MirOp::Loop { count });
                     }
                     None => {
                         // A symbolic bound is RISC-V arithmetic in the role,
                         // like the C loop of a tt-metal kernel; the count ends
                         // in the counter register and the branch reads it.
-                        for role in [&mut m.t0, &mut m.t1, &mut m.t2] {
+                        for role in [Role::Unpack, Role::Math, Role::Pack] {
+                            let mut ops = Vec::new();
                             let mut scratch = SCRATCH.iter().copied();
-                            scalar(k, types, role, &param, &loops, bound, counter, &mut scratch)?;
-                            role.push(MirOp::LoopReg { reg: counter });
+                            scalar(
+                                k,
+                                types,
+                                &mut ops,
+                                &param,
+                                &loops,
+                                bound,
+                                counter,
+                                &mut scratch,
+                            )?;
+                            ops.push(MirOp::LoopReg { reg: counter });
+                            for op in ops {
+                                m.push(role, op);
+                            }
                         }
                     }
                 }
@@ -215,9 +228,9 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             }
             Op::EndLoop => {
                 loops.pop();
-                m.t0.push(MirOp::EndLoop);
-                m.t1.push(MirOp::EndLoop);
-                m.t2.push(MirOp::EndLoop);
+                m.push(Role::Unpack, MirOp::EndLoop);
+                m.push(Role::Math, MirOp::EndLoop);
+                m.push(Role::Pack, MirOp::EndLoop);
             }
             Op::Load {
                 value,
@@ -276,39 +289,54 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     // overwritten before it has been packed. The page itself
                     // comes from the ring: wait for the producer's push, unpack,
                     // then release the page.
-                    m.t0.push(MirOp::SemWait {
-                        sem: SEM_SLOT,
-                        before: 0,
-                    });
-                    m.t0.push(MirOp::CbWait { cb });
-                    m.t0.push(MirOp::Setdst { row });
-                    m.t0.push(MirOp::Setadczw { unit: 0, face: 0 });
-                    m.t0.push(MirOp::Setadcx {
-                        unit: 0,
-                        first: 0,
-                        count: unit_shape.datums(),
-                    });
-                    m.t0.push(MirOp::UnpackConfig {
-                        unit: 0,
-                        to_src: false,
-                        dtype,
-                        haloize: false,
-                    });
-                    m.t0.push(MirOp::Unpacr {
-                        cb,
-                        unit: 0,
-                        count: unit_shape.datums(),
-                        flip: false,
-                    });
-                    m.t0.push(MirOp::SemPost { sem: SEM_UNPACKED });
-                    m.t1.push(MirOp::SemWait {
-                        sem: SEM_UNPACKED,
-                        before: 0,
-                    });
+                    m.push(
+                        Role::Unpack,
+                        MirOp::SemWait {
+                            sem: SEM_SLOT,
+                            before: 0,
+                        },
+                    );
+                    m.push(Role::Unpack, MirOp::CbWait { cb });
+                    m.push(Role::Unpack, MirOp::Setdst { row });
+                    m.push(Role::Unpack, MirOp::Setadczw { unit: 0, face: 0 });
+                    m.push(
+                        Role::Unpack,
+                        MirOp::Setadcx {
+                            unit: 0,
+                            first: 0,
+                            count: unit_shape.datums(),
+                        },
+                    );
+                    m.push(
+                        Role::Unpack,
+                        MirOp::UnpackConfig {
+                            unit: 0,
+                            to_src: false,
+                            dtype,
+                            haloize: false,
+                        },
+                    );
+                    m.push(
+                        Role::Unpack,
+                        MirOp::Unpacr {
+                            cb,
+                            unit: 0,
+                            count: unit_shape.datums(),
+                            flip: false,
+                        },
+                    );
+                    m.push(Role::Unpack, MirOp::SemPost { sem: SEM_UNPACKED });
+                    m.push(
+                        Role::Math,
+                        MirOp::SemWait {
+                            sem: SEM_UNPACKED,
+                            before: 0,
+                        },
+                    );
                 } else {
                     // The Matrix Unit's operand: the page is reserved here and
                     // unpacked at the matmul; the bank handover gates the rest.
-                    m.t0.push(MirOp::CbWait { cb });
+                    m.push(Role::Unpack, MirOp::CbWait { cb });
                 }
                 // A page the Matrix Unit still reads is released after that
                 // read, not here.
@@ -316,7 +344,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     let last = last_use[value as usize].expect("a read value has a last use");
                     pop_here[last].push(cb);
                 } else {
-                    m.t0.push(MirOp::CbPop { cb });
+                    m.push(Role::Unpack, MirOp::CbPop { cb });
                 }
                 let _ = info;
                 let _ = rows;
@@ -347,23 +375,26 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     // since their last write, the packer may still be reading
                     // them, so the math thread waits for the section to drain
                     // first (`wait_math_semaphores`).
-                    m.t1.push(MirOp::SemWaitFree { sem: SEM_READY });
-                    m.t1.push(MirOp::LaneConst { lreg: 0, bits });
+                    m.push(Role::Math, MirOp::SemWaitFree { sem: SEM_READY });
+                    m.push(Role::Math, MirOp::LaneConst { lreg: 0, bits });
                     // An SFPU store covers a row pair (`SFPSTORE` refuses an odd
                     // row and writes two), the same step the datapath uses.
                     for row in (0..rows).step_by(2) {
-                        m.t1.push(MirOp::Sfpstore {
-                            lreg: 0,
-                            row: base + row,
-                            dtype: acc_dtype,
-                        });
+                        m.push(
+                            Role::Math,
+                            MirOp::Sfpstore {
+                                lreg: 0,
+                                row: base + row,
+                                dtype: acc_dtype,
+                            },
+                        );
                     }
                     let _ = (offset, value);
                     // An accumulator store never reads a CB page, but a page
                     // this instruction was the last reader of is released here
                     // exactly like the packed path's.
                     for cb in std::mem::take(&mut pop_here[at]) {
-                        m.t0.push(MirOp::CbPop { cb });
+                        m.push(Role::Unpack, MirOp::CbPop { cb });
                     }
                     continue;
                 }
@@ -388,29 +419,32 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 // one before it offers this one. Without the wait two posts
                 // coalesce in the one-deep pack hand-off and the packer waits
                 // for a section that never comes.
-                m.t1.push(MirOp::SemWaitFree { sem: SEM_READY });
-                m.t1.push(MirOp::SemPost { sem: SEM_READY });
+                m.push(Role::Math, MirOp::SemWaitFree { sem: SEM_READY });
+                m.push(Role::Math, MirOp::SemPost { sem: SEM_READY });
                 // The packer claims the unit, packs it, and only then releases
                 // the semaphore — so the math core cannot overwrite `Dst` until
                 // the pack has actually read it (`_llk_pack_dest_section_done_`).
-                m.t2.push(MirOp::SemWaitData { sem: SEM_READY });
+                m.push(Role::Pack, MirOp::SemWaitData { sem: SEM_READY });
                 // The page comes from the ring: reserve a free one, pack into
                 // it, then publish it to the writer.
-                m.t2.push(MirOp::CbReserve { cb });
-                m.t2.push(MirOp::Pack {
-                    cb,
-                    rows,
-                    row: dst_row(alloc, resolve(&alias, value)),
-                    last: true,
-                    dtype,
-                    // A pack of a reduced accumulator carries the reduce's edge
-                    // mask; every other pack keeps the whole tile.
-                    mask: acc_mask[resolve(&alias, value) as usize],
-                });
-                m.t2.push(MirOp::SemGet { sem: SEM_READY });
-                m.t2.push(MirOp::CbPush { cb });
+                m.push(Role::Pack, MirOp::CbReserve { cb });
+                m.push(
+                    Role::Pack,
+                    MirOp::Pack {
+                        cb,
+                        rows,
+                        row: dst_row(alloc, resolve(&alias, value)),
+                        last: true,
+                        dtype,
+                        // A pack of a reduced accumulator carries the reduce's edge
+                        // mask; every other pack keeps the whole tile.
+                        mask: acc_mask[resolve(&alias, value) as usize],
+                    },
+                );
+                m.push(Role::Pack, MirOp::SemGet { sem: SEM_READY });
+                m.push(Role::Pack, MirOp::CbPush { cb });
                 // The pack has retired, so the `Dst` slot is free again.
-                m.t2.push(MirOp::SemPost { sem: SEM_SLOT });
+                m.push(Role::Pack, MirOp::SemPost { sem: SEM_SLOT });
                 let _ = offset;
             }
             Op::Cast { value, src, dtype } => {
@@ -433,22 +467,31 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     }
                 };
                 for row in rows {
-                    m.t1.push(MirOp::Sfpload {
-                        lreg: la,
-                        row: s + row,
-                        dtype: storage(from),
-                    });
-                    m.t1.push(MirOp::Cast {
-                        from: lane(from),
-                        to: lane(dtype),
-                        a: la,
-                        d: ld,
-                    });
-                    m.t1.push(MirOp::Sfpstore {
-                        lreg: ld,
-                        row: out + row,
-                        dtype: storage(dtype),
-                    });
+                    m.push(
+                        Role::Math,
+                        MirOp::Sfpload {
+                            lreg: la,
+                            row: s + row,
+                            dtype: storage(from),
+                        },
+                    );
+                    m.push(
+                        Role::Math,
+                        MirOp::Cast {
+                            from: lane(from),
+                            to: lane(dtype),
+                            a: la,
+                            d: ld,
+                        },
+                    );
+                    m.push(
+                        Role::Math,
+                        MirOp::Sfpstore {
+                            lreg: ld,
+                            row: out + row,
+                            dtype: storage(dtype),
+                        },
+                    );
                 }
             }
             // A bitcast is resolved, not lowered: every reader reads the source.
@@ -464,27 +507,48 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 // exponent assembly is `SFPEXEXP`/`SFPSETEXP`, so it is a body
                 // here rather than a line in `src/unfold.rs`.
                 if op == UnOp::Exp2 {
-                    exp2_body(&mut m.t1, src, out, &rows, la, dtype);
+                    let mut body = Vec::new();
+                    exp2_body(&mut body, src, out, &rows, la, dtype);
+                    for op in body {
+                        m.push(Role::Math, op);
+                    }
+                    continue;
+                }
+                if op == UnOp::Rsqrt {
+                    let mut body = Vec::new();
+                    rsqrt_body(&mut body, src, out, &rows, la, dtype);
+                    for op in body {
+                        m.push(Role::Math, op);
+                    }
                     continue;
                 }
                 let sfp = unary(op, at)?;
                 for row in rows {
-                    m.t1.push(MirOp::Sfpload {
-                        lreg: la,
-                        row: src + row,
-                        dtype,
-                    });
-                    m.t1.push(MirOp::Sfp {
-                        op: sfp,
-                        a: la,
-                        b: None,
-                        d: ld,
-                    });
-                    m.t1.push(MirOp::Sfpstore {
-                        lreg: ld,
-                        row: out + row,
-                        dtype,
-                    });
+                    m.push(
+                        Role::Math,
+                        MirOp::Sfpload {
+                            lreg: la,
+                            row: src + row,
+                            dtype,
+                        },
+                    );
+                    m.push(
+                        Role::Math,
+                        MirOp::Sfp {
+                            op: sfp,
+                            a: la,
+                            b: None,
+                            d: ld,
+                        },
+                    );
+                    m.push(
+                        Role::Math,
+                        MirOp::Sfpstore {
+                            lreg: ld,
+                            row: out + row,
+                            dtype,
+                        },
+                    );
                 }
             }
             Op::Binary { value, op, a, b } => {
@@ -547,7 +611,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     // A page whose last reader this broadcast was is released
                     // here; `continue` skips the common block below.
                     for cb in std::mem::take(&mut pop_here[at]) {
-                        m.t0.push(MirOp::CbPop { cb });
+                        m.push(Role::Unpack, MirOp::CbPop { cb });
                     }
                     continue;
                 }
@@ -618,32 +682,41 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 // direction), so it is re-loaded per row.
                 let reload_amount = matches!(op, BinOp::BitShiftRight);
                 if let Some(bits) = ca {
-                    m.t1.push(MirOp::LaneConst { lreg: la, bits });
+                    m.push(Role::Math, MirOp::LaneConst { lreg: la, bits });
                 }
                 if let Some(bits) = cb
                     && !reload_amount
                 {
-                    m.t1.push(MirOp::LaneConst { lreg: lb, bits });
+                    m.push(Role::Math, MirOp::LaneConst { lreg: lb, bits });
                 }
                 for row in rows {
                     if ca.is_none() {
-                        m.t1.push(MirOp::Sfpload {
-                            lreg: la,
-                            row: dst_row(alloc, resolve(&alias, a)) + row,
-                            dtype,
-                        });
+                        m.push(
+                            Role::Math,
+                            MirOp::Sfpload {
+                                lreg: la,
+                                row: dst_row(alloc, resolve(&alias, a)) + row,
+                                dtype,
+                            },
+                        );
                     }
                     if cb.is_none() {
-                        m.t1.push(MirOp::Sfpload {
-                            lreg: lb,
-                            row: dst_row(alloc, resolve(&alias, b)) + row,
-                            dtype,
-                        });
+                        m.push(
+                            Role::Math,
+                            MirOp::Sfpload {
+                                lreg: lb,
+                                row: dst_row(alloc, resolve(&alias, b)) + row,
+                                dtype,
+                            },
+                        );
                     } else if reload_amount {
-                        m.t1.push(MirOp::LaneConst {
-                            lreg: lb,
-                            bits: cb.expect("a re-loaded amount is a constant"),
-                        });
+                        m.push(
+                            Role::Math,
+                            MirOp::LaneConst {
+                                lreg: lb,
+                                bits: cb.expect("a re-loaded amount is a constant"),
+                            },
+                        );
                     }
                     match op {
                         BinOp::Cmplt | BinOp::Cmpgt | BinOp::Cmpge => {
@@ -652,12 +725,15 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                                 BinOp::Cmpgt => CmpOp::Gt,
                                 _ => CmpOp::Ge,
                             };
-                            m.t1.push(MirOp::Compare {
-                                op: cmp,
-                                a: la,
-                                b: lb,
-                                d: ld,
-                            });
+                            m.push(
+                                Role::Math,
+                                MirOp::Compare {
+                                    op: cmp,
+                                    a: la,
+                                    b: lb,
+                                    d: ld,
+                                },
+                            );
                         }
                         // `a == b` is `!(a > b || a < b)`, two of the ordered
                         // tests this compiler already has, combined as
@@ -665,61 +741,82 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         // `tt_sfp_compare` shape without its NaN and `-0`
                         // specials, which the ordered tests do not carry either.
                         BinOp::Eq | BinOp::NotEq => {
-                            m.t1.push(MirOp::Compare {
-                                op: CmpOp::Gt,
-                                a: la,
-                                b: lb,
-                                d: 3,
-                            });
-                            m.t1.push(MirOp::Compare {
-                                op: CmpOp::Lt,
-                                a: la,
-                                b: lb,
-                                d: 4,
-                            });
-                            m.t1.push(MirOp::Sfp {
-                                op: SfpOp::BitOr,
-                                a: 3,
-                                b: Some(4),
-                                d: ld,
-                            });
-                            if matches!(op, BinOp::Eq) {
-                                m.t1.push(MirOp::Sfp {
-                                    op: SfpOp::BitNot,
-                                    a: ld,
-                                    b: None,
+                            m.push(
+                                Role::Math,
+                                MirOp::Compare {
+                                    op: CmpOp::Gt,
+                                    a: la,
+                                    b: lb,
+                                    d: 3,
+                                },
+                            );
+                            m.push(
+                                Role::Math,
+                                MirOp::Compare {
+                                    op: CmpOp::Lt,
+                                    a: la,
+                                    b: lb,
+                                    d: 4,
+                                },
+                            );
+                            m.push(
+                                Role::Math,
+                                MirOp::Sfp {
+                                    op: SfpOp::BitOr,
+                                    a: 3,
+                                    b: Some(4),
                                     d: ld,
-                                });
+                                },
+                            );
+                            if matches!(op, BinOp::Eq) {
+                                m.push(
+                                    Role::Math,
+                                    MirOp::Sfp {
+                                        op: SfpOp::BitNot,
+                                        a: ld,
+                                        b: None,
+                                        d: ld,
+                                    },
+                                );
                             }
                         }
-                        BinOp::Max => m.t1.push(MirOp::Max {
-                            a: la,
-                            b: lb,
-                            d: ld,
-                        }),
-                        _ => m.t1.push(MirOp::Sfp {
-                            // An `i32` lane is a raw 32-bit word, so its add and
-                            // subtract are the integer instruction rather than
-                            // `SFPMAD`'s float ones.
-                            op: if left.dtype == crate::ir::DType::I32 {
-                                match op {
-                                    BinOp::Add => SfpOp::IAdd,
-                                    BinOp::Sub => SfpOp::ISub,
-                                    other => binary(other, at)?,
-                                }
-                            } else {
-                                binary(op, at)?
+                        BinOp::Max => m.push(
+                            Role::Math,
+                            MirOp::Max {
+                                a: la,
+                                b: lb,
+                                d: ld,
                             },
-                            a: la,
-                            b: Some(lb),
-                            d: ld,
-                        }),
+                        ),
+                        _ => m.push(
+                            Role::Math,
+                            MirOp::Sfp {
+                                // An `i32` lane is a raw 32-bit word, so its add and
+                                // subtract are the integer instruction rather than
+                                // `SFPMAD`'s float ones.
+                                op: if left.dtype == crate::ir::DType::I32 {
+                                    match op {
+                                        BinOp::Add => SfpOp::IAdd,
+                                        BinOp::Sub => SfpOp::ISub,
+                                        other => binary(other, at)?,
+                                    }
+                                } else {
+                                    binary(op, at)?
+                                },
+                                a: la,
+                                b: Some(lb),
+                                d: ld,
+                            },
+                        ),
                     }
-                    m.t1.push(MirOp::Sfpstore {
-                        lreg: ld,
-                        row: out + row,
-                        dtype: out_dtype,
-                    });
+                    m.push(
+                        Role::Math,
+                        MirOp::Sfpstore {
+                            lreg: ld,
+                            row: out + row,
+                            dtype: out_dtype,
+                        },
+                    );
                 }
             }
             Op::Select {
@@ -743,32 +840,47 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     return Err(Error::TT_ERROR_CONDITION_NOT_BOOL);
                 }
                 for row in rows {
-                    m.t1.push(MirOp::Sfpload {
-                        lreg: lc,
-                        row: sc + row,
-                        dtype: storage(crate::ir::DType::Bool),
-                    });
-                    m.t1.push(MirOp::Sfpload {
-                        lreg: lt,
-                        row: st + row,
-                        dtype: storage(types.of(if_true).dtype),
-                    });
-                    m.t1.push(MirOp::Sfpload {
-                        lreg: lf,
-                        row: sf + row,
-                        dtype: storage(types.of(if_false).dtype),
-                    });
-                    m.t1.push(MirOp::Select {
-                        cond: lc,
-                        t: lt,
-                        f: lf,
-                        d: ld,
-                    });
-                    m.t1.push(MirOp::Sfpstore {
-                        lreg: ld,
-                        row: out + row,
-                        dtype: storage(types.of(value).dtype),
-                    });
+                    m.push(
+                        Role::Math,
+                        MirOp::Sfpload {
+                            lreg: lc,
+                            row: sc + row,
+                            dtype: storage(crate::ir::DType::Bool),
+                        },
+                    );
+                    m.push(
+                        Role::Math,
+                        MirOp::Sfpload {
+                            lreg: lt,
+                            row: st + row,
+                            dtype: storage(types.of(if_true).dtype),
+                        },
+                    );
+                    m.push(
+                        Role::Math,
+                        MirOp::Sfpload {
+                            lreg: lf,
+                            row: sf + row,
+                            dtype: storage(types.of(if_false).dtype),
+                        },
+                    );
+                    m.push(
+                        Role::Math,
+                        MirOp::Select {
+                            cond: lc,
+                            t: lt,
+                            f: lf,
+                            d: ld,
+                        },
+                    );
+                    m.push(
+                        Role::Math,
+                        MirOp::Sfpstore {
+                            lreg: ld,
+                            row: out + row,
+                            dtype: storage(types.of(value).dtype),
+                        },
+                    );
                 }
             }
             // `sum row` is the Matrix Unit's `x @ scaler`: tt-metal's
@@ -806,11 +918,14 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     stage(&mut m, types, alloc, &alias, &acc_mask, b, cb_b);
                 }
                 let base = dst_row(alloc, acc);
+                // Scratch for `mvmul_group`, which emits a run of math ops: the
+                // run is appended to the one IR as it is produced.
+                let mut math_scratch: Vec<MirOp> = Vec::new();
                 // The Matrix Unit writes the accumulator's rows. If they were
                 // packed since their last write, the packer may still be
                 // reading them; wait for the section to drain
                 // (`_llk_math_wait_for_dest_available_`).
-                m.t1.push(MirOp::SemWaitFree { sem: SEM_READY });
+                m.push(Role::Math, MirOp::SemWaitFree { sem: SEM_READY });
                 // The Matrix Unit's address modifiers, fidelity phase and row
                 // counters are this thread's `ThreadConfig` and RWC state. Every
                 // word goes out as a whole `SETC16`, so an entry carrying several
@@ -855,17 +970,20 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     ],
                     vec![(thread::FIDELITY_BASE_Phase, 0)],
                 ] {
-                    m.t1.push(thread_word(&entry));
+                    m.push(Role::Math, thread_word(&entry));
                 }
                 // Src rows and the `Dst` counter start at 0.
-                m.t1.push(MirOp::Setrwc {
-                    src_a: 0,
-                    src_b: 0,
-                    dst: 0,
-                    flip_src_a: false,
-                    flip_src_b: false,
-                    dst_cr: false,
-                });
+                m.push(
+                    Role::Math,
+                    MirOp::Setrwc {
+                        src_a: 0,
+                        src_b: 0,
+                        dst: 0,
+                        flip_src_a: false,
+                        flip_src_b: false,
+                        dst_cr: false,
+                    },
+                );
                 // The accumulator's rows are added to, never cleared: an `acc`
                 // holds whatever the program last put there, and zeroing it is a
                 // `store_to %acc from %zero` the program writes itself.
@@ -877,72 +995,108 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 // the unpacker reads it, and released after the last face.
                 for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
                     if staged {
-                        m.t0.push(MirOp::CbWait { cb });
+                        m.push(Role::Unpack, MirOp::CbWait { cb });
                     }
                 }
                 for fi in 0..2u32 {
                     for kk in 0..2u32 {
-                        m.t0.push(MirOp::Setadczw {
-                            unit: 1,
-                            face: 2 * fi + kk,
-                        });
-                        m.t0.push(MirOp::UnpackConfig {
-                            unit: 1,
-                            to_src: true,
-                            dtype: dt_a,
-                            haloize: false,
-                        });
-                        m.t0.push(MirOp::Unpacr {
-                            cb: cb_a,
-                            unit: 1,
-                            count: FACE_DATUMS,
-                            flip: true,
-                        });
-                        m.t0.push(MirOp::Setadczw {
-                            unit: 0,
-                            face: 2 * kk,
-                        });
-                        m.t0.push(MirOp::UnpackConfig {
-                            unit: 0,
-                            to_src: true,
-                            dtype: dt_b,
-                            haloize: false,
-                        });
-                        m.t0.push(MirOp::Unpacr {
-                            cb: cb_b,
-                            unit: 0,
-                            count: FACE_DATUMS,
-                            flip: true,
-                        });
-                        mvmul_group(&mut m.t1, base);
-                        m.t1.push(MirOp::Mvmul {
-                            row: base + 8,
-                            addr_mod: MATMUL_AM_GROUP,
-                            flip_a: true,
-                            flip_b: false,
-                        });
-                        m.t0.push(MirOp::Setadczw {
-                            unit: 0,
-                            face: 2 * kk + 1,
-                        });
-                        m.t0.push(MirOp::Unpacr {
-                            cb: cb_b,
-                            unit: 0,
-                            count: FACE_DATUMS,
-                            flip: true,
-                        });
-                        mvmul_group(&mut m.t1, base + 16);
+                        m.push(
+                            Role::Unpack,
+                            MirOp::Setadczw {
+                                unit: 1,
+                                face: 2 * fi + kk,
+                            },
+                        );
+                        m.push(
+                            Role::Unpack,
+                            MirOp::UnpackConfig {
+                                unit: 1,
+                                to_src: true,
+                                dtype: dt_a,
+                                haloize: false,
+                            },
+                        );
+                        m.push(
+                            Role::Unpack,
+                            MirOp::Unpacr {
+                                cb: cb_a,
+                                unit: 1,
+                                count: FACE_DATUMS,
+                                flip: true,
+                            },
+                        );
+                        m.push(
+                            Role::Unpack,
+                            MirOp::Setadczw {
+                                unit: 0,
+                                face: 2 * kk,
+                            },
+                        );
+                        m.push(
+                            Role::Unpack,
+                            MirOp::UnpackConfig {
+                                unit: 0,
+                                to_src: true,
+                                dtype: dt_b,
+                                haloize: false,
+                            },
+                        );
+                        m.push(
+                            Role::Unpack,
+                            MirOp::Unpacr {
+                                cb: cb_b,
+                                unit: 0,
+                                count: FACE_DATUMS,
+                                flip: true,
+                            },
+                        );
+                        mvmul_group(&mut math_scratch, base);
+                        for op in math_scratch.drain(..) {
+                            m.push(Role::Math, op);
+                        }
+                        m.push(
+                            Role::Math,
+                            MirOp::Mvmul {
+                                row: base + 8,
+                                addr_mod: MATMUL_AM_GROUP,
+                                flip_a: true,
+                                flip_b: false,
+                            },
+                        );
+                        m.push(
+                            Role::Unpack,
+                            MirOp::Setadczw {
+                                unit: 0,
+                                face: 2 * kk + 1,
+                            },
+                        );
+                        m.push(
+                            Role::Unpack,
+                            MirOp::Unpacr {
+                                cb: cb_b,
+                                unit: 0,
+                                count: FACE_DATUMS,
+                                flip: true,
+                            },
+                        );
+                        mvmul_group(&mut math_scratch, base + 16);
+                        for op in math_scratch.drain(..) {
+                            m.push(Role::Math, op);
+                        }
                         let end = if kk == 0 {
                             MATMUL_AM_GROUP
                         } else {
                             MATMUL_AM_FI
                         };
-                        m.t1.push(MirOp::Mvmul {
-                            row: base + 24,
-                            addr_mod: end,
-                            flip_a: true,
-                            flip_b: true,
-                        });
+                        m.push(
+                            Role::Math,
+                            MirOp::Mvmul {
+                                row: base + 24,
+                                addr_mod: end,
+                                flip_a: true,
+                                flip_b: true,
+                            },
+                        );
                     }
                 }
                 // The Matrix Unit advanced the thread's `Dst` counter as it
@@ -950,20 +1104,23 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 // relative to it, so the counter goes back to 0. Its writes are
                 // still in flight, so the accumulator is not readable (the pack
                 // follows on T2) until the unit drains.
-                m.t1.push(MirOp::WaitMatrix);
+                m.push(Role::Math, MirOp::WaitMatrix);
                 for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
                     if staged {
-                        m.t0.push(MirOp::CbPop { cb });
+                        m.push(Role::Unpack, MirOp::CbPop { cb });
                     }
                 }
-                m.t1.push(MirOp::Setrwc {
-                    src_a: 0,
-                    src_b: 0,
-                    dst: 0,
-                    flip_src_a: false,
-                    flip_src_b: false,
-                    dst_cr: false,
-                });
+                m.push(
+                    Role::Math,
+                    MirOp::Setrwc {
+                        src_a: 0,
+                        src_b: 0,
+                        dst: 0,
+                        flip_src_a: false,
+                        flip_src_b: false,
+                        dst_cr: false,
+                    },
+                );
             }
             // `sum col`/`max col`: `GAPOOL`/`GMPOOL` fold each 16x16 face over
             // its rows into the destination row, one value per column, and the
@@ -1020,24 +1177,24 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 // for it before the first face and never pops it, so every
                 // `max` in the program re-reads the same page.
                 if scaler.is_none() {
-                    m.t0.push(MirOp::CbWait { cb: cb_b });
+                    m.push(Role::Unpack, MirOp::CbWait { cb: cb_b });
                 }
                 // A computed operand has no page: the compiler stages it, and
                 // the unpacker waits for that page before the first face.
                 if stage_x {
                     stage(&mut m, types, alloc, &alias, &acc_mask, x, cb_x);
-                    m.t0.push(MirOp::CbWait { cb: cb_x });
+                    m.push(Role::Unpack, MirOp::CbWait { cb: cb_x });
                 }
                 if stage_b {
                     if let Some(scaler) = scaler {
                         stage(&mut m, types, alloc, &alias, &acc_mask, scaler, cb_b);
                     }
-                    m.t0.push(MirOp::CbWait { cb: cb_b });
+                    m.push(Role::Unpack, MirOp::CbWait { cb: cb_b });
                 }
                 let base = dst_row(alloc, acc);
                 // The accumulator's rows are written, so wait for the packer to
                 // give the section back.
-                m.t1.push(MirOp::SemWaitFree { sem: SEM_READY });
+                m.push(Role::Math, MirOp::SemWaitFree { sem: SEM_READY });
                 // `reduce_configure_addrmod`: entry 0 clears the phase, 1 and 2
                 // step `SrcB`/`Dst`, and 3 steps only the phase.
                 for entry in [
@@ -1066,16 +1223,19 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     ],
                     vec![(thread::FIDELITY_BASE_Phase, 0)],
                 ] {
-                    m.t1.push(thread_word(&entry));
+                    m.push(Role::Math, thread_word(&entry));
                 }
-                m.t1.push(MirOp::Setrwc {
-                    src_a: 0,
-                    src_b: 0,
-                    dst: 0,
-                    flip_src_a: false,
-                    flip_src_b: false,
-                    dst_cr: false,
-                });
+                m.push(
+                    Role::Math,
+                    MirOp::Setrwc {
+                        src_a: 0,
+                        src_b: 0,
+                        dst: 0,
+                        flip_src_a: false,
+                        flip_src_b: false,
+                        dst_cr: false,
+                    },
+                );
                 if dim == crate::ir::ReduceDim::Row {
                     // tt-metal's `_llk_math_reduce_` for `REDUCE_ROW`: each
                     // face pair folds into one row of the accumulator (the
@@ -1084,18 +1244,24 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     // `reduce_row_perform_transpose` turns that row into the
                     // result's column 0. Only `max` reaches this arm: `sum row`
                     // is the Matrix Unit's matmul above.
-                    m.t0.push(MirOp::UnpackConfig {
-                        unit: 0,
-                        to_src: true,
-                        dtype: dt_x,
-                        haloize: true,
-                    });
-                    m.t0.push(MirOp::UnpackConfig {
-                        unit: 1,
-                        to_src: true,
-                        dtype: dt_b,
-                        haloize: false,
-                    });
+                    m.push(
+                        Role::Unpack,
+                        MirOp::UnpackConfig {
+                            unit: 0,
+                            to_src: true,
+                            dtype: dt_x,
+                            haloize: true,
+                        },
+                    );
+                    m.push(
+                        Role::Unpack,
+                        MirOp::UnpackConfig {
+                            unit: 1,
+                            to_src: true,
+                            dtype: dt_b,
+                            haloize: false,
+                        },
+                    );
                     for group in 0..2u32 {
                         let dst = base + 32 * group;
                         for half in 0..2u32 {
@@ -1103,36 +1269,48 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                             // One face into `SrcA` and one row of the scaler
                             // into `SrcB` (16 datums): tt-metal's AB-reduce
                             // unpack.
-                            m.t0.push(MirOp::Setadczw { unit: 0, face });
-                            m.t0.push(MirOp::Unpacr {
-                                cb: cb_x,
-                                unit: 0,
-                                count: FACE_DATUMS,
-                                flip: true,
-                            });
-                            m.t0.push(MirOp::Setadczw { unit: 1, face });
-                            m.t0.push(MirOp::Unpacr {
-                                cb: cb_b,
-                                unit: 1,
-                                count: 16,
-                                flip: true,
-                            });
-                            m.t0.push(MirOp::SemPost { sem: SEM_UNPACKED });
-                            m.t1.push(MirOp::SemWait {
-                                sem: SEM_UNPACKED,
-                                before: 0,
-                            });
+                            m.push(Role::Unpack, MirOp::Setadczw { unit: 0, face });
+                            m.push(
+                                Role::Unpack,
+                                MirOp::Unpacr {
+                                    cb: cb_x,
+                                    unit: 0,
+                                    count: FACE_DATUMS,
+                                    flip: true,
+                                },
+                            );
+                            m.push(Role::Unpack, MirOp::Setadczw { unit: 1, face });
+                            m.push(
+                                Role::Unpack,
+                                MirOp::Unpacr {
+                                    cb: cb_b,
+                                    unit: 1,
+                                    count: 16,
+                                    flip: true,
+                                },
+                            );
+                            m.push(Role::Unpack, MirOp::SemPost { sem: SEM_UNPACKED });
+                            m.push(
+                                Role::Math,
+                                MirOp::SemWait {
+                                    sem: SEM_UNPACKED,
+                                    before: 0,
+                                },
+                            );
                             // The first face of a pair hands both banks back
                             // (`CLR_AB`); the second leaves them, because
                             // `TRNSPSRCB` reads the `SrcB` bank the fold just
                             // consumed (tt-metal's `CLR_AB` then `CLR_NONE`).
-                            m.t1.push(MirOp::Gmpool {
-                                flip_src_b: half == 0,
-                                flip_src_a: half == 0,
-                                addr_mod: 0,
-                                arg_max: 0,
-                                dst_row: dst,
-                            });
+                            m.push(
+                                Role::Math,
+                                MirOp::Gmpool {
+                                    flip_src_b: half == 0,
+                                    flip_src_a: half == 0,
+                                    addr_mod: 0,
+                                    arg_max: 0,
+                                    dst_row: dst,
+                                },
+                            );
                         }
                         // `reduce_row_perform_transpose<true>`: the fold's row
                         // goes to `SrcB` rows 16..31, is transposed there, and
@@ -1147,107 +1325,152 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         // The low halves are saved in `SrcA` first: writing the
                         // high halves zeroes them in `Dst`, exactly as
                         // tt-metal's `transpose_dest_32b` orders it.
-                        m.t1.push(thread_word(&[(thread::DISABLE_IMPLIED_SRCA_FMT_Base, 1)]));
-                        m.t1.push(MirOp::SrcAFormat {
-                            dtype: crate::ir::DType::F32,
-                        });
-                        m.t1.push(MirOp::AluAccCtrl {
-                            fp32: true,
-                            zero_flag_src: true,
-                        });
+                        m.push(
+                            Role::Math,
+                            thread_word(&[(thread::DISABLE_IMPLIED_SRCA_FMT_Base, 1)]),
+                        );
+                        m.push(
+                            Role::Math,
+                            MirOp::SrcAFormat {
+                                dtype: crate::ir::DType::F32,
+                            },
+                        );
+                        m.push(
+                            Role::Math,
+                            MirOp::AluAccCtrl {
+                                fp32: true,
+                                zero_flag_src: true,
+                            },
+                        );
                         // The transposed low halves, parked in `SrcA` rows
                         // 0..15.
-                        m.t1.push(MirOp::Movd2b {
-                            use_dst32b_lo: true,
-                            src_row: 16,
-                            addr_mod: 0,
-                            move4_rows: false,
-                            dst_row: dst,
-                        });
-                        m.t1.push(MirOp::Trnspsrcb);
-                        for chunk in 0..4u32 {
-                            m.t1.push(MirOp::Movb2a {
-                                src_a_row: 4 * chunk,
+                        m.push(
+                            Role::Math,
+                            MirOp::Movd2b {
+                                use_dst32b_lo: true,
+                                src_row: 16,
                                 addr_mod: 0,
-                                move4_rows: true,
-                                src_b_row: 16 + 4 * chunk,
-                            });
+                                move4_rows: false,
+                                dst_row: dst,
+                            },
+                        );
+                        m.push(Role::Math, MirOp::Trnspsrcb);
+                        for chunk in 0..4u32 {
+                            m.push(
+                                Role::Math,
+                                MirOp::Movb2a {
+                                    src_a_row: 4 * chunk,
+                                    addr_mod: 0,
+                                    move4_rows: true,
+                                    src_b_row: 16 + 4 * chunk,
+                                },
+                            );
                         }
                         // The high halves, back into the `Dst` column.
-                        m.t1.push(MirOp::Movd2b {
-                            use_dst32b_lo: false,
-                            src_row: 16,
-                            addr_mod: 0,
-                            move4_rows: false,
-                            dst_row: dst,
-                        });
-                        m.t1.push(MirOp::Trnspsrcb);
-                        m.t1.push(MirOp::Movd2b {
-                            use_dst32b_lo: false,
-                            src_row: 16,
-                            addr_mod: 0,
-                            move4_rows: false,
-                            dst_row: dst,
-                        });
-                        for chunk in 0..4u32 {
-                            m.t1.push(MirOp::Movb2d {
+                        m.push(
+                            Role::Math,
+                            MirOp::Movd2b {
                                 use_dst32b_lo: false,
-                                src_row: 16 + 4 * chunk,
+                                src_row: 16,
                                 addr_mod: 0,
-                                move4_rows: true,
-                                dst_row: dst + 4 * chunk,
-                            });
+                                move4_rows: false,
+                                dst_row: dst,
+                            },
+                        );
+                        m.push(Role::Math, MirOp::Trnspsrcb);
+                        m.push(
+                            Role::Math,
+                            MirOp::Movd2b {
+                                use_dst32b_lo: false,
+                                src_row: 16,
+                                addr_mod: 0,
+                                move4_rows: false,
+                                dst_row: dst,
+                            },
+                        );
+                        for chunk in 0..4u32 {
+                            m.push(
+                                Role::Math,
+                                MirOp::Movb2d {
+                                    use_dst32b_lo: false,
+                                    src_row: 16 + 4 * chunk,
+                                    addr_mod: 0,
+                                    move4_rows: true,
+                                    dst_row: dst + 4 * chunk,
+                                },
+                            );
                         }
                         // The low halves, restored from the parked column.
                         for half in 0..2u32 {
-                            m.t1.push(MirOp::Mova2d {
-                                use_dst32b_lo: true,
-                                src_row: 8 * half,
-                                addr_mod: 0,
-                                move8_rows: true,
-                                dst_row: dst + 8 * half,
-                            });
+                            m.push(
+                                Role::Math,
+                                MirOp::Mova2d {
+                                    use_dst32b_lo: true,
+                                    src_row: 8 * half,
+                                    addr_mod: 0,
+                                    move8_rows: true,
+                                    dst_row: dst + 8 * half,
+                                },
+                            );
                         }
-                        m.t1.push(MirOp::AluAccCtrl {
-                            fp32: true,
-                            zero_flag_src: false,
-                        });
-                        m.t1.push(thread_word(&[(thread::DISABLE_IMPLIED_SRCA_FMT_Base, 0)]));
+                        m.push(
+                            Role::Math,
+                            MirOp::AluAccCtrl {
+                                fp32: true,
+                                zero_flag_src: false,
+                            },
+                        );
+                        m.push(
+                            Role::Math,
+                            thread_word(&[(thread::DISABLE_IMPLIED_SRCA_FMT_Base, 0)]),
+                        );
                         // `SETRWC(CLR_AB, 0, 0, 0, 0, SET_BD)`: hand both banks
                         // back before the next pair unpacks.
-                        m.t1.push(MirOp::Setrwc {
-                            src_a: 0,
-                            src_b: 0,
-                            dst: 0,
-                            flip_src_a: true,
-                            flip_src_b: true,
-                            dst_cr: false,
-                        });
+                        m.push(
+                            Role::Math,
+                            MirOp::Setrwc {
+                                src_a: 0,
+                                src_b: 0,
+                                dst: 0,
+                                flip_src_a: true,
+                                flip_src_b: true,
+                                dst_cr: false,
+                            },
+                        );
                     }
-                    m.t1.push(MirOp::WaitMatrix);
+                    m.push(Role::Math, MirOp::WaitMatrix);
                     // The pack's edge mask keeps column 0 of every row, and the
                     // fold's column lands at rows 0..15 and 32..47; the rows
                     // between (16..31 and 48..63) would pack stale datums, so
                     // they are written as the zeros the result defines.
-                    m.t1.push(MirOp::LaneConst {
-                        lreg: 0,
-                        bits: 0.0f32.to_bits(),
-                    });
-                    for row in (16..32).chain(48..DST_ROWS).step_by(2) {
-                        m.t1.push(MirOp::Sfpstore {
+                    m.push(
+                        Role::Math,
+                        MirOp::LaneConst {
                             lreg: 0,
-                            row: base + row,
-                            dtype: storage(crate::ir::DType::F32),
-                        });
+                            bits: 0.0f32.to_bits(),
+                        },
+                    );
+                    for row in (16..32).chain(48..DST_ROWS).step_by(2) {
+                        m.push(
+                            Role::Math,
+                            MirOp::Sfpstore {
+                                lreg: 0,
+                                row: base + row,
+                                dtype: storage(crate::ir::DType::F32),
+                            },
+                        );
                     }
-                    m.t1.push(MirOp::Setrwc {
-                        src_a: 0,
-                        src_b: 0,
-                        dst: 0,
-                        flip_src_a: false,
-                        flip_src_b: false,
-                        dst_cr: false,
-                    });
+                    m.push(
+                        Role::Math,
+                        MirOp::Setrwc {
+                            src_a: 0,
+                            src_b: 0,
+                            dst: 0,
+                            flip_src_a: false,
+                            flip_src_b: false,
+                            dst_cr: false,
+                        },
+                    );
                     acc_mask[acc as usize] = PackMask::Row;
                 } else {
                     // Four faces, `SrcA` (256 datums) and the scaler's row (16
@@ -1257,103 +1480,136 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     for face in 0..4u32 {
                         // One face into `SrcA` and one row of the scaler into
                         // `SrcB` (16 datums): tt-metal's AB-reduce unpack.
-                        m.t0.push(MirOp::Setadczw { unit: 0, face });
-                        m.t0.push(MirOp::UnpackConfig {
-                            unit: 0,
-                            to_src: true,
-                            dtype: dt_x,
-                            haloize: false,
-                        });
-                        m.t0.push(MirOp::Unpacr {
-                            cb: cb_x,
-                            unit: 0,
-                            count: FACE_DATUMS,
-                            flip: true,
-                        });
-                        m.t0.push(MirOp::Setadczw { unit: 1, face });
-                        m.t0.push(MirOp::UnpackConfig {
-                            unit: 1,
-                            to_src: true,
-                            dtype: dt_b,
-                            haloize: false,
-                        });
-                        m.t0.push(MirOp::Unpacr {
-                            cb: cb_b,
-                            unit: 1,
-                            count: 16,
-                            flip: true,
-                        });
-                        m.t0.push(MirOp::SemPost { sem: SEM_UNPACKED });
-                        m.t1.push(MirOp::SemWait {
-                            sem: SEM_UNPACKED,
-                            before: 0,
-                        });
+                        m.push(Role::Unpack, MirOp::Setadczw { unit: 0, face });
+                        m.push(
+                            Role::Unpack,
+                            MirOp::UnpackConfig {
+                                unit: 0,
+                                to_src: true,
+                                dtype: dt_x,
+                                haloize: false,
+                            },
+                        );
+                        m.push(
+                            Role::Unpack,
+                            MirOp::Unpacr {
+                                cb: cb_x,
+                                unit: 0,
+                                count: FACE_DATUMS,
+                                flip: true,
+                            },
+                        );
+                        m.push(Role::Unpack, MirOp::Setadczw { unit: 1, face });
+                        m.push(
+                            Role::Unpack,
+                            MirOp::UnpackConfig {
+                                unit: 1,
+                                to_src: true,
+                                dtype: dt_b,
+                                haloize: false,
+                            },
+                        );
+                        m.push(
+                            Role::Unpack,
+                            MirOp::Unpacr {
+                                cb: cb_b,
+                                unit: 1,
+                                count: 16,
+                                flip: true,
+                            },
+                        );
+                        m.push(Role::Unpack, MirOp::SemPost { sem: SEM_UNPACKED });
+                        m.push(
+                            Role::Math,
+                            MirOp::SemWait {
+                                sem: SEM_UNPACKED,
+                                before: 0,
+                            },
+                        );
                         // Faces 0 and 2 fold into the first half of row 0, faces 1
                         // and 3 into the second (tt-metal's `SETRWC(CR_D, 8)`
                         // twice).
                         let dst = base + if face % 2 == 0 { 0 } else { 16 };
                         if max {
-                            m.t1.push(MirOp::Gmpool {
-                                flip_src_b: false,
-                                flip_src_a: false,
-                                addr_mod: 0,
-                                arg_max: 0,
-                                dst_row: dst,
-                            });
+                            m.push(
+                                Role::Math,
+                                MirOp::Gmpool {
+                                    flip_src_b: false,
+                                    flip_src_a: false,
+                                    addr_mod: 0,
+                                    arg_max: 0,
+                                    dst_row: dst,
+                                },
+                            );
                         } else {
                             // Four fidelity phases, the last clearing the phase
                             // (tt-metal's `reduce_configure_mop`).
                             for addr_mod in [3u32, 3, 3, 0] {
-                                m.t1.push(MirOp::Gapool {
-                                    flip_src_b: false,
-                                    flip_src_a: false,
-                                    addr_mod,
-                                    dst_row: dst,
-                                });
+                                m.push(
+                                    Role::Math,
+                                    MirOp::Gapool {
+                                        flip_src_b: false,
+                                        flip_src_a: false,
+                                        addr_mod,
+                                        dst_row: dst,
+                                    },
+                                );
                             }
                         }
                         // `SETRWC(CLR_AB, 0, 0, 0, 0, SET_AD)`: hand both banks back
                         // and leave the counters where the face started.
-                        m.t1.push(MirOp::Setrwc {
-                            src_a: 0,
-                            src_b: 0,
-                            dst: 0,
-                            flip_src_a: true,
-                            flip_src_b: true,
-                            dst_cr: false,
-                        });
+                        m.push(
+                            Role::Math,
+                            MirOp::Setrwc {
+                                src_a: 0,
+                                src_b: 0,
+                                dst: 0,
+                                flip_src_a: true,
+                                flip_src_b: true,
+                                dst_cr: false,
+                            },
+                        );
                     }
-                    m.t1.push(MirOp::WaitMatrix);
+                    m.push(Role::Math, MirOp::WaitMatrix);
                     // The pack's edge mask keeps the first row of *every* face,
                     // and the fold only writes faces 0 and 1; the packer cannot
                     // select faces, so faces 2 and 3 (the lower half of the tile)
                     // are written as the zeros the result defines.
-                    m.t1.push(MirOp::LaneConst {
-                        lreg: 0,
-                        bits: 0.0f32.to_bits(),
-                    });
-                    for row in (32..DST_ROWS).step_by(2) {
-                        m.t1.push(MirOp::Sfpstore {
+                    m.push(
+                        Role::Math,
+                        MirOp::LaneConst {
                             lreg: 0,
-                            row: base + row,
-                            dtype: storage(crate::ir::DType::F32),
-                        });
+                            bits: 0.0f32.to_bits(),
+                        },
+                    );
+                    for row in (32..DST_ROWS).step_by(2) {
+                        m.push(
+                            Role::Math,
+                            MirOp::Sfpstore {
+                                lreg: 0,
+                                row: base + row,
+                                dtype: storage(crate::ir::DType::F32),
+                            },
+                        );
                     }
-                    m.t1.push(MirOp::Setrwc {
-                        src_a: 0,
-                        src_b: 0,
-                        dst: 0,
-                        flip_src_a: false,
-                        flip_src_b: false,
-                        dst_cr: false,
-                    });
+                    m.push(
+                        Role::Math,
+                        MirOp::Setrwc {
+                            src_a: 0,
+                            src_b: 0,
+                            dst: 0,
+                            flip_src_a: false,
+                            flip_src_b: false,
+                            dst_cr: false,
+                        },
+                    );
                     acc_mask[acc as usize] = PackMask::Col;
                 }
                 // A staged operand's page is the compiler's: release it once
                 // the fold has drained it.
                 for (cb, staged) in [(cb_x, stage_x), (cb_b, stage_b)] {
                     if staged {
-                        m.t0.push(MirOp::CbPop { cb });
+                        m.push(Role::Unpack, MirOp::CbPop { cb });
                     }
                 }
             }
@@ -1365,7 +1621,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
         // A page a `matmul` read is released once the last reader of the loaded
         // value has consumed it, which is after the matmul's own unpacks.
         for cb in std::mem::take(&mut pop_here[at]) {
-            m.t0.push(MirOp::CbPop { cb });
+            m.push(Role::Unpack, MirOp::CbPop { cb });
         }
     }
     // The compiler's 1.0 page: written once, at the start of the kernel, into
@@ -1375,25 +1631,30 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
     // scratch slot's old contents, which nothing reads.
     if let Some(ones) = plan.ones {
         let row = u32::from(crate::alloc::DST_SLOTS - 1) * DST_ROWS;
-        let mut t1 = vec![
-            MirOp::SemWaitFree { sem: SEM_READY },
+        let mut prologue: Vec<(Role, MirOp)> =
+            vec![(Role::Math, MirOp::SemWaitFree { sem: SEM_READY })];
+        prologue.push((
+            Role::Math,
             MirOp::LaneConst {
                 lreg: 0,
                 bits: 1.0f32.to_bits(),
             },
-        ];
+        ));
         for row_off in (0..DST_ROWS).step_by(2) {
-            t1.push(MirOp::Sfpstore {
-                lreg: 0,
-                row: row + row_off,
-                dtype: storage(ones.dtype),
-            });
+            prologue.push((
+                Role::Math,
+                MirOp::Sfpstore {
+                    lreg: 0,
+                    row: row + row_off,
+                    dtype: storage(ones.dtype),
+                },
+            ));
         }
-        t1.push(MirOp::SemPost { sem: SEM_READY });
+        prologue.push((Role::Math, MirOp::SemPost { sem: SEM_READY }));
         // The slot is reused by the program, so the math does not proceed
         // until the packer has retired this section.
-        t1.push(MirOp::SemWaitFree { sem: SEM_READY });
-        let mut t2 = vec![
+        prologue.push((Role::Math, MirOp::SemWaitFree { sem: SEM_READY }));
+        for op in [
             MirOp::SemWaitData { sem: SEM_READY },
             MirOp::CbReserve { cb: ones.cb },
             MirOp::Pack {
@@ -1406,11 +1667,28 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             },
             MirOp::SemGet { sem: SEM_READY },
             MirOp::CbPush { cb: ones.cb },
-        ];
-        t1.append(&mut m.t1);
-        t2.append(&mut m.t2);
-        m.t1 = t1;
-        m.t2 = t2;
+        ] {
+            prologue.push((Role::Pack, op));
+        }
+        prologue.extend(m.ops.drain(..));
+        m.ops = prologue;
+    }
+    if std::env::var_os("SKAMANDROS_DUMP").is_some() {
+        eprintln!("cbs: {}", plan.cbs.len());
+        for (i, cb) in plan.cbs.iter().enumerate() {
+            eprintln!("  {i}: page {} pages {}", cb.page, cb.pages);
+        }
+        for (v, cb) in plan.cb.iter().enumerate() {
+            if cb.is_some() {
+                eprintln!("cb {v} {} {:?}", k.names[v], cb);
+            }
+        }
+        for role in [Role::Unpack, Role::Math, Role::Pack] {
+            eprintln!("--- {role:?}");
+            for op in m.stream(role) {
+                eprintln!("{op:?}");
+            }
+        }
     }
     Ok(m)
 }
@@ -1537,88 +1815,115 @@ fn fpu_broadcast(
     // The `Src` banks are filled from the pages the unpacker owns.
     for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
         if staged {
-            m.t0.push(MirOp::CbWait { cb });
+            m.push(Role::Unpack, MirOp::CbWait { cb });
         }
     }
     // The counters start at 0 and `ADDR_MOD_0` steps `SrcA` and `Dst` eight
     // rows per instruction, and `SrcB` too unless the broadcast holds it still.
-    m.t1.push(MirOp::Setrwc {
-        src_a: 0,
-        src_b: 0,
-        dst: 0,
-        flip_src_a: false,
-        flip_src_b: false,
-        dst_cr: false,
-    });
-    m.t1.push(thread_word(&[
-        (thread::ADDR_MOD_AB_SEC0_SrcAIncr, 8),
-        (
-            thread::ADDR_MOD_AB_SEC0_SrcBIncr,
-            match bcast {
-                Bcast::Col => 8u16,
-                Bcast::Row | Bcast::Scalar => 0,
-            },
-        ),
-        (thread::ADDR_MOD_AB_SEC0_SrcBClear, 0),
-        (thread::ADDR_MOD_AB_SEC0_SrcAClear, 0),
-    ]));
-    m.t1.push(thread_word(&[
-        (thread::ADDR_MOD_DST_SEC0_DestIncr, 0),
-        (thread::ADDR_MOD_DST_SEC0_DestCR, 0),
-        // The last phase of a multiply hands the phase counter back to 0.
-        (thread::ADDR_MOD_DST_SEC0_FidelityClear, 1),
-    ]));
+    m.push(
+        Role::Math,
+        MirOp::Setrwc {
+            src_a: 0,
+            src_b: 0,
+            dst: 0,
+            flip_src_a: false,
+            flip_src_b: false,
+            dst_cr: false,
+        },
+    );
+    m.push(
+        Role::Math,
+        thread_word(&[
+            (thread::ADDR_MOD_AB_SEC0_SrcAIncr, 8),
+            (
+                thread::ADDR_MOD_AB_SEC0_SrcBIncr,
+                match bcast {
+                    Bcast::Col => 8u16,
+                    Bcast::Row | Bcast::Scalar => 0,
+                },
+            ),
+            (thread::ADDR_MOD_AB_SEC0_SrcBClear, 0),
+            (thread::ADDR_MOD_AB_SEC0_SrcAClear, 0),
+        ]),
+    );
+    m.push(
+        Role::Math,
+        thread_word(&[
+            (thread::ADDR_MOD_DST_SEC0_DestIncr, 0),
+            (thread::ADDR_MOD_DST_SEC0_DestCR, 0),
+            // The last phase of a multiply hands the phase counter back to 0.
+            (thread::ADDR_MOD_DST_SEC0_FidelityClear, 1),
+        ]),
+    );
     // `ADDR_MOD_1`: the next fidelity phase of the same eight rows — no
     // counter moves, only the phase, so the instruction re-multiplies the same
     // operands' next mantissa slice into the same `Dst` rows.
-    m.t1.push(thread_word(&[
-        (thread::ADDR_MOD_AB_SEC1_SrcAIncr, 0),
-        (thread::ADDR_MOD_AB_SEC1_SrcBIncr, 0),
-        (thread::ADDR_MOD_AB_SEC1_SrcBClear, 0),
-        (thread::ADDR_MOD_AB_SEC1_SrcAClear, 0),
-    ]));
-    m.t1.push(thread_word(&[
-        (thread::ADDR_MOD_DST_SEC1_DestIncr, 0),
-        (thread::ADDR_MOD_DST_SEC1_DestCR, 0),
-        (thread::ADDR_MOD_DST_SEC1_FidelityIncr, 1),
-    ]));
+    m.push(
+        Role::Math,
+        thread_word(&[
+            (thread::ADDR_MOD_AB_SEC1_SrcAIncr, 0),
+            (thread::ADDR_MOD_AB_SEC1_SrcBIncr, 0),
+            (thread::ADDR_MOD_AB_SEC1_SrcBClear, 0),
+            (thread::ADDR_MOD_AB_SEC1_SrcAClear, 0),
+        ]),
+    );
+    m.push(
+        Role::Math,
+        thread_word(&[
+            (thread::ADDR_MOD_DST_SEC1_DestIncr, 0),
+            (thread::ADDR_MOD_DST_SEC1_DestCR, 0),
+            (thread::ADDR_MOD_DST_SEC1_FidelityIncr, 1),
+        ]),
+    );
     // The section is written, never accumulated into.
-    m.t1.push(MirOp::SemWaitFree { sem: SEM_READY });
+    m.push(Role::Math, MirOp::SemWaitFree { sem: SEM_READY });
     // `ELWMUL`'s word carries bit 21 set, so the hardware accumulates into the
     // destination (tt-isa's measured encoding; `ELWADD`/`ELWSUB` overwrite).
     // That is also how the four fidelity phases add up, so the result section is
     // zeroed first and the phases accumulate onto nothing.
     if matches!(op, BinOp::Mul) {
-        m.t1.push(MirOp::LaneConst {
-            lreg: 0,
-            bits: 0.0f32.to_bits(),
-        });
-        for row in (0..DST_ROWS).step_by(2) {
-            m.t1.push(MirOp::Sfpstore {
+        m.push(
+            Role::Math,
+            MirOp::LaneConst {
                 lreg: 0,
-                row: out + row,
-                dtype: if m.dst_is_16_bit {
-                    crate::ir::DType::Bf16
-                } else {
-                    crate::ir::DType::F32
+                bits: 0.0f32.to_bits(),
+            },
+        );
+        for row in (0..DST_ROWS).step_by(2) {
+            m.push(
+                Role::Math,
+                MirOp::Sfpstore {
+                    lreg: 0,
+                    row: out + row,
+                    dtype: if m.dst_is_16_bit {
+                        crate::ir::DType::Bf16
+                    } else {
+                        crate::ir::DType::F32
+                    },
                 },
-            });
+            );
         }
     }
     for face in 0..4u32 {
-        m.t0.push(MirOp::Setadczw { unit: 0, face });
-        m.t0.push(MirOp::UnpackConfig {
-            unit: 0,
-            to_src: true,
-            dtype: dt_a,
-            haloize: false,
-        });
-        m.t0.push(MirOp::Unpacr {
-            cb: cb_a,
-            unit: 0,
-            count: FACE_DATUMS,
-            flip: true,
-        });
+        m.push(Role::Unpack, MirOp::Setadczw { unit: 0, face });
+        m.push(
+            Role::Unpack,
+            MirOp::UnpackConfig {
+                unit: 0,
+                to_src: true,
+                dtype: dt_a,
+                haloize: false,
+            },
+        );
+        m.push(
+            Role::Unpack,
+            MirOp::Unpacr {
+                cb: cb_a,
+                unit: 0,
+                count: FACE_DATUMS,
+                flip: true,
+            },
+        );
         // `SrcB`: the page face the FPU reads for `SrcA`'s face. A narrow
         // value's page keeps only its own part, so both halves of the tile read
         // the same face: a row's faces 0 and 1 (row 0) serve the tile's four
@@ -1629,27 +1934,39 @@ fn fpu_broadcast(
             Bcast::Col => face & !1,
             Bcast::Scalar => 0,
         };
-        m.t0.push(MirOp::Setadczw {
-            unit: 1,
-            face: b_face,
-        });
-        m.t0.push(MirOp::UnpackConfig {
-            unit: 1,
-            to_src: true,
-            dtype: dt_b,
-            haloize: false,
-        });
-        m.t0.push(MirOp::Unpacr {
-            cb: cb_b,
-            unit: 1,
-            count: FACE_DATUMS,
-            flip: true,
-        });
-        m.t0.push(MirOp::SemPost { sem: SEM_UNPACKED });
-        m.t1.push(MirOp::SemWait {
-            sem: SEM_UNPACKED,
-            before: 0,
-        });
+        m.push(
+            Role::Unpack,
+            MirOp::Setadczw {
+                unit: 1,
+                face: b_face,
+            },
+        );
+        m.push(
+            Role::Unpack,
+            MirOp::UnpackConfig {
+                unit: 1,
+                to_src: true,
+                dtype: dt_b,
+                haloize: false,
+            },
+        );
+        m.push(
+            Role::Unpack,
+            MirOp::Unpacr {
+                cb: cb_b,
+                unit: 1,
+                count: FACE_DATUMS,
+                flip: true,
+            },
+        );
+        m.push(Role::Unpack, MirOp::SemPost { sem: SEM_UNPACKED });
+        m.push(
+            Role::Math,
+            MirOp::SemWait {
+                sem: SEM_UNPACKED,
+                before: 0,
+            },
+        );
         // One face is two instructions of eight rows. `ELWMUL` is the Matrix
         // Unit's *sliced* multiply: one pass takes the top four mantissa bits of
         // each operand and each further phase adds the next slice into the same
@@ -1661,17 +1978,22 @@ fn fpu_broadcast(
         let phases: u32 = if matches!(op, BinOp::Mul) { 4 } else { 1 };
         for half in 0..2u32 {
             for phase in 0..phases {
-                m.t1.push(MirOp::Elw {
-                    op: match op {
-                        BinOp::Add => ElwOp::Add,
-                        BinOp::Sub => ElwOp::Sub,
-                        BinOp::Mul => ElwOp::Mul,
-                        other => unreachable!("the caller admits add, sub and mul, not {other:?}"),
+                m.push(
+                    Role::Math,
+                    MirOp::Elw {
+                        op: match op {
+                            BinOp::Add => ElwOp::Add,
+                            BinOp::Sub => ElwOp::Sub,
+                            BinOp::Mul => ElwOp::Mul,
+                            other => {
+                                unreachable!("the caller admits add, sub and mul, not {other:?}")
+                            }
+                        },
+                        bcast,
+                        addr_mod: if phase + 1 == phases { 0 } else { 1 },
+                        dst_row: out + 16 * face + 8 * half,
                     },
-                    bcast,
-                    addr_mod: if phase + 1 == phases { 0 } else { 1 },
-                    dst_row: out + 16 * face + 8 * half,
-                });
+                );
             }
         }
         // `SETRWC(CLR_AB, .., SET_AB)`: the banks go back before the next
@@ -1679,28 +2001,34 @@ fn fpu_broadcast(
         // (tt-metal's reduce clears after every face for the same reason). The
         // unpacker refills each face from the bank's start, so the counters stay
         // at 0 and the `SFPU` afterwards addresses `Dst` relative to 0.
-        m.t1.push(MirOp::Setrwc {
-            src_a: 0,
-            src_b: 0,
-            dst: 0,
-            flip_src_a: true,
-            flip_src_b: true,
-            dst_cr: false,
-        });
+        m.push(
+            Role::Math,
+            MirOp::Setrwc {
+                src_a: 0,
+                src_b: 0,
+                dst: 0,
+                flip_src_a: true,
+                flip_src_b: true,
+                dst_cr: false,
+            },
+        );
     }
     // The counters are back to 0 for the `SFPU`, which addresses `Dst` relative
     // to them.
-    m.t1.push(MirOp::Setrwc {
-        src_a: 0,
-        src_b: 0,
-        dst: 0,
-        flip_src_a: false,
-        flip_src_b: false,
-        dst_cr: false,
-    });
+    m.push(
+        Role::Math,
+        MirOp::Setrwc {
+            src_a: 0,
+            src_b: 0,
+            dst: 0,
+            flip_src_a: false,
+            flip_src_b: false,
+            dst_cr: false,
+        },
+    );
     for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
         if staged {
-            m.t0.push(MirOp::CbPop { cb });
+            m.push(Role::Unpack, MirOp::CbPop { cb });
         }
     }
     Ok(())
@@ -1721,22 +2049,25 @@ fn stage(
 ) {
     let id = resolve(alias, value);
     let dtype = types.of(id).dtype;
-    m.t1.push(MirOp::SemWaitFree { sem: SEM_READY });
-    m.t1.push(MirOp::SemPost { sem: SEM_READY });
-    m.t2.push(MirOp::SemWaitData { sem: SEM_READY });
-    m.t2.push(MirOp::CbReserve { cb });
-    m.t2.push(MirOp::Pack {
-        cb,
-        rows: DST_ROWS,
-        row: dst_row(alloc, id),
-        last: true,
-        dtype,
-        mask: acc_mask[id as usize],
-    });
-    m.t2.push(MirOp::SemGet { sem: SEM_READY });
-    m.t2.push(MirOp::CbPush { cb });
+    m.push(Role::Math, MirOp::SemWaitFree { sem: SEM_READY });
+    m.push(Role::Math, MirOp::SemPost { sem: SEM_READY });
+    m.push(Role::Pack, MirOp::SemWaitData { sem: SEM_READY });
+    m.push(Role::Pack, MirOp::CbReserve { cb });
+    m.push(
+        Role::Pack,
+        MirOp::Pack {
+            cb,
+            rows: DST_ROWS,
+            row: dst_row(alloc, id),
+            last: true,
+            dtype,
+            mask: acc_mask[id as usize],
+        },
+    );
+    m.push(Role::Pack, MirOp::SemGet { sem: SEM_READY });
+    m.push(Role::Pack, MirOp::CbPush { cb });
     // The pack has retired, so the `Dst` slot is free again.
-    m.t2.push(MirOp::SemPost { sem: SEM_SLOT });
+    m.push(Role::Pack, MirOp::SemPost { sem: SEM_SLOT });
 }
 
 /// The literal trip count of a bound, if it has one.
@@ -2007,6 +2338,350 @@ fn exp2_body(
     }
 }
 
+/// `1/sqrt(x)` in the lane: tt-metal's `_calculate_sqrt_body_` with its
+/// `RECIPROCAL` flag set, which is the accurate `rsqrt`
+/// (`ckernel_sfpu_rsqrt.h` dispatches to
+/// `_calculate_sqrt_internal_<…, RECIPROCAL = true, …>` unless the caller asks
+/// for the `legacy_compat` form). The program constants `_init_sqrt_` leaves in
+/// `vConstIntPrgm0`/`vConstFloatPrgm1`/`vConstFloatPrgm2` are lanes here: this
+/// compiler has no program-constant register, and the values are all the
+/// sequence reads.
+///
+/// The seed is the exponent-halving bit form `magic - bits(x)/2`; then one
+/// corrected Newton trio `y = y (P1 + c (P2 + c))`, `c = -y·xy`; then the
+/// reciprocal step `y = (1 - xy²)·y/2 + y`, with tt-metal's `addexp(y, -1)`
+/// spelled as `y · 0.5` (exact for every normal `y`). The guard keeps that root
+/// where `bits(x)` is neither zero nor `+inf` and writes
+/// `reinterpret(inf_bits - bits(x))` elsewhere — `+inf` for `x = 0`, `0` for
+/// `x = +inf` — and a negative `x` (but not `-0`) becomes NaN.
+///
+/// `la` is the input lane and lane 1 is the result; the other six are scratch,
+/// so the sequence fits the same per-row loop as every other SFPU body.
+fn rsqrt_body(
+    role: &mut Vec<MirOp>,
+    src: u32,
+    out: u32,
+    rows: &[u32],
+    la: u8,
+    dtype: crate::ir::DType,
+) {
+    // `_init_sqrt_`'s accurate-mode constants.
+    const MAGIC: u32 = 0x5f11_10a0;
+    const P1: f32 = 2.2825186;
+    const P2: f32 = 2.2533049;
+    const INF_BITS: u32 = 0x7f80_0000;
+    const NAN_BITS: u32 = 0x7fc0_0000;
+    debug_assert!(la < 2, "the body's scratch lanes start at 2");
+    // TEMP probe: stop the body at stage `N` and store lane `L` (`RSQRT_STAGE`
+    // / `RSQRT_LANE`). Removed before finishing.
+    let stage: u32 = std::env::var("RSQRT_STAGE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let stop_at: u8 = std::env::var("RSQRT_LANE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let mut step = 0u32;
+    for &row in rows {
+        role.push(MirOp::Sfpload {
+            lreg: la,
+            row: src + row,
+            dtype,
+        });
+        // `x` lives in lane 2 for the rest of the row: the lane a `cast` picks
+        // as scratch is the lowest one that is neither its operands, so lane 0
+        // has to be free (`cast_lanes`'s `scratch`).
+        role.push(MirOp::Cast {
+            from: crate::ir::DType::F32,
+            to: crate::ir::DType::F32,
+            a: la,
+            d: 2,
+        });
+        step += 1;
+        if stage == step {
+            role.push(MirOp::Sfpstore {
+                lreg: stop_at,
+                row: out + row,
+                dtype,
+            });
+            continue;
+        }
+        // `i = bits(x) >> 1`, logically: the amount lane holds the integer 1 and
+        // `SFPSHFT` negates it in its own lane.
+        role.push(MirOp::LaneConst { lreg: 7, bits: 1 });
+        role.push(MirOp::Sfp {
+            op: SfpOp::Shr,
+            a: 2,
+            b: Some(7),
+            d: 3,
+        });
+        // `y = reinterpret(MAGIC - i)`.
+        role.push(MirOp::LaneConst {
+            lreg: 0,
+            bits: MAGIC,
+        });
+        role.push(MirOp::Sfp {
+            op: SfpOp::ISub,
+            a: 0,
+            b: Some(3),
+            d: 3,
+        });
+        step += 1;
+        if stage == step {
+            role.push(MirOp::Sfpstore {
+                lreg: stop_at,
+                row: out + row,
+                dtype,
+            });
+            continue;
+        }
+        // `xy = x y`, `c = (-y) xy`.
+        role.push(MirOp::Sfp {
+            op: SfpOp::Mul,
+            a: 2,
+            b: Some(3),
+            d: 4,
+        });
+        role.push(MirOp::Sfp {
+            op: SfpOp::Neg,
+            a: 3,
+            b: None,
+            d: 5,
+        });
+        role.push(MirOp::Sfp {
+            op: SfpOp::Mul,
+            a: 5,
+            b: Some(4),
+            d: 4,
+        });
+        // `y = y (P1 + c (P2 + c))`.
+        role.push(MirOp::LaneConst {
+            lreg: 6,
+            bits: P2.to_bits(),
+        });
+        role.push(MirOp::Sfp {
+            op: SfpOp::Add,
+            a: 6,
+            b: Some(4),
+            d: 6,
+        });
+        role.push(MirOp::Sfp {
+            op: SfpOp::Mul,
+            a: 6,
+            b: Some(4),
+            d: 6,
+        });
+        role.push(MirOp::LaneConst {
+            lreg: 7,
+            bits: P1.to_bits(),
+        });
+        role.push(MirOp::Sfp {
+            op: SfpOp::Add,
+            a: 6,
+            b: Some(7),
+            d: 6,
+        });
+        role.push(MirOp::Sfp {
+            op: SfpOp::Mul,
+            a: 3,
+            b: Some(6),
+            d: 3,
+        });
+        step += 1;
+        if stage == step {
+            role.push(MirOp::Sfpstore {
+                lreg: stop_at,
+                row: out + row,
+                dtype,
+            });
+            continue;
+        }
+        // `xy = x y`, `one_minus_xyy = 1 + (-y) xy`.
+        role.push(MirOp::Sfp {
+            op: SfpOp::Mul,
+            a: 2,
+            b: Some(3),
+            d: 4,
+        });
+        role.push(MirOp::Sfp {
+            op: SfpOp::Neg,
+            a: 3,
+            b: None,
+            d: 5,
+        });
+        role.push(MirOp::LaneConst {
+            lreg: 6,
+            bits: 1.0f32.to_bits(),
+        });
+        role.push(MirOp::Sfp {
+            op: SfpOp::Mul,
+            a: 5,
+            b: Some(4),
+            d: 5,
+        });
+        role.push(MirOp::Sfp {
+            op: SfpOp::Add,
+            a: 5,
+            b: Some(6),
+            d: 5,
+        });
+        // `y = one_minus_xyy (y/2) + y`.
+        role.push(MirOp::LaneConst {
+            lreg: 6,
+            bits: 0.5f32.to_bits(),
+        });
+        role.push(MirOp::Sfp {
+            op: SfpOp::Mul,
+            a: 3,
+            b: Some(6),
+            d: 6,
+        });
+        role.push(MirOp::Sfp {
+            op: SfpOp::Mul,
+            a: 5,
+            b: Some(6),
+            d: 5,
+        });
+        role.push(MirOp::Sfp {
+            op: SfpOp::Add,
+            a: 5,
+            b: Some(3),
+            d: 3,
+        });
+        step += 1;
+        if stage == step {
+            role.push(MirOp::Sfpstore {
+                lreg: stop_at,
+                row: out + row,
+                dtype,
+            });
+            continue;
+        }
+        // The guard: `bits(x) != 0 && bits(x) != +inf`. The integer difference
+        // `inf_bits - bits(x)` is the other branch's value, reinterpreted. The
+        // two "not zero" tests go through `i32 -> f32` and two ordered compares
+        // each, because a nonzero integer is a nonzero float at every magnitude
+        // (the conversion saturates at `±2^31`, which is still nonzero) and the
+        // SFPU's own integer predicate, `SFPSETCC`'s `NE0`, has no IR op
+        // expressing it.
+        role.push(MirOp::LaneConst {
+            lreg: 4,
+            bits: INF_BITS,
+        });
+        role.push(MirOp::Sfp {
+            op: SfpOp::ISub,
+            a: 4,
+            b: Some(2),
+            d: 5,
+        });
+        step += 1;
+        if stage == step {
+            role.push(MirOp::Sfpstore {
+                lreg: stop_at,
+                row: out + row,
+                dtype,
+            });
+            continue;
+        }
+        role.push(MirOp::Cast {
+            from: DType::I32,
+            to: DType::F32,
+            a: 5,
+            d: 6,
+        });
+        role.push(MirOp::LaneConst {
+            lreg: 7,
+            bits: 0.0f32.to_bits(),
+        });
+        role.push(MirOp::Compare {
+            op: CmpOp::Gt,
+            a: 6,
+            b: 7,
+            d: 6,
+        });
+        role.push(MirOp::Compare {
+            op: CmpOp::Lt,
+            a: 6,
+            b: 7,
+            d: 7,
+        });
+        role.push(MirOp::Sfp {
+            op: SfpOp::BitOr,
+            a: 6,
+            b: Some(7),
+            d: 6,
+        });
+        role.push(MirOp::Cast {
+            from: DType::I32,
+            to: DType::F32,
+            a: 2,
+            d: 7,
+        });
+        role.push(MirOp::LaneConst {
+            lreg: 4,
+            bits: 0.0f32.to_bits(),
+        });
+        role.push(MirOp::Compare {
+            op: CmpOp::Gt,
+            a: 7,
+            b: 4,
+            d: 7,
+        });
+        role.push(MirOp::Compare {
+            op: CmpOp::Lt,
+            a: 7,
+            b: 4,
+            d: 4,
+        });
+        role.push(MirOp::Sfp {
+            op: SfpOp::BitOr,
+            a: 7,
+            b: Some(4),
+            d: 7,
+        });
+        role.push(MirOp::Sfp {
+            op: SfpOp::BitAnd,
+            a: 6,
+            b: Some(7),
+            d: 6,
+        });
+        role.push(MirOp::Select {
+            cond: 6,
+            t: 3,
+            f: 5,
+            d: 1,
+        });
+        // A negative input (but not `-0`) is NaN: tt-metal's `!FAST_APPROX`
+        // tail.
+        role.push(MirOp::LaneConst {
+            lreg: 6,
+            bits: 0.0f32.to_bits(),
+        });
+        role.push(MirOp::Compare {
+            op: CmpOp::Lt,
+            a: 2,
+            b: 6,
+            d: 7,
+        });
+        role.push(MirOp::LaneConst {
+            lreg: 6,
+            bits: NAN_BITS,
+        });
+        role.push(MirOp::Select {
+            cond: 7,
+            t: 6,
+            f: 1,
+            d: 3,
+        });
+        role.push(MirOp::Sfpstore {
+            lreg: 3,
+            row: out + row,
+            dtype,
+        });
+    }
+}
+
 /// The `Dst` rows an SFPU body walks. An instruction covers 32 lanes, two
 /// 16-datum rows, so a tile is its 64 rows two at a time. A narrow value keeps
 /// the acc's narrow part (a `1,32` in rows 0 and 16, a `32,1` in column 0), and
@@ -2124,8 +2799,8 @@ copy 32,32 %out [1] = %bo [0]
         let mut released = false;
         let mut posts = 0;
         let mut writes = 0;
-        for op in &m.t1 {
-            match *op {
+        for op in m.stream(Role::Math) {
+            match op {
                 MirOp::SemPost { sem } if sem == SEM_READY => {
                     posts += 1;
                     released = false;

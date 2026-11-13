@@ -39,7 +39,7 @@ const IS_NC: bool = matches!(M.core, tt_isa::tensix::Core::NC);
 
 /// The entry the other direction would run, which this mover refuses
 /// (`Mover::permits`, which the host checks lists against too): NC runs
-/// writes, waits and credits only, B everything but GDDR writes. Const, so
+/// writes, waits and CB operations only, B everything but GDDR writes. Const, so
 /// each image drops the other's arms.
 const fn reader_only() -> Result<(), u32> {
     if IS_NC {
@@ -630,7 +630,7 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
         }
         Entry::CheckFlags { slot, rows, cols } => {
             if !IS_NC { return Err(dm::error::DIRECTION); }
-            // The packet's ready credit follows pack retirement. Fence the
+            // The packet's ready flags follow pack retirement. Fence the
             // SFPU-generated status tile before validating it; no tensor
             // arithmetic or host intermediate download is involved.
             publish();
@@ -904,7 +904,7 @@ fn finish_pair(sequence: u32, result: Result<(), u32>) -> Result<(), u32> {
         tt_firmware::dataflow::abort_with(code);
         // NC reads this packet's writer entries out of B's ring and may still
         // be writing GDDR: B's slot is not reported done under it. NC stops at
-        // its next credit wait, which sees the abort. Bounded (about 60 ms),
+        // its next CB wait, which sees the abort. Bounded (about 60 ms),
         // since NC may be what hung; the host resets the tile after any
         // failed region either way.
         let mut spins = 0u32;

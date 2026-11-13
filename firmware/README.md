@@ -12,7 +12,7 @@ it by hand.
 |---|---|---|---|
 | `role_t0`, `role_t1`, `role_t2` | T0, T1, T2 | `link_role_t0.x`, `link_role_t1.x`, `link_role_t2.x` | The unpack / math / pack role runners. Each in its 10 KiB slot (`tt_isa::l1::roles`), reached through its reset-PC override, so all three and B's mover sit in one tile's L1. Resident in a `Session`. |
 | `dm_b` | B | `link_b.x` | The reader (`tt_isa::dm`): GDDR to L1, list entries, reading op records expanded on the tile, padding fills, tilizes, PCIe moves, barriers, `KERNEL` entries that point the resident roles at their programs and run them, and the shared packets that start NC. It never writes GDDR. No arithmetic: the image gate refuses every F-extension instruction, in every image. |
-| `dm_nc` | NC | `link_nc.x` | The writer, loaded above the data arena via NC's reset stub: L1 to GDDR on NoC1, writing op records expanded on the tile, and the credits that order them. It runs no read, kernel launch, barrier or PCIe move. |
+| `dm_nc` | NC | `link_nc.x` | The writer, loaded above the data arena via NC's reset stub: L1 to GDDR on NoC1, writing op records expanded on the tile, and the CB operations that order them. It runs no read, kernel launch, barrier or PCIe move. |
 | `eth_e1` | E1 (Ethernet) | `link_e1.x` | The chip-to-chip data mover (`tt_isa::eth::mover`). |
 | `corpus` / `corpus_t0` | T1 / T0 | `link.x` | Generic single-thread program runner (T1 for ttsim, T0 for silicon). |
 | `heartbeat`, `sfpu_mul` | T0, or the corpus core | `link.x` | The step 3 and step 4 bring-up gates. |
@@ -38,7 +38,7 @@ picks each binary's link script and passes the mailbox base from `tt-isa` as a
 one shared reader/writer packet, starts NC locally, and launches the three roles
 once per compatible region (a standalone transfer is a packet with no roles: B
 reads, NC writes). Tagged role scripts reuse the existing arithmetic
-bodies and loops. Input/output credits are released after backend retirement and
+bodies and loops. Input/output pages are released after backend retirement and
 DRAM acknowledgment, respectively; B completion joins the entire region. Traces
 retain both mover streams and all referenced programs.
 This is the only GDDR compute scheduler. `set_pipeline(false)` serializes buffer

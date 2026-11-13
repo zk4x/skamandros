@@ -14,7 +14,7 @@
 //! stride or a `Dst` address.
 
 use crate::ir::{DType, Error};
-use crate::mir::{Bcast, CmpOp, ElwOp, IOp, Machine, MirOp, PackMask, SfpOp};
+use crate::mir::{Bcast, CmpOp, ElwOp, IOp, Machine, MirOp, PackMask, Role, SfpOp};
 use crate::riscv::{self as rv, Asm, reg};
 use tt_isa::backend::{
     self, Before, ConfigWords, ThreadConfigEntry, block, cond, wait_for_packer, wait_for_unpacker0,
@@ -225,9 +225,9 @@ impl Words {
 /// Encode all three compute programs.
 pub fn encode(m: &Machine) -> Result<Words, Error> {
     let mut out = Words::default();
-    encode_unpack(&m.t0, &mut out.t0, m.dst_is_16_bit)?;
-    encode_math(&m.t1, &mut out.t1, m.dst_is_16_bit)?;
-    encode_pack(&m.t2, &mut out.t2, m.dst_is_16_bit)?;
+    encode_unpack(&m.stream(Role::Unpack), &mut out.t0, m.dst_is_16_bit)?;
+    encode_math(&m.stream(Role::Math), &mut out.t1, m.dst_is_16_bit)?;
+    encode_pack(&m.stream(Role::Pack), &mut out.t2, m.dst_is_16_bit)?;
     Ok(out)
 }
 
@@ -368,7 +368,18 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result
             continue;
         }
         match *op {
-            MirOp::Loop { count } => open_loop(out, &mut loops, count)?,
+            MirOp::Loop { count } => {
+                // The unpacker's config bank is runtime state and the cache
+                // below is straight-line: at a loop head the previous execution
+                // is the loop's own tail, not the instruction before it in the
+                // stream, so every config in the body is rewritten on entry. A
+                // body that ends with a `Src` unpack and starts with a `Dst` one
+                // is how this went wrong: the second iteration's first `Src`
+                // write was elided and `SRCA_SET_SetOvrdWithAddr` stayed clear
+                // under an unpack to `Src`, which ttsim refuses.
+                state.cfg = [None, None];
+                open_loop(out, &mut loops, count)?;
+            }
             MirOp::EndLoop => close_loop(out, &mut loops)?,
             MirOp::Setdst { row } => state.dst_row = row,
             MirOp::Setadcx { unit, first, count } => {
