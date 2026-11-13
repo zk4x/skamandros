@@ -3195,6 +3195,119 @@ fn softmax_runs_on_the_simulator() {
     }
 }
 
+/// A dense tile through a narrow operand: the row broadcast multiplies every
+/// row by the page's first row, and `ELWMUL` reproduces each datum exactly.
+/// The Matrix Unit's multiply is sliced — one fidelity pass takes the top four
+/// mantissa bits of each operand — so a single pass is a five-bit product; the
+/// lowering runs tt-metal's `HiFi4`'s four phases and this pins all of them.
+#[test]
+fn a_narrow_multiply_keeps_every_datum() {
+    let ramp: Vec<f32> = (0..1024).map(|i| (i as f32 + 1.0) / 1024.0).collect();
+    let ramp_bytes: Vec<u8> = ramp.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mut narrow = vec![0.0f32; 1024];
+    for column in 0..32 {
+        narrow[tile_index(0, column)] = 1.0;
+    }
+    let narrow_bytes: Vec<u8> = narrow.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let program = "\
+version 9
+grid 1,1
+%pr = param f32 1024
+%pn = param f32 1024
+%out = param f32 1024
+%br = buffer f32 32,32
+%bn = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %br [0] = %pr [0]
+copy 32,32 %bn [0] = %pn [0]
+load 32,32 %r = %br [0]
+load 1,32 %n = %bn [0]
+%y = mul %r %n
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
+";
+    let out = run_kernel_tensors(program, &[&ramp_bytes, &narrow_bytes], 4096);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for i in 0..1024 {
+        assert_eq!(
+            got[i], ramp[i],
+            "narrow multiply, datum {i}: got {}, want {}",
+            got[i], ramp[i]
+        );
+    }
+
+    // The same tile through `add` against a zero page: `ELWADD`/`ELWSUB` are
+    // one pass at any fidelity, so they are exact where the multiply is sliced.
+    let program_add = "\
+version 9
+grid 1,1
+%pr = param f32 1024
+%pn = param f32 1024
+%out = param f32 1024
+%br = buffer f32 32,32
+%bn = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %br [0] = %pr [0]
+copy 32,32 %bn [0] = %pn [0]
+load 32,32 %r = %br [0]
+load 1,32 %n = %bn [0]
+%y = add %r %n
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
+";
+    let zeros = vec![0.0f32; 1024];
+    let zero_bytes: Vec<u8> = zeros.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_tensors(program_add, &[&ramp_bytes, &zero_bytes], 4096);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for i in 0..1024 {
+        assert_eq!(
+            got[i], ramp[i],
+            "narrow add, datum {i}: got {}, want {}",
+            got[i], ramp[i]
+        );
+    }
+
+    // `mul` with a zero A: `ELWMUL` accumulates into `Dst` (bit 21) and the
+    // lowering zeroes the section first, so anything non-zero here is `Dst`
+    // content the zeroing did not reach.
+    let program_mul0 = "\
+version 9
+grid 1,1
+%pr = param f32 1024
+%pn = param f32 1024
+%out = param f32 1024
+%br = buffer f32 32,32
+%bn = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %br [0] = %pr [0]
+copy 32,32 %bn [0] = %pn [0]
+load 32,32 %r = %br [0]
+load 1,32 %n = %bn [0]
+%y = mul %r %n
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
+";
+    let ones: Vec<f32> = (0..1024).map(|_| 1.0f32).collect();
+    let one_bytes: Vec<u8> = ones.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_tensors(program_mul0, &[&zero_bytes, &one_bytes], 4096);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    // The section a multiply accumulates into starts at zero, so a zero
+    // operand leaves a zero tile: nothing of an earlier value survives the
+    // phases.
+    for (i, value) in got.iter().enumerate() {
+        assert_eq!(*value, 0.0, "multiply by zero, datum {i}: {value:e}");
+    }
+}
+
 /// Two products into one accumulator: `matmul` adds into the tile it names, so
 /// the second one does not clear what the first wrote. No loop — the only thing
 /// exercised is that `acc` holds its value from one `matmul` to the next.

@@ -1565,12 +1565,29 @@ fn fpu_broadcast(
     m.t1.push(thread_word(&[
         (thread::ADDR_MOD_DST_SEC0_DestIncr, 0),
         (thread::ADDR_MOD_DST_SEC0_DestCR, 0),
+        // The last phase of a multiply hands the phase counter back to 0.
+        (thread::ADDR_MOD_DST_SEC0_FidelityClear, 1),
+    ]));
+    // `ADDR_MOD_1`: the next fidelity phase of the same eight rows — no
+    // counter moves, only the phase, so the instruction re-multiplies the same
+    // operands' next mantissa slice into the same `Dst` rows.
+    m.t1.push(thread_word(&[
+        (thread::ADDR_MOD_AB_SEC1_SrcAIncr, 0),
+        (thread::ADDR_MOD_AB_SEC1_SrcBIncr, 0),
+        (thread::ADDR_MOD_AB_SEC1_SrcBClear, 0),
+        (thread::ADDR_MOD_AB_SEC1_SrcAClear, 0),
+    ]));
+    m.t1.push(thread_word(&[
+        (thread::ADDR_MOD_DST_SEC1_DestIncr, 0),
+        (thread::ADDR_MOD_DST_SEC1_DestCR, 0),
+        (thread::ADDR_MOD_DST_SEC1_FidelityIncr, 1),
     ]));
     // The section is written, never accumulated into.
     m.t1.push(MirOp::SemWaitFree { sem: SEM_READY });
     // `ELWMUL`'s word carries bit 21 set, so the hardware accumulates into the
     // destination (tt-isa's measured encoding; `ELWADD`/`ELWSUB` overwrite).
-    // The result section is zeroed first so the accumulate is the plain product.
+    // That is also how the four fidelity phases add up, so the result section is
+    // zeroed first and the phases accumulate onto nothing.
     if matches!(op, BinOp::Mul) {
         m.t1.push(MirOp::LaneConst {
             lreg: 0,
@@ -1633,19 +1650,29 @@ fn fpu_broadcast(
             sem: SEM_UNPACKED,
             before: 0,
         });
-        // One face is two instructions of eight rows.
+        // One face is two instructions of eight rows. `ELWMUL` is the Matrix
+        // Unit's *sliced* multiply: one pass takes the top four mantissa bits of
+        // each operand and each further phase adds the next slice into the same
+        // `Dst` rows, so a single pass is a five-bit product. tt-metal's
+        // `MathFidelity` counts those passes and its softmax configures
+        // `HiFi4`; `ELWADD`/`ELWSUB` are one pass at any fidelity, which is why
+        // only the multiply repeats. The last pass clears the phase and steps
+        // the counters on to the next eight rows.
+        let phases: u32 = if matches!(op, BinOp::Mul) { 4 } else { 1 };
         for half in 0..2u32 {
-            m.t1.push(MirOp::Elw {
-                op: match op {
-                    BinOp::Add => ElwOp::Add,
-                    BinOp::Sub => ElwOp::Sub,
-                    BinOp::Mul => ElwOp::Mul,
-                    other => unreachable!("the caller admits add, sub and mul, not {other:?}"),
-                },
-                bcast,
-                addr_mod: 0,
-                dst_row: out + 16 * face + 8 * half,
-            });
+            for phase in 0..phases {
+                m.t1.push(MirOp::Elw {
+                    op: match op {
+                        BinOp::Add => ElwOp::Add,
+                        BinOp::Sub => ElwOp::Sub,
+                        BinOp::Mul => ElwOp::Mul,
+                        other => unreachable!("the caller admits add, sub and mul, not {other:?}"),
+                    },
+                    bcast,
+                    addr_mod: if phase + 1 == phases { 0 } else { 1 },
+                    dst_row: out + 16 * face + 8 * half,
+                });
+            }
         }
         // `SETRWC(CLR_AB, .., SET_AB)`: the banks go back before the next
         // face's unpack, which is the only way the unpacker may refill them

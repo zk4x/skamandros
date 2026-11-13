@@ -358,6 +358,14 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   operand's page is read as its own part: faces 0/1 row 0 for a row, faces 0/2
   column 0 for a column. A narrow value that reaches the SFPU (a `1,32`/`32,1`
   value read as a datapath value) is `TT_TODO_ACCESS_SHAPE`.
+- The Matrix Unit's multiply is sliced: one fidelity pass multiplies the top
+  four mantissa bits of each operand and each further pass adds the next slice
+  into the same `Dst` rows, so a single pass is a five-bit product (tt-metal's
+  `LoFi`). A broadcast multiply therefore issues four `ELW`s per eight rows —
+  tt-metal's `HiFi4`, which is what its softmax configures, and the same four
+  phases the `sum` fold already ran — with `ADDR_MOD_1` stepping only the phase
+  and `ADDR_MOD_0` clearing it. `ELWADD`/`ELWSUB` are one pass at any fidelity
+  and stay one `ELW`.
 - Any buffer may be both written and read by any role: a `store` packs a page
   the unpacker may `load` back (any role may drive either end of a ring), and
   the page handshake is what keeps it honest.
