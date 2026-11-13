@@ -459,6 +459,7 @@ fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
                     LoopCount::Value(value) => eval_value(
                         &mut a,
                         k,
+                        plan,
                         &def,
                         &param_index,
                         &loops,
@@ -494,6 +495,7 @@ fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
                         eval_value(
                             &mut a,
                             k,
+                            plan,
                             &def,
                             &param_index,
                             &loops,
@@ -563,6 +565,7 @@ fn param_indices(k: &Kernel, types: &Types) -> Vec<Option<u32>> {
 fn eval_value(
     a: &mut Asm,
     k: &Kernel,
+    plan: &Plan,
     def: &[Option<usize>],
     param_index: &[Option<u32>],
     loops: &[MoverLoop],
@@ -620,12 +623,12 @@ fn eval_value(
                 let _ = (at, op);
                 return Err(Error::TT_TODO_LOOP_ADDRESS);
             }
-            eval_value(a, k, def, param_index, loops, lhs, dest, temps)?;
+            eval_value(a, k, plan, def, param_index, loops, lhs, dest, temps)?;
             let Some((right, rest)) = temps.split_first_mut() else {
                 return Err(Error::TT_TODO_LOOP_ADDRESS);
             };
             let right = *right;
-            eval_value(a, k, def, param_index, loops, rhs, right, rest)?;
+            eval_value(a, k, plan, def, param_index, loops, rhs, right, rest)?;
             a.word(match op {
                 BinOp::Add => rv::add(dest, dest, right),
                 BinOp::Sub => rv::sub(dest, dest, right),
@@ -640,6 +643,58 @@ fn eval_value(
                 BinOp::BitShiftRight => rv::sra(dest, dest, right),
                 _ => unreachable!("the match above refused the rest"),
             });
+            Ok(())
+        }
+        // A scalar read out of an L1 page: an index the mover brought in
+        // itself, read back as a register (tt-metal's `input_l1_ptr[index]`,
+        // zyx's `value_into`). It is a plain `lw`, not a NoC request, so no
+        // congruence rule applies. The page address is a compile-time constant
+        // only on a one-page ring: the pointer wraps back to the base after
+        // every push.
+        Op::Load {
+            buffer, ref offset, ..
+        } => {
+            let Some(Op::Buffer { dtype, .. }) = def[buffer as usize].map(|d| &k.ops[d]) else {
+                let _ = buffer;
+                return Err(Error::TT_ERROR_NOT_A_BUFFER);
+            };
+            let cb = plan.cb[buffer as usize].ok_or_else(|| {
+                let _ = (at, buffer);
+                Error::TT_ERROR_BUFFER_NOT_PLACED
+            })?;
+            let ring = plan.cbs[cb as usize];
+            if ring.pages != 1 {
+                let _ = (at, ring.pages);
+                return Err(Error::TT_TODO_LOOP_ADDRESS);
+            }
+            let el = dtype.bytes();
+            a.li(dest, ring.base);
+            match *offset {
+                Dim::Const(n) => {
+                    let bytes = n
+                        .checked_mul(el)
+                        .ok_or(Error::TT_ERROR_PARAM_OFFSET_OVERFLOW)?;
+                    if bytes != 0 {
+                        a.word(rv::addi(dest, dest, bytes as i32));
+                    }
+                }
+                Dim::Value(v) => {
+                    let Some((off, rest)) = temps.split_first_mut() else {
+                        return Err(Error::TT_TODO_LOOP_ADDRESS);
+                    };
+                    let off = *off;
+                    eval_value(a, k, plan, def, param_index, loops, v, off, rest)?;
+                    if el != 1 {
+                        let Some((scale, _)) = rest.split_first_mut() else {
+                            return Err(Error::TT_TODO_LOOP_ADDRESS);
+                        };
+                        a.li(*scale, el);
+                        a.word(rv::mul(off, off, *scale));
+                    }
+                    a.word(rv::add(dest, dest, off));
+                }
+            }
+            a.word(rv::lw(dest, dest, 0));
             Ok(())
         }
         _ => Err(Error::TT_TODO_LOOP_ADDRESS),

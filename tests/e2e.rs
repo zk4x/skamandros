@@ -3177,3 +3177,40 @@ copy_to %out from %bo [0]
         );
     }
 }
+
+/// The embedding gather as pure data movement: the row index is copied in as a
+/// whole row, read back as a scalar, and selects the weight page, which is
+/// copied out. No compute role runs.
+const GATHER: &str = "\
+version 7
+grid 1,1
+%ids = param i32 1024
+%w = param f32 32768
+%out = param f32 1024
+%ib = buffer i32 1,32
+%wb = buffer f32 32,32
+copy_to %ib from %ids [0]
+%i = const i32 0
+%id = load %ib [%i]
+%tile = const i32 1024
+%off = mul %id %tile
+copy_to %wb from %w [0] [%off]
+copy_to %out from %wb [0]
+";
+
+#[test]
+fn a_gather_is_pure_data_movement() {
+    const TOKEN: usize = 3;
+    let mut ids = vec![0u8; 1024 * 4];
+    ids[..4].copy_from_slice(&(TOKEN as i32).to_le_bytes());
+    let w: Vec<f32> = (0..32768).map(|i| i as f32).collect();
+    let weight: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_tensors(GATHER, &[&ids, &weight], 1024 * 4);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (i, &g) in got.iter().enumerate() {
+        assert_eq!(g, w[TOKEN * 1024 + i], "datum {i}");
+    }
+}

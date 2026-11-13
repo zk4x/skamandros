@@ -187,6 +187,11 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 buffer,
                 offset,
             } => {
+                // A scalar load is an index read: the mover evaluates it from
+                // the page it copied, in RISC-V (see `mover::eval_value`).
+                if types.of(value).shape == RegShape::Scalar {
+                    continue;
+                }
                 let info = types.of(buffer);
                 let Op::Buffer { shape, dtype, .. } = k.ops[def[buffer as usize].expect("defined")]
                 else {

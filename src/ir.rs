@@ -952,10 +952,18 @@ impl Kernel {
                         let total = shape[0] * shape[1];
                         check_offset(offset, total, unit_shape.datums(), at)?;
                         let _ = value;
+                        // A vector buffer's unit is 32 datums; a symbolic offset
+                        // into it selects one datum, which is how a mover reads a
+                        // scalar out of a row it just copied (an index). A tile
+                        // stays whole: its offset is a page number.
+                        let shape = match (unit_shape, offset) {
+                            (RegShape::Row | RegShape::Column, Dim::Value(_)) => RegShape::Scalar,
+                            _ => unit_shape,
+                        };
                         ValueInfo {
                             kind: ValueKind::Register,
                             dtype: b.dtype,
-                            shape: unit_shape,
+                            shape,
                         }
                     }
                 }

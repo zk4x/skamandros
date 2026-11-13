@@ -6,7 +6,7 @@
 
 use crate::compile;
 use crate::compile::ParamKind;
-use crate::ir::{DType, Dim, Kernel, Op};
+use crate::ir::{DType, Dim, Kernel, Op, RegShape};
 use crate::status::ttStatus;
 
 /// The unified program: no reader/compute/writer segments, no unpack/pack, no
@@ -245,6 +245,41 @@ grid 1,1
     assert!(
         m.cores.iter().all(|c| !c.is_empty()),
         "unpack, math and pack"
+    );
+}
+
+/// A vector buffer's unit is 32 datums, but a symbolic offset into it selects
+/// one datum: that is how a mover reads an index out of a row it copied. A
+/// literal offset still reads the whole vector.
+#[test]
+fn a_symbolic_offset_into_a_row_buffer_reads_one_datum() {
+    const ROW: &str = "\
+version 7
+grid 1,1
+%ids = param i32 1024
+%ib = buffer i32 1,32
+copy_to %ib from %ids [0]
+%i = const i32 0
+%x = load %ib [%i]
+%y = load %ib [0]
+";
+    let k = Kernel::parse(ROW).expect("the row program parses");
+    let types = k.verify().expect("the row program verifies");
+    let value = |name: &str| {
+        k.names
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("`{name}` is defined")) as u32
+    };
+    assert_eq!(
+        types.of(value("x")).shape,
+        RegShape::Scalar,
+        "a symbolic offset is one datum"
+    );
+    assert_eq!(
+        types.of(value("y")).shape,
+        RegShape::Row,
+        "a literal offset is the whole row"
     );
 }
 
