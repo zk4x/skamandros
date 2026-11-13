@@ -2365,6 +2365,94 @@ fn matmul_runs_on_the_simulator() {
     }
 }
 
+/// The same product with a computed operand: `%n = neg %a` lives in `Dst`, and
+/// the Matrix Unit reads only `Src`, so the compiler packs `%n` into a page it
+/// owns and the product is `(-a) x b`.
+const MATMUL_F32_STAGED: &str = "\
+version 9
+grid 1,1
+%pa = param f32 1024
+%pb = param f32 1024
+%out = param f32 1024
+%ba = buffer f32 32,32
+%bb = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %ba [0] = %pa [0]
+copy 32,32 %bb [0] = %pb [0]
+%m = acc f32 32,32
+%zero = const f32 0
+store 32,32 %m = %zero
+load 32,32 %a = %ba [0]
+load 32,32 %b = %bb [0]
+%n = neg %a
+matmul %m %n %b
+store 32,32 %bo [0] = %m
+copy 32,32 %out [0] = %bo [0]
+";
+
+/// The same with the other operand staged: `%n = neg %b` and the product is
+/// `a x (-b)`.
+const MATMUL_F32_STAGED_B: &str = "\
+version 9
+grid 1,1
+%pa = param f32 1024
+%pb = param f32 1024
+%out = param f32 1024
+%ba = buffer f32 32,32
+%bb = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %ba [0] = %pa [0]
+copy 32,32 %bb [0] = %pb [0]
+%m = acc f32 32,32
+%zero = const f32 0
+store 32,32 %m = %zero
+load 32,32 %a = %ba [0]
+load 32,32 %b = %bb [0]
+%n = neg %b
+matmul %m %a %n
+store 32,32 %bo [0] = %m
+copy 32,32 %out [0] = %bo [0]
+";
+
+/// A computed operand is staged into a page the compiler owns: the product is
+/// the one `(-a) x b` and every datum is exact.
+#[test]
+fn a_computed_matmul_operand_is_staged_into_a_page() {
+    let a: Vec<f32> = (0..1024).map(|i| (i % 7) as f32 - 3.0).collect();
+    let b: Vec<f32> = (0..1024).map(|i| (i % 5) as f32 - 2.0).collect();
+    let a_bytes: Vec<u8> = a.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let b_bytes: Vec<u8> = b.iter().flat_map(|v| v.to_le_bytes()).collect();
+    for (program, left, right, what) in [
+        (
+            MATMUL_F32_STAGED,
+            a.iter().map(|v| -v).collect::<Vec<f32>>(),
+            b.clone(),
+            "(-a) x b",
+        ),
+        (
+            MATMUL_F32_STAGED_B,
+            a.clone(),
+            b.iter().map(|v| -v).collect::<Vec<f32>>(),
+            "a x (-b)",
+        ),
+    ] {
+        let want = tile_matmul(&left, &right);
+        let out = run_kernel_tensors(program, &[&a_bytes, &b_bytes], 4096);
+        let got: Vec<f32> = out
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        for i in 0..1024 {
+            let (row, column) = tile_rc(i);
+            assert_eq!(
+                got[i], want[i],
+                "{what}, datum {i} at ({row}, {column}): got {}, want {}",
+                got[i], want[i]
+            );
+        }
+    }
+}
+
 /// bf16 operands over an `f32` accumulator: `SrcA`/`SrcB` take the bf16 pages as
 /// they are, the Matrix Unit accumulates in the 32-bit `Dst`, and the packer
 /// writes the f32 result.

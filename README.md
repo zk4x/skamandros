@@ -308,11 +308,13 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   is one `matmul` under one `loop` — the accumulator is written every iteration
   and packed once after it. `acc` starts unspecified: a program that needs zeros
   writes them itself (`store 32,32 %acc = %zero`, a fill from an `f32` constant).
-  Both operands must be `load` values — the unpacker fills `SrcA`/`SrcB` straight
-  from their CB pages, in the `Src` format their dtype implies (`TF32` for `f32`,
-  `BF16` for bf16) — and they are the same dtype: `bf16`/`bf16`, `bf16`/`f32`
-  and `f32`/`f32` run; an `f32` operand with a `bf16` accumulator is refused. A
-  `bf16` accumulator needs the whole module to be 16-bit, since the bank is one
+  Both operands are 32x32 tiles of the same dtype — `bf16`/`bf16`,
+  `bf16`/`f32` and `f32`/`f32` run; an `f32` operand with a `bf16` accumulator
+  is refused. A `load` operand is unpacked straight from its CB page, in the
+  `Src` format its dtype implies (`TF32` for `f32`, `BF16` for bf16); a value
+  the datapath computed lives in `Dst`, so the compiler packs it into a page it
+  owns (`Plan::staged`) and the unpacker reads that. A `bf16` accumulator needs
+  the whole module to be 16-bit, since the bank is one
   width. A `load` that also feeds a datapath op keeps its `Dst` unpack and is
   unpacked once more into `Src` at the matmul; its page is released after the
   Matrix Unit has read it.

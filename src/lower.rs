@@ -737,8 +737,16 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     let _ = at;
                     return Err(Error::TT_ERROR_MATMUL_ACCUM_WIDE);
                 }
-                let cb_a = matmul_page(k, plan, &def, &alias, a, at)?;
-                let cb_b = matmul_page(k, plan, &def, &alias, b, at)?;
+                let (cb_a, stage_a) = matmul_page(k, plan, &def, &alias, a, at)?;
+                let (cb_b, stage_b) = matmul_page(k, plan, &def, &alias, b, at)?;
+                // A computed operand has no page: the compiler packs it into its
+                // own and the Matrix Unit reads that.
+                if stage_a {
+                    stage(&mut m, types, alloc, &alias, &acc_mask, a, cb_a);
+                }
+                if stage_b {
+                    stage(&mut m, types, alloc, &alias, &acc_mask, b, cb_b);
+                }
                 let base = dst_row(alloc, acc);
                 // The Matrix Unit writes the accumulator's rows. If they were
                 // packed since their last write, the packer may still be
@@ -807,6 +815,13 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 // faces `(k, 0)` and `(k, 1)` into `SrcA`. The unpacker and the
                 // Matrix Unit alternate through the bank handover, so the two
                 // roles interleave by ownership, not by instruction position.
+                // A staged operand's page is published by the packer (T2) before
+                // the unpacker reads it, and released after the last face.
+                for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
+                    if staged {
+                        m.t0.push(MirOp::CbWait { cb });
+                    }
+                }
                 for fi in 0..2u32 {
                     for kk in 0..2u32 {
                         m.t0.push(MirOp::Setadczw {
@@ -878,6 +893,11 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 // still in flight, so the accumulator is not readable (the pack
                 // follows on T2) until the unit drains.
                 m.t1.push(MirOp::WaitMatrix);
+                for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
+                    if staged {
+                        m.t0.push(MirOp::CbPop { cb });
+                    }
+                }
                 m.t1.push(MirOp::Setrwc {
                     src_a: 0,
                     src_b: 0,
@@ -912,11 +932,20 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     return Err(Error::TT_ERROR_MATMUL_ACCUM_WIDE);
                 }
                 let cb_x = matmul_page(k, plan, &def, &alias, x, at)?;
+                if cb_x.1 {
+                    let _ = (at, x);
+                    return Err(Error::TT_ERROR_REDUCE_OPERAND);
+                }
+                let cb_x = cb_x.0;
                 let (cb_b, dt_b) = match scaler {
-                    Some(scaler) => (
-                        matmul_page(k, plan, &def, &alias, scaler, at)?,
-                        types.of(scaler).dtype,
-                    ),
+                    Some(scaler) => {
+                        let (cb, staged) = matmul_page(k, plan, &def, &alias, scaler, at)?;
+                        if staged {
+                            let _ = (at, scaler);
+                            return Err(Error::TT_ERROR_REDUCE_OPERAND);
+                        }
+                        (cb, types.of(scaler).dtype)
+                    }
                     None => {
                         let ones = plan.ones.ok_or_else(|| {
                             let _ = at;
@@ -1353,9 +1382,9 @@ fn thread_word(fields: &[(tt_isa::cfg::ThreadConfigField, u16)]) -> MirOp {
     }
 }
 
-/// The CB a `matmul` operand reads: the value must be a `load` (possibly through
-/// a bitcast), because the Matrix Unit's `SrcA`/`SrcB` are filled by the
-/// unpacker from a page, not from `Dst`.
+/// The CB a `matmul` operand or a reduce's `Src` operand reads, and whether it
+/// had to be staged: a `load` already has a page, while a computed value is
+/// packed into the compiler's page for it (see [`stage`]).
 fn matmul_page(
     k: &Kernel,
     plan: &Plan,
@@ -1363,20 +1392,63 @@ fn matmul_page(
     alias: &[Option<crate::ir::ValueId>],
     value: crate::ir::ValueId,
     at: usize,
-) -> Result<u32, Error> {
+) -> Result<(u32, bool), Error> {
     let id = resolve(alias, value);
     let Some(op_at) = def[id as usize] else {
         let _ = (at, value);
         return Err(Error::TT_ERROR_MATMUL_OPERAND);
     };
-    let Op::Load { buffer, .. } = k.ops[op_at] else {
-        let _ = (at, value);
-        return Err(Error::TT_ERROR_MATMUL_OPERAND);
-    };
-    plan.cb[buffer as usize].ok_or_else(|| {
-        let _ = buffer;
-        Error::TT_ERROR_BUFFER_NOT_PLACED
-    })
+    if let Op::Load { buffer, .. } = k.ops[op_at] {
+        return Ok((
+            plan.cb[buffer as usize].ok_or_else(|| {
+                let _ = buffer;
+                Error::TT_ERROR_BUFFER_NOT_PLACED
+            })?,
+            false,
+        ));
+    }
+    // Not a `load`: the value lives in `Dst` and the Matrix Unit reads `Src`,
+    // so the compiler packs it into a page it owns. The verifier admits only
+    // f32/bf16 operands, which is also what a staging `Pack` takes.
+    let _ = at;
+    let cb = plan.staged[id as usize].ok_or_else(|| {
+        let _ = (id, value);
+        Error::TT_ERROR_MATMUL_OPERAND
+    })?;
+    Ok((cb, true))
+}
+
+/// Pack a computed value's `Dst` rows into the compiler's page for it, so the
+/// FPU can read it from `Src`. This is the store path's hand-off without a
+/// caller buffer: the math core publishes the section, the packer drains it
+/// into the page and publishes the page, and the unpacker waits for that page.
+fn stage(
+    m: &mut Machine,
+    types: &Types,
+    alloc: &Alloc,
+    alias: &[Option<crate::ir::ValueId>],
+    acc_mask: &[PackMask],
+    value: crate::ir::ValueId,
+    cb: u32,
+) {
+    let id = resolve(alias, value);
+    let dtype = types.of(id).dtype;
+    m.t1.push(MirOp::SemWaitFree { sem: SEM_READY });
+    m.t1.push(MirOp::SemPost { sem: SEM_READY });
+    m.t2.push(MirOp::SemWaitData { sem: SEM_READY });
+    m.t2.push(MirOp::CbReserve { cb });
+    m.t2.push(MirOp::Pack {
+        cb,
+        rows: DST_ROWS,
+        row: dst_row(alloc, id),
+        last: true,
+        dtype,
+        mask: acc_mask[id as usize],
+    });
+    m.t2.push(MirOp::SemGet { sem: SEM_READY });
+    m.t2.push(MirOp::CbPush { cb });
+    // The pack has retired, so the `Dst` slot is free again.
+    m.t2.push(MirOp::SemPost { sem: SEM_SLOT });
 }
 
 /// The literal trip count of a bound, if it has one.

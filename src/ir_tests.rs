@@ -664,10 +664,10 @@ fn a_matmul_is_refused_for_what_the_matrix_unit_cannot_take() {
         assert_eq!(err, want, "{what}");
     };
 
-    // An operand the datapath computed has no page to unpack into `Src`.
-    case(
-        "a negated operand",
-        "\
+    // An operand the datapath computed has no page of its own; the compiler
+    // stages it: it owns a page and packs the value into it, so the Matrix Unit
+    // still reads `Src` from L1. Three caller buffers plus that page.
+    const NEGATED: &str = "\
 version 9
 grid 1,1
 %pa = param f32 1024
@@ -686,9 +686,10 @@ load 32,32 %b = %bb [0]
 matmul %m %n %b
 store 32,32 %bo [0] = %m
 copy 32,32 %out [0] = %bo [0]
-",
-        S::TT_ERROR_MATMUL_OPERAND,
-    );
+";
+    let k = Kernel::parse(NEGATED).expect("a negated operand parses");
+    let m = compile::compile(&k).expect("a negated operand is staged");
+    assert_eq!(m.cbs.len(), 4, "three buffers and the staging page");
 
     // The destination is not an accumulator. Only an `acc` is written in place
     // by the Matrix Unit; a buffer is L1 and a value is immutable.

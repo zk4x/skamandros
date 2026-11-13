@@ -57,6 +57,10 @@ pub struct Plan {
     pub iface: u32,
     /// The compiler's 1.0 page, when a reduce needs one.
     pub ones: Option<OnesPage>,
+    /// The compiler's staging page of each value the FPU reads that is not a
+    /// `load`: the Matrix Unit reads `Src` from L1 only, so a computed value is
+    /// packed into a page the compiler owns, by value id.
+    pub staged: Vec<Option<u32>>,
 }
 
 const ALIGN: u32 = 64;
@@ -129,6 +133,47 @@ pub fn place(k: &Kernel, types: &Types) -> Result<Plan, Error> {
         cbs.push(ring);
         at = end;
     }
+    // Then the staging pages, one per value the FPU reads that is not a
+    // `load`: the Matrix Unit's `Src` banks are filled from L1, so a computed
+    // value is packed into a page of its own. One page each, like the 1.0 page
+    // and for the same reason: the compiler owns the ring and its contents.
+    let mut staged: Vec<Option<u32>> = vec![None; types.values.len()];
+    let mut def: Vec<Option<usize>> = vec![None; types.values.len()];
+    for (op_at, op) in k.ops.iter().enumerate() {
+        if let Some(value) = op.defined() {
+            def[value as usize] = Some(op_at);
+        }
+    }
+    for op in &k.ops {
+        let Op::Matmul { a, b, .. } = *op else {
+            continue;
+        };
+        for operand in [a, b] {
+            // A bitcast has no page of its own: the value it renames does.
+            let value = owner(k, &def, operand);
+            if staged[value as usize].is_some() || is_load(k, &def, value) {
+                continue;
+            }
+            let dtype = types.of(value).dtype;
+            let bytes = 1024u32
+                .checked_mul(dtype.bytes())
+                .ok_or(Error::TT_ERROR_L1_OVERFLOW)?;
+            let base = at.div_ceil(ALIGN) * ALIGN;
+            let end = base.checked_add(bytes).ok_or(Error::TT_ERROR_L1_OVERFLOW)?;
+            if u64::from(end) > tt_isa::l1::DATA.end {
+                let _ = (value, base, end);
+                return Err(Error::TT_ERROR_L1_ARENA);
+            }
+            let cb = cbs.len() as u32;
+            cbs.push(Cb {
+                base,
+                page: bytes,
+                pages: 1,
+            });
+            staged[value as usize] = Some(cb);
+            at = end;
+        }
+    }
     // The interface table follows the buffers: one `LocalCBInterface` per CB, as
     // many entries as tt-metal's table has, and only `cbs.len()` of them used.
     let iface = at.div_ceil(ALIGN) * ALIGN;
@@ -148,7 +193,29 @@ pub fn place(k: &Kernel, types: &Types) -> Result<Plan, Error> {
         cbs,
         iface,
         ones,
+        staged,
     })
+}
+
+/// The value a bitcast chain ends at: a bitcast has no home of its own.
+fn owner(k: &Kernel, def: &[Option<usize>], value: crate::ir::ValueId) -> crate::ir::ValueId {
+    let mut at = value;
+    while let Some(op_at) = def[at as usize] {
+        match k.ops[op_at] {
+            Op::Bitcast { src, .. } => at = src,
+            _ => break,
+        }
+    }
+    at
+}
+
+/// Whether a value is read from an L1 page of its own, i.e. whether its
+/// definition is a `load`.
+fn is_load(k: &Kernel, def: &[Option<usize>], value: crate::ir::ValueId) -> bool {
+    matches!(
+        def[value as usize].map(|at| &k.ops[at]),
+        Some(Op::Load { .. })
+    )
 }
 
 #[cfg(test)]
