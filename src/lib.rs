@@ -24,8 +24,17 @@ mod optimize;
 mod planner;
 mod riscv;
 mod runtime;
+mod slab;
 mod status;
 mod unfold;
+
+/// The hash set zyx's `Slab` keeps its free list in. zyx uses the crate's own
+/// `FHasher`; with no equivalent here the standard hasher stands in, which
+/// changes nothing the slab observes.
+type Set<T> = std::collections::HashSet<
+    T,
+    std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>,
+>;
 
 #[cfg(test)]
 mod ir_tests;

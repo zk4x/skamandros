@@ -22,6 +22,8 @@ tenstorrent = []
 tt-isa = { path = "../tt-isa" }
 libloading = "0.8"
 libc = "0.2"
+# zyx's line: the slab's `SerBin`/`DeBin` impls are copied with the file.
+nanoserde = { version = "0.2.1", default-features = false, features = ["std", "binary", "json"] }
 
 # The release artifact is what ships: fully optimized, stripped, and
 # `panic = "abort"` so a panic cannot unwind across the C ABI. This is zyx's
