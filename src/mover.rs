@@ -17,7 +17,9 @@
 //! way round. Which copies belong to the inbound program and which to the
 //! outbound one is decided here from the operands, not by the caller.
 
-use crate::ir::{BinOp, Dim, Error, Kernel, Op, Types, ValueId};
+use std::collections::BTreeMap;
+
+use crate::ir::{BinOp, Dim, Error, Kernel, Op, OpId, Types, ValueId};
 use crate::planner::Plan;
 use crate::riscv::{self as rv, Asm, reg};
 use tt_isa::noc::niu::{
@@ -138,20 +140,17 @@ pub fn add_movers(k: &Kernel, types: &Types) -> Result<Kernel, Error> {
         }
         _ => false,
     };
-    if !k.ops.iter().any(direct) {
+    if !k.ops().any(|(_, op)| direct(op)) {
         return Ok(k.clone());
     }
 
-    let mut out = Kernel {
-        ops: Vec::with_capacity(k.ops.len()),
-        names: Vec::with_capacity(k.names.len()),
-    };
+    let mut out = Kernel::default();
     // Old value id -> new value id. Definitions are emitted in the same order,
     // so a use only needs an already-emitted definition.
-    let mut map: Vec<ValueId> = vec![u32::MAX; k.names.len()];
+    let mut map: BTreeMap<OpId, OpId> = BTreeMap::new();
     let mut stage = 0usize;
 
-    for op in &k.ops {
+    for (_, op) in k.ops() {
         match *op {
             Op::Load {
                 value,
@@ -161,26 +160,29 @@ pub fn add_movers(k: &Kernel, types: &Types) -> Result<Kernel, Error> {
             } if types.of(buffer).kind == crate::ir::ValueKind::Param => {
                 let info = *types.of(buffer);
                 let shape = stage_shape(info.shape, buffer)?;
-                let staged = fresh(&mut out, &k.names, &mut stage);
-                out.ops.push(Op::Buffer {
+                let staged = fresh(&mut out, k, &mut stage);
+                out.push(Op::Buffer {
                     value: staged,
                     dtype: info.dtype,
                     shape,
                 });
-                out.ops.push(Op::CopyTo {
+                let src = map[&buffer];
+                out.push(Op::CopyTo {
                     dst: staged,
-                    src: map[buffer as usize],
+                    src,
                     dst_offset: Dim::Const(0),
-                    src_offset: remap_dim(offset, &map),
+                    src_offset: move_dim(offset, &map),
                     shape,
                 });
-                let value = define(&mut out, k, value, &mut map);
-                out.ops.push(Op::Load {
-                    value,
+                let id = out.ops.max_id();
+                out.push(Op::Load {
+                    value: id,
                     buffer: staged,
                     offset: Dim::Const(0),
                     shape,
                 });
+                map.insert(value, id);
+                name(&mut out, k, value, id);
             }
             Op::StoreTo {
                 value,
@@ -190,34 +192,37 @@ pub fn add_movers(k: &Kernel, types: &Types) -> Result<Kernel, Error> {
             } if types.of(buffer).kind == crate::ir::ValueKind::Param => {
                 let info = *types.of(buffer);
                 let shape = stage_shape(info.shape, buffer)?;
-                let staged = fresh(&mut out, &k.names, &mut stage);
-                out.ops.push(Op::Buffer {
+                let staged = fresh(&mut out, k, &mut stage);
+                out.push(Op::Buffer {
                     value: staged,
                     dtype: info.dtype,
                     shape,
                 });
-                out.ops.push(Op::StoreTo {
-                    value: map[value as usize],
+                let value = map[&value];
+                out.push(Op::StoreTo {
+                    value,
                     buffer: staged,
                     offset: Dim::Const(0),
                     shape,
                 });
-                out.ops.push(Op::CopyTo {
-                    dst: map[buffer as usize],
+                let dst = map[&buffer];
+                out.push(Op::CopyTo {
+                    dst,
                     src: staged,
-                    dst_offset: remap_dim(offset, &map),
+                    dst_offset: move_dim(offset, &map),
                     src_offset: Dim::Const(0),
                     shape,
                 });
             }
             _ => {
-                let value = op.defined().map(|_| out.names.len() as ValueId);
-                let new = remap(op, &map, value);
+                let mut op = op.clone();
+                let id = out.ops.max_id();
                 if let Some(old) = op.defined() {
-                    map[old as usize] = value.expect("a definition has a new id");
-                    out.names.push(k.names[old as usize].clone());
+                    map.insert(old, id);
+                    name(&mut out, k, old, id);
                 }
-                out.ops.push(new);
+                crate::ir::renumber(&mut op, &map)?;
+                out.push(op);
             }
         }
     }
@@ -237,39 +242,42 @@ fn stage_shape(shape: crate::ir::RegShape, param: ValueId) -> Result<[u32; 2], E
     }
 }
 
-/// Define one fresh value with a name no existing value has.
-fn fresh(out: &mut Kernel, names: &[String], stage: &mut usize) -> ValueId {
-    let value = out.names.len() as ValueId;
+/// Define one fresh staging value, with a name no existing value has, at the id
+/// its `Buffer` will get.
+fn fresh(out: &mut Kernel, k: &Kernel, stage: &mut usize) -> ValueId {
+    let value = out.ops.max_id();
     loop {
         let name = format!("stage{}", *stage);
         *stage += 1;
-        if !names.contains(&name) && !out.names.contains(&name) {
-            out.names.push(name);
+        let taken = k.names.values().any(|n| *n == name) || out.names.values().any(|n| *n == name);
+        if !taken {
+            out.names.insert(value, name);
             return value;
         }
     }
 }
 
-/// Give an existing definition its new id and copy its name.
-fn define(out: &mut Kernel, k: &Kernel, old: ValueId, map: &mut [ValueId]) -> ValueId {
-    let value = out.names.len() as ValueId;
-    map[old as usize] = value;
-    out.names.push(k.names[old as usize].clone());
-    value
+/// Give a copied definition its name under its new id.
+fn name(out: &mut Kernel, k: &Kernel, old: ValueId, new: ValueId) {
+    if let Some(name) = k.names.get(&old) {
+        out.names.insert(new, name.clone());
+    }
 }
 
-fn remap_dim(dim: Dim, map: &[ValueId]) -> Dim {
+/// The same bracket with every value it names renamed.
+fn move_dim(dim: Dim, map: &BTreeMap<OpId, OpId>) -> Dim {
     match dim {
         Dim::Const(n) => Dim::Const(n),
-        Dim::Value(v) => Dim::Value(map[v as usize]),
+        Dim::Value(v) => Dim::Value(map[&v]),
     }
 }
 
 /// The same op with every value it reads renamed, and (for a definition) its
 /// own new id installed.
-fn remap(op: &Op, map: &[ValueId], value: Option<ValueId>) -> Op {
-    let v = |x: ValueId| map[x as usize];
-    let d = |x: Dim| remap_dim(x, map);
+#[allow(dead_code)]
+fn remap(op: &Op, map: &BTreeMap<OpId, OpId>, value: Option<ValueId>) -> Op {
+    let v = |x: ValueId| map[&x];
+    let d = |x: Dim| move_dim(x, map);
     let own = || value.expect("a definition has a new id");
     match *op {
         Op::Const { dtype, bits, .. } => Op::Const {
@@ -404,8 +412,7 @@ fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
     // mul %nx %ny` is three), and at this point the CB counters are in memory and
     // the sync scratch has been dropped, so the three sync words are free again.
     let mut eval_temps: [u8; 5] = [reg::T6, reg::T4, reg::T0, reg::T1, reg::T2];
-    let def = definitions(k);
-    let param_index = param_indices(k, types);
+    let param_index = param_indices(k);
     let mut loops: Vec<MoverLoop> = Vec::new();
     let mut at = 0usize;
     for item in &items {
@@ -425,7 +432,6 @@ fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
                         &mut a,
                         k,
                         plan,
-                        &def,
                         &param_index,
                         &loops,
                         value,
@@ -463,7 +469,6 @@ fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
                         &mut a,
                         k,
                         plan,
-                        &def,
                         at,
                         copy,
                         load,
@@ -480,7 +485,6 @@ fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
                                     &mut a,
                                     k,
                                     plan,
-                                    &def,
                                     &param_index,
                                     &loops,
                                     value,
@@ -516,24 +520,13 @@ fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
     a.finish().map_err(|_| Error::TT_ERROR_MOVER_PROGRAM)
 }
 
-/// The definition site of every value, for lowering an index expression.
-fn definitions(k: &Kernel) -> Vec<Option<usize>> {
-    let mut def: Vec<Option<usize>> = vec![None; k.names.len()];
-    for (at, op) in k.ops.iter().enumerate() {
-        if let Some(value) = op.defined() {
-            def[value as usize] = Some(at);
-        }
-    }
-    def
-}
-
 /// The launch argument index of every parameter, in program order.
-fn param_indices(k: &Kernel, types: &Types) -> Vec<Option<u32>> {
-    let mut index: Vec<Option<u32>> = vec![None; types.values.len()];
+fn param_indices(k: &Kernel) -> BTreeMap<OpId, u32> {
+    let mut index: BTreeMap<OpId, u32> = BTreeMap::new();
     let mut next = 0u32;
-    for op in &k.ops {
+    for (_, op) in k.ops() {
         if let Op::Param { value, .. } = *op {
-            index[value as usize] = Some(next);
+            index.insert(value, next);
             next += 1;
         }
     }
@@ -555,8 +548,7 @@ fn eval_value(
     a: &mut Asm,
     k: &Kernel,
     plan: &Plan,
-    def: &[Option<usize>],
-    param_index: &[Option<u32>],
+    param_index: &BTreeMap<OpId, u32>,
     loops: &[MoverLoop],
     value: ValueId,
     dest: u8,
@@ -567,11 +559,11 @@ fn eval_value(
         a.word(rv::add(dest, index_reg, reg::ZERO));
         return Ok(());
     }
-    let Some(at) = def[value as usize] else {
+    let Some(op) = k.op(value) else {
         let _ = value;
         return Err(Error::TT_TODO_LOOP_ADDRESS);
     };
-    match k.ops[at] {
+    match *op {
         Op::Const {
             dtype: crate::ir::DType::I32,
             bits,
@@ -583,7 +575,7 @@ fn eval_value(
         // A scalar parameter's launch argument is its value, not an address:
         // the array the host wrote holds the value word (`get_arg_val`).
         Op::Param { ref dims, .. } if dims.is_empty() => {
-            let index = param_index[value as usize].ok_or(Error::TT_TODO_LOOP_ADDRESS)?;
+            let index = *param_index.get(&value).ok_or(Error::TT_TODO_LOOP_ADDRESS)?;
             a.word(rv::lw(dest, reg::A0, param_arg(index).0));
             Ok(())
         }
@@ -609,15 +601,15 @@ fn eval_value(
                     | BinOp::BitShiftLeft
                     | BinOp::BitShiftRight
             ) {
-                let _ = (at, op);
+                let _ = op;
                 return Err(Error::TT_TODO_LOOP_ADDRESS);
             }
-            eval_value(a, k, plan, def, param_index, loops, lhs, dest, temps)?;
+            eval_value(a, k, plan, param_index, loops, lhs, dest, temps)?;
             let Some((right, rest)) = temps.split_first_mut() else {
                 return Err(Error::TT_TODO_LOOP_ADDRESS);
             };
             let right = *right;
-            eval_value(a, k, plan, def, param_index, loops, rhs, right, rest)?;
+            eval_value(a, k, plan, param_index, loops, rhs, right, rest)?;
             a.word(match op {
                 BinOp::Add => rv::add(dest, dest, right),
                 BinOp::Sub => rv::sub(dest, dest, right),
@@ -643,17 +635,20 @@ fn eval_value(
         Op::Load {
             buffer, ref offset, ..
         } => {
-            let Some(Op::Buffer { dtype, .. }) = def[buffer as usize].map(|d| &k.ops[d]) else {
-                let _ = buffer;
-                return Err(Error::TT_ERROR_NOT_A_BUFFER);
+            let dtype = match k.at(buffer) {
+                Op::Buffer { dtype, .. } => *dtype,
+                _ => {
+                    let _ = buffer;
+                    return Err(Error::TT_ERROR_NOT_A_BUFFER);
+                }
             };
-            let cb = plan.cb[buffer as usize].ok_or_else(|| {
-                let _ = (at, buffer);
+            let cb = *plan.cb.get(&buffer).ok_or_else(|| {
+                let _ = buffer;
                 Error::TT_ERROR_BUFFER_NOT_PLACED
             })?;
             let ring = plan.cbs[cb as usize];
             if ring.pages != 1 {
-                let _ = (at, ring.pages);
+                let _ = ring.pages;
                 return Err(Error::TT_TODO_LOOP_ADDRESS);
             }
             let el = dtype.bytes();
@@ -672,7 +667,7 @@ fn eval_value(
                         return Err(Error::TT_TODO_LOOP_ADDRESS);
                     };
                     let off = *off;
-                    eval_value(a, k, plan, def, param_index, loops, v, off, rest)?;
+                    eval_value(a, k, plan, param_index, loops, v, off, rest)?;
                     if el != 1 {
                         let Some((scale, _)) = rest.split_first_mut() else {
                             return Err(Error::TT_TODO_LOOP_ADDRESS);
@@ -691,15 +686,9 @@ fn eval_value(
 }
 
 fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<Item>, Error> {
-    let param_index = param_indices(k, types);
-    let mut def: Vec<Option<usize>> = vec![None; types.values.len()];
-    for (at, op) in k.ops.iter().enumerate() {
-        if let Some(value) = op.defined() {
-            def[value as usize] = Some(at);
-        }
-    }
+    let param_index = param_indices(k);
     let mut items = Vec::new();
-    for (at, op) in k.ops.iter().enumerate() {
+    for (at, op) in k.ops() {
         match *op {
             Op::Loop { value, bound } => {
                 let count = match bound {
@@ -745,10 +734,11 @@ fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
                             return Err(Error::TT_ERROR_COPY_ENDS);
                         }
                     };
-                let Op::Buffer { dtype, .. } = k.ops[def[buffer as usize].expect("defined")] else {
-                    unreachable!("the type says it is a buffer");
+                let dtype = match k.at(buffer) {
+                    Op::Buffer { dtype, .. } => *dtype,
+                    _ => unreachable!("the type says it is a buffer"),
                 };
-                let cb = plan.cb[buffer as usize].ok_or_else(|| {
+                let cb = *plan.cb.get(&buffer).ok_or_else(|| {
                     let _ = (at, buffer);
                     Error::TT_ERROR_BUFFER_NOT_PLACED
                 })?;
@@ -800,7 +790,7 @@ fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
                         .ok_or(Error::TT_ERROR_BUFFER_OFFSET_OVERFLOW)?;
                 }
                 items.push(Item::Copy(Copy {
-                    param: param_index[param as usize].expect("a parameter has an index"),
+                    param: *param_index.get(&param).expect("a parameter has an index"),
                     offset,
                     cb,
                     bytes: unit,
@@ -837,7 +827,6 @@ fn emit_lanes(
     a: &mut Asm,
     k: &Kernel,
     plan: &Plan,
-    def: &[Option<usize>],
     at: usize,
     copy: &Copy,
     load: ValueId,
@@ -846,7 +835,7 @@ fn emit_lanes(
     depth: usize,
     inbound: bool,
 ) -> Result<(), Error> {
-    let (base, el) = lane_page(k, plan, def, load, at)?;
+    let (base, el) = lane_page(k, plan, load, at)?;
     // A lane loop is one more nesting level: it takes the next counter pair, so
     // two program loops around a lane copy do not fit.
     let (counter, limit) = match depth {
@@ -887,14 +876,8 @@ fn emit_lanes(
 /// The L1 address of the vector a lane index reads and its datum width: the
 /// page the `load` names, on a one-page ring. A deeper ring's pointer moves at
 /// run time, so its page is refused rather than read from the wrong one.
-fn lane_page(
-    k: &Kernel,
-    plan: &Plan,
-    def: &[Option<usize>],
-    load: ValueId,
-    at: usize,
-) -> Result<(u32, u32), Error> {
-    let Some(op) = def[load as usize].map(|d| &k.ops[d]) else {
+fn lane_page(k: &Kernel, plan: &Plan, load: ValueId, at: usize) -> Result<(u32, u32), Error> {
+    let Some(op) = k.op(load) else {
         let _ = (at, load);
         return Err(Error::TT_TODO_MULTI_LANE);
     };
@@ -905,11 +888,14 @@ fn lane_page(
         let _ = (at, load);
         return Err(Error::TT_TODO_MULTI_LANE);
     };
-    let Some(Op::Buffer { dtype, .. }) = def[buffer as usize].map(|d| &k.ops[d]) else {
-        let _ = buffer;
-        return Err(Error::TT_ERROR_NOT_A_BUFFER);
+    let dtype = match k.at(buffer) {
+        Op::Buffer { dtype, .. } => *dtype,
+        _ => {
+            let _ = buffer;
+            return Err(Error::TT_ERROR_NOT_A_BUFFER);
+        }
     };
-    let cb = plan.cb[buffer as usize].ok_or_else(|| {
+    let cb = *plan.cb.get(&buffer).ok_or_else(|| {
         let _ = (at, buffer);
         Error::TT_ERROR_BUFFER_NOT_PLACED
     })?;

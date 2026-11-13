@@ -28,8 +28,62 @@
 use core::fmt;
 use std::collections::BTreeMap;
 
-/// Identifier of an SSA value. Equals the definition order.
-pub type ValueId = u32;
+use crate::slab::{Slab, SlabId};
+
+/// One operation of the kernel's list.
+///
+/// The list is a slab with a doubly linked order (zyx's `OpLinked`): ids never
+/// move, removing is O(1), and a pass inserts by id instead of by position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpLinked {
+    pub prev: OpId,
+    pub next: OpId,
+    pub op: Op,
+}
+
+/// Identifier of an op, and of the value it defines: there is one id space
+/// (zyx's model), so a value *is* its defining op.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OpId(pub(crate) u32);
+
+impl OpId {
+    /// The sentinel for "no op": no previous/next link, no index.
+    pub const NULL: Self = Self(u32::MAX);
+    /// Whether this is [`OpId::NULL`].
+    pub const fn is_null(self) -> bool {
+        self.0 == u32::MAX
+    }
+}
+
+impl fmt::Display for OpId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl From<usize> for OpId {
+    fn from(value: usize) -> Self {
+        OpId(value as u32)
+    }
+}
+
+impl From<OpId> for usize {
+    fn from(value: OpId) -> Self {
+        value.0 as usize
+    }
+}
+
+impl SlabId for OpId {
+    const ZERO: Self = Self(0);
+    const NULL: Self = Self(u32::MAX);
+
+    fn inc(&mut self) {
+        self.0 += 1;
+    }
+}
+
+/// Identifier of an SSA value: the `OpId` of the op that defines it.
+pub type ValueId = OpId;
 
 /// The fixed dtype of every index, shape and bracket term.
 pub const INDEX: DType = DType::I32;
@@ -574,22 +628,132 @@ impl Op {
 /// value means; a program that fails it must never reach the compiler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Kernel {
-    pub ops: Vec<Op>,
-    /// The name of every value, by id.
-    pub names: Vec<String>,
+    /// The op slab: ids never move, so a pass can hold one across an edit.
+    pub ops: Slab<OpId, OpLinked>,
+    /// Head of the list, in program order.
+    pub head: OpId,
+    /// Tail of the list.
+    pub tail: OpId,
+    /// The name of every value that has one, by the id of its defining op.
+    pub names: BTreeMap<OpId, String>,
+}
+
+impl Default for Kernel {
+    fn default() -> Self {
+        Self {
+            ops: Slab::new(),
+            head: OpId::NULL,
+            tail: OpId::NULL,
+            names: BTreeMap::new(),
+        }
+    }
+}
+
+impl Kernel {
+    /// The op `id`, and the only way to read one: a stale id is a panic, not a
+    /// neighbouring op.
+    pub fn at(&self, id: OpId) -> &Op {
+        &self.ops[id].op
+    }
+
+    /// One op's program order, as the slab's `(id, op)` pairs. The order is the
+    /// linked list, not the slab's storage order (a removed id is skipped, and
+    /// an inserted one keeps its id).
+    pub fn ops(&self) -> impl Iterator<Item = (OpId, &Op)> + '_ {
+        let mut id = self.head;
+        std::iter::from_fn(move || {
+            if id.is_null() {
+                return None;
+            }
+            let here = id;
+            id = self.ops[here].next;
+            Some((here, &self.ops[here].op))
+        })
+    }
+
+    /// The op after `id` in program order. Unused until the CB pass walks the
+    /// list by id (`TODO.md`, the IR re-modeling); part of the editing API the
+    /// slab exists for.
+    #[allow(dead_code)]
+    pub fn next_op(&self, id: OpId) -> OpId {
+        self.ops[id].next
+    }
+
+    /// How many ops the program has.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        usize::from(self.ops.len())
+    }
+
+    /// Whether the program has no ops.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The op before `id` in program order. Part of the editing API the slab
+    /// exists for.
+    #[allow(dead_code)]
+    pub fn prev_op(&self, id: OpId) -> OpId {
+        self.ops[id].prev
+    }
+
+    /// Append `op` to the list and return its id.
+    pub fn push(&mut self, op: Op) -> OpId {
+        let id = self.ops.push(OpLinked {
+            prev: self.tail,
+            next: OpId::NULL,
+            op,
+        });
+        if self.tail.is_null() {
+            self.head = id;
+        } else {
+            self.ops[self.tail].next = id;
+        }
+        self.tail = id;
+        id
+    }
+
+    /// Insert `op` before `at`. Part of the editing API the slab exists for.
+    #[allow(dead_code)]
+    pub fn insert_before(&mut self, at: OpId, op: Op) -> OpId {
+        let prev = self.ops[at].prev;
+        let id = self.ops.push(OpLinked { prev, next: at, op });
+        self.ops[at].prev = id;
+        if prev.is_null() {
+            self.head = id;
+        } else {
+            self.ops[prev].next = id;
+        }
+        id
+    }
+
+    /// Insert `op` after `at`. Part of the editing API the slab exists for.
+    #[allow(dead_code)]
+    pub fn insert_after(&mut self, at: OpId, op: Op) -> OpId {
+        let next = self.ops[at].next;
+        let id = self.ops.push(OpLinked { prev: at, next, op });
+        self.ops[at].next = id;
+        if next.is_null() {
+            self.tail = id;
+        } else {
+            self.ops[next].prev = id;
+        }
+        id
+    }
 }
 
 /// The meaning of every value, by id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Types {
-    pub values: Vec<ValueInfo>,
+    pub values: BTreeMap<OpId, ValueInfo>,
     /// The grid terms. A program must have them.
     pub grid: [Dim; 2],
 }
 
 impl Types {
     pub fn of(&self, value: ValueId) -> &ValueInfo {
-        &self.values[value as usize]
+        &self.values[&value]
     }
 }
 
@@ -645,32 +809,60 @@ pub fn unit_of(shape: [u32; 2], dtype: DType) -> Result<(RegShape, u32, u32), Er
 // Verification
 // ---------------------------------------------------------------------------
 
+/// Grow `slots` so `id` has one, and return the slot.
+fn grow<T: Clone>(slots: &mut Vec<T>, id: OpId, fill: T) -> usize {
+    let index = usize::from(id);
+    if slots.len() <= index {
+        slots.resize(index + 1, fill);
+    }
+    index
+}
+
+/// Record what a value means, at its own id.
+fn set_value(values: &mut Vec<Option<ValueInfo>>, id: ValueId, info: ValueInfo) {
+    let index = grow(values, id, None);
+    values[index] = Some(info);
+}
+
+/// Record whether a value is visible, at its own id.
+fn set_visible(visible: &mut Vec<bool>, id: OpId, value: bool) {
+    let slot = grow(visible, id, false);
+    visible[slot] = value;
+}
+
 fn lookup<'a>(
-    values: &'a [ValueInfo],
+    values: &'a [Option<ValueInfo>],
     visible: &[bool],
     v: ValueId,
     _at: usize,
 ) -> Result<&'a ValueInfo, Error> {
+    let slot = usize::from(v);
     let info = values
-        .get(v as usize)
+        .get(slot)
+        .and_then(|v| v.as_ref())
         .ok_or(Error::TT_ERROR_VALUE_UNDEFINED)?;
-    if !visible.get(v as usize).copied().unwrap_or(false) {
+    if !visible.get(slot).copied().unwrap_or(false) {
         return Err(Error::TT_ERROR_VALUE_OUT_OF_SCOPE);
     }
     Ok(info)
 }
 
 impl Kernel {
+    /// The op `id`, if it is live.
+    pub fn op(&self, id: OpId) -> Option<&Op> {
+        self.ops.get(id).map(|linked| &linked.op)
+    }
+
     /// The `i32` a value folds to, when it is a constant or constant-only
     /// arithmetic. This is how a `Dim::Value` that names a literal (`%two`,
     /// `%step`) becomes a `Dim::Const` without unrolling the loop that carries
-    /// it; a value that depends on a loop index is not constant.
+    /// it; a value that depends on a loop index is not constant. The value *is*
+    /// its defining op, so this is one lookup, not a scan.
     ///
     /// The folds are exact two's-complement `i32`; a division by zero or a
     /// shift outside `0..32` is `None`, never a guess.
     pub fn const_i32(&self, value: ValueId) -> Option<i32> {
-        let op = self.ops.iter().find(|op| op.defined() == Some(value))?;
-        match *op {
+        match *self.op(value)? {
             Op::Const {
                 dtype: DType::I32,
                 bits,
@@ -708,37 +900,32 @@ impl Kernel {
     /// Check every reference, dtype, shape and scope, and return what each
     /// value means.
     pub fn verify(&self) -> Result<Types, Error> {
-        let mut values: Vec<ValueInfo> = Vec::with_capacity(self.names.len());
-        let mut visible: Vec<bool> = Vec::with_capacity(self.names.len());
+        // A value's id is the id of the op that defines it, so the side tables
+        // are one slot per op, addressed by id.
+        let slots = usize::from(self.ops.max_id());
+        let mut values: Vec<Option<ValueInfo>> = vec![None; slots];
+        let mut visible: Vec<bool> = vec![false; slots];
         let mut loops: Vec<usize> = Vec::new();
         let mut grid: Option<([Dim; 2], usize)> = None;
-        let mut seen: Vec<&str> = Vec::with_capacity(self.names.len());
-        for name in &self.names {
-            if seen.contains(&name.as_str()) {
-                return Err(Error::TT_ERROR_NAME_DUPLICATE);
-            }
-            seen.push(name);
-        }
-        // The op that defines each value. Value ids are definition order, not op
-        // indices: a `grid`, a `copy_to` or an `endloop` takes an op slot and
-        // defines nothing.
-        let mut def: Vec<usize> = vec![usize::MAX; self.names.len()];
-        for (at, op) in self.ops.iter().enumerate() {
+        // The op that defines each value: its own id.
+        let mut def: Vec<OpId> = vec![OpId::NULL; slots];
+        for (id, op) in self.ops() {
             if let Some(value) = op.defined() {
-                def[value as usize] = at;
+                let slot = grow(&mut def, value, OpId::NULL);
+                def[slot] = id;
             }
         }
 
-        for (at, op) in self.ops.iter().enumerate() {
+        for (id, op) in self.ops() {
+            let at: usize = id.into();
             for v in op.used() {
                 lookup(&values, &visible, v, at)?;
             }
-            if let Some(value) = op.defined() {
-                if value as usize != values.len() {
-                    return Err(Error::TT_ERROR_VALUE_ORDER);
-                }
-                if self.names.get(value as usize).is_none() {
-                    return Err(Error::TT_ERROR_VALUE_UNNAMED);
+            let defined = op.defined();
+            if let Some(value) = defined {
+                if self.op(value).is_none() {
+                    let _ = value;
+                    return Err(Error::TT_ERROR_VALUE_UNDEFINED);
                 }
             }
             let info = match *op {
@@ -852,13 +1039,18 @@ impl Kernel {
                             return Err(Error::TT_ERROR_LOOP_BOUND_NOT_INDEX);
                         }
                     }
-                    loops.push(values.len());
-                    values.push(ValueInfo {
-                        kind: ValueKind::Induction,
-                        dtype: INDEX,
-                        shape: RegShape::Scalar,
-                    });
-                    visible.push(true);
+                    let value = defined.expect("a loop defines its induction value");
+                    loops.push(usize::from(value) + 1);
+                    set_value(
+                        &mut values,
+                        value,
+                        ValueInfo {
+                            kind: ValueKind::Induction,
+                            dtype: INDEX,
+                            shape: RegShape::Scalar,
+                        },
+                    );
+                    set_visible(&mut visible, value, true);
                     continue;
                 }
                 Op::EndLoop => {
@@ -923,9 +1115,12 @@ impl Kernel {
                     if page != 1 {
                         return Err(Error::TT_TODO_MULTI_LANE);
                     }
-                    let Op::Buffer { shape, .. } = self.ops[def[buffer as usize]] else {
-                        let _ = buffer;
-                        return Err(Error::TT_ERROR_NOT_A_BUFFER);
+                    let shape = match self.at(def[usize::from(buffer)]) {
+                        Op::Buffer { shape, .. } => *shape,
+                        _ => {
+                            let _ = buffer;
+                            return Err(Error::TT_ERROR_NOT_A_BUFFER);
+                        }
                     };
                     let (unit_shape, _, _) = unit_of(shape, b.dtype)?;
                     let datums = access[0] * access[1];
@@ -982,11 +1177,11 @@ impl Kernel {
                             let _ = buffer;
                             return Err(Error::TT_ERROR_NOT_A_BUFFER);
                         }
-                        let Op::Buffer { shape, .. } = self.ops[def[buffer as usize]] else {
+                        let Op::Buffer { shape, .. } = self.at(def[usize::from(buffer)]) else {
                             let _ = buffer;
                             return Err(Error::TT_ERROR_NOT_A_BUFFER);
                         };
-                        let (unit_shape, _, _) = unit_of(shape, b.dtype)?;
+                        let (unit_shape, _, _) = unit_of(*shape, b.dtype)?;
                         if unit_shape.datums() < datums {
                             let _ = (unit_shape, access);
                             return Err(Error::TT_ERROR_ACCESS_SHAPE);
@@ -1070,9 +1265,12 @@ impl Kernel {
                         let _ = (v.dtype, b.dtype);
                         return Err(Error::TT_ERROR_STORE_BUFFER_CAST);
                     }
-                    let Op::Buffer { shape, .. } = self.ops[def[buffer as usize]] else {
-                        let _ = buffer;
-                        return Err(Error::TT_ERROR_NOT_A_BUFFER);
+                    let shape = match self.at(def[usize::from(buffer)]) {
+                        Op::Buffer { shape, .. } => *shape,
+                        _ => {
+                            let _ = buffer;
+                            return Err(Error::TT_ERROR_NOT_A_BUFFER);
+                        }
                     };
                     let (unit_shape, _, _) = unit_of(shape, b.dtype)?;
                     if unit_shape.datums() < datums {
@@ -1311,13 +1509,18 @@ impl Kernel {
                     continue;
                 }
             };
-            values.push(info);
-            visible.push(true);
+            let value = defined.expect("a defining op produced a value");
+            set_value(&mut values, value, info);
+            set_visible(&mut visible, value, true);
         }
         if !loops.is_empty() {
             return Err(Error::TT_ERROR_LOOP_UNTERMINATED);
         }
-        if values.len() != self.names.len() {
+        // Every defining op recorded what its value means.
+        let defined = values.iter().filter(|v| v.is_some()).count();
+        let named = self.ops().filter(|(_, op)| op.defined().is_some()).count();
+        if defined != named {
+            let _ = (defined, named);
             return Err(Error::TT_ERROR_VALUE_COUNT);
         }
         let Some((grid, at)) = grid else {
@@ -1337,7 +1540,16 @@ impl Kernel {
             at,
             Error::TT_ERROR_GRID_DIMENSION_NOT_INDEX,
         )?;
-        Ok(Types { values, grid })
+        let mut table: BTreeMap<OpId, ValueInfo> = BTreeMap::new();
+        for (slot, info) in values.into_iter().enumerate() {
+            if let Some(info) = info {
+                table.insert(OpId(slot as u32), info);
+            }
+        }
+        Ok(Types {
+            values: table,
+            grid,
+        })
     }
 }
 
@@ -1416,7 +1628,7 @@ fn broadcast(a: RegShape, b: RegShape) -> Option<RegShape> {
 /// `bad` is the variant for the concrete context the term appears in (a grid
 /// dimension, an offset, ...), so a caller can tell them apart.
 fn check_dim(
-    values: &[ValueInfo],
+    values: &[Option<ValueInfo>],
     visible: &[bool],
     dim: Dim,
     at: usize,
@@ -1446,7 +1658,7 @@ pub(crate) fn access_shape(shape: [u32; 2]) -> Result<RegShape, Error> {
 /// An access's index, and how many bases it names. A literal is one base; a
 /// value is one base per datum of its shape, so a `1,32` vector names 32.
 fn check_index(
-    values: &[ValueInfo],
+    values: &[Option<ValueInfo>],
     visible: &[bool],
     dim: Dim,
     at: usize,
@@ -1485,8 +1697,8 @@ fn check_offset(offset: Dim, total: u32, unit: u32, at: usize) -> Result<(), Err
 }
 
 /// A parameter's element count when every dimension is a literal.
-fn param_elements(k: &Kernel, def: &[usize], param: ValueId) -> Option<u32> {
-    let Op::Param { dims, .. } = &k.ops[def[param as usize]] else {
+fn param_elements(k: &Kernel, def: &[OpId], param: ValueId) -> Option<u32> {
+    let Op::Param { dims, .. } = k.at(def[usize::from(param)]) else {
         return None;
     };
     if dims.is_empty() {
@@ -1572,15 +1784,15 @@ impl Kernel {
                     Op::GridCoord { value, axis }
                 }
                 6 => Op::CopyTo {
-                    dst: r.u32()?,
-                    src: r.u32()?,
+                    dst: r.id()?,
+                    src: r.id()?,
                     dst_offset: r.dim()?,
                     src_offset: r.dim()?,
                     shape: [r.u32()?, r.u32()?],
                 },
                 7 => {
                     let name = r.name()?;
-                    let buffer = r.u32()?;
+                    let buffer = r.id()?;
                     let offset = r.dim()?;
                     let shape = [r.u32()?, r.u32()?];
                     let value = define(&mut names, name)?;
@@ -1592,21 +1804,21 @@ impl Kernel {
                     }
                 }
                 8 => Op::StoreTo {
-                    buffer: r.u32()?,
-                    value: r.u32()?,
+                    buffer: r.id()?,
+                    value: r.id()?,
                     offset: r.dim()?,
                     shape: [r.u32()?, r.u32()?],
                 },
                 9 => {
                     let name = r.name()?;
-                    let src = r.u32()?;
+                    let src = r.id()?;
                     let dtype = r.dtype()?;
                     let value = define(&mut names, name)?;
                     Op::Cast { value, src, dtype }
                 }
                 15 => {
                     let name = r.name()?;
-                    let src = r.u32()?;
+                    let src = r.id()?;
                     let dtype = r.dtype()?;
                     let value = define(&mut names, name)?;
                     Op::Bitcast { value, src, dtype }
@@ -1614,22 +1826,22 @@ impl Kernel {
                 10 => {
                     let name = r.name()?;
                     let op = UnOp::from_tag(r.u8()?).ok_or(Error::TT_ERROR_UNARY_TAG)?;
-                    let a = r.u32()?;
+                    let a = r.id()?;
                     let value = define(&mut names, name)?;
                     Op::Unary { value, op, a }
                 }
                 11 => {
                     let name = r.name()?;
                     let op = BinOp::from_tag(r.u8()?).ok_or(Error::TT_ERROR_BINARY_TAG)?;
-                    let a = r.u32()?;
-                    let b = r.u32()?;
+                    let a = r.id()?;
+                    let b = r.id()?;
                     let value = define(&mut names, name)?;
                     Op::Binary { value, op, a, b }
                 }
                 12 => {
-                    let acc = r.u32()?;
-                    let a = r.u32()?;
-                    let b = r.u32()?;
+                    let acc = r.id()?;
+                    let a = r.id()?;
+                    let b = r.id()?;
                     Op::Matmul { acc, a, b }
                 }
                 16 => {
@@ -1645,9 +1857,9 @@ impl Kernel {
                 }
                 13 => {
                     let name = r.name()?;
-                    let cond = r.u32()?;
-                    let if_true = r.u32()?;
-                    let if_false = r.u32()?;
+                    let cond = r.id()?;
+                    let if_true = r.id()?;
+                    let if_false = r.id()?;
                     let value = define(&mut names, name)?;
                     Op::Select {
                         value,
@@ -1657,14 +1869,14 @@ impl Kernel {
                     }
                 }
                 17 => {
-                    let acc = r.u32()?;
-                    let x = r.u32()?;
-                    let scaler = r.u32()?;
+                    let acc = r.id()?;
+                    let x = r.id()?;
+                    let scaler = r.id()?;
                     Op::Sum { acc, x, scaler }
                 }
                 18 => {
-                    let acc = r.u32()?;
-                    let x = r.u32()?;
+                    let acc = r.id()?;
+                    let x = r.id()?;
                     Op::Max { acc, x }
                 }
                 other => {
@@ -1677,7 +1889,7 @@ impl Kernel {
         if r.at != r.bytes.len() {
             return Err(Error::TT_ERROR_TRAILING_INPUT);
         }
-        let k = Kernel { ops, names };
+        let k = build(ops, names)?;
         k.verify()?;
         Ok(k)
     }
@@ -1687,9 +1899,138 @@ fn define(names: &mut Vec<String>, name: String) -> Result<ValueId, Error> {
     if names.iter().any(|n| *n == name) {
         return Err(Error::TT_ERROR_NAME_DUPLICATE);
     }
-    let value = names.len() as ValueId;
+    let value = names.len();
     names.push(name);
-    Ok(value)
+    Ok(OpId(value as u32))
+}
+
+/// Build the kernel from a parsed run of ops whose value ids are dense
+/// definition indices: each value takes the id of the op that defines it (one
+/// id space), and the names follow their values.
+fn build(ops: Vec<Op>, names: Vec<String>) -> Result<Kernel, Error> {
+    let mut k = Kernel::default();
+    let mut map: BTreeMap<OpId, OpId> = BTreeMap::new();
+    for mut op in ops {
+        if let Some(value) = op.defined() {
+            let id = k.ops.max_id();
+            map.insert(value, id);
+        }
+        renumber(&mut op, &map)?;
+        k.push(op);
+    }
+    for (dense, name) in names.into_iter().enumerate() {
+        if let Some(id) = map.get(&OpId(dense as u32)).copied() {
+            k.names.insert(id, name);
+        }
+    }
+    Ok(k)
+}
+
+/// Map every value id in `op` through `map`. A use always follows its
+/// definition, so the map is complete at each step.
+pub(crate) fn renumber(op: &mut Op, map: &BTreeMap<OpId, OpId>) -> Result<(), Error> {
+    fn v(id: &mut ValueId, map: &BTreeMap<OpId, OpId>) -> Result<(), Error> {
+        *id = *map.get(id).ok_or(Error::TT_ERROR_VALUE_UNDEFINED)?;
+        Ok(())
+    }
+    fn d(dim: &mut Dim, map: &BTreeMap<OpId, OpId>) -> Result<(), Error> {
+        if let Dim::Value(id) = dim {
+            v(id, map)?;
+        }
+        Ok(())
+    }
+    match op {
+        Op::Const { value, .. }
+        | Op::Acc { value, .. }
+        | Op::GridCoord { value, .. }
+        | Op::Buffer { value, .. } => v(value, map)?,
+        Op::Cast { value, src, .. } | Op::Bitcast { value, src, .. } => {
+            v(value, map)?;
+            v(src, map)?;
+        }
+        Op::Unary { value, a, .. } => {
+            v(value, map)?;
+            v(a, map)?;
+        }
+        Op::Binary { value, a, b, .. } => {
+            v(value, map)?;
+            v(a, map)?;
+            v(b, map)?;
+        }
+        Op::Select {
+            value,
+            cond,
+            if_true,
+            if_false,
+        } => {
+            v(value, map)?;
+            v(cond, map)?;
+            v(if_true, map)?;
+            v(if_false, map)?;
+        }
+        Op::Loop { value, bound } => {
+            v(value, map)?;
+            d(bound, map)?;
+        }
+        Op::Param { value, dims, .. } => {
+            v(value, map)?;
+            for dim in dims {
+                d(dim, map)?;
+            }
+        }
+        Op::Grid { columns, rows } => {
+            d(columns, map)?;
+            d(rows, map)?;
+        }
+        Op::CopyTo {
+            dst,
+            src,
+            dst_offset,
+            src_offset,
+            ..
+        } => {
+            v(dst, map)?;
+            v(src, map)?;
+            d(dst_offset, map)?;
+            d(src_offset, map)?;
+        }
+        Op::Load {
+            value,
+            buffer,
+            offset,
+            ..
+        } => {
+            v(value, map)?;
+            v(buffer, map)?;
+            d(offset, map)?;
+        }
+        Op::StoreTo {
+            value,
+            buffer,
+            offset,
+            ..
+        } => {
+            v(value, map)?;
+            v(buffer, map)?;
+            d(offset, map)?;
+        }
+        Op::Matmul { acc, a, b } => {
+            v(acc, map)?;
+            v(a, map)?;
+            v(b, map)?;
+        }
+        Op::Sum { acc, x, scaler } => {
+            v(acc, map)?;
+            v(x, map)?;
+            v(scaler, map)?;
+        }
+        Op::Max { acc, x } => {
+            v(acc, map)?;
+            v(x, map)?;
+        }
+        Op::EndLoop => {}
+    }
+    Ok(())
 }
 
 struct Cursor<'a> {
@@ -1716,6 +2057,12 @@ impl Cursor<'_> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
 
+    /// A dense value index, as an [`OpId`]: [`build`] renumbers it to the
+    /// id of the op that defines it.
+    fn id(&mut self) -> Result<OpId, Error> {
+        Ok(OpId(self.u32()?))
+    }
+
     fn dtype(&mut self) -> Result<DType, Error> {
         let tag = self.u8()?;
         // tt-metal's `DataFormat::Tf32` is 4; the dtype itself is not wired yet.
@@ -1734,7 +2081,7 @@ impl Cursor<'_> {
     fn dim(&mut self) -> Result<Dim, Error> {
         match self.u8()? {
             0 => Ok(Dim::Const(self.u32()?)),
-            1 => Ok(Dim::Value(self.u32()?)),
+            1 => Ok(Dim::Value(OpId(self.u32()?))),
             other => {
                 let _ = other;
                 Err(Error::TT_ERROR_SHAPE_TERM_TAG)
@@ -1893,10 +2240,7 @@ impl Kernel {
             }
             None => return Err(Error::TT_ERROR_VERSION),
         }
-        let k = Kernel {
-            ops: p.ops,
-            names: p.names,
-        };
+        let k = build(p.ops, p.names)?;
         k.verify()?;
         Ok(k)
     }
@@ -1931,7 +2275,7 @@ impl Parser {
         if self.symbols.contains_key(&name) {
             return Err(Error::TT_ERROR_NAME_DUPLICATE);
         }
-        let value = self.names.len() as ValueId;
+        let value = OpId(self.names.len() as u32);
         self.symbols.insert(name.clone(), value);
         self.names.push(name);
         Ok(value)

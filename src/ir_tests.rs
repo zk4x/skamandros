@@ -52,7 +52,7 @@ matmul %m %a %b
 ";
 
     let k = Kernel::parse(PROGRAM).unwrap_or_else(|e| panic!("the unified program parses: {e}"));
-    assert_eq!(k.ops.len(), 31, "every op of the unified program");
+    assert_eq!(k.len(), 31, "every op of the unified program");
 
     // Symbolic grid and symbolic parameter dims, with the grid after the values
     // it reads: a scalar parameter is a rank-0 shape.
@@ -65,7 +65,7 @@ grid %d,8
 
     let k = Kernel::parse(SYMBOLIC).unwrap_or_else(|e| panic!("the symbolic program parses: {e}"));
     assert_eq!(
-        k.ops.len(),
+        k.len(),
         3,
         "the scalar param, the tensor param and the grid"
     );
@@ -212,22 +212,19 @@ grid 1,1
     let types = k.verify().expect("the direct form verifies");
     let staged = crate::mover::add_movers(&k, &types).expect("the access is staged");
     let buffers = staged
-        .ops
-        .iter()
-        .filter(|op| matches!(op, Op::Buffer { .. }))
+        .ops()
+        .filter(|(_, op)| matches!(op, Op::Buffer { .. }))
         .count();
     let copies = staged
-        .ops
-        .iter()
-        .filter(|op| matches!(op, Op::CopyTo { .. }))
+        .ops()
+        .filter(|(_, op)| matches!(op, Op::CopyTo { .. }))
         .count();
     assert_eq!(buffers, 2, "one staged buffer per direct access");
     assert_eq!(copies, 2, "one inbound and one outbound copy");
     assert!(
         staged
-            .ops
-            .iter()
-            .filter(|op| matches!(
+            .ops()
+            .filter(|(_, op)| matches!(
                 op,
                 Op::Load {
                     offset: Dim::Const(0),
@@ -266,10 +263,11 @@ load 1,32 %y = %ib [0]
     let k = Kernel::parse(ROW).expect("the row program parses");
     let types = k.verify().expect("the row program verifies");
     let value = |name: &str| {
-        k.names
+        *k.names
             .iter()
-            .position(|n| n == name)
-            .unwrap_or_else(|| panic!("`{name}` is defined")) as u32
+            .find(|(_, n)| n.as_str() == name)
+            .map(|(id, _)| id)
+            .unwrap_or_else(|| panic!("`{name}` is defined"))
     };
     assert_eq!(
         types.of(value("x")).shape,
@@ -573,8 +571,15 @@ grid 1,1
 ";
     let k = Kernel::parse(SELECT).expect("the select program parses");
     let types = k.verify().expect("it verifies");
-    assert_eq!(types.values[2].dtype, DType::Bool, "cmplt is bool");
-    assert_eq!(types.values[3].dtype, DType::I32, "sel is i32");
+    let of = |name: &str| {
+        *k.names
+            .iter()
+            .find(|(_, n)| n.as_str() == name)
+            .map(|(id, _)| id)
+            .expect("the program names it")
+    };
+    assert_eq!(types.of(of("lt")).dtype, DType::Bool, "cmplt is bool");
+    assert_eq!(types.of(of("m")).dtype, DType::I32, "sel is i32");
 
     // A bool condition is required, and a value with no bool is not one.
     let bad = "version 9\n%x = const i32 3\n%m = sel %x %x %x\ngrid 1,1\n";
@@ -851,7 +856,7 @@ fn an_acc_is_one_32x32_tile_of_an_accumulating_dtype() {
     for shape in ["1,32", "32,1", "1,1", "32,32"] {
         let text = format!("version 9\n%m = acc f32 {shape}\ngrid 1,1\n");
         let k = Kernel::parse(&text).unwrap_or_else(|e| panic!("acc f32 {shape}: {e}"));
-        assert_eq!(k.ops.len(), 2, "acc f32 {shape}");
+        assert_eq!(k.len(), 2, "acc f32 {shape}");
     }
     // `tf32` is a real format with no path yet: named, never guessed.
     case(

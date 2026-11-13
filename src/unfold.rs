@@ -23,20 +23,19 @@
 //! `BinOp`s, and both are part of the program format already. A `pow` whose
 //! operands are not floats is left alone, and `lower` refuses it loudly.
 
-use crate::ir::{BinOp, DType, Dim, Error, Kernel, Op, Types, UnOp, ValueId};
+use std::collections::BTreeMap;
+
+use crate::ir::{BinOp, DType, Error, Kernel, Op, OpId, Types, UnOp, ValueId};
 
 /// Rewrite every transcendental `k` has into its primitive form.
 pub fn unfold(k: &Kernel, types: &Types) -> Result<Kernel, Error> {
     let mut b = Build {
-        out: Kernel {
-            ops: Vec::with_capacity(k.ops.len()),
-            names: Vec::with_capacity(k.names.len()),
-        },
+        out: Kernel::default(),
         old: k,
-        map: vec![u32::MAX; k.names.len()],
+        map: BTreeMap::new(),
         seq: 0,
     };
-    for op in &k.ops {
+    for (_, op) in k.ops() {
         match *op {
             Op::Unary {
                 value,
@@ -49,7 +48,7 @@ pub fn unfold(k: &Kernel, types: &Types) -> Result<Kernel, Error> {
                     UnOp::Sin => b.sin_cos(x, false),
                     _ => b.sin_cos(x, true),
                 };
-                b.map[value as usize] = out;
+                b.map.insert(value, out);
             }
             Op::Binary {
                 value,
@@ -88,7 +87,7 @@ pub fn unfold(k: &Kernel, types: &Types) -> Result<Kernel, Error> {
                         continue;
                     }
                 };
-                b.map[value as usize] = out;
+                b.map.insert(value, out);
             }
             _ => b.copy(op.clone()),
         }
@@ -102,7 +101,7 @@ pub fn unfold(k: &Kernel, types: &Types) -> Result<Kernel, Error> {
 struct Build<'a> {
     out: Kernel,
     old: &'a Kernel,
-    map: Vec<ValueId>,
+    map: BTreeMap<OpId, ValueId>,
     /// A counter for the names of the values this pass creates, so that
     /// unfolding the same shape twice does not emit the same name twice.
     seq: u32,
@@ -110,18 +109,18 @@ struct Build<'a> {
 
 impl Build<'_> {
     fn map_of(&self, v: ValueId) -> ValueId {
-        self.map[v as usize]
+        self.map[&v]
     }
 
     fn value(&mut self, tag: &str) -> ValueId {
-        let v = self.out.names.len() as ValueId;
-        self.out.names.push(format!("{tag}{}", self.seq));
+        let v = self.out.ops.max_id();
+        self.out.names.insert(v, format!("{tag}{}", self.seq));
         self.seq += 1;
         v
     }
 
     fn push(&mut self, op: Op) {
-        self.out.ops.push(op);
+        self.out.push(op);
     }
 
     fn kf(&mut self, x: f32, tag: &str) -> ValueId {
@@ -366,138 +365,19 @@ impl Build<'_> {
         self.bitcast(signed, DType::F32, "recip_out")
     }
 
-    /// Copy an op unchanged, with its value ids remapped.
+    /// Copy an op unchanged, with its value ids remapped. A value *is* its
+    /// defining op, so a copied value takes the id of the copy.
     fn copy(&mut self, op: Op) {
-        let new = op.defined().map(|old| {
-            let v = self.out.names.len() as ValueId;
-            self.out.names.push(self.old.names[old as usize].clone());
-            self.map[old as usize] = v;
-            v
-        });
-        let op = match op {
-            Op::Const { dtype, bits, .. } => Op::Const {
-                value: new.expect("a const defines its value"),
-                dtype,
-                bits,
-            },
-            Op::Param { dtype, dims, .. } => Op::Param {
-                value: new.expect("a parameter defines its value"),
-                dtype,
-                dims: dims.into_iter().map(|d| self.dim(d)).collect(),
-            },
-            Op::Buffer { dtype, shape, .. } => Op::Buffer {
-                value: new.expect("a buffer defines its value"),
-                dtype,
-                shape,
-            },
-            Op::Acc { dtype, shape, .. } => Op::Acc {
-                value: new.expect("an acc defines its value"),
-                dtype,
-                shape,
-            },
-            Op::Grid { columns, rows } => Op::Grid {
-                columns: self.dim(columns),
-                rows: self.dim(rows),
-            },
-            Op::Loop { bound, .. } => Op::Loop {
-                value: new.expect("a loop defines its value"),
-                bound: self.dim(bound),
-            },
-            Op::EndLoop => Op::EndLoop,
-            Op::GridCoord { axis, .. } => Op::GridCoord {
-                value: new.expect("a grid coordinate defines its value"),
-                axis,
-            },
-            Op::CopyTo {
-                dst,
-                src,
-                dst_offset,
-                src_offset,
-                shape,
-            } => Op::CopyTo {
-                dst: self.map_of(dst),
-                src: self.map_of(src),
-                dst_offset: self.dim(dst_offset),
-                src_offset: self.dim(src_offset),
-                shape,
-            },
-            Op::Load {
-                buffer,
-                offset,
-                shape,
-                ..
-            } => Op::Load {
-                value: new.expect("a load defines its value"),
-                buffer: self.map_of(buffer),
-                offset: self.dim(offset),
-                shape,
-            },
-            Op::StoreTo {
-                value,
-                buffer,
-                offset,
-                shape,
-            } => Op::StoreTo {
-                value: self.map_of(value),
-                buffer: self.map_of(buffer),
-                offset: self.dim(offset),
-                shape,
-            },
-            Op::Cast { src, dtype, .. } => Op::Cast {
-                value: new.expect("a cast defines its value"),
-                src: self.map_of(src),
-                dtype,
-            },
-            Op::Bitcast { src, dtype, .. } => Op::Bitcast {
-                value: new.expect("a bitcast defines its value"),
-                src: self.map_of(src),
-                dtype,
-            },
-            Op::Unary { op, a, .. } => Op::Unary {
-                value: new.expect("a unary op defines its value"),
-                op,
-                a: self.map_of(a),
-            },
-            Op::Binary { op, a, b, .. } => Op::Binary {
-                value: new.expect("a binary op defines its value"),
-                op,
-                a: self.map_of(a),
-                b: self.map_of(b),
-            },
-            Op::Select {
-                cond,
-                if_true,
-                if_false,
-                ..
-            } => Op::Select {
-                value: new.expect("a select defines its value"),
-                cond: self.map_of(cond),
-                if_true: self.map_of(if_true),
-                if_false: self.map_of(if_false),
-            },
-            Op::Matmul { acc, a, b } => Op::Matmul {
-                acc: self.map_of(acc),
-                a: self.map_of(a),
-                b: self.map_of(b),
-            },
-            Op::Sum { acc, x, scaler } => Op::Sum {
-                acc: self.map_of(acc),
-                x: self.map_of(x),
-                scaler: self.map_of(scaler),
-            },
-            Op::Max { acc, x } => Op::Max {
-                acc: self.map_of(acc),
-                x: self.map_of(x),
-            },
-        };
-        self.push(op);
-    }
-
-    fn dim(&self, d: Dim) -> Dim {
-        match d {
-            Dim::Value(v) => Dim::Value(self.map_of(v)),
-            other => other,
+        let mut op = op;
+        let id = self.out.ops.max_id();
+        if let Some(old) = op.defined() {
+            self.map.insert(old, id);
+            if let Some(name) = self.old.names.get(&old) {
+                self.out.names.insert(id, name.clone());
+            }
         }
+        crate::ir::renumber(&mut op, &self.map).expect("a use follows its definition");
+        self.push(op);
     }
 }
 
@@ -526,7 +406,7 @@ copy 32,32 %out [0] = %bo [0]
         let out = unfold(&k, &types).expect("the unfold runs");
         out.verify().expect("the unfolded program verifies");
         assert!(
-            !out.ops.iter().any(|op| matches!(
+            !out.ops().any(|(_, op)| matches!(
                 op,
                 Op::Unary {
                     op: UnOp::Log2 | UnOp::Sin | UnOp::Cos,

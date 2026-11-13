@@ -9,9 +9,11 @@
 //! programs. The reader/compute/writer split is not in the input; it is what
 //! falls out of which instructions touch a parameter, a buffer or a register.
 
+use std::collections::BTreeMap;
+
 use crate::alloc::allocate;
 use crate::encode;
-use crate::ir::{BinOp, Dim, Error, Kernel, Op};
+use crate::ir::{BinOp, Dim, Error, Kernel, Op, OpId};
 use crate::lower::lower;
 use crate::mover;
 use crate::optimize;
@@ -70,7 +72,7 @@ pub fn compile(k: &Kernel) -> Result<Module, Error> {
 /// One launch argument kind per parameter, in program order.
 fn parameter_kinds(k: &Kernel, types: &crate::ir::Types) -> Vec<ParamKind> {
     let mut kinds = Vec::new();
-    for op in &k.ops {
+    for (_, op) in k.ops() {
         if let Op::Param { value, .. } = *op {
             kinds.push(if types.of(value).shape == crate::ir::RegShape::Scalar {
                 ParamKind::Scalar
@@ -86,11 +88,11 @@ fn parameter_kinds(k: &Kernel, types: &crate::ir::Types) -> Vec<ParamKind> {
 /// constant; anything else is an expression over the launch's scalar parameters,
 /// evaluated by the runtime before any core starts.
 fn grid_term(k: &Kernel, dim: Dim) -> Result<GridTerm, Error> {
-    let mut param: Vec<Option<u32>> = vec![None; k.names.len()];
+    let mut param: BTreeMap<OpId, u32> = BTreeMap::new();
     let mut next = 0u32;
-    for op in &k.ops {
+    for (_, op) in k.ops() {
         if let Op::Param { value, .. } = *op {
-            param[value as usize] = Some(next);
+            param.insert(value, next);
             next += 1;
         }
     }
@@ -107,14 +109,10 @@ fn grid_term(k: &Kernel, dim: Dim) -> Result<GridTerm, Error> {
 
 fn grid_value(
     k: &Kernel,
-    param: &[Option<u32>],
+    param: &BTreeMap<OpId, u32>,
     value: crate::ir::ValueId,
 ) -> Result<GridTerm, Error> {
-    let op = k
-        .ops
-        .iter()
-        .find(|op| op.defined() == Some(value))
-        .ok_or(Error::TT_ERROR_VALUE_UNDEFINED)?;
+    let op = k.op(value).ok_or(Error::TT_ERROR_VALUE_UNDEFINED)?;
     match *op {
         Op::Const {
             dtype: crate::ir::DType::I32,
@@ -124,7 +122,7 @@ fn grid_value(
         Op::Param {
             value: p, ref dims, ..
         } if dims.is_empty() => Ok(GridTerm::Param(
-            param[p as usize].ok_or(Error::TT_ERROR_ARGUMENT)?,
+            *param.get(&p).ok_or(Error::TT_ERROR_ARGUMENT)?,
         )),
         Op::Binary { op, a, b, .. } if grid_op(op) => Ok(GridTerm::Binary(
             op,

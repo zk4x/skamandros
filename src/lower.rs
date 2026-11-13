@@ -15,9 +15,12 @@
 //! Addresses come from the L1 plan, `Dst` slots from the allocation; the caller
 //! named none of them.
 
+use std::collections::BTreeMap;
+
 use crate::alloc::Alloc;
 use crate::ir::{
-    BinOp, DType, Dim, Error, Kernel, Op, RegShape, Types, UnOp, access_shape, unit_of,
+    BinOp, DType, Dim, Error, Kernel, Op, OpId, RegShape, Types, UnOp, ValueId, access_shape,
+    unit_of,
 };
 use crate::mir::{Bcast, CmpOp, ElwOp, IOp, Machine, MirOp, PackMask, Role, SfpOp};
 use crate::planner::Plan;
@@ -52,12 +55,11 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
     // `bool` does not force 32-bit mode: its lane is the sign-magnitude `-1`,
     // and the bf16 store keeps exactly that pattern (`0xBF80`), so a comparison
     // in a bf16 kernel round-trips.
-    let wide = (0..types.values.len()).any(|v| {
-        alloc.place[v].is_some()
-            && matches!(
-                types.values[v].dtype,
-                crate::ir::DType::F32 | crate::ir::DType::I32
-            )
+    let wide = alloc.place.keys().any(|v| {
+        matches!(
+            types.of(*v).dtype,
+            crate::ir::DType::F32 | crate::ir::DType::I32
+        )
     });
     // The dtype a value occupies `Dst` with. 16-bit mode stores every value as
     // a bf16 datum, the `bool` lane's `-1` pattern included; 32-bit mode holds
@@ -76,88 +78,87 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
         dst_is_16_bit: !wide,
         ..Machine::default()
     };
-    let mut def: Vec<Option<usize>> = vec![None; types.values.len()];
-    for (at, op) in k.ops.iter().enumerate() {
-        if let Some(value) = op.defined() {
-            def[value as usize] = Some(at);
-        }
-    }
     // The launch argument index of every parameter, in program order: a scalar
     // parameter's value is loaded from its pair in the arguments array.
-    let mut param: Vec<Option<u32>> = vec![None; types.values.len()];
+    let mut param: BTreeMap<crate::ir::OpId, u32> = BTreeMap::new();
     let mut next = 0u32;
-    for op in &k.ops {
+    for (_, op) in k.ops() {
         if let Op::Param { value, .. } = *op {
-            param[value as usize] = Some(next);
+            param.insert(value, next);
             next += 1;
         }
     }
     // The induction value of every loop being lowered, innermost last: a bound
     // may name an outer loop's index, whose value is its counter register.
     let mut loops: Vec<crate::ir::ValueId> = Vec::new();
-    // A bitcast is the same bits under another name, so it has no program of its
-    // own and no `Dst` slot: every reader of the bitcast reads its source.
-    let mut alias: Vec<Option<crate::ir::ValueId>> = vec![None; types.values.len()];
-    for op in &k.ops {
-        if let Op::Bitcast { value, src, .. } = *op {
-            alias[value as usize] = Some(resolve(&alias, src));
-        }
-    }
     // The edge mask a pack of each value carries follows the value's shape: a
     // reduce's result keeps only its folded positions, and every value with the
     // same narrow shape keeps the same part — a `1,32` row 0, a `32,1` column 0.
-    let mut acc_mask: Vec<PackMask> = types
+    let mut acc_mask: BTreeMap<crate::ir::OpId, PackMask> = types
         .values
         .iter()
-        .map(|v| match v.shape {
-            RegShape::Row => PackMask::Col,
-            RegShape::Column => PackMask::Row,
-            _ => PackMask::None,
+        .map(|(id, v)| {
+            let mask = match v.shape {
+                RegShape::Row => PackMask::Col,
+                RegShape::Column => PackMask::Row,
+                _ => PackMask::None,
+            };
+            (*id, mask)
         })
         .collect();
     // Who reads each value, and where it last does: a `matmul` reads its
     // operands' CB pages straight into `SrcA`/`SrcB`, so a page stays reserved
     // until the last of its readers, and only then is popped.
-    let mut last_use: Vec<Option<usize>> = vec![None; types.values.len()];
-    let mut matmul_use: Vec<bool> = vec![false; types.values.len()];
-    let mut non_matmul_use: Vec<bool> = vec![false; types.values.len()];
+    let mut last_use: BTreeMap<crate::ir::OpId, crate::ir::OpId> = BTreeMap::new();
+    let mut matmul_use: std::collections::BTreeSet<crate::ir::OpId> =
+        std::collections::BTreeSet::new();
+    let mut non_matmul_use: std::collections::BTreeSet<crate::ir::OpId> =
+        std::collections::BTreeSet::new();
     // A value read only as a copy's index is the mover's: it is an address
     // expression, or a row of bases the mover reads one datum of per lane.
-    let mut index_use: Vec<bool> = vec![false; types.values.len()];
-    let mut other_use: Vec<bool> = vec![false; types.values.len()];
-    for (at, op) in k.ops.iter().enumerate() {
+    let mut index_use: std::collections::BTreeSet<crate::ir::OpId> =
+        std::collections::BTreeSet::new();
+    let mut other_use: std::collections::BTreeSet<crate::ir::OpId> =
+        std::collections::BTreeSet::new();
+    for (at, op) in k.ops() {
         for v in op.used() {
-            last_use[v as usize] = Some(at);
+            last_use.insert(v, at);
             // A copy's ends are its operands; its other reads are indices.
             if matches!(*op, Op::CopyTo { dst, src, .. } if v != dst && v != src) {
-                index_use[v as usize] = true;
+                index_use.insert(v);
                 continue;
             }
-            other_use[v as usize] = true;
+            other_use.insert(v);
             if let Some((tile, narrow)) = crate::ir::broadcast_pair(types, op)
                 && (v == tile || v == narrow)
             {
                 // The FPU's broadcast reads both operands from `Src` pages.
-                matmul_use[v as usize] = true;
+                matmul_use.insert(v);
                 continue;
             }
             match *op {
-                Op::Matmul { a, b, .. } if v == a || v == b => matmul_use[v as usize] = true,
+                Op::Matmul { a, b, .. } if v == a || v == b => {
+                    matmul_use.insert(v);
+                }
                 // A reduce's operands are Src operands too: the fold runs on
                 // the Src path from their pages, exactly as `matmul`'s do.
                 Op::Sum { x, scaler, .. } if v == x || v == scaler => {
-                    matmul_use[v as usize] = true;
+                    matmul_use.insert(v);
                 }
-                Op::Max { x, .. } if v == x => matmul_use[v as usize] = true,
-                _ => non_matmul_use[v as usize] = true,
+                Op::Max { x, .. } if v == x => {
+                    matmul_use.insert(v);
+                }
+                _ => {
+                    non_matmul_use.insert(v);
+                }
             }
         }
     }
     // The page of a load that a `matmul` also reads is released at the last
     // reader, not at the load: the ring's read pointer must not move while the
     // Matrix Unit's unpack still points at it.
-    let mut pop_here: Vec<Vec<u32>> = vec![Vec::new(); k.ops.len()];
-    for (at, op) in k.ops.iter().enumerate() {
+    let mut pop_here: BTreeMap<crate::ir::OpId, Vec<u32>> = BTreeMap::new();
+    for (at, op) in k.ops() {
         // A reduce's axis is its accumulator's shape (`ReduceDim::of`); the
         // verifier has already refused a `32,32` acc there, and a `matmul`
         // needs that same `32,32`.
@@ -239,20 +240,23 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 // A vector load that nothing reads but a copy's index is the
                 // mover's lane bases: it reads one datum per lane out of the
                 // page it just copied, so no `Dst` slot ever holds it.
-                if index_use[value as usize] && !other_use[value as usize] {
+                if index_use.contains(&value) && !other_use.contains(&value) {
                     continue;
                 }
                 let info = types.of(buffer);
-                let Op::Buffer { dtype, .. } = k.ops[def[buffer as usize].expect("defined")] else {
-                    let _ = buffer;
-                    return Err(Error::TT_ERROR_NOT_A_BUFFER);
+                let dtype = match k.at(buffer) {
+                    Op::Buffer { dtype, .. } => *dtype,
+                    _ => {
+                        let _ = buffer;
+                        return Err(Error::TT_ERROR_NOT_A_BUFFER);
+                    }
                 };
                 let unit_shape = access_shape(access)?;
-                let row = dst_row(alloc, resolve(&alias, value));
+                let row = dst_row(alloc, owner(k, value));
                 // A value only an `Src` reader consumes never enters `Dst`: the
                 // unpack goes straight into `SrcA`/`SrcB` at the op that reads
                 // it, and this load only reserves the page.
-                let lands_in_dst = non_matmul_use[value as usize] || !matmul_use[value as usize];
+                let lands_in_dst = non_matmul_use.contains(&value) || !matmul_use.contains(&value);
                 // Only a tile (one whole page) is lowered into the datapath
                 // today; a row, a column or a datum needs the narrowed unpack,
                 // which is not written. A narrow access that only an `Src`
@@ -263,7 +267,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     return Err(Error::TT_TODO_ACCESS_SHAPE);
                 }
                 let rows = rows_of(unit_shape, at)?;
-                let cb = plan.cb[buffer as usize].ok_or_else(|| {
+                let cb = plan.cb.get(&buffer).copied().ok_or_else(|| {
                     let _ = buffer;
                     Error::TT_ERROR_BUFFER_NOT_PLACED
                 })?;
@@ -316,9 +320,12 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 }
                 // A page the Matrix Unit still reads is released after that
                 // read, not here.
-                if matmul_use[value as usize] {
-                    let last = last_use[value as usize].expect("a read value has a last use");
-                    pop_here[last].push(cb);
+                if matmul_use.contains(&value) {
+                    let last = last_use
+                        .get(&value)
+                        .copied()
+                        .expect("a read value has a last use");
+                    pop_here.entry(last).or_default().push(cb);
                 } else {
                     m.push(Role::Unpack, MirOp::CbPop { cb });
                 }
@@ -336,8 +343,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 // only form the verifier admits is a fill from an f32 constant,
                 // and the SFPU writes it row by row.
                 if types.of(buffer).kind == crate::ir::ValueKind::Acc {
-                    let bits = match k.ops[def[value as usize].expect("defined")] {
-                        Op::Const { bits, .. } => bits,
+                    let bits = match k.at(value) {
+                        Op::Const { bits, .. } => *bits,
                         _ => {
                             let _ = value;
                             return Err(Error::TT_TODO_ACC_STORE);
@@ -366,14 +373,17 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     // An accumulator store never reads a CB page, but a page
                     // this instruction was the last reader of is released here
                     // exactly like the packed path's.
-                    for cb in std::mem::take(&mut pop_here[at]) {
+                    for cb in pop_here.remove(&at).unwrap_or_default() {
                         m.push(Role::Unpack, MirOp::CbPop { cb });
                     }
                     continue;
                 }
-                let Op::Buffer { dtype, .. } = k.ops[def[buffer as usize].expect("defined")] else {
-                    let _ = buffer;
-                    return Err(Error::TT_ERROR_NOT_A_BUFFER);
+                let dtype = match k.at(buffer) {
+                    Op::Buffer { dtype, .. } => *dtype,
+                    _ => {
+                        let _ = buffer;
+                        return Err(Error::TT_ERROR_NOT_A_BUFFER);
+                    }
                 };
                 let unit_shape = access_shape(access)?;
                 // Only a tile is lowered today; a narrower pack needs the
@@ -383,7 +393,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     return Err(Error::TT_TODO_ACCESS_SHAPE);
                 }
                 let rows = rows_of(unit_shape, at)?;
-                let cb = plan.cb[buffer as usize].ok_or_else(|| {
+                let cb = plan.cb.get(&buffer).copied().ok_or_else(|| {
                     let _ = buffer;
                     Error::TT_ERROR_BUFFER_NOT_PLACED
                 })?;
@@ -397,12 +407,12 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     MirOp::Pack {
                         cb,
                         rows,
-                        row: dst_row(alloc, resolve(&alias, value)),
+                        row: dst_row(alloc, owner(k, value)),
                         last: true,
                         dtype,
                         // A pack of a reduced accumulator carries the reduce's edge
                         // mask; every other pack keeps the whole tile.
-                        mask: acc_mask[resolve(&alias, value) as usize],
+                        mask: acc_mask[&owner(k, value)],
                     },
                 );
                 m.push(Role::Pack, MirOp::CbPush { cb });
@@ -412,9 +422,9 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 let from = types.of(src).dtype;
                 let shape = types.of(src).shape;
                 let rows = sfp_rows(shape, at)?;
-                let s = dst_row(alloc, resolve(&alias, src));
-                let out = dst_row(alloc, resolve(&alias, value));
-                let (la, ld) = alloc.lreg[resolve(&alias, value) as usize];
+                let s = dst_row(alloc, owner(k, src));
+                let out = dst_row(alloc, owner(k, value));
+                let (la, ld) = alloc.lreg[&owner(k, value)];
                 // The conversion happens in the lane. 16-bit mode stores every
                 // value as a bf16 datum, so a `bool` lane *is* `-1.0`/`0.0` there
                 // and an `f32` one is already bf16 precision; 32-bit mode holds
@@ -460,9 +470,9 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             Op::Unary { value, op, a } => {
                 let shape = types.of(a).shape;
                 let rows = sfp_rows(shape, at)?;
-                let src = dst_row(alloc, resolve(&alias, a));
-                let out = dst_row(alloc, resolve(&alias, value));
-                let (la, ld) = alloc.lreg[resolve(&alias, value) as usize];
+                let src = dst_row(alloc, owner(k, a));
+                let out = dst_row(alloc, owner(k, value));
+                let (la, ld) = alloc.lreg[&owner(k, value)];
                 let dtype = storage(types.of(a).dtype);
                 // `exp2` is the one transcendental no IR op spells: its
                 // exponent assembly is `SFPEXEXP`/`SFPSETEXP`, so it is a body
@@ -520,8 +530,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 // literal, and a lane load is two instructions where a filled
                 // tile would be a `Dst` slot and a sweep. Any other scalar
                 // (an index expression) still has no lane and is refused.
-                let ca = scalar_const(k, &def, a);
-                let cb = scalar_const(k, &def, b);
+                let ca = scalar_const(k, a);
+                let cb = scalar_const(k, b);
                 if left.shape != right.shape
                     && !(left.shape == RegShape::Scalar && ca.is_some())
                     && !(right.shape == RegShape::Scalar && cb.is_some())
@@ -566,12 +576,12 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         RegShape::Tile => unreachable!("the tile is the other operand"),
                     };
                     fpu_broadcast(
-                        &mut m, k, types, plan, alloc, &def, &alias, &acc_mask, value, op, tile,
-                        narrow, bcast, at,
+                        &mut m, k, types, plan, alloc, &acc_mask, value, op, tile, narrow, bcast,
+                        at,
                     )?;
                     // A page whose last reader this broadcast was is released
                     // here; `continue` skips the common block below.
-                    for cb in std::mem::take(&mut pop_here[at]) {
+                    for cb in pop_here.remove(&at).unwrap_or_default() {
                         m.push(Role::Unpack, MirOp::CbPop { cb });
                     }
                     continue;
@@ -623,8 +633,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     }
                 };
                 let rows = sfp_rows(shape, at)?;
-                let out = dst_row(alloc, resolve(&alias, value));
-                let (la, ld) = alloc.lreg[resolve(&alias, value) as usize];
+                let out = dst_row(alloc, owner(k, value));
+                let (la, ld) = alloc.lreg[&owner(k, value)];
                 let lb = 2u8;
                 // A comparison writes `-1`/`0` lanes, so its result is stored in
                 // the integer format; everything else keeps the operands'.
@@ -656,7 +666,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                             Role::Math,
                             MirOp::Sfpload {
                                 lreg: la,
-                                row: dst_row(alloc, resolve(&alias, a)) + row,
+                                row: dst_row(alloc, owner(k, a)) + row,
                                 dtype,
                             },
                         );
@@ -666,7 +676,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                             Role::Math,
                             MirOp::Sfpload {
                                 lreg: lb,
-                                row: dst_row(alloc, resolve(&alias, b)) + row,
+                                row: dst_row(alloc, owner(k, b)) + row,
                                 dtype,
                             },
                         );
@@ -788,11 +798,11 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             } => {
                 let shape = types.of(if_true).shape;
                 let rows = sfp_rows(shape, at)?;
-                let sc = dst_row(alloc, resolve(&alias, cond));
-                let st = dst_row(alloc, resolve(&alias, if_true));
-                let sf = dst_row(alloc, resolve(&alias, if_false));
-                let out = dst_row(alloc, resolve(&alias, value));
-                let ld = alloc.lreg[resolve(&alias, value) as usize].1;
+                let sc = dst_row(alloc, owner(k, cond));
+                let st = dst_row(alloc, owner(k, if_true));
+                let sf = dst_row(alloc, owner(k, if_false));
+                let out = dst_row(alloc, owner(k, value));
+                let ld = alloc.lreg[&owner(k, value)].1;
                 let lc = 3u8;
                 let lt = 0u8;
                 let lf = 2u8;
@@ -866,17 +876,15 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     let _ = at;
                     return Err(Error::TT_ERROR_MATMUL_ACCUM_WIDE);
                 }
-                let (cb_a, stage_a) =
-                    fpu_page(k, plan, &def, &alias, a, at, Error::TT_ERROR_MATMUL_OPERAND)?;
-                let (cb_b, stage_b) =
-                    fpu_page(k, plan, &def, &alias, b, at, Error::TT_ERROR_MATMUL_OPERAND)?;
+                let (cb_a, stage_a) = fpu_page(k, plan, a, at, Error::TT_ERROR_MATMUL_OPERAND)?;
+                let (cb_b, stage_b) = fpu_page(k, plan, b, at, Error::TT_ERROR_MATMUL_OPERAND)?;
                 // A computed operand has no page: the compiler packs it into its
                 // own and the Matrix Unit reads that.
                 if stage_a {
-                    stage(&mut m, types, alloc, &alias, &acc_mask, a, cb_a);
+                    stage(&mut m, k, types, alloc, &acc_mask, a, cb_a);
                 }
                 if stage_b {
-                    stage(&mut m, types, alloc, &alias, &acc_mask, b, cb_b);
+                    stage(&mut m, k, types, alloc, &acc_mask, b, cb_b);
                 }
                 let base = dst_row(alloc, acc);
                 // Scratch for `mvmul_group`, which emits a run of math ops: the
@@ -1104,19 +1112,11 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     let _ = at;
                     return Err(Error::TT_ERROR_MATMUL_ACCUM_WIDE);
                 }
-                let (cb_x, stage_x) =
-                    fpu_page(k, plan, &def, &alias, x, at, Error::TT_ERROR_REDUCE_OPERAND)?;
+                let (cb_x, stage_x) = fpu_page(k, plan, x, at, Error::TT_ERROR_REDUCE_OPERAND)?;
                 let (cb_b, stage_b, dt_b) = match scaler {
                     Some(scaler) => {
-                        let (cb, staged) = fpu_page(
-                            k,
-                            plan,
-                            &def,
-                            &alias,
-                            scaler,
-                            at,
-                            Error::TT_ERROR_REDUCE_OPERAND,
-                        )?;
+                        let (cb, staged) =
+                            fpu_page(k, plan, scaler, at, Error::TT_ERROR_REDUCE_OPERAND)?;
                         (cb, staged, types.of(scaler).dtype)
                     }
                     None => {
@@ -1140,12 +1140,12 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 // A computed operand has no page: the compiler stages it, and
                 // the unpacker waits for that page before the first face.
                 if stage_x {
-                    stage(&mut m, types, alloc, &alias, &acc_mask, x, cb_x);
+                    stage(&mut m, k, types, alloc, &acc_mask, x, cb_x);
                     m.push(Role::Unpack, MirOp::CbWait { cb: cb_x });
                 }
                 if stage_b {
                     if let Some(scaler) = scaler {
-                        stage(&mut m, types, alloc, &alias, &acc_mask, scaler, cb_b);
+                        stage(&mut m, k, types, alloc, &acc_mask, scaler, cb_b);
                     }
                     m.push(Role::Unpack, MirOp::CbWait { cb: cb_b });
                 }
@@ -1420,7 +1420,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                             dst_cr: false,
                         },
                     );
-                    acc_mask[acc as usize] = PackMask::Row;
+                    acc_mask.insert(acc, PackMask::Row);
                 } else {
                     // Four faces, `SrcA` (256 datums) and the scaler's row (16
                     // datums) each: tt-metal's AB-reduce unpack, then the fold.
@@ -1544,7 +1544,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                             dst_cr: false,
                         },
                     );
-                    acc_mask[acc as usize] = PackMask::Col;
+                    acc_mask.insert(acc, PackMask::Col);
                 }
                 // A staged operand's page is the compiler's: release it once
                 // the fold has drained it.
@@ -1561,7 +1561,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
         }
         // A page a `matmul` read is released once the last reader of the loaded
         // value has consumed it, which is after the matmul's own unpacks.
-        for cb in std::mem::take(&mut pop_here[at]) {
+        for cb in pop_here.remove(&at).unwrap_or_default() {
             m.push(Role::Unpack, MirOp::CbPop { cb });
         }
     }
@@ -1660,20 +1660,18 @@ fn thread_word(fields: &[(tt_isa::cfg::ThreadConfigField, u16)]) -> MirOp {
 fn fpu_page(
     k: &Kernel,
     plan: &Plan,
-    def: &[Option<usize>],
-    alias: &[Option<crate::ir::ValueId>],
     value: crate::ir::ValueId,
-    at: usize,
+    at: OpId,
     err: Error,
 ) -> Result<(u32, bool), Error> {
-    let id = resolve(alias, value);
-    let Some(op_at) = def[id as usize] else {
+    let id = owner(k, value);
+    if k.op(id).is_none() {
         let _ = (at, value);
         return Err(err);
-    };
-    if let Op::Load { buffer, .. } = k.ops[op_at] {
+    }
+    if let Some(Op::Load { buffer, .. }) = k.op(id) {
         return Ok((
-            plan.cb[buffer as usize].ok_or_else(|| {
+            plan.cb.get(buffer).copied().ok_or_else(|| {
                 let _ = buffer;
                 Error::TT_ERROR_BUFFER_NOT_PLACED
             })?,
@@ -1684,7 +1682,7 @@ fn fpu_page(
     // the compiler packs it into a page it owns. The verifier admits only
     // f32/bf16 operands, which is also what a staging `Pack` takes.
     let _ = at;
-    let cb = plan.staged[id as usize].ok_or_else(|| {
+    let cb = plan.staged.get(&id).copied().ok_or_else(|| {
         let _ = (id, value);
         err
     })?;
@@ -1707,27 +1705,25 @@ fn fpu_broadcast(
     types: &Types,
     plan: &Plan,
     alloc: &Alloc,
-    def: &[Option<usize>],
-    alias: &[Option<crate::ir::ValueId>],
-    acc_mask: &[PackMask],
+    acc_mask: &BTreeMap<OpId, PackMask>,
     value: crate::ir::ValueId,
     op: BinOp,
     tile: crate::ir::ValueId,
     narrow: crate::ir::ValueId,
     bcast: Bcast,
-    at: usize,
+    at: OpId,
 ) -> Result<(), Error> {
-    let (cb_a, stage_a) = fpu_page(k, plan, def, alias, tile, at, Error::TT_TODO_BROADCAST)?;
-    let (cb_b, stage_b) = fpu_page(k, plan, def, alias, narrow, at, Error::TT_TODO_BROADCAST)?;
+    let (cb_a, stage_a) = fpu_page(k, plan, tile, at, Error::TT_TODO_BROADCAST)?;
+    let (cb_b, stage_b) = fpu_page(k, plan, narrow, at, Error::TT_TODO_BROADCAST)?;
     if stage_a {
-        stage(m, types, alloc, alias, acc_mask, tile, cb_a);
+        stage(m, k, types, alloc, acc_mask, tile, cb_a);
     }
     if stage_b {
-        stage(m, types, alloc, alias, acc_mask, narrow, cb_b);
+        stage(m, k, types, alloc, acc_mask, narrow, cb_b);
     }
     let dt_a = types.of(tile).dtype;
     let dt_b = types.of(narrow).dtype;
-    let out = dst_row(alloc, resolve(alias, value));
+    let out = dst_row(alloc, owner(k, value));
     // The `Src` banks are filled from the pages the unpacker owns.
     for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
         if staged {
@@ -1948,14 +1944,14 @@ fn fpu_broadcast(
 /// into the page and publishes the page, and the unpacker waits for that page.
 fn stage(
     m: &mut Machine,
+    k: &Kernel,
     types: &Types,
     alloc: &Alloc,
-    alias: &[Option<crate::ir::ValueId>],
-    acc_mask: &[PackMask],
+    acc_mask: &BTreeMap<OpId, PackMask>,
     value: crate::ir::ValueId,
     cb: u32,
 ) {
-    let id = resolve(alias, value);
+    let id = owner(k, value);
     let dtype = types.of(id).dtype;
     m.push(Role::Pack, MirOp::CbReserve { cb });
     m.push(
@@ -1966,7 +1962,7 @@ fn stage(
             row: dst_row(alloc, id),
             last: true,
             dtype,
-            mask: acc_mask[id as usize],
+            mask: acc_mask[&id],
         },
     );
     m.push(Role::Pack, MirOp::CbPush { cb });
@@ -1991,7 +1987,7 @@ fn scalar(
     k: &Kernel,
     types: &Types,
     role: &mut Vec<MirOp>,
-    param: &[Option<u32>],
+    param: &BTreeMap<OpId, u32>,
     loops: &[crate::ir::ValueId],
     dim: Dim,
     dest: u8,
@@ -2016,7 +2012,7 @@ fn eval(
     k: &Kernel,
     types: &Types,
     role: &mut Vec<MirOp>,
-    param: &[Option<u32>],
+    param: &BTreeMap<OpId, u32>,
     loops: &[crate::ir::ValueId],
     value: crate::ir::ValueId,
     dest: u8,
@@ -2033,11 +2029,7 @@ fn eval(
         });
         return Ok(());
     }
-    let op = k
-        .ops
-        .iter()
-        .find(|op| op.defined() == Some(value))
-        .ok_or(Error::TT_TODO_LOOP_ADDRESS)?;
+    let op = k.op(value).ok_or(Error::TT_TODO_LOOP_ADDRESS)?;
     match *op {
         Op::Const {
             dtype: crate::ir::DType::I32,
@@ -2051,7 +2043,7 @@ fn eval(
             Ok(())
         }
         Op::Param { value: p, .. } if types.of(p).shape == RegShape::Scalar => {
-            let index = param[p as usize].ok_or(Error::TT_TODO_LOOP_ADDRESS)?;
+            let index = *param.get(&p).ok_or(Error::TT_TODO_LOOP_ADDRESS)?;
             role.push(MirOp::LoadArg {
                 reg: dest,
                 arg: crate::mover::param_arg(index).0,
@@ -2100,9 +2092,9 @@ fn int_op(op: BinOp) -> Option<IOp> {
 /// The bits a scalar constant operand carries, if `v` is one: `lower` puts
 /// them in a lane instead of reading a `Dst` tile, which is what lets the
 /// unfold write its coefficients and masks as ordinary `const` values.
-fn scalar_const(k: &Kernel, def: &[Option<usize>], v: crate::ir::ValueId) -> Option<u32> {
-    match k.ops[def[v as usize]?] {
-        Op::Const { bits, .. } => Some(bits),
+fn scalar_const(k: &Kernel, v: crate::ir::ValueId) -> Option<u32> {
+    match k.op(v) {
+        Some(Op::Const { bits, .. }) => Some(*bits),
         _ => None,
     }
 }
@@ -2534,7 +2526,7 @@ fn rsqrt_body(
 /// its lane layout in the lane — sixteen meaningful lanes of each — is not
 /// lowered: a value that reaches the datapath with that shape is refused rather
 /// than walked with a tile's addressing.
-fn sfp_rows(shape: RegShape, at: usize) -> Result<Vec<u32>, Error> {
+fn sfp_rows(shape: RegShape, at: OpId) -> Result<Vec<u32>, Error> {
     Ok(match shape {
         RegShape::Tile => (0..DST_ROWS).step_by(2).collect(),
         RegShape::Row | RegShape::Column => {
@@ -2548,7 +2540,7 @@ fn sfp_rows(shape: RegShape, at: usize) -> Result<Vec<u32>, Error> {
     })
 }
 
-fn rows_of(shape: RegShape, at: usize) -> Result<u32, Error> {
+fn rows_of(shape: RegShape, at: OpId) -> Result<u32, Error> {
     match shape {
         RegShape::Scalar => {
             let _ = at;
@@ -2565,13 +2557,18 @@ fn dst_row(alloc: &Alloc, value: crate::ir::ValueId) -> u32 {
     }
 }
 
-/// Follow a bitcast to the value that owns the `Dst` slot. The alias table is
-/// fully resolved when it is built, so one lookup is enough.
-fn resolve(alias: &[Option<crate::ir::ValueId>], value: crate::ir::ValueId) -> crate::ir::ValueId {
-    alias[value as usize].unwrap_or(value)
+/// Follow a bitcast to the value that owns the `Dst` slot: a bitcast has no
+/// home of its own. The definition is the value itself, so this is a walk of
+/// the chain, not a table.
+fn owner(k: &Kernel, value: ValueId) -> ValueId {
+    let mut at = value;
+    while let Some(Op::Bitcast { src, .. }) = k.op(at) {
+        at = *src;
+    }
+    at
 }
 
-fn unary(op: UnOp, at: usize) -> Result<SfpOp, Error> {
+fn unary(op: UnOp, at: OpId) -> Result<SfpOp, Error> {
     match op {
         UnOp::Neg => Ok(SfpOp::Neg),
         UnOp::Abs => Ok(SfpOp::Abs),
@@ -2583,7 +2580,7 @@ fn unary(op: UnOp, at: usize) -> Result<SfpOp, Error> {
     }
 }
 
-fn binary(op: BinOp, at: usize) -> Result<SfpOp, Error> {
+fn binary(op: BinOp, at: OpId) -> Result<SfpOp, Error> {
     match op {
         BinOp::Add => Ok(SfpOp::Add),
         BinOp::Sub => Ok(SfpOp::Sub),

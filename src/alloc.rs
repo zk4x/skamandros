@@ -6,12 +6,14 @@
 //! The caller never names a physical resource. A value's home follows from
 //! liveness: slots are reused as soon as the value is dead, and the lane
 //! registers of an op's body are its own temporaries. The cross-core hand-offs
-//! are emitted by [`crate::lower`] at the `load`/`store_to` that need them.
+//! are derived by [`crate::optimize::reg_sync`] from the accesses.
 //!
 //! Parameters and buffers are not allocated here: they are L1, placed by
 //! [`crate::planner`], and their contents are mutated in place.
 
-use crate::ir::{Error, Kernel, Op, Types, ValueId};
+use std::collections::BTreeMap;
+
+use crate::ir::{Error, Kernel, Op, OpId, Types, ValueId};
 
 /// `Dst` slots the hardware has (32-bit tiles).
 pub const DST_SLOTS: u8 = 8;
@@ -28,9 +30,9 @@ pub enum Place {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Alloc {
     /// Home of each value, if it is a register value.
-    pub place: Vec<Option<Place>>,
+    pub place: BTreeMap<OpId, Place>,
     /// Lane registers a value's own body uses: `(input, output)`.
-    pub lreg: Vec<(u8, u8)>,
+    pub lreg: BTreeMap<OpId, (u8, u8)>,
     /// Peak `Dst` slots in use.
     pub dst_peak: u8,
 }
@@ -38,58 +40,61 @@ pub struct Alloc {
 impl Alloc {
     /// The home of `value`. Only a register value has one.
     pub fn place_of(&self, value: ValueId) -> Place {
-        self.place[value as usize].expect("a register value has a home")
+        self.place[&value]
     }
 }
 
 /// Allocate homes for the register values of `k`.
 pub fn allocate(k: &Kernel, types: &Types) -> Result<Alloc, Error> {
-    let n = types.values.len();
-    let mut place: Vec<Option<Place>> = vec![None; n];
-    let mut lreg: Vec<(u8, u8)> = vec![(0, 1); n];
+    let mut place: BTreeMap<OpId, Place> = BTreeMap::new();
+    let mut lreg: BTreeMap<OpId, (u8, u8)> = BTreeMap::new();
     // A kernel with a `max` reduce gives the compiler the last slot for its
     // 1.0 page (see `lower`): the page is written at the start of the kernel
     // and packed before any allocated value is live, so the slot must not be
     // handed out.
-    let slots = if k.ops.iter().any(|op| matches!(op, Op::Max { .. })) {
+    let slots = if k.ops().any(|(_, op)| matches!(op, Op::Max { .. })) {
         DST_SLOTS - 1
     } else {
         DST_SLOTS
     };
     let mut free: Vec<bool> = vec![false; slots as usize];
-    let mut last_use: Vec<Option<usize>> = vec![None; n];
-    let mut freed: Vec<bool> = vec![false; n];
+    let mut last_use: BTreeMap<OpId, OpId> = BTreeMap::new();
+    let mut freed: Vec<OpId> = Vec::new();
     let mut live = 0usize;
     let mut peak = 0usize;
 
-    for (at, op) in k.ops.iter().enumerate() {
+    for (id, op) in k.ops() {
         for v in op.used() {
-            last_use[v as usize] = Some(at);
+            last_use.insert(v, id);
         }
     }
     // A bitcast has no `Dst` slot: its readers read its source, so the source
     // stays live until the last reader of the bitcast. Walking backwards lets a
     // chain of bitcasts settle in one pass.
-    for op in k.ops.iter().rev() {
+    let order: Vec<OpId> = k.ops().map(|(id, _)| id).collect();
+    for id in order.into_iter().rev() {
+        let op = k.at(id);
         if let Op::Bitcast { value, src, .. } = *op {
-            let Some(end) = last_use[value as usize] else {
+            let Some(end) = last_use.get(&value).copied() else {
                 continue;
             };
-            let use_at = &mut last_use[src as usize];
-            *use_at = Some(use_at.map_or(end, |u| u.max(end)));
+            let use_at = last_use.entry(src).or_insert(end);
+            *use_at = (*use_at).max(end);
         }
     }
 
-    for (at, op) in k.ops.iter().enumerate() {
+    for (id, op) in k.ops() {
         // Free the homes of values that died before this instruction, so an
         // output can reuse its input's slot.
-        for id in 0..n {
-            let Some(home) = place[id] else { continue };
-            if !freed[id] && last_use[id].is_some_and(|u| u <= at) {
-                let Place::Dst(slot) = home;
+        for (value, home) in place.iter() {
+            if freed.contains(value) {
+                continue;
+            }
+            if last_use.get(value).is_some_and(|u| *u <= id) {
+                let Place::Dst(slot) = *home;
                 free[slot as usize] = false;
                 live = live.saturating_sub(1);
-                freed[id] = true;
+                freed.push(*value);
             }
         }
         let Some(value) = op.defined() else { continue };
@@ -116,8 +121,8 @@ pub fn allocate(k: &Kernel, types: &Types) -> Result<Alloc, Error> {
             return Err(Error::TT_ERROR_DST_SLOTS_EXHAUSTED);
         };
         free[slot] = true;
-        place[value as usize] = Some(Place::Dst(slot as u8));
-        lreg[value as usize] = (0, 1);
+        place.insert(value, Place::Dst(slot as u8));
+        lreg.insert(value, (0, 1));
         live += 1;
         peak = peak.max(live);
     }

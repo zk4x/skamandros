@@ -14,7 +14,9 @@
 //! 16x16 faces for a tile, contiguous datums for a vector), and both ends of the
 //! datapath are configured from that.
 
-use crate::ir::{Error, Kernel, Op, Types, unit_of};
+use std::collections::BTreeMap;
+
+use crate::ir::{Error, Kernel, Op, OpId, Types, ValueId, unit_of};
 
 /// One circular buffer's L1 ring: where it starts, how big a page is, and how
 /// many pages fit. tt-metal's `CB` is described the same three ways; the ring
@@ -47,9 +49,9 @@ pub struct OnesPage {
 /// table the host writes before the launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
-    pub buf: Vec<Option<u32>>,
+    pub buf: BTreeMap<OpId, u32>,
     /// The CB id of each buffer value, by value id.
-    pub cb: Vec<Option<u32>>,
+    pub cb: BTreeMap<OpId, u32>,
     /// The rings, in cb-id order.
     pub cbs: Vec<Cb>,
     /// Byte address of the `LocalCBInterface` table (`riscv::cb::COUNT` entries,
@@ -60,7 +62,7 @@ pub struct Plan {
     /// The compiler's staging page of each value the FPU reads that is not a
     /// `load`: the Matrix Unit reads `Src` from L1 only, so a computed value is
     /// packed into a page the compiler owns, by value id.
-    pub staged: Vec<Option<u32>>,
+    pub staged: BTreeMap<OpId, u32>,
 }
 
 const ALIGN: u32 = 64;
@@ -68,11 +70,11 @@ const ALIGN: u32 = 64;
 /// Place every buffer in `tt_isa::l1::DATA`, in declaration order, and the CB
 /// interface table after them.
 pub fn place(k: &Kernel, types: &Types) -> Result<Plan, Error> {
-    let mut buf = vec![None; types.values.len()];
-    let mut cb = vec![None; types.values.len()];
+    let mut buf: BTreeMap<OpId, u32> = BTreeMap::new();
+    let mut cb: BTreeMap<OpId, u32> = BTreeMap::new();
     let mut cbs: Vec<Cb> = Vec::new();
     let mut at = tt_isa::l1::DATA.base as u32;
-    for (op_at, op) in k.ops.iter().enumerate() {
+    for (op_at, op) in k.ops() {
         let Op::Buffer {
             value,
             dtype,
@@ -96,8 +98,8 @@ pub fn place(k: &Kernel, types: &Types) -> Result<Plan, Error> {
             .datums()
             .checked_mul(dtype.bytes())
             .ok_or(Error::TT_ERROR_L1_OVERFLOW)?;
-        buf[value as usize] = Some(base);
-        cb[value as usize] = Some(cbs.len() as u32);
+        buf.insert(value, base);
+        cb.insert(value, cbs.len() as u32);
         cbs.push(Cb {
             base,
             page,
@@ -108,7 +110,7 @@ pub fn place(k: &Kernel, types: &Types) -> Result<Plan, Error> {
     // A `max` reduce's `SrcB` must be a row of exactly 1.0, and the caller
     // names no scaler for it: the compiler owns one 32x32 page of ones, in the
     // datum format of the operand.
-    let ones_dtype = k.ops.iter().find_map(|op| match *op {
+    let ones_dtype = k.ops().find_map(|(_, op)| match *op {
         Op::Max { x, .. } => Some(types.of(x).dtype),
         _ => None,
     });
@@ -137,18 +139,12 @@ pub fn place(k: &Kernel, types: &Types) -> Result<Plan, Error> {
     // `load`: the Matrix Unit's `Src` banks are filled from L1, so a computed
     // value is packed into a page of its own. One page each, like the 1.0 page
     // and for the same reason: the compiler owns the ring and its contents.
-    let mut staged: Vec<Option<u32>> = vec![None; types.values.len()];
-    let mut def: Vec<Option<usize>> = vec![None; types.values.len()];
-    for (op_at, op) in k.ops.iter().enumerate() {
-        if let Some(value) = op.defined() {
-            def[value as usize] = Some(op_at);
-        }
-    }
-    for op in &k.ops {
+    let mut staged: BTreeMap<OpId, u32> = BTreeMap::new();
+    for (_, op) in k.ops() {
         for operand in page_operands(types, op) {
             // A bitcast has no page of its own: the value it renames does.
-            let value = owner(k, &def, operand);
-            if staged[value as usize].is_some() || is_load(k, &def, value) {
+            let value = owner(k, operand);
+            if staged.contains_key(&value) || is_load(k, value) {
                 continue;
             }
             let dtype = types.of(value).dtype;
@@ -167,7 +163,7 @@ pub fn place(k: &Kernel, types: &Types) -> Result<Plan, Error> {
                 page: bytes,
                 pages: 1,
             });
-            staged[value as usize] = Some(cb);
+            staged.insert(value, cb);
             at = end;
         }
     }
@@ -211,24 +207,18 @@ fn page_operands(types: &Types, op: &Op) -> Vec<crate::ir::ValueId> {
 }
 
 /// The value a bitcast chain ends at: a bitcast has no home of its own.
-fn owner(k: &Kernel, def: &[Option<usize>], value: crate::ir::ValueId) -> crate::ir::ValueId {
+fn owner(k: &Kernel, value: ValueId) -> ValueId {
     let mut at = value;
-    while let Some(op_at) = def[at as usize] {
-        match k.ops[op_at] {
-            Op::Bitcast { src, .. } => at = src,
-            _ => break,
-        }
+    while let Some(Op::Bitcast { src, .. }) = k.op(at) {
+        at = *src;
     }
     at
 }
 
 /// Whether a value is read from an L1 page of its own, i.e. whether its
 /// definition is a `load`.
-fn is_load(k: &Kernel, def: &[Option<usize>], value: crate::ir::ValueId) -> bool {
-    matches!(
-        def[value as usize].map(|at| &k.ops[at]),
-        Some(Op::Load { .. })
-    )
+fn is_load(k: &Kernel, value: ValueId) -> bool {
+    matches!(k.op(value), Some(Op::Load { .. }))
 }
 
 #[cfg(test)]
@@ -263,8 +253,16 @@ grid 1,1
         assert_eq!(plan.cbs[0].base + 2 * 4096, plan.cbs[1].base);
         assert_eq!(plan.iface, plan.cbs[1].base + 4096);
         assert_eq!(plan.iface % 64, 0);
-        // `%bi` is value 2, `%bo` value 3 in declaration order.
-        assert_eq!(plan.cb[2], Some(0));
-        assert_eq!(plan.cb[3], Some(1));
+        // `%bi` and `%bo` are the two declared buffers; their CB ids follow
+        // declaration order.
+        let id_of = |name: &str| {
+            *k.names
+                .iter()
+                .find(|(_, n)| n.as_str() == name)
+                .map(|(id, _)| id)
+                .expect("the program names it")
+        };
+        assert_eq!(plan.cb[&id_of("bi")], 0);
+        assert_eq!(plan.cb[&id_of("bo")], 1);
     }
 }
