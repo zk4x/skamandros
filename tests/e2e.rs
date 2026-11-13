@@ -9,7 +9,7 @@
 //! handle here exactly as it is for a C consumer.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use libloading::{Library, Symbol};
@@ -67,12 +67,52 @@ fn library_path() -> PathBuf {
 /// process-wide state, and `libttsim` — which stays resident — refuses a second
 /// `libttsim_init`. Keeping one handle for the whole process is also how a real
 /// consumer uses the `.so`.
+///
+/// `cargo test` builds the test binary and the `rlib` half of the crate but not
+/// the `cdylib`, so the file next to this binary would be whatever the last
+/// `cargo build` left behind — stale after any edit, and a test that passes
+/// against a stale library is no test. The initializer builds it first, once,
+/// in the profile this binary was built in.
 fn library() -> &'static Library {
     static LIB: OnceLock<Library> = OnceLock::new();
     LIB.get_or_init(|| {
         let path = library_path();
+        build_library(&path);
         unsafe { Library::new(&path) }.unwrap_or_else(|e| panic!("dlopen {}: {e}", path.display()))
     })
+}
+
+/// `cargo build --lib` in the profile `path`'s directory names: `debug` and
+/// `release` have their own flags, any other profile is named. A build failure
+/// is the test's failure, with cargo's own message.
+fn build_library(path: &Path) {
+    let profile = path
+        .parent()
+        .and_then(Path::file_name)
+        .expect("a profile directory")
+        .to_string_lossy()
+        .into_owned();
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let mut command = std::process::Command::new(cargo);
+    command
+        .arg("build")
+        .arg("--lib")
+        .current_dir(env!("CARGO_MANIFEST_DIR"));
+    match profile.as_str() {
+        "debug" => {}
+        "release" => {
+            command.arg("--release");
+        }
+        other => {
+            command.args(["--profile", other]);
+        }
+    }
+    let out = command.output().expect("cargo runs");
+    assert!(
+        out.status.success(),
+        "cargo build --lib failed for {profile}:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 const COPY: &str = "\

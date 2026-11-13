@@ -186,9 +186,12 @@ cargo build          # target/debug/libTT.so
 cargo test           # unit tests and the end-to-end suite
 ```
 
-The end-to-end suite loads `target/<profile>/libTT.so`, so build the library
-before running it (`cargo build && cargo test`); `cargo test` alone does not
-rebuild the `cdylib` if only its Rust sources changed.
+The end-to-end suite loads `target/<profile>/libTT.so` and builds it itself —
+`cargo build --lib`, in the profile the test binary lives in — once, before the
+first `dlopen`, so `cargo test` alone is enough. `cargo test` does not build the
+`cdylib` on its own: an integration test links the `rlib` half of the crate, so
+without that step the suite would load whatever the last `cargo build` left
+behind.
 
 The end-to-end suite also needs Tenstorrent's functional simulator, `ttsim`,
 which is not part of this repository: download `libttsim_bh.so` from the
