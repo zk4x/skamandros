@@ -264,9 +264,9 @@ fn launch_steps(
             for ring in &module.cbs {
                 words.extend_from_slice(&crate::riscv::cb::interface(
                     ring.base,
-                    ring.page * ring.pages,
-                    ring.page,
-                    ring.pages,
+                    ring.page_bytes.checked_mul(ring.len).unwrap_or(0),
+                    ring.page_bytes,
+                    ring.len,
                 ));
             }
             let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();

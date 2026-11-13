@@ -104,6 +104,12 @@ impl<Id: SlabId, T> Drop for Slab<Id, T> {
     }
 }
 
+impl<Id: SlabId, T> Default for Slab<Id, T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<Id: SlabId, T> Slab<Id, T> {
     pub(crate) const fn new() -> Self {
         Self {

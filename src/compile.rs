@@ -1,64 +1,62 @@
 // Copyright (C) 2025 zk4x
 // SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
 
-//! `compile`: unified program to loadable machine programs.
-//!
-//! The whole pipeline in one place, in the order the design fixes: verify the
-//! program, place its L1, allocate its register homes, lower to the machine IR,
-//! fuse and verify that, encode the three compute programs, and emit the mover
-//! programs. The reader/compute/writer split is not in the input; it is what
-//! falls out of which instructions touch a parameter, a buffer or a register.
+//! Rendering a machine kernel into the module a launch runs.
 
-use std::collections::BTreeMap;
-
-use crate::alloc::allocate;
 use crate::encode;
-use crate::ir::{BinOp, Dim, Error, Kernel, Op, OpId};
-use crate::lower::lower;
-use crate::mover;
-use crate::optimize;
-use crate::planner::place;
-use crate::unfold;
+use crate::ir::{Error, Kernel};
+use crate::mir::{CbInfo, MachineKernel};
 
 pub use crate::module::{GridTerm, Module, ParamKind};
 
-/// Compile one program. Every refusal is an error, never a partial module.
+/// Compile one program: the virtual passes, the lowering, the machine passes,
+/// the allocation and the render — in that order, and nothing else.
+///
+/// Every refusal is an error, never a partial module.
 pub fn compile(k: &Kernel) -> Result<Module, Error> {
     k.verify()?;
-    let types = k.verify()?;
-    // The transcendentals become primitives here, before anything is placed:
-    // every value the unfold creates gets its own `Dst` slot, which is correct
-    // and slow, and the allocator pass in `TODO.md` is what fuses the chain.
-    let k = unfold::unfold(k, &types)?;
+    let k = crate::unfold::unfold(k)?;
     let k = &k;
-    let types = k.verify()?;
-    // `tt_add_movers`: a direct parameter access gets its staging and copy.
-    let k = mover::add_movers(k, &types)?;
+    k.verify()?;
+    let k = crate::mover::add_movers(k)?;
     let k = &k;
-    let types = k.verify()?;
-    let plan = place(k, &types)?;
-    let alloc = allocate(k, &types)?;
-    let mut machine = lower(k, &types, &plan, &alloc)?;
-    // The role hand-offs are derived from the accesses, before fusion replaces
-    // the cross-role order with the three per-role streams.
-    optimize::reg_sync(&mut machine);
-    optimize::fuse(&mut machine);
-    optimize::verify(&machine)?;
-    let words = encode::encode(&machine)?;
-    let setup = encode::setup(&machine.sems())?;
-    let reader = mover::inbound(k, &types, &plan)?;
-    let writer = mover::outbound(k, &types, &plan)?;
-    let params = parameter_kinds(k, &types);
-    let grid = [grid_term(k, types.grid[0])?, grid_term(k, types.grid[1])?];
+    k.verify()?;
+    let mut machine = k.lower()?;
+    // The hand-offs are derived from the accesses, before fusion replaces the
+    // cross-core order with the per-core streams.
+    crate::optimize::reg_sync(&mut machine);
+    crate::optimize::fuse(&mut machine);
+    machine.verify()?;
+    machine.alloc()?;
+    machine.plan_cbs()?;
+    machine.render()
+}
+
+/// Render one machine kernel: the five programs as words, the setup program
+/// thread 0 runs, and the launch metadata the lowering carried over.
+///
+/// `render` is read-only: everything that had to be decided (the rings' places,
+/// the registers, the grid and the parameters) was decided before it.
+pub fn render(m: &MachineKernel) -> Result<Module, Error> {
+    let words = encode::encode(m)?;
+    let setup = encode::setup(&m.sems)?;
+    let mut cbs: Vec<CbInfo> = m.cbs.iter().map(|(_, info)| *info).collect();
+    cbs.sort_by_key(|info| info.base);
+    let iface = m
+        .cbs
+        .iter()
+        .map(|(_, info)| info.iface_entry)
+        .min()
+        .unwrap_or(0);
     let module = Module {
-        grid,
-        params,
-        reader,
-        writer,
-        cores: words.words()?,
+        grid: m.grid.clone(),
+        params: m.params.clone(),
+        reader: words[0].clone(),
+        writer: words[4].clone(),
+        cores: [words[1].clone(), words[2].clone(), words[3].clone()],
         setup,
-        iface: plan.iface,
-        cbs: plan.cbs.clone(),
+        iface,
+        cbs,
     };
     if module.reader.is_empty()
         && module.writer.is_empty()
@@ -69,92 +67,53 @@ pub fn compile(k: &Kernel) -> Result<Module, Error> {
     Ok(module)
 }
 
-/// One launch argument kind per parameter, in program order.
-fn parameter_kinds(k: &Kernel, types: &crate::ir::Types) -> Vec<ParamKind> {
+/// The launch's parameter kinds, in program order.
+pub fn parameter_kinds(k: &Kernel) -> Vec<ParamKind> {
     let mut kinds = Vec::new();
     for (_, op) in k.ops() {
         match *op {
-            Op::Param { value, .. } => {
-                kinds.push(if types.of(value).shape == crate::ir::RegShape::Scalar {
-                    ParamKind::Scalar
-                } else {
-                    ParamKind::Tensor
-                })
-            }
-            Op::Variable { .. } => kinds.push(ParamKind::Scalar),
+            crate::ir::Op::Param { .. } => kinds.push(ParamKind::Tensor),
+            crate::ir::Op::Variable { .. } => kinds.push(ParamKind::Scalar),
             _ => {}
         }
     }
     kinds
 }
 
-/// Compile one grid extent. A literal (or an expression that folds to one) is a
-/// constant; anything else is an expression over the launch's scalar parameters,
-/// evaluated by the runtime before any core starts.
-fn grid_term(k: &Kernel, dim: Dim) -> Result<GridTerm, Error> {
-    let mut param: BTreeMap<OpId, u32> = BTreeMap::new();
-    let mut next = 0u32;
+/// The launch's grid: the two terms of the program's `grid` op.
+pub fn grid_terms(k: &Kernel) -> Result<[GridTerm; 2], Error> {
+    let mut grid = None;
     for (_, op) in k.ops() {
-        match *op {
-            Op::Param { value, .. } | Op::Variable { value, .. } => {
-                param.insert(value, next);
-                next += 1;
-            }
-            _ => {}
+        if let crate::ir::Op::Grid { x, y } = *op {
+            grid = Some((x, y));
         }
     }
-    match dim {
-        Dim::Const(n) => Ok(GridTerm::Const(n)),
-        Dim::Value(value) => match k.const_i32(value) {
-            Some(n) => u32::try_from(n)
-                .map(GridTerm::Const)
-                .map_err(|_| Error::TT_ERROR_GRID),
-            None => grid_value(k, &param, value),
-        },
-    }
+    let Some((x, y)) = grid else {
+        return Err(Error::TT_ERROR_GRID);
+    };
+    Ok([term(k, x)?, term(k, y)?])
 }
 
-fn grid_value(
-    k: &Kernel,
-    param: &BTreeMap<OpId, u32>,
-    value: crate::ir::ValueId,
-) -> Result<GridTerm, Error> {
-    let op = k.op(value).ok_or(Error::TT_ERROR_VALUE_UNDEFINED)?;
-    match *op {
-        Op::Const {
-            dtype: crate::ir::DType::I32,
-            bits,
-            ..
-        } => Ok(GridTerm::Const(bits)),
-        Op::Variable { value: p, .. } => Ok(GridTerm::Param(
-            *param.get(&p).ok_or(Error::TT_ERROR_ARGUMENT)?,
-        )),
-        Op::Binary { op, a, b, .. } if grid_op(op) => Ok(GridTerm::Binary(
-            op,
-            Box::new(grid_value(k, param, a)?),
-            Box::new(grid_value(k, param, b)?),
-        )),
-        Op::GridCoord { .. } => Err(Error::TT_ERROR_GRID_COORD),
-        _ => Err(Error::TT_TODO_SYMBOLIC_GRID),
+/// One grid term: a foldable expression is a constant, a scalar parameter is
+/// the launch's argument, and anything else is refused.
+fn term(k: &Kernel, value: crate::ir::OpId) -> Result<GridTerm, Error> {
+    if let Some(n) = k.const_i32(value) {
+        return u32::try_from(n)
+            .map(GridTerm::Const)
+            .map_err(|_| Error::TT_ERROR_GRID);
     }
-}
-
-/// The arithmetic a grid extent may contain: the same set `Kernel::const_i32`
-/// folds.
-fn grid_op(op: BinOp) -> bool {
-    matches!(
-        op,
-        BinOp::Add
-            | BinOp::Sub
-            | BinOp::Mul
-            | BinOp::Div
-            | BinOp::Mod
-            | BinOp::Pow
-            | BinOp::Max
-            | BinOp::BitAnd
-            | BinOp::BitOr
-            | BinOp::BitXor
-            | BinOp::BitShiftLeft
-            | BinOp::BitShiftRight
-    )
+    if matches!(*k.at(value), crate::ir::Op::Variable { .. }) {
+        let ordinal = k
+            .ops()
+            .filter(|(_, op)| {
+                matches!(
+                    **op,
+                    crate::ir::Op::Param { .. } | crate::ir::Op::Variable { .. }
+                )
+            })
+            .position(|(id, _)| id == value)
+            .ok_or(Error::TT_ERROR_GRID)?;
+        return Ok(GridTerm::Param(ordinal as u32));
+    }
+    Err(Error::TT_ERROR_GRID)
 }

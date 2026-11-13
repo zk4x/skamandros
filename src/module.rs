@@ -4,7 +4,6 @@
 //! The compiled program: what a launch runs.
 
 use crate::ir::BinOp;
-use crate::planner::Cb;
 
 /// What a launch argument for one parameter is: a value or an address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +50,6 @@ pub struct Module {
     pub setup: Vec<u32>,
     /// The CB interface table the host writes before the launch.
     pub iface: u32,
-    /// The rings the table describes, in cb-id order.
-    pub cbs: Vec<Cb>,
+    /// The rings the table describes, in base-address order.
+    pub cbs: Vec<crate::mir::CbInfo>,
 }

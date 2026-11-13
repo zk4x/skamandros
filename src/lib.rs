@@ -21,7 +21,6 @@ mod mir;
 mod module;
 mod mover;
 mod optimize;
-mod planner;
 mod riscv;
 mod runtime;
 mod slab;

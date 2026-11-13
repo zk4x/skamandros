@@ -6,7 +6,7 @@
 
 use crate::compile;
 use crate::compile::ParamKind;
-use crate::ir::{DType, Dim, Kernel, Op, RegShape};
+use crate::ir::{DType, Kernel, Op, OpId, RegShape};
 use crate::status::ttStatus;
 
 /// The unified program: no reader/compute/writer segments, no unpack/pack, no
@@ -210,7 +210,7 @@ grid 1,1
 ";
     let k = Kernel::parse(DIRECT).expect("the direct kernel parses");
     let types = k.verify().expect("the direct form verifies");
-    let staged = crate::mover::add_movers(&k, &types).expect("the access is staged");
+    let staged = crate::mover::add_movers(&k).expect("the access is staged");
     let buffers = staged
         .ops()
         .filter(|(_, op)| matches!(op, Op::Cb { .. }))
@@ -227,7 +227,7 @@ grid 1,1
             .filter(|(_, op)| matches!(
                 op,
                 Op::Load {
-                    offset: Dim::Const(0),
+                    offset: OpId::NULL,
                     ..
                 }
             ))
@@ -270,12 +270,12 @@ load 1,32 %y = %ib [0]
             .unwrap_or_else(|| panic!("`{name}` is defined"))
     };
     assert_eq!(
-        types.of(value("x")).shape,
+        k.info(value("x")).shape,
         RegShape::Scalar,
         "a `1,1` access is one datum"
     );
     assert_eq!(
-        types.of(value("y")).shape,
+        k.info(value("y")).shape,
         RegShape::Row,
         "a `1,32` access is the whole row"
     );
@@ -578,8 +578,8 @@ grid 1,1
             .map(|(id, _)| id)
             .expect("the program names it")
     };
-    assert_eq!(types.of(of("lt")).dtype, DType::Bool, "cmplt is bool");
-    assert_eq!(types.of(of("m")).dtype, DType::I32, "sel is i32");
+    assert_eq!(k.dtype(of("lt")), DType::Bool, "cmplt is bool");
+    assert_eq!(k.dtype(of("m")), DType::I32, "sel is i32");
 
     // A bool condition is required, and a value with no bool is not one.
     let bad = "version 9\n%x = const i32 3\n%m = sel %x %x %x\ngrid 1,1\n";

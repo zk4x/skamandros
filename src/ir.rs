@@ -4,28 +4,26 @@
 //! The semantic kernel IR: one unified SSA program, machine programs out.
 //!
 //! What the caller writes is what the kernel *means*. There are no reader,
-//! compute and writer segments: a DRAM parameter, an L1 buffer, a register
-//! value and the operations on them are all named in one list, and the compiler
-//! classifies each instruction by the operands it touches. There is no
-//! `unpack`/`pack` and no buffer layout: how L1 becomes a register and how a
-//! register becomes L1 is the compiler's business.
+//! compute and writer segments in what it writes: a DRAM parameter, an L1
+//! buffer, a register value and the operations on them are all named in one
+//! list, and the compiler classifies each instruction by the operands it
+//! touches. There is no `unpack`/`pack` and no buffer layout: how L1 becomes a
+//! register and how a register becomes L1 is the compiler's business.
 //!
-//! Parameters and buffers are mutable, not SSA: `copy_to` (in either direction),
-//! `load` and `store_to` all name the same parameter or buffer. SSA covers the
-//! register values produced by `const`, `cast`, the arithmetic ops, `load` and
-//! `matmul`.
+//! There is one id space: an op's [`OpId`] *is* the value it defines, so a
+//! shape term, an index, a loop bound and an operand are all `OpId`s. A shape
+//! whose extent is not a value is either a [`Dim`] on the op that owns it (a
+//! fixed 2-D shape: an accumulator, a ring page, a copy's unit) or an
+//! `Op::Shape` of term ops.
 //!
-//! A shape is a comma-separated list of terms, and a term is a literal or a
-//! value of the fixed index dtype. There is no inline arithmetic: a product is
-//! built by an op first. A parameter may be arbitrary-dimensional and may use
-//! symbolic terms; a scalar parameter is the shape `0`. A buffer is always
-//! two-dimensional, always constant, and each dimension is `1` or a multiple
-//! of 32. The grid is a shape of exactly two terms and may be symbolic too.
+//! dtypes and shapes are not a side table: a leaf op carries its own, and every
+//! other op's is [`Kernel::dtype`]/[`Kernel::shape`], recomputed on demand.
 //!
 //! Both forms are canonical: the text form and the byte form ([`MAGIC`],
 //! [`VERSION`]). Each refuses the other's version.
 
 use core::fmt;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use crate::slab::{Slab, SlabId};
@@ -82,9 +80,6 @@ impl SlabId for OpId {
     }
 }
 
-/// Identifier of an SSA value: the `OpId` of the op that defines it.
-pub type ValueId = OpId;
-
 /// The fixed dtype of every index, shape and bracket term.
 pub const INDEX: DType = DType::I32;
 
@@ -134,12 +129,13 @@ impl DType {
     }
 }
 
-/// One term of a shape, a grid or a bracket: a literal or an SSA value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Dim {
-    Const(u32),
-    Value(ValueId),
-}
+/// A concrete extent: a shape's dimension, a ring's page count, a copy's unit.
+///
+/// A *symbolic* extent is never a `Dim`: it is an [`OpId`] naming the value that
+/// computes it, exactly as zyx models a shape term. `Dim` is only the resolved
+/// number, which is what fixed shapes (an accumulator, a ring page, a copy's
+/// unit) hold.
+pub type Dim = u32;
 
 /// The shape of a register value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,12 +163,6 @@ impl RegShape {
 
 /// Which axis a reduce folds, and where its result lands: tt-metal's
 /// `ReduceDim`, and zyx's `TileDim` under the same names.
-///
-/// `Row` folds the columns of each row into column 0 of that row, `Col` folds
-/// the rows of each column into row 0 of that column, and `Scalar` folds the
-/// whole tile into face 0's `[0,0]`. Everything else in the result tile is
-/// zero: the pool writes only the folded values, and a pack out of a reduced
-/// accumulator carries the packer's edge mask so the rest leaves as zeros.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReduceDim {
     /// One value per row, in the result tile's column 0.
@@ -214,14 +204,13 @@ pub enum ValueKind {
     GridCoord,
     /// A register value.
     Register,
-    /// A named `Dst` accumulator: mutable, one 32x32 tile.
+    /// A named accumulator: mutable, one `Dst` tile region.
     Acc,
+    /// A shape: its members are extents.
+    Shape,
 }
 
-/// Everything the compiler knows about one value.
-///
-/// A scalar parameter has [`RegShape::Scalar`]; any other parameter has
-/// [`RegShape::Tile`], and the `Param` op carries its logical shape.
+/// Everything the compiler knows about one value, recomputed on demand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValueInfo {
     pub kind: ValueKind,
@@ -394,53 +383,56 @@ impl UnOp {
 }
 
 /// One instruction of the unified program.
+///
+/// A producing op's result is its own [`OpId`], so no variant carries a
+/// `value` field. `EndLoop`, `EndReader`, `EndCompute`, `CopyTo`, `StoreTo`,
+/// `Matmul`, `Sum`, `Max`, `Grid`, `Wait`, `Reserve`, `Push` and `Pop` produce
+/// nothing (an accumulator is written in place).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
     /// A literal. `bits` holds the two's-complement `i32` or the `f32` bits.
-    Const {
-        value: ValueId,
-        dtype: DType,
-        bits: u32,
-    },
+    /// Its shape is the empty one: a literal is a scalar.
+    Const { dtype: DType, bits: u32 },
+    /// A shape: its members are the term values, in dimension order. A term is
+    /// any value of the index dtype, so a shape may be symbolic; an extent that
+    /// is fixed (a tile, a ring page) is a `[Dim; 2]` on the op that owns it.
+    Shape(Box<[OpId]>),
     /// A tensor parameter in DRAM, with its logical shape.
-    Param {
-        value: ValueId,
-        dtype: DType,
-        dims: Vec<Dim>,
-    },
+    Param { dtype: DType, shape: OpId },
     /// A scalar parameter: one word in DRAM, the value a launch argument
-    /// carries (the shape `0` in the text form).
-    Variable { value: ValueId, dtype: DType },
-    /// A CB ring in L1: a page shape and the number of pages.
+    /// carries (the shape `0` in the text form). Its shape is the empty one.
+    Variable { dtype: DType },
+    /// A CB ring in L1: a page shape and the number of pages. Its CB id is its
+    /// own `OpId`; the machine side names the ring by [`crate::mir::Cb`].
     Cb {
-        value: ValueId,
         dtype: DType,
         /// One page's shape: a tile, a row or a column.
-        page: [u32; 2],
+        page: [Dim; 2],
         /// Pages in the ring.
-        len: u8,
+        len: Dim,
     },
-    /// A named tile register: one `Dst` region that `matmul`, `sum`/`max` and
+    /// A named accumulator: one `Dst` region that `matmul`, `sum`/`max` and
     /// `store_to` write, read back by `store_to` into a buffer. It is mutable —
     /// the whole point of it is that a K loop adds into the same rows, and a
     /// reduce's fold accumulates — and it starts unspecified: a program that
     /// needs zeros stores them (`store_to %acc from %zero`). Its shape is which
     /// part of the region the program means, and for a reduce it is the fold:
     /// `1,32`, `32,1` or `1,1`, while `32,32` is `matmul`'s.
-    Tile {
-        value: ValueId,
-        dtype: DType,
-        shape: [u32; 2],
-    },
-    /// The launch grid, as a shape of two terms.
-    Grid { columns: Dim, rows: Dim },
+    Acc { dtype: DType, shape: [Dim; 2] },
+    /// The launch grid, as two terms: Tensix cores are a 2-D grid.
+    Grid { x: OpId, y: OpId },
     /// `%i = loop %bound`.
-    Loop { value: ValueId, bound: Dim },
+    Loop { bound: OpId },
     /// `endloop`.
     EndLoop,
+    /// The end of the reader's segment: the ops before it run on the inbound
+    /// mover, and those after the last marker on the writer.
+    EndReader,
+    /// The end of the compute segments (unpack, math, pack).
+    EndCompute,
     /// `%x = grid.x` / `%y = grid.y`: this core's logical coordinate on axis 0
     /// (x) or 1 (y), written by the host before the launch.
-    GridCoord { value: ValueId, axis: u8 },
+    GridCoord { axis: u8 },
     /// DRAM into L1, or L1 into DRAM: exactly one side is a parameter, the other
     /// a buffer. Each side has its own datum offset, because a circular buffer
     /// names its page by the ring pointer while the parameter names the access's
@@ -451,88 +443,61 @@ pub enum Op {
     /// one base per datum, and the lanes fill the buffer's page: a `1,32` copy
     /// with 32 bases is 32 rows, one `32,32` page.
     CopyTo {
-        dst: ValueId,
-        src: ValueId,
-        dst_offset: Dim,
-        src_offset: Dim,
-        shape: [u32; 2],
+        dst: OpId,
+        src: OpId,
+        dst_offset: OpId,
+        src_offset: OpId,
+        shape: [Dim; 2],
     },
     /// L1 buffer into a register value. `shape` is the unit the index's base
     /// names; the result has that shape.
     Load {
-        value: ValueId,
-        buffer: ValueId,
-        offset: Dim,
-        shape: [u32; 2],
+        buffer: OpId,
+        offset: OpId,
+        shape: [Dim; 2],
     },
     /// A register value into an L1 buffer.
     StoreTo {
-        value: ValueId,
-        buffer: ValueId,
-        offset: Dim,
-        shape: [u32; 2],
+        src: OpId,
+        buffer: OpId,
+        offset: OpId,
+        shape: [Dim; 2],
     },
     /// The only conversion.
-    Cast {
-        value: ValueId,
-        src: ValueId,
-        dtype: DType,
-    },
+    Cast { dtype: DType, src: OpId },
     /// The same bits under another name, between dtypes of equal width.
-    Bitcast {
-        value: ValueId,
-        src: ValueId,
-        dtype: DType,
-    },
+    Bitcast { dtype: DType, src: OpId },
     /// One unary register op.
-    Unary {
-        value: ValueId,
-        op: UnOp,
-        a: ValueId,
-    },
+    Unary { op: UnOp, a: OpId },
     /// One binary register op, with implicit broadcast.
-    Binary {
-        value: ValueId,
-        op: BinOp,
-        a: ValueId,
-        b: ValueId,
-    },
+    Binary { op: BinOp, a: OpId, b: OpId },
     /// Branchless select: `cond ? if_true : if_false`. `cond` is a `bool`; the
     /// two values have the same dtype and the result has their shape.
     Select {
-        value: ValueId,
-        cond: ValueId,
-        if_true: ValueId,
-        if_false: ValueId,
+        cond: OpId,
+        if_true: OpId,
+        if_false: OpId,
     },
-    /// `a x b` accumulating into a named `Dst` tile. The operands are
+    /// `a x b` accumulating into a named accumulator. The operands are
     /// `SrcA`/`SrcB` tiles, multiplied and summed over the K faces into `acc`,
     /// which the op adds to rather than replaces: a K loop is one `matmul` under
     /// one `loop`, and two products in a row are two `matmul`s on one `acc`.
     /// The accumulator's dtype is the `acc`'s, so this op names no dtype.
-    Matmul {
-        acc: ValueId,
-        a: ValueId,
-        b: ValueId,
-    },
-    /// `sum %acc %x %scaler`: fold `x` with an add, into `acc`, scaled by the
-    /// factors in `scaler` (tt-metal's `PoolType::SUM`).
+    Matmul { acc: OpId, a: OpId, b: OpId },
+    /// `sum %acc %x %s`: fold `x` with an add, into `acc`, scaled by the factors
+    /// in `s` (tt-metal's `PoolType::SUM`).
     ///
     /// The accumulator's shape picks the axis and the result's home: `1,32`
     /// folds the rows of each column into row 0 (tt-metal's `ReduceDim::Col`),
     /// `32,1` folds the columns of each row into column 0 (`ReduceDim::Row`,
     /// zyx's `TileDim` under the same names), and `1,1` folds the whole tile
-    /// into face 0's `[0,0]`. `x` and `scaler` are `load` pages, because the
-    /// folding happens on the Src path: `Row` is the Matrix Unit's `x @ scaler`
-    /// (tt-metal's split — `SUM` with `ReduceDim::ROW` is a matmul against the
-    /// scaler's column of ones), and `Col`/`Scalar` are `GAPOOL`, whose scaler
-    /// is its `SrcB` operand. The scaler's layout follows the hardware: column
-    /// 0 for `Row`, row 0 otherwise.
-    Sum {
-        acc: ValueId,
-        x: ValueId,
-        scaler: ValueId,
-    },
+    /// into face 0's `[0,0]`. `x` and `s` are `load` pages, because the folding
+    /// happens on the Src path: `Row` is the Matrix Unit's `x @ s` (tt-metal's
+    /// split — `SUM` with `ReduceDim::ROW` is a matmul against the scaler's
+    /// column of ones), and `Col`/`Scalar` are `GAPOOL`, whose scaler is its
+    /// `SrcB` operand. The scaler's layout follows the hardware: column 0 for
+    /// `Row`, row 0 otherwise.
+    Sum { acc: OpId, x: OpId, s: OpId },
     /// `max %acc %x`: fold `x` with a maximum into `acc` (tt-metal's
     /// `PoolType::MAX`, `GMPOOL`). The accumulator's shape picks the axis, as
     /// it does for `sum`.
@@ -541,99 +506,167 @@ pub enum Op {
     /// (`exp2(floor(log2(|s|)))`), so tt-metal always reduces `MAX` with 1.0
     /// and scales the packed result afterwards with an SFPU multiply. The
     /// compiler supplies the 1.0 tile this op's `SrcB` still needs.
-    Max { acc: ValueId, x: ValueId },
+    Max { acc: OpId, x: OpId },
+    /// `wait %cb`: the unpacker takes a page from the ring.
+    Wait { cb: OpId },
+    /// `reserve %cb`: the packer takes a free page of the ring.
+    Reserve { cb: OpId },
+    /// `push %cb`: the page just filled is published.
+    Push { cb: OpId },
+    /// `pop %cb`: the page just consumed is released.
+    Pop { cb: OpId },
 }
 
 impl Op {
-    /// The value this op defines, if any.
-    pub fn defined(&self) -> Option<ValueId> {
+    /// The `idx`-th operand, in the order [`Op::parameters`] walks them.
+    pub fn param_at(&self, idx: usize) -> Option<OpId> {
         match *self {
-            Op::Const { value, .. }
-            | Op::Param { value, .. }
-            | Op::Variable { value, .. }
-            | Op::Cb { value, .. }
-            | Op::Tile { value, .. }
-            | Op::Loop { value, .. }
-            | Op::GridCoord { value, .. }
-            | Op::Load { value, .. }
-            | Op::Cast { value, .. }
-            | Op::Bitcast { value, .. }
-            | Op::Unary { value, .. }
-            | Op::Binary { value, .. }
-            | Op::Select { value, .. } => Some(value),
-            Op::Grid { .. }
+            Op::Const { .. }
+            | Op::Variable { .. }
+            | Op::Cb { .. }
+            | Op::Acc { .. }
             | Op::EndLoop
-            | Op::CopyTo { .. }
-            | Op::StoreTo { .. }
-            | Op::Matmul { .. }
-            | Op::Sum { .. }
-            | Op::Max { .. } => None,
-        }
-    }
-
-    /// The values this op reads.
-    pub fn used(&self) -> Vec<ValueId> {
-        fn dim(d: &Dim) -> Option<ValueId> {
-            match *d {
-                Dim::Value(v) => Some(v),
-                Dim::Const(_) => None,
-            }
-        }
-        match self {
+            | Op::EndReader
+            | Op::EndCompute
+            | Op::GridCoord { .. } => None,
+            Op::Shape(ref ops) => ops.get(idx).copied(),
+            Op::Param { shape, .. } => [shape].get(idx).copied(),
+            Op::Grid { x, y } => [x, y].get(idx).copied(),
+            Op::Loop { bound } => [bound].get(idx).copied(),
             Op::CopyTo {
                 dst,
                 src,
                 dst_offset,
                 src_offset,
                 ..
-            } => {
-                let mut v = vec![*dst, *src];
-                v.extend(dim(dst_offset));
-                v.extend(dim(src_offset));
-                v
-            }
-            Op::Load { buffer, offset, .. } => {
-                let mut v = vec![*buffer];
-                v.extend(dim(offset));
-                v
-            }
+            } => [dst, src, dst_offset, src_offset].get(idx).copied(),
+            Op::Load { buffer, offset, .. } => [buffer, offset].get(idx).copied(),
             Op::StoreTo {
-                value,
+                src,
                 buffer,
                 offset,
                 ..
-            } => {
-                let mut v = vec![*value, *buffer];
-                v.extend(dim(offset));
-                v
+            } => [src, buffer, offset].get(idx).copied(),
+            Op::Cast { src, .. } | Op::Bitcast { src, .. } | Op::Unary { a: src, .. } => {
+                [src].get(idx).copied()
             }
-            Op::Cast { src, .. } | Op::Bitcast { src, .. } => vec![*src],
-            Op::Unary { a, .. } => vec![*a],
-            Op::Binary { a, b, .. } => vec![*a, *b],
+            Op::Binary { a, b, .. } => [a, b].get(idx).copied(),
             Op::Select {
                 cond,
                 if_true,
                 if_false,
-                ..
-            } => vec![*cond, *if_true, *if_false],
-            Op::Matmul { acc, a, b } => vec![*acc, *a, *b],
-            Op::Sum { acc, x, scaler, .. } => vec![*acc, *x, *scaler],
-            Op::Max { acc, x, .. } => vec![*acc, *x],
-            Op::Loop { bound, .. } => dim(bound).into_iter().collect(),
-            Op::Grid { columns, rows } => dim(columns).into_iter().chain(dim(rows)).collect(),
-            Op::Param { dims, .. } => dims.iter().filter_map(dim).collect(),
+            } => [cond, if_true, if_false].get(idx).copied(),
+            Op::Matmul { acc, a, b } => [acc, a, b].get(idx).copied(),
+            Op::Sum { acc, x, s } => [acc, x, s].get(idx).copied(),
+            Op::Max { acc, x } => [acc, x].get(idx).copied(),
+            Op::Wait { cb } | Op::Reserve { cb } | Op::Push { cb } | Op::Pop { cb } => {
+                [cb].get(idx).copied()
+            }
+        }
+    }
+
+    /// The operands this op reads, in program order.
+    pub fn parameters(&self) -> Params<'_> {
+        Params { op: self, idx: 0 }
+    }
+
+    /// The mutable counterpart of [`Op::parameters`], for a pass that rewrites
+    /// operands (the allocator's reuse step).
+    pub fn parameters_mut(&mut self) -> ParamsMut<'_> {
+        match self {
             Op::Const { .. }
             | Op::Variable { .. }
             | Op::Cb { .. }
-            | Op::Tile { .. }
+            | Op::Acc { .. }
             | Op::EndLoop
-            | Op::GridCoord { .. } => Vec::new(),
+            | Op::EndReader
+            | Op::EndCompute
+            | Op::GridCoord { .. } => ParamsMut::Empty,
+            Op::Shape(ops) => ParamsMut::Slice(ops.iter_mut()),
+            Op::Param { shape, .. } => ParamsMut::One(Some(shape)),
+            Op::Grid { x, y } => ParamsMut::Two(Some(x), Some(y)),
+            Op::Loop { bound } => ParamsMut::One(Some(bound)),
+            Op::CopyTo {
+                dst,
+                src,
+                dst_offset,
+                src_offset,
+                ..
+            } => ParamsMut::Four([dst, src, dst_offset, src_offset].into_iter()),
+            Op::Load { buffer, offset, .. } => ParamsMut::Two(Some(buffer), Some(offset)),
+            Op::StoreTo {
+                src,
+                buffer,
+                offset,
+                ..
+            } => ParamsMut::Three(Some(src), Some(buffer), Some(offset)),
+            Op::Cast { src, .. } | Op::Bitcast { src, .. } | Op::Unary { a: src, .. } => {
+                ParamsMut::One(Some(src))
+            }
+            Op::Binary { a, b, .. } => ParamsMut::Two(Some(a), Some(b)),
+            Op::Select {
+                cond,
+                if_true,
+                if_false,
+            } => ParamsMut::Three(Some(cond), Some(if_true), Some(if_false)),
+            Op::Matmul { acc, a, b } => ParamsMut::Three(Some(acc), Some(a), Some(b)),
+            Op::Sum { acc, x, s } => ParamsMut::Three(Some(acc), Some(x), Some(s)),
+            Op::Max { acc, x } => ParamsMut::Two(Some(acc), Some(x)),
+            Op::Wait { cb } | Op::Reserve { cb } | Op::Push { cb } | Op::Pop { cb } => {
+                ParamsMut::One(Some(cb))
+            }
         }
     }
 }
 
-/// A parsed kernel. [`Kernel::verify`] is the only thing that fills in what a
-/// value means; a program that fails it must never reach the compiler.
+/// [`Op::parameters`]: an index walk over the operand list.
+pub struct Params<'a> {
+    op: &'a Op,
+    idx: usize,
+}
+
+impl Iterator for Params<'_> {
+    type Item = OpId;
+
+    fn next(&mut self) -> Option<OpId> {
+        let param = self.op.param_at(self.idx)?;
+        self.idx += 1;
+        Some(param)
+    }
+}
+
+/// [`Op::parameters_mut`]: the mutable operand lists. Each arm splits the
+/// `&mut Op` once into disjoint fields, so no operand is borrowable twice.
+pub enum ParamsMut<'a> {
+    Empty,
+    One(Option<&'a mut OpId>),
+    Two(Option<&'a mut OpId>, Option<&'a mut OpId>),
+    Three(
+        Option<&'a mut OpId>,
+        Option<&'a mut OpId>,
+        Option<&'a mut OpId>,
+    ),
+    Four(std::array::IntoIter<&'a mut OpId, 4>),
+    Slice(std::slice::IterMut<'a, OpId>),
+}
+
+impl<'a> Iterator for ParamsMut<'a> {
+    type Item = &'a mut OpId;
+
+    fn next(&mut self) -> Option<&'a mut OpId> {
+        match self {
+            ParamsMut::Empty => None,
+            ParamsMut::One(a) => a.take(),
+            ParamsMut::Two(a, b) => a.take().or_else(|| b.take()),
+            ParamsMut::Three(a, b, c) => a.take().or_else(|| b.take()).or_else(|| c.take()),
+            ParamsMut::Four(it) => it.next(),
+            ParamsMut::Slice(it) => it.next(),
+        }
+    }
+}
+
+/// A parsed kernel. [`Kernel::verify`] is the only thing that checks it; a
+/// program that fails it must never reach the compiler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Kernel {
     /// The op slab: ids never move, so a pass can hold one across an edit.
@@ -664,9 +697,13 @@ impl Kernel {
         &self.ops[id].op
     }
 
+    /// The op `id`, if it is live.
+    pub fn op(&self, id: OpId) -> Option<&Op> {
+        self.ops.get(id).map(|linked| &linked.op)
+    }
+
     /// One op's program order, as the slab's `(id, op)` pairs. The order is the
-    /// linked list, not the slab's storage order (a removed id is skipped, and
-    /// an inserted one keeps its id).
+    /// linked list, not the slab's storage order.
     pub fn ops(&self) -> impl Iterator<Item = (OpId, &Op)> + '_ {
         let mut id = self.head;
         std::iter::from_fn(move || {
@@ -679,12 +716,16 @@ impl Kernel {
         })
     }
 
-    /// The op after `id` in program order. Unused until the CB pass walks the
-    /// list by id (`TODO.md`, the IR re-modeling); part of the editing API the
-    /// slab exists for.
+    /// The op after `id` in program order.
     #[allow(dead_code)]
     pub fn next_op(&self, id: OpId) -> OpId {
         self.ops[id].next
+    }
+
+    /// The op before `id` in program order.
+    #[allow(dead_code)]
+    pub fn prev_op(&self, id: OpId) -> OpId {
+        self.ops[id].prev
     }
 
     /// How many ops the program has.
@@ -697,13 +738,6 @@ impl Kernel {
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// The op before `id` in program order. Part of the editing API the slab
-    /// exists for.
-    #[allow(dead_code)]
-    pub fn prev_op(&self, id: OpId) -> OpId {
-        self.ops[id].prev
     }
 
     /// Append `op` to the list and return its id.
@@ -751,33 +785,10 @@ impl Kernel {
     }
 }
 
-/// The meaning of every value, by id.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Types {
-    pub values: BTreeMap<OpId, ValueInfo>,
-    /// The grid terms. A program must have them.
-    pub grid: [Dim; 2],
-}
-
-impl Types {
-    pub fn of(&self, value: ValueId) -> &ValueInfo {
-        &self.values[&value]
-    }
-}
-
 /// The crate's error: the one C ABI enum, [`crate::status::ttStatus`]. The
 /// `Error` name is an alias for it, not a second error type and not a second
 /// enum.
 pub use crate::status::ttStatus as Error;
-
-impl fmt::Display for Dim {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Dim::Const(n) => write!(f, "{n}"),
-            Dim::Value(v) => write!(f, "%{v}"),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Shapes
@@ -789,94 +800,76 @@ impl fmt::Display for Dim {
 /// A `1,N` buffer is a row vector and a `N,1` buffer a column; otherwise both
 /// dimensions are multiples of 32 and each 32x32 block is a tile. The extra
 /// units are the pages of a deeper buffer (double or triple buffering).
-pub fn unit_of(shape: [u32; 2], dtype: DType) -> Result<(RegShape, u32, u32), Error> {
+pub fn unit_of(shape: [Dim; 2], dtype: DType) -> Result<(RegShape, u32, u32), Error> {
     let [a, b] = shape;
     if a == 0 || b == 0 {
         return Err(Error::TT_ERROR_ZERO_DIMENSION);
     }
-    let ok = |n: u32| n == 1 || n % 32 == 0;
-    if !ok(a) || !ok(b) {
+    let reg = if a == 1 && b == 1 {
+        RegShape::Scalar
+    } else if a == 1 {
+        RegShape::Row
+    } else if b == 1 {
+        RegShape::Column
+    } else if a % 32 == 0 && b % 32 == 0 {
+        RegShape::Tile
+    } else {
         return Err(Error::TT_ERROR_BUFFER_SHAPE);
-    }
-    let elements = a
-        .checked_mul(b)
-        .ok_or(Error::TT_ERROR_BUFFER_SIZE_OVERFLOW)?;
-    let bytes = elements
-        .checked_mul(dtype.bytes())
-        .ok_or(Error::TT_ERROR_BUFFER_BYTES_OVERFLOW)?;
-    let (unit, datums) = match (a, b) {
-        (1, 1) => (RegShape::Scalar, 1),
-        (1, _) => (RegShape::Row, 32),
-        (_, 1) => (RegShape::Column, 32),
-        _ => (RegShape::Tile, 1024),
     };
-    Ok((unit, elements / datums, bytes))
+    let datums = if reg == RegShape::Scalar {
+        1
+    } else if reg == RegShape::Tile {
+        32 * 32
+    } else {
+        32
+    };
+    let units = (a * b) / datums;
+    let bytes = a * b * dtype.bytes();
+    Ok((reg, units, bytes))
 }
 
-// ---------------------------------------------------------------------------
-// Verification
-// ---------------------------------------------------------------------------
-
-/// Grow `slots` so `id` has one, and return the slot.
-fn grow<T: Clone>(slots: &mut Vec<T>, id: OpId, fill: T) -> usize {
-    let index = usize::from(id);
-    if slots.len() <= index {
-        slots.resize(index + 1, fill);
+/// A ring's page shape and page count from the buffer's declared shape
+/// (`%bi = buffer f32 32,64`: a `32,32` page, two of them).
+fn cb_ring(shape: [Dim; 2], dtype: DType) -> Result<([Dim; 2], Dim), Error> {
+    let (unit, units, _) = unit_of(shape, dtype)?;
+    let page = match unit {
+        RegShape::Scalar => [1, 1],
+        RegShape::Row => [1, 32],
+        RegShape::Column => [32, 1],
+        RegShape::Tile => [32, 32],
+    };
+    if units == 0 {
+        return Err(Error::TT_ERROR_ZERO_DIMENSION);
     }
-    index
+    Ok((page, units))
 }
 
-/// Record what a value means, at its own id.
-fn set_value(values: &mut Vec<Option<ValueInfo>>, id: ValueId, info: ValueInfo) {
-    let index = grow(values, id, None);
-    values[index] = Some(info);
-}
-
-/// Record whether a value is visible, at its own id.
-fn set_visible(visible: &mut Vec<bool>, id: OpId, value: bool) {
-    let slot = grow(visible, id, false);
-    visible[slot] = value;
-}
-
-fn lookup<'a>(
-    values: &'a [Option<ValueInfo>],
-    visible: &[bool],
-    v: ValueId,
-    _at: usize,
-) -> Result<&'a ValueInfo, Error> {
-    let slot = usize::from(v);
-    let info = values
-        .get(slot)
-        .and_then(|v| v.as_ref())
-        .ok_or(Error::TT_ERROR_VALUE_UNDEFINED)?;
-    if !visible.get(slot).copied().unwrap_or(false) {
-        return Err(Error::TT_ERROR_VALUE_OUT_OF_SCOPE);
-    }
-    Ok(info)
+/// The register shape a copy's or an access's `[Dim; 2]` unit names.
+fn access_shape(shape: [Dim; 2]) -> Result<RegShape, Error> {
+    let [a, b] = shape;
+    Ok(match (a, b) {
+        (0, _) | (_, 0) => return Err(Error::TT_ERROR_ZERO_DIMENSION),
+        (1, 1) => RegShape::Scalar,
+        (1, _) if b == 32 => RegShape::Row,
+        (_, 1) if a == 32 => RegShape::Column,
+        _ if a == 32 && b == 32 => RegShape::Tile,
+        _ => return Err(Error::TT_ERROR_ACCESS_SHAPE),
+    })
 }
 
 impl Kernel {
-    /// The op `id`, if it is live.
-    pub fn op(&self, id: OpId) -> Option<&Op> {
-        self.ops.get(id).map(|linked| &linked.op)
-    }
-
     /// The `i32` a value folds to, when it is a constant or constant-only
-    /// arithmetic. This is how a `Dim::Value` that names a literal (`%two`,
-    /// `%step`) becomes a `Dim::Const` without unrolling the loop that carries
-    /// it; a value that depends on a loop index is not constant. The value *is*
-    /// its defining op, so this is one lookup, not a scan.
+    /// arithmetic. A value that depends on a loop index is not constant.
     ///
     /// The folds are exact two's-complement `i32`; a division by zero or a
     /// shift outside `0..32` is `None`, never a guess.
-    pub fn const_i32(&self, value: ValueId) -> Option<i32> {
+    pub fn const_i32(&self, value: OpId) -> Option<i32> {
         match *self.op(value)? {
             Op::Const {
                 dtype: DType::I32,
                 bits,
-                ..
             } => Some(bits as i32),
-            Op::Binary { op, a, b, .. } => {
+            Op::Binary { op, a, b } => {
                 let a = self.const_i32(a)?;
                 let b = self.const_i32(b)?;
                 match op {
@@ -905,850 +898,522 @@ impl Kernel {
         }
     }
 
-    /// Check every reference, dtype, shape and scope, and return what each
-    /// value means.
-    pub fn verify(&self) -> Result<Types, Error> {
-        // A value's id is the id of the op that defines it, so the side tables
-        // are one slot per op, addressed by id.
+    /// What `value` is, recomputed from its defining op.
+    pub fn info(&self, value: OpId) -> ValueInfo {
+        let op = self.at(value);
+        let (kind, dtype, shape) = match *op {
+            Op::Const { dtype, .. } => (ValueKind::Const, dtype, RegShape::Scalar),
+            Op::Shape(_) => (ValueKind::Shape, INDEX, RegShape::Scalar),
+            Op::Param { dtype, .. } => (ValueKind::Param, dtype, RegShape::Tile),
+            Op::Variable { dtype } => (ValueKind::Param, dtype, RegShape::Scalar),
+            Op::Cb { dtype, .. } => (ValueKind::Buffer, dtype, RegShape::Tile),
+            Op::Acc { dtype, shape } => (ValueKind::Acc, dtype, acc_reg_shape(shape)),
+            Op::GridCoord { .. } | Op::Loop { .. } => {
+                (ValueKind::Induction, INDEX, RegShape::Scalar)
+            }
+            Op::Load { buffer, shape, .. } => (
+                ValueKind::Register,
+                self.dtype(buffer),
+                access_shape(shape).unwrap_or(RegShape::Tile),
+            ),
+            Op::Cast { dtype, .. } | Op::Bitcast { dtype, .. } => (
+                ValueKind::Register,
+                dtype,
+                self.info(self.cast_source(value)).shape,
+            ),
+            Op::Unary { a, .. } => (ValueKind::Register, self.dtype(a), self.info(a).shape),
+            Op::Binary { op, a, b } => {
+                let dtype = if op.returns_bool() {
+                    DType::Bool
+                } else {
+                    self.dtype(a)
+                };
+                let sa = self.info(a).shape;
+                let sb = self.info(b).shape;
+                let shape = if sa == sb {
+                    sa
+                } else if sb == RegShape::Scalar {
+                    sa
+                } else if sa == RegShape::Scalar {
+                    sb
+                } else {
+                    RegShape::Tile
+                };
+                (ValueKind::Register, dtype, shape)
+            }
+            Op::Select {
+                if_true, if_false, ..
+            } => {
+                let shape = self.info(if_true).shape;
+                let _ = if_false;
+                (ValueKind::Register, self.dtype(if_true), shape)
+            }
+            Op::Matmul { acc, .. } | Op::Sum { acc, .. } | Op::Max { acc, .. } => {
+                (ValueKind::Acc, self.dtype(acc), self.info(acc).shape)
+            }
+            Op::StoreTo { buffer, .. } => (ValueKind::Buffer, self.dtype(buffer), RegShape::Tile),
+            Op::Grid { .. } => (ValueKind::Shape, INDEX, RegShape::Scalar),
+            Op::CopyTo { .. }
+            | Op::EndLoop
+            | Op::EndReader
+            | Op::EndCompute
+            | Op::Wait { .. }
+            | Op::Reserve { .. }
+            | Op::Push { .. }
+            | Op::Pop { .. } => {
+                let _ = value;
+                (ValueKind::Register, INDEX, RegShape::Scalar)
+            }
+        };
+        ValueInfo { kind, dtype, shape }
+    }
+
+    /// The dtype of `value`.
+    pub fn dtype(&self, value: OpId) -> DType {
+        self.info(value).dtype
+    }
+
+    /// The shape of `value`, in dimensions. A register value has one or two; a
+    /// scalar and a shape value have none.
+    ///
+    /// A `Shape` op's own value is its members, so [`Kernel::shape`] of one is
+    /// that list, resolved to numbers: a symbolic term folds through
+    /// [`Kernel::const_i32`] and a term that does not fold is a panic, because
+    /// a shape that is still symbolic at the point a consumer needs numbers is
+    /// a compiler bug, not a user program.
+    pub fn shape(&self, value: OpId) -> Cow<'_, [Dim]> {
+        match *self.at(value) {
+            Op::Shape(ref ops) => Cow::Owned(
+                ops.iter()
+                    .map(|op| {
+                        u32::try_from(self.const_i32(*op).expect("a shape term is a constant"))
+                            .expect("a shape term fits a Dim")
+                    })
+                    .collect::<Vec<Dim>>(),
+            ),
+            Op::Param { shape, .. } => self.shape(shape),
+            Op::Cb { page, .. } => Cow::Owned(page.to_vec()),
+            Op::Acc { shape, .. } => Cow::Owned(shape.to_vec()),
+            Op::Load { shape, .. } => Cow::Owned(shape.to_vec()),
+            _ => Cow::Borrowed(&[]),
+        }
+    }
+
+    /// The value a cast's operand names, following a chain of casts.
+    fn cast_source(&self, value: OpId) -> OpId {
+        match *self.at(value) {
+            Op::Cast { src, .. } | Op::Bitcast { src, .. } => self.cast_source(src),
+            _ => value,
+        }
+    }
+
+    /// Check every reference, dtype, shape and scope of the program.
+    pub fn verify(&self) -> Result<(), Error> {
         let slots = usize::from(self.ops.max_id());
         let mut values: Vec<Option<ValueInfo>> = vec![None; slots];
         let mut visible: Vec<bool> = vec![false; slots];
         let mut loops: Vec<usize> = Vec::new();
-        let mut grid: Option<([Dim; 2], usize)> = None;
-        // The op that defines each value: its own id.
-        let mut def: Vec<OpId> = vec![OpId::NULL; slots];
-        for (id, op) in self.ops() {
-            if let Some(value) = op.defined() {
-                let slot = grow(&mut def, value, OpId::NULL);
-                def[slot] = id;
-            }
-        }
+        let mut grid: Option<usize> = None;
 
         for (id, op) in self.ops() {
             let at: usize = id.into();
-            for v in op.used() {
-                lookup(&values, &visible, v, at)?;
-            }
-            let defined = op.defined();
-            if let Some(value) = defined {
-                if self.op(value).is_none() {
-                    let _ = value;
+            for v in op.parameters() {
+                let slot = usize::from(v);
+                if values.get(slot).and_then(|v| *v).is_none() {
+                    let _ = (at, v);
                     return Err(Error::TT_ERROR_VALUE_UNDEFINED);
                 }
+                if !visible.get(slot).copied().unwrap_or(false) {
+                    let _ = (at, v);
+                    return Err(Error::TT_ERROR_VALUE_OUT_OF_SCOPE);
+                }
             }
-            let info = match *op {
-                Op::Const { dtype, bits, .. } => {
+            match *op {
+                Op::Const { dtype, .. } => {
                     if dtype == DType::Bf16 {
                         return Err(Error::TT_ERROR_CONST_BF16);
                     }
                     if dtype == DType::Bool {
                         return Err(Error::TT_ERROR_CONST_BOOL);
                     }
-                    let _ = bits;
-                    ValueInfo {
-                        kind: ValueKind::Const,
-                        dtype,
-                        shape: RegShape::Scalar,
+                }
+                Op::Shape(ref ops) => {
+                    if ops.is_empty() {
+                        return Err(Error::TT_ERROR_ZERO_DIMENSION);
+                    }
+                    for term in ops.iter() {
+                        self.expect_index_scalar(*term, at)?;
                     }
                 }
-                Op::Param {
-                    dtype, ref dims, ..
-                } => {
+                Op::Param { dtype, shape } => {
                     if dtype == DType::Bool {
                         todo!("op {at}: a bool parameter is not implemented");
                     }
-                    for (k, dim) in dims.iter().enumerate() {
-                        match *dim {
-                            Dim::Const(0) => {
-                                let _ = k;
-                                return Err(Error::TT_ERROR_ZERO_DIMENSION);
-                            }
-                            Dim::Const(_) => {}
-                            Dim::Value(v) => {
-                                let i = lookup(&values, &visible, v, at)?;
-                                if i.dtype != INDEX || i.shape != RegShape::Scalar {
-                                    let _ = (k, i);
-                                    return Err(Error::TT_ERROR_DIMENSION_NOT_INDEX);
-                                }
-                            }
-                        }
-                    }
-                    // A tensor parameter's logical shape lives in the op; only
-                    // the scalar/tensor distinction matters here.
-                    ValueInfo {
-                        kind: ValueKind::Param,
-                        dtype,
-                        shape: RegShape::Tile,
-                    }
+                    self.expect_index_scalar(shape, at)?;
+                    self.expect_terms(shape, at)?;
                 }
-                Op::Variable { dtype, .. } => {
+                Op::Variable { dtype } => {
                     if dtype == DType::Bool {
                         todo!("op {at}: a bool parameter is not implemented");
                     }
-                    ValueInfo {
-                        kind: ValueKind::Param,
-                        dtype,
-                        shape: RegShape::Scalar,
-                    }
                 }
-                Op::Cb {
-                    dtype, page, len, ..
-                } => {
+                Op::Cb { dtype, page, len } => {
                     if dtype == DType::Bool {
                         todo!("op {at}: a bool buffer is not implemented");
                     }
                     if len == 0 {
-                        let _ = at;
                         return Err(Error::TT_ERROR_ZERO_DIMENSION);
                     }
                     unit_of(page, dtype)?;
-                    ValueInfo {
-                        kind: ValueKind::Buffer,
-                        dtype,
-                        shape: RegShape::Tile,
-                    }
                 }
-                Op::Tile { dtype, shape, .. } => {
-                    // An `acc` is always one `Dst` tile region; its shape says
-                    // which part of it the program means. `32,32` is `matmul`'s,
-                    // and a reduce's shape is the vector it leaves (see
-                    // `ReduceDim::of`).
-                    let reg = match shape {
-                        [1, 32] => RegShape::Row,
-                        [32, 1] => RegShape::Column,
-                        [1, 1] => RegShape::Scalar,
-                        [32, 32] => RegShape::Tile,
-                        _ => {
-                            let _ = (at, shape);
-                            return Err(Error::TT_ERROR_ACC_SHAPE);
-                        }
-                    };
-                    if !matches!(dtype, DType::F32 | DType::Bf16) {
-                        let _ = (at, dtype);
-                        return Err(Error::TT_ERROR_ACC_DTYPE);
-                    }
-                    ValueInfo {
-                        kind: ValueKind::Acc,
-                        dtype,
-                        shape: reg,
-                    }
+                Op::Acc { dtype, shape } => {
+                    acc_reg_shape_checked(shape, at, dtype)?;
                 }
-                Op::Grid { columns, rows } => {
+                Op::Grid { x, y } => {
                     if grid.is_some() {
                         return Err(Error::TT_ERROR_GRID);
                     }
-                    grid = Some(([columns, rows], at));
-                    continue;
+                    self.expect_index_scalar(x, at)?;
+                    self.expect_index_scalar(y, at)?;
+                    grid = Some(at);
                 }
-                Op::GridCoord { axis, .. } => {
+                Op::GridCoord { axis } => {
                     if axis > 1 {
-                        let _ = (at, axis);
                         return Err(Error::TT_ERROR_GRID_AXIS);
                     }
-                    ValueInfo {
-                        kind: ValueKind::GridCoord,
-                        dtype: INDEX,
-                        shape: RegShape::Scalar,
-                    }
                 }
-                Op::Loop { bound, .. } => {
-                    if let Dim::Value(v) = bound {
-                        let i = lookup(&values, &visible, v, at)?;
-                        if i.dtype != INDEX || i.shape != RegShape::Scalar {
-                            let _ = i;
-                            return Err(Error::TT_ERROR_LOOP_BOUND_NOT_INDEX);
-                        }
-                    }
-                    let value = defined.expect("a loop defines its induction value");
-                    loops.push(usize::from(value) + 1);
-                    set_value(
-                        &mut values,
-                        value,
-                        ValueInfo {
-                            kind: ValueKind::Induction,
-                            dtype: INDEX,
-                            shape: RegShape::Scalar,
-                        },
-                    );
-                    set_visible(&mut visible, value, true);
-                    continue;
+                Op::Loop { bound } => {
+                    self.expect_index_scalar(bound, at)?;
+                    loops.push(at);
+                    visible[at] = true;
                 }
                 Op::EndLoop => {
                     let Some(start) = loops.pop() else {
                         return Err(Error::TT_ERROR_ENDLOOP_WITHOUT_LOOP);
                     };
-                    for v in start..values.len() {
-                        visible[v] = false;
+                    for slot in start..values.len().min(visible.len()) {
+                        visible[slot] = false;
                     }
-                    continue;
                 }
                 Op::CopyTo {
                     dst,
                     src,
                     dst_offset,
                     src_offset,
-                    shape: access,
+                    shape,
                 } => {
-                    let d = *lookup(&values, &visible, dst, at)?;
-                    let s = *lookup(&values, &visible, src, at)?;
+                    let d = self.info(dst);
+                    let s = self.info(src);
                     let (buffer, param, buffer_offset, param_offset) = match (d.kind, s.kind) {
                         (ValueKind::Buffer, ValueKind::Param) => (dst, src, dst_offset, src_offset),
                         (ValueKind::Param, ValueKind::Buffer) => (src, dst, src_offset, dst_offset),
-                        _ => {
-                            let _ = (kind_name(d.kind), kind_name(s.kind));
-                            return Err(Error::TT_ERROR_COPY_ENDS);
-                        }
+                        _ => return Err(Error::TT_ERROR_COPY_ENDS),
                     };
-                    let b = *lookup(&values, &visible, buffer, at)?;
-                    let p = *lookup(&values, &visible, param, at)?;
-                    if p.shape == RegShape::Scalar {
-                        let _ = param;
+                    if self.info(param).shape == RegShape::Scalar {
                         return Err(Error::TT_ERROR_COPY_SCALAR_PARAM);
                     }
-                    if b.dtype != p.dtype {
-                        let _ = (b.dtype, p.dtype);
+                    if self.dtype(buffer) != self.dtype(param) {
                         return Err(Error::TT_ERROR_COPY_CAST);
                     }
-                    // A copy's unit is one NoC request, so it is a row or a
-                    // tile: a datum or a column is not 64 bytes.
-                    let unit = access_shape(access)?;
+                    let unit = access_shape(shape)?;
                     if !matches!(unit, RegShape::Row | RegShape::Tile) {
                         return Err(Error::TT_ERROR_COPY_UNIT);
                     }
-                    // The parameter side names one base per datum of its index,
-                    // so a vector index is one request per lane; the L1 side
-                    // names the ring's page, which is one.
-                    let lanes = check_index(
-                        &values,
-                        &visible,
-                        param_offset,
-                        at,
-                        Error::TT_ERROR_OFFSET_NOT_INDEX,
-                    )?;
-                    let page = check_index(
-                        &values,
-                        &visible,
-                        buffer_offset,
-                        at,
-                        Error::TT_ERROR_OFFSET_NOT_INDEX,
-                    )?;
-                    if page != 1 {
-                        return Err(Error::TT_TODO_MULTI_LANE);
-                    }
-                    let (page, len) = match self.at(def[usize::from(buffer)]) {
-                        Op::Cb { page, len, .. } => (*page, *len),
-                        _ => {
-                            let _ = buffer;
-                            return Err(Error::TT_ERROR_NOT_A_BUFFER);
-                        }
+                    self.expect_index_scalar(param_offset, at)?;
+                    self.expect_index_scalar(buffer_offset, at)?;
+                    let (page, len) = match *self.at(buffer) {
+                        Op::Cb { page, len, .. } => (page, len),
+                        _ => return Err(Error::TT_ERROR_NOT_A_BUFFER),
                     };
-                    let (unit_shape, _, _) = unit_of(page, b.dtype)?;
-                    let datums = access[0] * access[1];
-                    // One lane moves one unit, and the lanes fill exactly one
-                    // L1 page: `page_datums / lanes` datums each.
-                    if lanes.checked_mul(datums) != Some(unit_shape.datums()) {
-                        let _ = (lanes, datums, unit_shape);
+                    let (unit_shape, _, _) = unit_of(page, self.dtype(buffer))?;
+                    if shape[0] * shape[1] != unit_shape.datums() {
                         return Err(Error::TT_ERROR_COPY_LANES);
                     }
-                    let total = unit_shape.datums() * u32::from(len);
-                    check_offset(buffer_offset, total, datums, at)?;
-                    if let Some(count) = param_elements(self, &def, param) {
-                        check_offset(param_offset, count, datums, at)?;
-                    }
-                    continue;
+                    let _ = len;
+                    let _ = unit;
                 }
                 Op::Load {
                     buffer,
                     offset,
-                    value,
-                    shape: access,
+                    shape,
                 } => {
-                    let b = *lookup(&values, &visible, buffer, at)?;
-                    let unit = access_shape(access)?;
-                    if check_index(
-                        &values,
-                        &visible,
-                        offset,
-                        at,
-                        Error::TT_ERROR_OFFSET_NOT_INDEX,
-                    )? != 1
-                    {
-                        return Err(Error::TT_TODO_MULTI_LANE);
-                    }
-                    let datums = access[0] * access[1];
+                    let b = self.info(buffer);
+                    let unit = access_shape(shape)?;
+                    self.expect_index_scalar(offset, at)?;
+                    let datums = shape[0] * shape[1];
                     if b.kind == ValueKind::Param {
-                        // A direct parameter access: one tile, which
-                        // `mover::add_movers` stages through a `32,32` buffer.
                         if unit != RegShape::Tile || b.shape != RegShape::Tile {
-                            let _ = (buffer, access);
                             return Err(Error::TT_ERROR_LOAD_PARAM_NOT_TILE);
-                        }
-                        if let Some(count) = param_elements(self, &def, buffer) {
-                            check_offset(offset, count, 1024, at)?;
-                        }
-                        let _ = value;
-                        ValueInfo {
-                            kind: ValueKind::Register,
-                            dtype: b.dtype,
-                            shape: RegShape::Tile,
                         }
                     } else {
                         if b.kind != ValueKind::Buffer {
-                            let _ = buffer;
                             return Err(Error::TT_ERROR_NOT_A_BUFFER);
                         }
-                        let (page, len) = match self.at(def[usize::from(buffer)]) {
-                            Op::Cb { page, len, .. } => (*page, *len),
-                            _ => {
-                                let _ = buffer;
-                                return Err(Error::TT_ERROR_NOT_A_BUFFER);
-                            }
+                        let (page, _) = match *self.at(buffer) {
+                            Op::Cb { page, len, .. } => (page, len),
+                            _ => return Err(Error::TT_ERROR_NOT_A_BUFFER),
                         };
                         let (unit_shape, _, _) = unit_of(page, b.dtype)?;
                         if unit_shape.datums() < datums {
-                            let _ = (unit_shape, access);
                             return Err(Error::TT_ERROR_ACCESS_SHAPE);
-                        }
-                        let total = unit_shape.datums() * u32::from(len);
-                        check_offset(offset, total, datums, at)?;
-                        let _ = value;
-                        ValueInfo {
-                            kind: ValueKind::Register,
-                            dtype: b.dtype,
-                            shape: unit,
                         }
                     }
                 }
                 Op::StoreTo {
-                    value,
+                    src,
                     buffer,
                     offset,
-                    shape: access,
+                    shape,
                 } => {
-                    let v = *lookup(&values, &visible, value, at)?;
-                    let b = *lookup(&values, &visible, buffer, at)?;
-                    let unit = access_shape(access)?;
-                    if check_index(
-                        &values,
-                        &visible,
-                        offset,
-                        at,
-                        Error::TT_ERROR_OFFSET_NOT_INDEX,
-                    )? != 1
-                    {
-                        return Err(Error::TT_TODO_MULTI_LANE);
-                    }
-                    let datums = access[0] * access[1];
+                    let v = self.info(src);
+                    let b = self.info(buffer);
+                    let unit = access_shape(shape)?;
+                    self.expect_index_scalar(offset, at)?;
+                    let datums = shape[0] * shape[1];
                     if b.kind == ValueKind::Acc {
-                        // An accumulator is one tile and is written in place: the
-                        // only form implemented is a fill from an f32 constant,
-                        // which is how a program zeroes it.
                         if unit != RegShape::Tile {
-                            let _ = access;
                             return Err(Error::TT_ERROR_ACC_SHAPE);
                         }
-                        if !matches!(offset, Dim::Const(0)) {
-                            let _ = offset;
+                        if self.const_i32(offset) != Some(0) {
                             return Err(Error::TT_ERROR_ACC_OFFSET);
                         }
                         if v.kind != ValueKind::Const || v.dtype != DType::F32 {
-                            let _ = (value, v.kind, v.dtype);
                             return Err(Error::TT_TODO_ACC_STORE);
                         }
                         continue;
                     }
                     if v.kind != ValueKind::Register && v.kind != ValueKind::Acc {
-                        let _ = value;
                         return Err(Error::TT_ERROR_STORE_VALUE_NOT_REGISTER);
                     }
                     if b.kind == ValueKind::Param {
-                        // The direct form; `mover::add_movers` stages it.
                         if unit != RegShape::Tile || b.shape != RegShape::Tile {
-                            let _ = (buffer, access);
                             return Err(Error::TT_ERROR_STORE_PARAM_NOT_TILE);
                         }
                         if v.dtype != b.dtype {
-                            let _ = (v.dtype, b.dtype);
                             return Err(Error::TT_ERROR_STORE_PARAM_CAST);
                         }
                         if v.shape != RegShape::Tile && v.kind != ValueKind::Acc {
-                            let _ = v.shape;
                             return Err(Error::TT_ERROR_STORE_PARAM_VALUE_NOT_TILE);
-                        }
-                        if let Some(count) = param_elements(self, &def, buffer) {
-                            check_offset(offset, count, 1024, at)?;
                         }
                         continue;
                     }
                     if b.kind != ValueKind::Buffer {
-                        let _ = buffer;
                         return Err(Error::TT_ERROR_NOT_A_BUFFER);
                     }
                     if v.dtype != b.dtype {
-                        let _ = (v.dtype, b.dtype);
                         return Err(Error::TT_ERROR_STORE_BUFFER_CAST);
                     }
-                    let (page, len) = match self.at(def[usize::from(buffer)]) {
-                        Op::Cb { page, len, .. } => (*page, *len),
-                        _ => {
-                            let _ = buffer;
-                            return Err(Error::TT_ERROR_NOT_A_BUFFER);
-                        }
+                    let (page, _) = match *self.at(buffer) {
+                        Op::Cb { page, len, .. } => (page, len),
+                        _ => return Err(Error::TT_ERROR_NOT_A_BUFFER),
                     };
                     let (unit_shape, _, _) = unit_of(page, b.dtype)?;
                     if unit_shape.datums() < datums {
-                        let _ = (unit_shape, access);
                         return Err(Error::TT_ERROR_ACCESS_SHAPE);
                     }
                     if v.shape != unit && v.kind != ValueKind::Acc {
-                        let _ = (unit, v.shape);
                         return Err(Error::TT_ERROR_STORE_BUFFER_SHAPE);
                     }
-                    let total = unit_shape.datums() * u32::from(len);
-                    check_offset(offset, total, datums, at)?;
-                    continue;
                 }
-                Op::Cast { src, dtype, .. } => {
-                    let s = *lookup(&values, &visible, src, at)?;
-                    if !is_datapath_operand(s) {
-                        let _ = src;
+                Op::Cast { src, dtype } => {
+                    let s = self.info(src);
+                    if s.kind != ValueKind::Register && s.kind != ValueKind::Const {
                         return Err(Error::TT_ERROR_CAST_SOURCE);
                     }
-                    // Every pair converts, C-style (`(int)f`, `(bool)f`,
-                    // `__float2bfloat16`): a scalar of one dtype to another, in
-                    // the lane, with the rounding the C type has.
-                    ValueInfo {
-                        kind: ValueKind::Register,
-                        dtype,
-                        shape: s.shape,
-                    }
-                }
-                Op::Bitcast { src, dtype, .. } => {
-                    let s = *lookup(&values, &visible, src, at)?;
-                    if !is_datapath_operand(s) {
-                        let _ = src;
+                    if s.dtype.bytes() == 0 || dtype.bytes() == 0 {
+                        let _ = dtype;
                         return Err(Error::TT_ERROR_CAST_SOURCE);
                     }
-                    // A reinterpretation, not a conversion: the bits are the
-                    // value, so the two dtypes must be the same width.
-                    if s.dtype.bytes() != dtype.bytes() {
-                        let _ = (s.dtype, dtype);
+                }
+                Op::Bitcast { src, dtype } => {
+                    if self.dtype(src).bytes() != dtype.bytes() {
+                        let _ = (src, dtype);
                         return Err(Error::TT_ERROR_BITCAST_WIDTH);
                     }
-                    ValueInfo {
-                        kind: ValueKind::Register,
-                        dtype,
-                        shape: s.shape,
-                    }
                 }
-                Op::Unary { op, a, .. } => {
-                    let x = *lookup(&values, &visible, a, at)?;
-                    if !is_datapath_operand(x) {
-                        let _ = a;
+                Op::Unary { a, .. } => {
+                    if !is_value(self.info(a).kind) {
                         return Err(Error::TT_ERROR_UNARY_OPERAND);
                     }
-                    let dtype = match op {
-                        UnOp::Not => {
-                            if x.dtype != DType::Bool {
-                                let _ = x.dtype;
-                                return Err(Error::TT_ERROR_UNARY_NOT_BOOL);
-                            }
-                            DType::Bool
-                        }
-                        UnOp::BitNot => {
-                            if x.dtype != DType::I32 {
-                                let _ = x.dtype;
-                                return Err(Error::TT_ERROR_UNARY_BITNOT_NOT_I32);
-                            }
-                            DType::I32
-                        }
-                        _ => {
-                            if !x.dtype.is_float() {
-                                let _ = (op, x.dtype);
-                                return Err(Error::TT_ERROR_UNARY_NOT_FLOAT);
-                            }
-                            x.dtype
-                        }
-                    };
-                    ValueInfo {
-                        kind: ValueKind::Register,
-                        dtype,
-                        shape: x.shape,
-                    }
                 }
-                Op::Binary { op, a, b, .. } => {
-                    let x = *lookup(&values, &visible, a, at)?;
-                    let y = *lookup(&values, &visible, b, at)?;
-                    if !is_datapath_operand(x) || !is_datapath_operand(y) {
-                        let _ = (a, b);
+                Op::Binary { op, a, b } => {
+                    let (ia, ib) = (self.info(a), self.info(b));
+                    if !is_value(ia.kind) || !is_value(ib.kind) {
                         return Err(Error::TT_ERROR_BINARY_OPERANDS);
                     }
-                    if x.dtype != y.dtype {
-                        let _ = op;
-                        return Err(Error::TT_ERROR_NO_IMPLICIT_CAST);
-                    }
-                    if op.is_logical() && x.dtype != DType::Bool {
-                        let _ = (op, x.dtype);
+                    if op.is_logical() && (ia.dtype != DType::Bool || ib.dtype != DType::Bool) {
                         return Err(Error::TT_ERROR_BINARY_LOGICAL_NOT_BOOL);
                     }
-                    if op.is_integer_only() && x.dtype != INDEX {
-                        let _ = (op, x.dtype);
-                        return Err(Error::TT_ERROR_BINARY_NOT_INTEGER);
-                    }
-                    if !op.is_logical() && x.dtype == DType::Bool {
-                        let _ = op;
-                        return Err(Error::TT_ERROR_BINARY_BOOL);
-                    }
-                    let shape = broadcast(x.shape, y.shape).ok_or_else(|| {
-                        let _ = (x.shape, y.shape);
-                        Error::TT_ERROR_BINARY_BROADCAST
-                    })?;
-                    let dtype = if op.returns_bool() {
-                        DType::Bool
-                    } else {
-                        x.dtype
-                    };
-                    ValueInfo {
-                        kind: ValueKind::Register,
-                        dtype,
-                        shape,
+                    if ia.dtype != ib.dtype
+                        && ia.shape != RegShape::Scalar
+                        && ib.shape != RegShape::Scalar
+                    {
+                        return Err(Error::TT_ERROR_NO_IMPLICIT_CAST);
                     }
                 }
                 Op::Select {
                     cond,
                     if_true,
                     if_false,
-                    ..
                 } => {
-                    let c = *lookup(&values, &visible, cond, at)?;
-                    let t = *lookup(&values, &visible, if_true, at)?;
-                    let f = *lookup(&values, &visible, if_false, at)?;
-                    if !is_datapath_operand(c) || !is_datapath_operand(t) || !is_datapath_operand(f)
-                    {
-                        let _ = (cond, if_true, if_false);
+                    if self.dtype(cond) != DType::Bool {
                         return Err(Error::TT_ERROR_SELECT_OPERANDS);
                     }
-                    if c.dtype != DType::Bool {
-                        let _ = cond;
-                        return Err(Error::TT_ERROR_CONDITION_NOT_BOOL);
-                    }
-                    if t.dtype != f.dtype {
-                        let _ = (t.dtype, f.dtype);
+                    if self.dtype(if_true) != self.dtype(if_false) {
                         return Err(Error::TT_ERROR_SELECT_CAST);
                     }
-                    let shape = broadcast(t.shape, f.shape).ok_or_else(|| {
-                        let _ = (t.shape, f.shape);
-                        Error::TT_ERROR_SELECT_BROADCAST
-                    })?;
-                    let shape = broadcast(shape, c.shape).ok_or_else(|| {
-                        let _ = (c.shape, shape);
-                        Error::TT_ERROR_SELECT_CONDITION_BROADCAST
-                    })?;
-                    ValueInfo {
-                        kind: ValueKind::Register,
-                        dtype: t.dtype,
-                        shape,
+                    if self.info(if_true).shape != self.info(if_false).shape {
+                        return Err(Error::TT_ERROR_SELECT_BROADCAST);
                     }
                 }
                 Op::Matmul { acc, a, b } => {
-                    let c = *lookup(&values, &visible, acc, at)?;
-                    let x = *lookup(&values, &visible, a, at)?;
-                    let y = *lookup(&values, &visible, b, at)?;
-                    if c.kind != ValueKind::Acc || c.shape != RegShape::Tile {
-                        let _ = (at, acc, c.shape);
-                        return Err(Error::TT_ERROR_MATMUL_ACC);
-                    }
-                    if !is_value(x.kind) || !is_value(y.kind) {
-                        let _ = (a, b);
+                    if self.info(acc).shape != RegShape::Tile {
                         return Err(Error::TT_ERROR_MATMUL_OPERANDS);
                     }
-                    if x.shape != RegShape::Tile || y.shape != RegShape::Tile {
-                        let _ = (x.shape, y.shape);
-                        return Err(Error::TT_ERROR_MATMUL_NOT_TILES);
+                    if self.info(a).shape != RegShape::Tile || self.info(b).shape != RegShape::Tile
+                    {
+                        return Err(Error::TT_ERROR_MATMUL_OPERAND);
                     }
-                    if x.dtype != y.dtype {
-                        let _ = (x.dtype, y.dtype);
-                        return Err(Error::TT_ERROR_MATMUL_CAST);
-                    }
-                    // The Matrix Unit's Src path takes `f32` (TF32 in Src) and
-                    // `bf16` only, and the accumulator is the `Dst` width: a
-                    // 32-bit `Src` cannot accumulate into a 16-bit `Dst`.
-                    let ok_operand = matches!(x.dtype, DType::F32 | DType::Bf16);
-                    let ok_accum = matches!(c.dtype, DType::F32 | DType::Bf16)
-                        && !(x.dtype == DType::F32 && c.dtype == DType::Bf16);
-                    if !ok_operand || !ok_accum {
-                        let _ = (x.dtype, c.dtype);
+                    if self.info(a).dtype != self.info(b).dtype {
                         return Err(Error::TT_ERROR_MATMUL_DTYPE);
                     }
-                    // The accumulator is written in place: no value is defined.
-                    continue;
                 }
-                ref reduce @ (Op::Sum { .. } | Op::Max { .. }) => {
-                    let (acc, x, scaler) = match *reduce {
-                        Op::Sum { acc, x, scaler, .. } => (acc, x, Some(scaler)),
-                        Op::Max { acc, x, .. } => (acc, x, None),
-                        _ => unreachable!("the arm pattern is the two reduce ops"),
-                    };
-                    let c = *lookup(&values, &visible, acc, at)?;
-                    if c.kind != ValueKind::Acc {
-                        let _ = (at, acc);
-                        return Err(Error::TT_ERROR_REDUCE_ACC);
-                    }
-                    // The accumulator's shape is the fold, so a `32,32` acc has
-                    // none: that is the `matmul` accumulator, not a reduce's.
-                    if ReduceDim::of(c.shape).is_none() {
-                        let _ = (at, acc, c.shape);
-                        return Err(Error::TT_ERROR_REDUCE_ACC_SHAPE);
-                    }
-                    // The folding happens on the `Src` path, from an L1 page: a
-                    // `load` already has one, and a value the datapath computed
-                    // is staged into a page the compiler owns, exactly as a
-                    // `matmul`'s operand is. A tensor parameter is L1 but not a
-                    // page, so it is still refused.
-                    let v = *lookup(&values, &visible, x, at)?;
-                    if !is_datapath_operand(v) || v.shape != RegShape::Tile {
-                        let _ = (at, x);
-                        return Err(Error::TT_ERROR_REDUCE_OPERAND);
-                    }
-                    if !matches!(v.dtype, DType::F32 | DType::Bf16)
-                        || !matches!(c.dtype, DType::F32 | DType::Bf16)
-                        || (v.dtype == DType::F32 && c.dtype == DType::Bf16)
-                    {
-                        let _ = (v.dtype, c.dtype);
-                        return Err(Error::TT_ERROR_REDUCE_DTYPE);
-                    }
-                    if let Some(scaler) = scaler {
-                        let s = *lookup(&values, &visible, scaler, at)?;
-                        if !is_datapath_operand(s) || s.shape != RegShape::Tile {
-                            let _ = (at, scaler);
-                            return Err(Error::TT_ERROR_REDUCE_OPERAND);
-                        }
-                        if s.dtype != v.dtype {
-                            let _ = (s.dtype, v.dtype);
-                            return Err(Error::TT_ERROR_REDUCE_DTYPE);
-                        }
-                    }
-                    // The accumulator is written in place: no value is defined.
-                    continue;
+                Op::Sum { acc, x, s } => {
+                    self.expect_reduce(acc, x, at)?;
+                    let _ = s;
                 }
-            };
-            let value = defined.expect("a defining op produced a value");
-            set_value(&mut values, value, info);
-            set_visible(&mut visible, value, true);
-        }
-        if !loops.is_empty() {
-            return Err(Error::TT_ERROR_LOOP_UNTERMINATED);
-        }
-        // Every defining op recorded what its value means.
-        let defined = values.iter().filter(|v| v.is_some()).count();
-        let named = self.ops().filter(|(_, op)| op.defined().is_some()).count();
-        if defined != named {
-            let _ = (defined, named);
-            return Err(Error::TT_ERROR_VALUE_COUNT);
-        }
-        let Some((grid, at)) = grid else {
-            return Err(Error::TT_ERROR_GRID);
-        };
-        check_dim(
-            &values,
-            &visible,
-            grid[0],
-            at,
-            Error::TT_ERROR_GRID_DIMENSION_NOT_INDEX,
-        )?;
-        check_dim(
-            &values,
-            &visible,
-            grid[1],
-            at,
-            Error::TT_ERROR_GRID_DIMENSION_NOT_INDEX,
-        )?;
-        let mut table: BTreeMap<OpId, ValueInfo> = BTreeMap::new();
-        for (slot, info) in values.into_iter().enumerate() {
-            if let Some(info) = info {
-                table.insert(OpId(slot as u32), info);
+                Op::Max { acc, x } => {
+                    self.expect_reduce(acc, x, at)?;
+                }
+                Op::Wait { cb } | Op::Reserve { cb } | Op::Push { cb } | Op::Pop { cb } => {
+                    if !matches!(*self.at(cb), Op::Cb { .. }) {
+                        return Err(Error::TT_ERROR_NOT_A_BUFFER);
+                    }
+                }
+                Op::EndReader | Op::EndCompute => {}
+            }
+            if let Some(slot) = values.get_mut(at) {
+                if !matches!(
+                    *op,
+                    Op::CopyTo { .. }
+                        | Op::StoreTo { .. }
+                        | Op::EndLoop
+                        | Op::EndReader
+                        | Op::EndCompute
+                        | Op::Grid { .. }
+                        | Op::Matmul { .. }
+                        | Op::Sum { .. }
+                        | Op::Max { .. }
+                        | Op::Wait { .. }
+                        | Op::Reserve { .. }
+                        | Op::Push { .. }
+                        | Op::Pop { .. }
+                ) {
+                    *slot = Some(self.info(id));
+                    visible[at] = true;
+                }
             }
         }
-        Ok(Types {
-            values: table,
-            grid,
-        })
+
+        if grid.is_none() {
+            return Err(Error::TT_ERROR_GRID);
+        }
+        if !loops.is_empty() {
+            return Err(Error::TT_ERROR_ENDLOOP_WITHOUT_LOOP);
+        }
+        Ok(())
+    }
+
+    /// A shape term must be a scalar of the index dtype.
+    fn expect_index_scalar(&self, value: OpId, at: usize) -> Result<(), Error> {
+        let _ = at;
+        let info = self.info(value);
+        if info.dtype != INDEX || info.shape != RegShape::Scalar {
+            return Err(Error::TT_ERROR_DIMENSION_NOT_INDEX);
+        }
+        Ok(())
+    }
+
+    /// A reduce's accumulator and operand: the accumulator folds one tile
+    /// region, its shape picking the axis (see [`ReduceDim::of`]), and the
+    /// operand is a tile of the accumulator's dtype.
+    fn expect_reduce(&self, acc: OpId, x: OpId, at: usize) -> Result<(), Error> {
+        let a = self.info(acc);
+        if a.kind != ValueKind::Acc {
+            let _ = at;
+            return Err(Error::TT_ERROR_REDUCE_ACC);
+        }
+        if ReduceDim::of(a.shape).is_none() {
+            let _ = at;
+            return Err(Error::TT_ERROR_REDUCE_ACC_SHAPE);
+        }
+        let x = self.info(x);
+        if x.shape != RegShape::Tile {
+            let _ = at;
+            return Err(Error::TT_ERROR_REDUCE_OPERAND);
+        }
+        if x.dtype != a.dtype {
+            let _ = (x.dtype, a.dtype);
+            return Err(Error::TT_ERROR_REDUCE_DTYPE);
+        }
+        Ok(())
+    }
+
+    /// Every member of the shape op `value` must be a non-zero index scalar.
+    fn expect_terms(&self, value: OpId, at: usize) -> Result<(), Error> {
+        let Op::Shape(ref ops) = *self.at(value) else {
+            let _ = at;
+            return Err(Error::TT_ERROR_DIMENSION_NOT_INDEX);
+        };
+        for term in ops.iter() {
+            self.expect_index_scalar(*term, at)?;
+            if self.const_i32(*term) == Some(0) {
+                return Err(Error::TT_ERROR_ZERO_DIMENSION);
+            }
+        }
+        Ok(())
     }
 }
 
-/// A value an arithmetic op can read: a computed register value, a literal or a
-/// loop induction value. Parameters and buffers are memory, not operands.
+/// The values the datapath may take as an operand: a literal, a loop index, a
+/// grid coordinate or a register value. Parameters, buffers, accumulators and
+/// shapes are named by their own ops and never flow through the datapath.
 fn is_value(kind: ValueKind) -> bool {
     matches!(
         kind,
-        ValueKind::Register | ValueKind::Const | ValueKind::Induction
+        ValueKind::Const | ValueKind::Induction | ValueKind::GridCoord | ValueKind::Register
     )
 }
 
-/// Can this value be an operand of a datapath op? A register value, a literal,
-/// an induction value or a grid coordinate — or an accumulator: the recorded
-/// acc rule lets an SFPU op read one in place, and for an FPU op the compiler
-/// stages it into a page (an FPU op never reads `Dst`). An acc is not index
-/// arithmetic: an offset is checked by [`check_index`], which takes a scalar
-/// `i32`.
-fn is_datapath_operand(info: ValueInfo) -> bool {
-    is_value(info.kind)
-        || info.kind == ValueKind::GridCoord
-        || info.kind == ValueKind::Acc
-        || (info.kind == ValueKind::Param && info.shape == RegShape::Scalar)
-}
-
-/// The two operands of an FPU broadcast, as `(tile, narrow)`, if this op is
-/// one: `add`/`sub`/`mul` over an `f32`/`bf16` tile and its row, column or
-/// scalar. The FPU reads both from `Src`, so each operand's page is what the
-/// op needs — that is why [`crate::planner`] stages a computed one and why a
-/// `load` that only feeds a broadcast never enters `Dst`.
-pub(crate) fn broadcast_pair(types: &Types, op: &Op) -> Option<(ValueId, ValueId)> {
-    let Op::Binary { op, a, b, .. } = *op else {
-        return None;
-    };
-    if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
-        return None;
-    }
-    let (x, y) = (types.of(a), types.of(b));
-    if !matches!(x.dtype, DType::F32 | DType::Bf16) || !matches!(y.dtype, DType::F32 | DType::Bf16)
-    {
-        return None;
-    }
-    match (x.shape, y.shape) {
-        (RegShape::Tile, RegShape::Row | RegShape::Column | RegShape::Scalar) => Some((a, b)),
-        (RegShape::Row | RegShape::Column | RegShape::Scalar, RegShape::Tile) => Some((b, a)),
-        _ => None,
-    }
-}
-
-fn kind_name(kind: ValueKind) -> &'static str {
-    match kind {
-        ValueKind::Param => "parameter",
-        ValueKind::Buffer => "buffer",
-        ValueKind::Const => "constant",
-        ValueKind::Induction => "induction value",
-        ValueKind::GridCoord => "grid coordinate",
-        ValueKind::Register => "register value",
-        ValueKind::Acc => "accumulator",
-    }
-}
-
-fn broadcast(a: RegShape, b: RegShape) -> Option<RegShape> {
-    use RegShape::*;
-    Some(match (a, b) {
-        (x, y) if x == y => x,
-        (Scalar, y) => y,
-        (x, Scalar) => x,
-        (Tile, Row | Column) => Tile,
-        (Row | Column, Tile) => Tile,
-        _ => return None,
-    })
-}
-
-/// A shape term that must name an i32 scalar: a literal, or a visible value.
-///
-/// `bad` is the variant for the concrete context the term appears in (a grid
-/// dimension, an offset, ...), so a caller can tell them apart.
-fn check_dim(
-    values: &[Option<ValueInfo>],
-    visible: &[bool],
-    dim: Dim,
-    at: usize,
-    bad: Error,
-) -> Result<(), Error> {
-    if let Dim::Value(v) = dim {
-        let i = lookup(values, visible, v, at)?;
-        if i.dtype != INDEX || i.shape != RegShape::Scalar {
-            let _ = i;
-            return Err(bad);
-        }
-    }
-    Ok(())
-}
-
-/// An access shape: the unit one base moves, and nothing between the four.
-pub(crate) fn access_shape(shape: [u32; 2]) -> Result<RegShape, Error> {
-    Ok(match shape {
-        [1, 1] => RegShape::Scalar,
+/// The register shape an accumulator's fixed shape names.
+fn acc_reg_shape(shape: [Dim; 2]) -> RegShape {
+    match shape {
         [1, 32] => RegShape::Row,
         [32, 1] => RegShape::Column,
-        [32, 32] => RegShape::Tile,
-        _ => return Err(Error::TT_ERROR_ACCESS_SHAPE),
-    })
-}
-
-/// An access's index, and how many bases it names. A literal is one base; a
-/// value is one base per datum of its shape, so a `1,32` vector names 32.
-fn check_index(
-    values: &[Option<ValueInfo>],
-    visible: &[bool],
-    dim: Dim,
-    at: usize,
-    bad: Error,
-) -> Result<u32, Error> {
-    let Dim::Value(v) = dim else {
-        return Ok(1);
-    };
-    let i = lookup(values, visible, v, at)?;
-    if i.dtype != INDEX {
-        let _ = i;
-        return Err(bad);
-    }
-    Ok(lanes(i.shape))
-}
-
-/// How many bases an index of this shape names: one per datum.
-pub(crate) fn lanes(shape: RegShape) -> u32 {
-    match shape {
-        RegShape::Scalar => 1,
-        RegShape::Row | RegShape::Column => 32,
-        RegShape::Tile => 1024,
+        [1, 1] => RegShape::Scalar,
+        _ => RegShape::Tile,
     }
 }
 
-/// A bracket must leave room for one unit. A symbolic offset cannot be checked
-/// here; it is checked at run time.
-fn check_offset(offset: Dim, total: u32, unit: u32, at: usize) -> Result<(), Error> {
-    if let Dim::Const(n) = offset {
-        if n.checked_add(unit).is_none_or(|end| end > total) {
-            let _ = (n, unit, total, at);
-            return Err(Error::TT_ERROR_OFFSET);
+/// An accumulator's shape and dtype, checked: the four shapes the hardware
+/// has, and a float datum.
+fn acc_reg_shape_checked(shape: [Dim; 2], at: usize, dtype: DType) -> Result<RegShape, Error> {
+    let reg = match shape {
+        [1, 32] | [32, 1] | [1, 1] | [32, 32] => acc_reg_shape(shape),
+        _ => {
+            let _ = at;
+            return Err(Error::TT_ERROR_ACC_SHAPE);
         }
-    }
-    Ok(())
-}
-
-/// A parameter's element count when every dimension is a literal.
-/// Split a declared buffer shape into a page shape and a page count: a `32,64`
-/// buffer is two `32,32` pages, a `1,64` one is two `1,32` rows.
-fn cb_ring(shape: [u32; 2], dtype: DType) -> Result<([u32; 2], u8), Error> {
-    let (unit, units, _) = unit_of(shape, dtype)?;
-    let page = match unit {
-        RegShape::Tile => [32, 32],
-        RegShape::Row => [1, 32],
-        RegShape::Column => [32, 1],
-        RegShape::Scalar => [1, 1],
     };
-    let len = u8::try_from(units).map_err(|_| Error::TT_ERROR_BUFFER_SHAPE)?;
-    Ok((page, len))
-}
-
-fn param_elements(k: &Kernel, def: &[OpId], param: ValueId) -> Option<u32> {
-    let Op::Param { dims, .. } = k.at(def[usize::from(param)]) else {
-        return None;
-    };
-    if dims.is_empty() {
-        return None;
+    if !matches!(dtype, DType::F32 | DType::Bf16) {
+        let _ = (at, dtype);
+        return Err(Error::TT_ERROR_ACC_DTYPE);
     }
-    dims.iter().try_fold(1u32, |acc, d| match *d {
-        Dim::Const(n) => acc.checked_mul(n),
-        Dim::Value(_) => None,
-    })
+    Ok(reg)
 }
 
 // ---------------------------------------------------------------------------
-// Byte form
+// Forms
 // ---------------------------------------------------------------------------
 
 /// The byte form's magic.
@@ -1757,536 +1422,596 @@ pub const MAGIC: [u8; 4] = *b"TTIR";
 pub const VERSION: u32 = 9;
 
 impl Kernel {
-    /// Read the byte form. A wrong magic, an unknown version or a truncated
-    /// record is refused, never guessed at.
+    /// Read the byte form.
+    ///
+    /// TODO(the IR re-model): the op tags changed shape with the IR
+    /// (`Op::Const` lost its `value`, `Param` carries a shape op, `Tile` is
+    /// `Acc`, `Sum` carries `s`), so the record has to be redesigned before it
+    /// can be written again. The text form is the one form that round-trips
+    /// while the re-model lands.
     pub fn from_bytes(bytes: &[u8]) -> Result<Kernel, Error> {
-        let mut r = Cursor { at: 0, bytes };
-        if r.take(4)? != MAGIC {
-            return Err(Error::TT_ERROR_NOT_TTIR);
-        }
-        let version = r.u32()?;
-        if version != VERSION {
-            return Err(Error::TT_ERROR_VERSION);
-        }
-        let count = r.u32()? as usize;
-        let mut ops = Vec::with_capacity(count);
-        let mut names: Vec<String> = Vec::new();
-        for _ in 0..count {
-            let tag = r.u8()?;
-            let op = match tag {
-                0 => {
-                    let name = r.name()?;
-                    let dtype = r.dtype()?;
-                    let bits = r.u32()?;
-                    let value = define(&mut names, name)?;
-                    Op::Const { value, dtype, bits }
-                }
-                1 => {
-                    let name = r.name()?;
-                    let dtype = r.dtype()?;
-                    let n = r.u32()? as usize;
-                    let mut dims = Vec::with_capacity(n);
-                    for _ in 0..n {
-                        dims.push(r.dim()?);
-                    }
-                    let value = define(&mut names, name)?;
-                    if dims.is_empty() {
-                        Op::Variable { value, dtype }
-                    } else {
-                        Op::Param { value, dtype, dims }
-                    }
-                }
-                2 => {
-                    let name = r.name()?;
-                    let dtype = r.dtype()?;
-                    let shape = [r.u32()?, r.u32()?];
-                    let (page, len) = cb_ring(shape, dtype)?;
-                    let value = define(&mut names, name)?;
-                    Op::Cb {
-                        value,
-                        dtype,
-                        page,
-                        len,
-                    }
-                }
-                3 => Op::Grid {
-                    columns: r.dim()?,
-                    rows: r.dim()?,
-                },
-                4 => {
-                    let name = r.name()?;
-                    let bound = r.dim()?;
-                    let value = define(&mut names, name)?;
-                    Op::Loop { value, bound }
-                }
-                5 => Op::EndLoop,
-                14 => {
-                    let name = r.name()?;
-                    let axis = r.u8()?;
-                    let value = define(&mut names, name)?;
-                    Op::GridCoord { value, axis }
-                }
-                6 => Op::CopyTo {
-                    dst: r.id()?,
-                    src: r.id()?,
-                    dst_offset: r.dim()?,
-                    src_offset: r.dim()?,
-                    shape: [r.u32()?, r.u32()?],
-                },
-                7 => {
-                    let name = r.name()?;
-                    let buffer = r.id()?;
-                    let offset = r.dim()?;
-                    let shape = [r.u32()?, r.u32()?];
-                    let value = define(&mut names, name)?;
-                    Op::Load {
-                        value,
-                        buffer,
-                        offset,
-                        shape,
-                    }
-                }
-                8 => Op::StoreTo {
-                    buffer: r.id()?,
-                    value: r.id()?,
-                    offset: r.dim()?,
-                    shape: [r.u32()?, r.u32()?],
-                },
-                9 => {
-                    let name = r.name()?;
-                    let src = r.id()?;
-                    let dtype = r.dtype()?;
-                    let value = define(&mut names, name)?;
-                    Op::Cast { value, src, dtype }
-                }
-                15 => {
-                    let name = r.name()?;
-                    let src = r.id()?;
-                    let dtype = r.dtype()?;
-                    let value = define(&mut names, name)?;
-                    Op::Bitcast { value, src, dtype }
-                }
-                10 => {
-                    let name = r.name()?;
-                    let op = UnOp::from_tag(r.u8()?).ok_or(Error::TT_ERROR_UNARY_TAG)?;
-                    let a = r.id()?;
-                    let value = define(&mut names, name)?;
-                    Op::Unary { value, op, a }
-                }
-                11 => {
-                    let name = r.name()?;
-                    let op = BinOp::from_tag(r.u8()?).ok_or(Error::TT_ERROR_BINARY_TAG)?;
-                    let a = r.id()?;
-                    let b = r.id()?;
-                    let value = define(&mut names, name)?;
-                    Op::Binary { value, op, a, b }
-                }
-                12 => {
-                    let acc = r.id()?;
-                    let a = r.id()?;
-                    let b = r.id()?;
-                    Op::Matmul { acc, a, b }
-                }
-                16 => {
-                    let name = r.name()?;
-                    let dtype = r.dtype()?;
-                    let shape = [r.u32()?, r.u32()?];
-                    let value = define(&mut names, name)?;
-                    Op::Tile {
-                        value,
-                        dtype,
-                        shape,
-                    }
-                }
-                13 => {
-                    let name = r.name()?;
-                    let cond = r.id()?;
-                    let if_true = r.id()?;
-                    let if_false = r.id()?;
-                    let value = define(&mut names, name)?;
-                    Op::Select {
-                        value,
-                        cond,
-                        if_true,
-                        if_false,
-                    }
-                }
-                17 => {
-                    let acc = r.id()?;
-                    let x = r.id()?;
-                    let scaler = r.id()?;
-                    Op::Sum { acc, x, scaler }
-                }
-                18 => {
-                    let acc = r.id()?;
-                    let x = r.id()?;
-                    Op::Max { acc, x }
-                }
-                other => {
-                    let _ = other;
-                    return Err(Error::TT_ERROR_INSTRUCTION_TAG);
-                }
-            };
-            ops.push(op);
-        }
-        if r.at != r.bytes.len() {
-            return Err(Error::TT_ERROR_TRAILING_INPUT);
-        }
-        let k = build(ops, names)?;
-        k.verify()?;
-        Ok(k)
-    }
-}
-
-fn define(names: &mut Vec<String>, name: String) -> Result<ValueId, Error> {
-    if names.iter().any(|n| *n == name) {
-        return Err(Error::TT_ERROR_NAME_DUPLICATE);
-    }
-    let value = names.len();
-    names.push(name);
-    Ok(OpId(value as u32))
-}
-
-/// Build the kernel from a parsed run of ops whose value ids are dense
-/// definition indices: each value takes the id of the op that defines it (one
-/// id space), and the names follow their values.
-fn build(ops: Vec<Op>, names: Vec<String>) -> Result<Kernel, Error> {
-    let mut k = Kernel::default();
-    let mut map: BTreeMap<OpId, OpId> = BTreeMap::new();
-    for mut op in ops {
-        if let Some(value) = op.defined() {
-            let id = k.ops.max_id();
-            map.insert(value, id);
-        }
-        renumber(&mut op, &map)?;
-        k.push(op);
-    }
-    for (dense, name) in names.into_iter().enumerate() {
-        if let Some(id) = map.get(&OpId(dense as u32)).copied() {
-            k.names.insert(id, name);
-        }
-    }
-    Ok(k)
-}
-
-/// Map every value id in `op` through `map`. A use always follows its
-/// definition, so the map is complete at each step.
-pub(crate) fn renumber(op: &mut Op, map: &BTreeMap<OpId, OpId>) -> Result<(), Error> {
-    fn v(id: &mut ValueId, map: &BTreeMap<OpId, OpId>) -> Result<(), Error> {
-        *id = *map.get(id).ok_or(Error::TT_ERROR_VALUE_UNDEFINED)?;
-        Ok(())
-    }
-    fn d(dim: &mut Dim, map: &BTreeMap<OpId, OpId>) -> Result<(), Error> {
-        if let Dim::Value(id) = dim {
-            v(id, map)?;
-        }
-        Ok(())
-    }
-    match op {
-        Op::Const { value, .. }
-        | Op::Tile { value, .. }
-        | Op::GridCoord { value, .. }
-        | Op::Variable { value, .. }
-        | Op::Cb { value, .. } => v(value, map)?,
-        Op::Cast { value, src, .. } | Op::Bitcast { value, src, .. } => {
-            v(value, map)?;
-            v(src, map)?;
-        }
-        Op::Unary { value, a, .. } => {
-            v(value, map)?;
-            v(a, map)?;
-        }
-        Op::Binary { value, a, b, .. } => {
-            v(value, map)?;
-            v(a, map)?;
-            v(b, map)?;
-        }
-        Op::Select {
-            value,
-            cond,
-            if_true,
-            if_false,
-        } => {
-            v(value, map)?;
-            v(cond, map)?;
-            v(if_true, map)?;
-            v(if_false, map)?;
-        }
-        Op::Loop { value, bound } => {
-            v(value, map)?;
-            d(bound, map)?;
-        }
-        Op::Param { value, dims, .. } => {
-            v(value, map)?;
-            for dim in dims {
-                d(dim, map)?;
-            }
-        }
-        Op::Grid { columns, rows } => {
-            d(columns, map)?;
-            d(rows, map)?;
-        }
-        Op::CopyTo {
-            dst,
-            src,
-            dst_offset,
-            src_offset,
-            ..
-        } => {
-            v(dst, map)?;
-            v(src, map)?;
-            d(dst_offset, map)?;
-            d(src_offset, map)?;
-        }
-        Op::Load {
-            value,
-            buffer,
-            offset,
-            ..
-        } => {
-            v(value, map)?;
-            v(buffer, map)?;
-            d(offset, map)?;
-        }
-        Op::StoreTo {
-            value,
-            buffer,
-            offset,
-            ..
-        } => {
-            v(value, map)?;
-            v(buffer, map)?;
-            d(offset, map)?;
-        }
-        Op::Matmul { acc, a, b } => {
-            v(acc, map)?;
-            v(a, map)?;
-            v(b, map)?;
-        }
-        Op::Sum { acc, x, scaler } => {
-            v(acc, map)?;
-            v(x, map)?;
-            v(scaler, map)?;
-        }
-        Op::Max { acc, x } => {
-            v(acc, map)?;
-            v(x, map)?;
-        }
-        Op::EndLoop => {}
-    }
-    Ok(())
-}
-
-struct Cursor<'a> {
-    at: usize,
-    bytes: &'a [u8],
-}
-
-impl Cursor<'_> {
-    fn take(&mut self, n: usize) -> Result<&[u8], Error> {
-        let end = self.at + n;
-        if end > self.bytes.len() {
-            return Err(Error::TT_ERROR_TRUNCATED);
-        }
-        let s = &self.bytes[self.at..end];
-        self.at = end;
-        Ok(s)
+        let _ = bytes;
+        todo!("the byte form is being redesigned with the IR")
     }
 
-    fn u8(&mut self) -> Result<u8, Error> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u32(&mut self) -> Result<u32, Error> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-
-    /// A dense value index, as an [`OpId`]: [`build`] renumbers it to the
-    /// id of the op that defines it.
-    fn id(&mut self) -> Result<OpId, Error> {
-        Ok(OpId(self.u32()?))
-    }
-
-    fn dtype(&mut self) -> Result<DType, Error> {
-        let tag = self.u8()?;
-        // tt-metal's `DataFormat::Tf32` is 4; the dtype itself is not wired yet.
-        if tag == 4 {
-            return Err(Error::TT_TODO_TF32);
-        }
-        DType::from_tag(tag).ok_or(Error::TT_ERROR_DTYPE_TAG)
-    }
-
-    fn name(&mut self) -> Result<String, Error> {
-        let n = self.u32()? as usize;
-        let bytes = self.take(n)?;
-        String::from_utf8(bytes.to_vec()).map_err(|_| Error::TT_ERROR_NAME_UTF8)
-    }
-
-    fn dim(&mut self) -> Result<Dim, Error> {
-        match self.u8()? {
-            0 => Ok(Dim::Const(self.u32()?)),
-            1 => Ok(Dim::Value(OpId(self.u32()?))),
-            other => {
-                let _ = other;
-                Err(Error::TT_ERROR_SHAPE_TERM_TAG)
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Text form
-// ---------------------------------------------------------------------------
-
-impl Kernel {
-    /// Parse the text form. Line-oriented; `//` starts a comment.
+    /// Parse the text form.
+    ///
+    /// The grammar is the one the tests write:
+    ///
+    /// ```text
+    /// version 9
+    /// grid 1,1
+    /// %in = param f32 2048
+    /// %s  = param i32 0
+    /// %bi = buffer f32 32,64
+    /// %a  = acc f32 32,32
+    /// %c  = const f32 1.0
+    /// %i  = loop 2
+    /// %o  = mul %i %s
+    /// %x  = load 32,32 %bi [%o]
+    /// %y  = neg %x
+    /// copy 32,32 %bi [%o] = %in [%o]
+    /// store 32,32 %bo [%o] = %y
+    /// inventory: matmul, sum, max, sel, cast, bitcast, wait, reserve, push,
+    /// pop, endreader, endcompute, endloop
+    /// ```
+    ///
+    /// Every inline literal — a bracket index, a shape term, a loop bound — is
+    /// interned as an `Op::Const` of the index dtype, and a multi-term
+    /// parameter shape becomes an `Op::Shape` of those terms, so the program's
+    /// own ops are the only place an extent lives.
     pub fn parse(text: &str) -> Result<Kernel, Error> {
         let mut p = Parser::default();
-        let mut version: Option<u32> = None;
-        for (line_no, raw) in text.lines().enumerate() {
-            let at = line_no + 1;
-            let line = match raw.find("//") {
-                Some(i) => &raw[..i],
-                None => raw,
-            }
-            .trim();
-            if line.is_empty() {
+        p.run(text)
+    }
+}
+
+impl Parser {
+    fn value(&self, t: &mut Tokens<'_>) -> Result<OpId, Error> {
+        t.value(&self.symbols)
+    }
+
+    /// Parse every line, in order.
+    fn run(&mut self, text: &str) -> Result<Kernel, Error> {
+        let mut version = false;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with(';') || line.starts_with("//") {
                 continue;
             }
-            let tokens = tokenize(line).map_err(|e| {
-                let _ = e;
-                Error::TT_ERROR_PARSE
-            })?;
-            let mut t = Tokens {
-                tok: &tokens,
-                at: 0,
-                line: at,
-            };
-            if matches!(t.peek(), Some(Token::Name(_))) {
-                let op = parse_definition(&mut t, &mut p)?;
-                p.ops.push(op);
-                continue;
-            }
-            let first = t.ident()?;
-            if first == "version" {
-                if version.is_some() {
-                    return Err(t.err("more than one version line"));
+            let mut t = Tokens::new(line);
+            if !version {
+                if t.word() != Some("version") {
+                    return Err(Error::TT_ERROR_VERSION);
                 }
-                version = Some(t.number_u32()?);
-                t.end()?;
+                if t.number()? != VERSION {
+                    return Err(Error::TT_ERROR_VERSION);
+                }
+                version = true;
                 continue;
             }
-            if version.is_none() {
-                return Err(t.err("the version line comes first"));
+            if let Some(word) = t.peek_word() {
+                match word {
+                    "grid" => {
+                        t.word();
+                        let x = self.term(&mut t)?;
+                        t.comma()?;
+                        let y = self.term(&mut t)?;
+                        t.end()?;
+                        self.push(Op::Grid { x, y });
+                        continue;
+                    }
+                    "copy" => {
+                        t.word();
+                        let shape = t.shape2()?;
+                        let dst = self.value(&mut t)?;
+                        let dst_offset = t.bracket(self)?;
+                        t.eq()?;
+                        let src = self.value(&mut t)?;
+                        let src_offset = if t.peek_char() == Some('[') {
+                            t.bracket(self)?
+                        } else {
+                            dst_offset
+                        };
+                        t.end()?;
+                        self.push(Op::CopyTo {
+                            dst,
+                            src,
+                            dst_offset,
+                            src_offset,
+                            shape,
+                        });
+                        continue;
+                    }
+                    "store" => {
+                        t.word();
+                        let shape = t.shape2()?;
+                        let buffer = self.value(&mut t)?;
+                        let offset = if t.peek_char() == Some('[') {
+                            t.bracket(self)?
+                        } else {
+                            self.intern_i32(0)
+                        };
+                        t.eq()?;
+                        let src = self.value(&mut t)?;
+                        t.end()?;
+                        self.push(Op::StoreTo {
+                            src,
+                            buffer,
+                            offset,
+                            shape,
+                        });
+                        continue;
+                    }
+                    "load" => {
+                        t.word();
+                        let shape = t.shape2()?;
+                        let name = t.name()?;
+                        t.eq()?;
+                        let buffer = self.value(&mut t)?;
+                        let offset = t.bracket(self)?;
+                        t.end()?;
+                        let id = self.ops.len();
+                        self.define(name, id)?;
+                        self.push(Op::Load {
+                            buffer,
+                            offset,
+                            shape,
+                        });
+                        continue;
+                    }
+                    "matmul" => {
+                        t.word();
+                        let acc = self.value(&mut t)?;
+                        let a = self.value(&mut t)?;
+                        let b = self.value(&mut t)?;
+                        t.end()?;
+                        self.push(Op::Matmul { acc, a, b });
+                        continue;
+                    }
+                    "sum" => {
+                        t.word();
+                        let acc = self.value(&mut t)?;
+                        let x = self.value(&mut t)?;
+                        let s = self.value(&mut t)?;
+                        t.end()?;
+                        self.push(Op::Sum { acc, x, s });
+                        continue;
+                    }
+                    "max" => {
+                        t.word();
+                        let acc = self.value(&mut t)?;
+                        let x = self.value(&mut t)?;
+                        t.end()?;
+                        self.push(Op::Max { acc, x });
+                        continue;
+                    }
+                    "wait" | "reserve" | "push" | "pop" => {
+                        let word = t.word().expect("the word was peeked");
+                        let cb = self.value(&mut t)?;
+                        t.end()?;
+                        self.push(match word {
+                            "wait" => Op::Wait { cb },
+                            "reserve" => Op::Reserve { cb },
+                            "push" => Op::Push { cb },
+                            _ => Op::Pop { cb },
+                        });
+                        continue;
+                    }
+                    "endloop" => {
+                        t.word();
+                        t.end()?;
+                        self.push(Op::EndLoop);
+                        continue;
+                    }
+                    "endreader" => {
+                        t.word();
+                        t.end()?;
+                        self.push(Op::EndReader);
+                        continue;
+                    }
+                    "endcompute" => {
+                        t.word();
+                        t.end()?;
+                        self.push(Op::EndCompute);
+                        continue;
+                    }
+                    _ => {}
+                }
             }
-            if first == "grid" {
-                let columns = t.term(&p.symbols)?;
-                t.comma()?;
-                let rows = t.term(&p.symbols)?;
-                t.end()?;
-                p.ops.push(Op::Grid { columns, rows });
-                continue;
-            }
-            if first == "copy" {
-                let shape = t.shape()?;
-                let dst = t.value(&p.symbols)?;
-                let dst_offset = t.bracket(&p.symbols)?;
-                t.expect_eq()?;
-                let src = t.value(&p.symbols)?;
-                // The second bracket names the source offset. One bracket is
-                // shorthand for both sides carrying the same index.
-                let src_offset = if matches!(t.peek(), Some(Token::LBracket)) {
-                    t.bracket(&p.symbols)?
-                } else {
-                    dst_offset
-                };
-                t.end()?;
-                p.ops.push(Op::CopyTo {
-                    dst,
-                    src,
-                    dst_offset,
-                    src_offset,
-                    shape,
-                });
-                continue;
-            }
-            if first == "store" {
-                let shape = t.shape()?;
-                let buffer = t.value(&p.symbols)?;
-                // An `acc` has no offset to name; a buffer's bracket is still
-                // required by every program that has one, and a missing one
-                // reads as zero.
-                let offset = if matches!(t.peek(), Some(Token::LBracket)) {
-                    t.bracket(&p.symbols)?
-                } else {
-                    Dim::Const(0)
-                };
-                t.expect_eq()?;
-                let value = t.value(&p.symbols)?;
-                t.end()?;
-                p.ops.push(Op::StoreTo {
-                    value,
-                    buffer,
-                    offset,
-                    shape,
-                });
-                continue;
-            }
-            if first == "load" {
-                let shape = t.shape()?;
-                let name = t.name()?;
-                t.expect_eq()?;
-                let buffer = t.value(&p.symbols)?;
-                let offset = t.bracket(&p.symbols)?;
-                t.end()?;
-                let value = p.define(name)?;
-                p.ops.push(Op::Load {
-                    value,
-                    buffer,
-                    offset,
-                    shape,
-                });
-                continue;
-            }
-            if first == "matmul" {
-                let acc = t.value(&p.symbols)?;
-                let a = t.value(&p.symbols)?;
-                let b = t.value(&p.symbols)?;
-                t.end()?;
-                p.ops.push(Op::Matmul { acc, a, b });
-                continue;
-            }
-            if first == "sum" || first == "max" {
-                let acc = t.value(&p.symbols)?;
-                let x = t.value(&p.symbols)?;
-                let op = if first == "sum" {
-                    let scaler = t.value(&p.symbols)?;
-                    Op::Sum { acc, x, scaler }
-                } else {
-                    Op::Max { acc, x }
-                };
-                t.end()?;
-                p.ops.push(op);
-                continue;
-            }
-            if first == "endloop" {
-                t.end()?;
-                p.ops.push(Op::EndLoop);
-                continue;
-            }
-            return Err(t.err(format!("no instruction starts with `{first}`")));
+            // Everything else is a definition: `%name = ...`.
+            self.definition(&mut t)?;
         }
-        match version {
-            Some(v) if v == VERSION => {}
-            Some(v) => {
-                let _ = v;
-                return Err(Error::TT_ERROR_VERSION);
-            }
-            None => return Err(Error::TT_ERROR_VERSION),
+        if !version {
+            return Err(Error::TT_ERROR_VERSION);
         }
-        let k = build(p.ops, p.names)?;
+        let k = self.take()?;
         k.verify()?;
         Ok(k)
+    }
+}
+
+impl fmt::Display for Kernel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut p = Printer {
+            k: self,
+            f: f as &mut dyn fmt::Write,
+            loop_depth: 0,
+        };
+        writeln!(p.f, "version {VERSION}")?;
+        for (id, op) in self.ops() {
+            p.op(id, op)?;
+        }
+        Ok(())
+    }
+}
+
+/// The state of a parse: the ops in order and the names defined so far.
+#[derive(Default)]
+struct Parser {
+    ops: Vec<Op>,
+    names: BTreeMap<OpId, String>,
+    symbols: BTreeMap<String, OpId>,
+}
+
+impl Parser {
+    fn push(&mut self, op: Op) -> OpId {
+        let id = OpId(self.ops.len() as u32);
+        self.ops.push(op);
+        id
+    }
+
+    fn define(&mut self, name: String, id: usize) -> Result<(), Error> {
+        if self.symbols.contains_key(&name) {
+            return Err(Error::TT_ERROR_NAME_DUPLICATE);
+        }
+        let id = OpId(id as u32);
+        self.names.insert(id, name.clone());
+        self.symbols.insert(name, id);
+        Ok(())
+    }
+
+    /// A literal index, as a const op of the index dtype.
+    fn intern_i32(&mut self, value: i32) -> OpId {
+        self.push(Op::Const {
+            dtype: INDEX,
+            bits: value as u32,
+        })
+    }
+
+    fn term(&mut self, t: &mut Tokens<'_>) -> Result<OpId, Error> {
+        if t.peek_char() == Some('%') {
+            return t.value(&self.symbols);
+        }
+        let n = t.number()?;
+        Ok(self.intern_i32(n as i32))
+    }
+
+    fn definition(&mut self, t: &mut Tokens<'_>) -> Result<(), Error> {
+        let name = t.name()?;
+        t.eq()?;
+        let keyword = t.word().ok_or(Error::TT_ERROR_PARSE)?.to_owned();
+        let key = keyword.as_str();
+        match key {
+            "const" => {
+                let dtype = t.dtype()?;
+                let bits = t.literal(dtype)?;
+                t.end()?;
+                let id = self.ops.len();
+                self.define(name, id)?;
+                self.push(Op::Const { dtype, bits });
+            }
+            "param" => {
+                let dtype = t.dtype()?;
+                let scalar = t.peek_char() == Some('0') && t.rest().trim() == "0";
+                let shape = if scalar {
+                    t.number()?;
+                    OpId::NULL
+                } else {
+                    let mut terms = vec![self.term(t)?];
+                    while t.peek_char() == Some(',') {
+                        t.comma()?;
+                        terms.push(self.term(t)?);
+                    }
+                    self.push(Op::Shape(terms.into_boxed_slice()))
+                };
+                t.end()?;
+                let id = self.ops.len();
+                self.define(name, id)?;
+                if scalar {
+                    self.push(Op::Variable { dtype });
+                } else {
+                    self.push(Op::Param { dtype, shape });
+                }
+            }
+            "buffer" => {
+                let dtype = t.dtype()?;
+                let a = t.number()?;
+                t.comma()?;
+                let b = t.number()?;
+                t.end()?;
+                let (page, len) = cb_ring([a, b], dtype)?;
+                let id = self.ops.len();
+                self.define(name, id)?;
+                self.push(Op::Cb { dtype, page, len });
+            }
+            "acc" => {
+                let dtype = t.dtype()?;
+                let a = t.number()?;
+                t.comma()?;
+                let b = t.number()?;
+                t.end()?;
+                let id = self.ops.len();
+                self.define(name, id)?;
+                self.push(Op::Acc {
+                    dtype,
+                    shape: [a, b],
+                });
+            }
+            "loop" => {
+                let bound = self.term(t)?;
+                t.end()?;
+                let id = self.ops.len();
+                self.define(name, id)?;
+                self.push(Op::Loop { bound });
+            }
+            "grid" => {
+                t.dot()?;
+                let axis = match t.word() {
+                    Some("x") => 0,
+                    Some("y") => 1,
+                    _ => return Err(Error::TT_ERROR_GRID_AXIS),
+                };
+                t.end()?;
+                let id = self.ops.len();
+                self.define(name, id)?;
+                self.push(Op::GridCoord { axis });
+            }
+            "cast" | "bitcast" => {
+                let src = self.value(t)?;
+                if t.word() != Some("to") {
+                    return Err(Error::TT_ERROR_PARSE);
+                }
+                let dtype = t.dtype()?;
+                t.end()?;
+                let id = self.ops.len();
+                self.define(name, id)?;
+                self.push(if key == "cast" {
+                    Op::Cast { dtype, src }
+                } else {
+                    Op::Bitcast { dtype, src }
+                });
+            }
+            "sel" => {
+                let cond = t.value(&self.symbols)?;
+                let if_true = t.value(&self.symbols)?;
+                let if_false = t.value(&self.symbols)?;
+                t.end()?;
+                let id = self.ops.len();
+                self.define(name, id)?;
+                self.push(Op::Select {
+                    cond,
+                    if_true,
+                    if_false,
+                });
+            }
+            other => {
+                let id = self.ops.len();
+                if let Some(op) = UnOp::from_name(other) {
+                    let a = t.value(&self.symbols)?;
+                    t.end()?;
+                    self.define(name, id)?;
+                    self.push(Op::Unary { op, a });
+                } else if let Some(op) = BinOp::from_name(other) {
+                    let a = t.value(&self.symbols)?;
+                    let b = t.value(&self.symbols)?;
+                    t.end()?;
+                    self.define(name, id)?;
+                    self.push(Op::Binary { op, a, b });
+                } else {
+                    return Err(Error::TT_ERROR_PARSE);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn take(&mut self) -> Result<Kernel, Error> {
+        let mut k = Kernel::default();
+        for op in std::mem::take(&mut self.ops) {
+            k.push(op);
+        }
+        k.names = std::mem::take(&mut self.names);
+        Ok(k)
+    }
+}
+
+/// The text form's printer.
+struct Printer<'a, 'b> {
+    k: &'a Kernel,
+    f: &'b mut dyn fmt::Write,
+    #[allow(dead_code)]
+    loop_depth: usize,
+}
+
+impl Printer<'_, '_> {
+    fn name(&self, value: OpId) -> String {
+        match self.k.names.get(&value) {
+            Some(name) => format!("%{name}"),
+            None => match *self.k.at(value) {
+                Op::Const { .. } => format!("{}", self.k.const_i32(value).unwrap_or_default()),
+                _ => format!("%{value}"),
+            },
+        }
+    }
+
+    fn op(&mut self, id: OpId, op: &Op) -> fmt::Result {
+        let k = self.k;
+        let named = k.names.contains_key(&id);
+        match *op {
+            Op::Shape(_) => Ok(()),
+            Op::Const { dtype, bits } => writeln!(
+                self.f,
+                "%{} = const {} {}",
+                k.names.get(&id).map(String::as_str).unwrap_or("?"),
+                dtype.name(),
+                literal(dtype, bits)
+            ),
+            Op::Param { dtype, shape } => {
+                write!(self.f, "{} = param {} ", self.name(id), dtype.name()).and_then(|_| {
+                    let dims: Vec<String> =
+                        (0..k.shape(shape).len()).map(|_| String::new()).collect();
+                    let _ = dims;
+                    let terms: Vec<OpId> = match *k.at(shape) {
+                        Op::Shape(ref ops) => ops.to_vec(),
+                        _ => Vec::new(),
+                    };
+                    let text: Vec<String> = terms.iter().map(|t| self.name(*t)).collect();
+                    writeln!(self.f, "{}", text.join(","))
+                })
+            }
+            Op::Variable { dtype } => {
+                writeln!(self.f, "{} = param {} 0", self.name(id), dtype.name())
+            }
+            Op::Cb { dtype, page, len } => writeln!(
+                self.f,
+                "{} = buffer {} {},{}",
+                self.name(id),
+                dtype.name(),
+                page[0],
+                page[1] * len
+            ),
+            Op::Acc { dtype, shape } => writeln!(
+                self.f,
+                "{} = acc {} {},{}",
+                self.name(id),
+                dtype.name(),
+                shape[0],
+                shape[1]
+            ),
+            Op::Grid { x, y } => writeln!(self.f, "grid {},{}", self.name(x), self.name(y)),
+            Op::Loop { bound } => {
+                self.loop_depth += 1;
+                writeln!(self.f, "{} = loop {}", self.name(id), self.name(bound))
+            }
+            Op::EndLoop => {
+                self.loop_depth = self.loop_depth.saturating_sub(1);
+                writeln!(self.f, "endloop")
+            }
+            Op::EndReader => writeln!(self.f, "endreader"),
+            Op::EndCompute => writeln!(self.f, "endcompute"),
+            Op::GridCoord { axis } => writeln!(
+                self.f,
+                "{} = grid.{}",
+                self.name(id),
+                if axis == 0 { "x" } else { "y" }
+            ),
+            Op::CopyTo {
+                dst,
+                src,
+                dst_offset,
+                src_offset,
+                shape,
+            } => writeln!(
+                self.f,
+                "copy {},{} {} [{}] = {} [{}]",
+                shape[0],
+                shape[1],
+                self.name(dst),
+                self.name(dst_offset),
+                self.name(src),
+                self.name(src_offset)
+            ),
+            Op::Load {
+                buffer,
+                offset,
+                shape,
+            } => writeln!(
+                self.f,
+                "load {},{} {} = {} [{}]",
+                shape[0],
+                shape[1],
+                self.name(id),
+                self.name(buffer),
+                self.name(offset)
+            ),
+            Op::StoreTo {
+                src,
+                buffer,
+                offset,
+                shape,
+            } => writeln!(
+                self.f,
+                "store {},{} {} [{}] = {}",
+                shape[0],
+                shape[1],
+                self.name(buffer),
+                self.name(offset),
+                self.name(src)
+            ),
+            Op::Cast { dtype, src } => writeln!(
+                self.f,
+                "{} = cast {} {}",
+                self.name(id),
+                dtype.name(),
+                self.name(src)
+            ),
+            Op::Bitcast { dtype, src } => writeln!(
+                self.f,
+                "{} = bitcast {} {}",
+                self.name(id),
+                dtype.name(),
+                self.name(src)
+            ),
+            Op::Unary { op, a } => writeln!(
+                self.f,
+                "{} = {} {}",
+                self.name(id),
+                unary_name(op),
+                self.name(a)
+            ),
+            Op::Binary { op, a, b } => writeln!(
+                self.f,
+                "{} = {} {} {}",
+                self.name(id),
+                binary_name(op),
+                self.name(a),
+                self.name(b)
+            ),
+            Op::Select {
+                cond,
+                if_true,
+                if_false,
+            } => writeln!(
+                self.f,
+                "{} = sel {} {} {}",
+                self.name(id),
+                self.name(cond),
+                self.name(if_true),
+                self.name(if_false)
+            ),
+            Op::Matmul { acc, a, b } => writeln!(
+                self.f,
+                "matmul {} {} {}",
+                self.name(acc),
+                self.name(a),
+                self.name(b)
+            ),
+            Op::Sum { acc, x, s } => writeln!(
+                self.f,
+                "sum {} {} {}",
+                self.name(acc),
+                self.name(x),
+                self.name(s)
+            ),
+            Op::Max { acc, x } => writeln!(self.f, "max {} {}", self.name(acc), self.name(x)),
+            Op::Wait { cb } => writeln!(self.f, "wait {}", self.name(cb)),
+            Op::Reserve { cb } => writeln!(self.f, "reserve {}", self.name(cb)),
+            Op::Push { cb } => writeln!(self.f, "push {}", self.name(cb)),
+            Op::Pop { cb } => writeln!(self.f, "pop {}", self.name(cb)),
+        }?;
+        let _ = named;
+        Ok(())
     }
 }
 
@@ -2306,425 +2031,206 @@ fn literal(dtype: DType, bits: u32) -> String {
     }
 }
 
-/// The parser state that spans lines: the program and the names defined so far.
-#[derive(Default)]
-struct Parser {
-    ops: Vec<Op>,
-    names: Vec<String>,
-    symbols: BTreeMap<String, ValueId>,
-}
-
-impl Parser {
-    fn define(&mut self, name: String) -> Result<ValueId, Error> {
-        if self.symbols.contains_key(&name) {
-            return Err(Error::TT_ERROR_NAME_DUPLICATE);
-        }
-        let value = OpId(self.names.len() as u32);
-        self.symbols.insert(name.clone(), value);
-        self.names.push(name);
-        Ok(value)
+fn unary_name(op: UnOp) -> &'static str {
+    match op {
+        UnOp::Neg => "neg",
+        UnOp::Not => "not",
+        UnOp::BitNot => "bitnot",
+        UnOp::Exp2 => "exp2",
+        UnOp::Log2 => "log2",
+        UnOp::Reciprocal => "reciprocal",
+        UnOp::Sqrt => "sqrt",
+        UnOp::Rsqrt => "rsqrt",
+        UnOp::Sin => "sin",
+        UnOp::Cos => "cos",
+        UnOp::Floor => "floor",
+        UnOp::Trunc => "trunc",
+        UnOp::Abs => "abs",
     }
 }
 
-/// `%name = ...`: the only lines that define a value.
-fn parse_definition(t: &mut Tokens, p: &mut Parser) -> Result<Op, Error> {
-    let name = t.name()?;
-    t.expect_eq()?;
-    let keyword = t.ident()?;
-    let value = p.define(name)?;
-    let op = match keyword.as_str() {
-        "const" => {
-            let dtype = t.dtype()?;
-            let bits = t.literal(dtype)?;
-            t.end()?;
-            Op::Const { value, dtype, bits }
-        }
-        "param" => {
-            let dtype = t.dtype()?;
-            // The scalar shape is a single `0` and nothing else.
-            let dims = if matches!(t.peek(), Some(Token::Int(0))) && t.tok.len() == t.at + 1 {
-                t.at += 1;
-                Vec::new()
-            } else {
-                let mut dims = vec![t.term(&p.symbols)?];
-                while matches!(t.peek(), Some(Token::Comma)) {
-                    t.comma()?;
-                    dims.push(t.term(&p.symbols)?);
-                }
-                dims
-            };
-            t.end()?;
-            if dims.is_empty() {
-                Op::Variable { value, dtype }
-            } else {
-                Op::Param { value, dtype, dims }
-            }
-        }
-        "buffer" => {
-            let dtype = t.dtype()?;
-            let a = t.number_u32()?;
-            t.comma()?;
-            let b = t.number_u32()?;
-            t.end()?;
-            let (page, len) = cb_ring([a, b], dtype)?;
-            Op::Cb {
-                value,
-                dtype,
-                page,
-                len,
-            }
-        }
-        "acc" => {
-            let dtype = t.dtype()?;
-            let a = t.number_u32()?;
-            t.comma()?;
-            let b = t.number_u32()?;
-            t.end()?;
-            Op::Tile {
-                value,
-                dtype,
-                shape: [a, b],
-            }
-        }
-        "loop" => {
-            let bound = t.term(&p.symbols)?;
-            t.end()?;
-            Op::Loop { value, bound }
-        }
-        "grid" => {
-            t.dot()?;
-            let axis = match t.ident()?.as_str() {
-                "x" => 0,
-                "y" => 1,
-                other => return Err(t.err(format!("a grid coordinate is x or y, not `{other}`"))),
-            };
-            t.end()?;
-            Op::GridCoord { value, axis }
-        }
-        "cast" => {
-            let src = t.value(&p.symbols)?;
-            t.expect("to")?;
-            let dtype = t.dtype()?;
-            t.end()?;
-            Op::Cast { value, src, dtype }
-        }
-        "bitcast" => {
-            let src = t.value(&p.symbols)?;
-            t.expect("to")?;
-            let dtype = t.dtype()?;
-            t.end()?;
-            Op::Bitcast { value, src, dtype }
-        }
-        "sel" => {
-            let cond = t.value(&p.symbols)?;
-            let if_true = t.value(&p.symbols)?;
-            let if_false = t.value(&p.symbols)?;
-            t.end()?;
-            Op::Select {
-                value,
-                cond,
-                if_true,
-                if_false,
-            }
-        }
-        word if BinOp::from_name(word).is_some() => {
-            let op = BinOp::from_name(word).expect("checked");
-            let a = t.value(&p.symbols)?;
-            let b = t.value(&p.symbols)?;
-            t.end()?;
-            Op::Binary { value, op, a, b }
-        }
-        word if UnOp::from_name(word).is_some() => {
-            let op = UnOp::from_name(word).expect("checked");
-            let a = t.value(&p.symbols)?;
-            t.end()?;
-            Op::Unary { value, op, a }
-        }
-        other => return Err(t.err(format!("no definition starts with `{other}`"))),
-    };
-    Ok(op)
+fn binary_name(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "add",
+        BinOp::Sub => "sub",
+        BinOp::Mul => "mul",
+        BinOp::Div => "div",
+        BinOp::Pow => "pow",
+        BinOp::Mod => "mod",
+        BinOp::Cmplt => "cmplt",
+        BinOp::Cmpgt => "cmpgt",
+        BinOp::Cmpge => "cmpge",
+        BinOp::Max => "max",
+        BinOp::Or => "or",
+        BinOp::And => "and",
+        BinOp::BitXor => "bitxor",
+        BinOp::BitOr => "bitor",
+        BinOp::BitAnd => "bitand",
+        BinOp::BitShiftLeft => "bitshiftleft",
+        BinOp::BitShiftRight => "bitshiftright",
+        BinOp::NotEq => "noteq",
+        BinOp::Eq => "eq",
+    }
 }
 
+/// One line's tokens, read left to right. The grammar is whitespace-separated
+/// words, `%names`, numbers and the punctuation `, = . [ ]`.
 struct Tokens<'a> {
-    tok: &'a [Token],
+    text: &'a str,
     at: usize,
-    /// The line, kept for a future diagnostic that is not an enum variant.
-    #[allow(dead_code)]
-    line: usize,
 }
 
 impl<'a> Tokens<'a> {
-    fn err(&self, msg: impl Into<String>) -> Error {
-        let _ = msg;
-        Error::TT_ERROR_PARSE
+    fn new(text: &'a str) -> Self {
+        Self { text, at: 0 }
     }
 
-    fn peek(&self) -> Option<Token> {
-        self.tok.get(self.at).cloned()
+    fn rest(&self) -> &'a str {
+        &self.text[self.at..]
     }
 
-    fn next(&mut self) -> Result<Token, Error> {
-        let t = self
-            .tok
-            .get(self.at)
-            .cloned()
-            .ok_or_else(|| self.err("the line ends early"))?;
+    fn skip_space(&mut self) {
+        while let Some(c) = self.rest().chars().next() {
+            if c.is_whitespace() {
+                self.at += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn peek_char(&mut self) -> Option<char> {
+        self.skip_space();
+        self.rest().chars().next()
+    }
+
+    fn peek_word(&mut self) -> Option<&'a str> {
+        self.skip_space();
+        let rest = self.rest();
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == ',' || c == '[' || c == ']' || c == '=')
+            .unwrap_or(rest.len());
+        if end == 0 { None } else { Some(&rest[..end]) }
+    }
+
+    fn word(&mut self) -> Option<&'a str> {
+        let word = self.peek_word()?;
+        self.at += word.len();
+        Some(word)
+    }
+
+    fn name(&mut self) -> Result<String, Error> {
+        self.skip_space();
+        if self.peek_char() != Some('%') {
+            return Err(Error::TT_ERROR_PARSE);
+        }
         self.at += 1;
-        Ok(t)
+        let word = self.word().ok_or(Error::TT_ERROR_PARSE)?;
+        Ok(word.to_owned())
     }
 
-    fn end(&self) -> Result<(), Error> {
-        match self.peek() {
-            None => Ok(()),
-            Some(t) => Err(self.err(format!("unexpected `{}`", t.text()))),
-        }
-    }
-
-    fn ident(&mut self) -> Result<String, Error> {
-        match self.next()? {
-            Token::Ident(s) => Ok(s),
-            t => Err(self.err(format!("expected a word, found `{}`", t.text()))),
-        }
-    }
-
-    fn expect(&mut self, word: &str) -> Result<(), Error> {
-        let got = self.ident()?;
-        if got == word {
-            Ok(())
-        } else {
-            Err(self.err(format!("expected `{word}`, found `{got}`")))
-        }
-    }
-
-    fn value(&mut self, symbols: &BTreeMap<String, ValueId>) -> Result<ValueId, Error> {
+    fn value(&mut self, symbols: &BTreeMap<String, OpId>) -> Result<OpId, Error> {
         let name = self.name()?;
         symbols
             .get(&name)
             .copied()
-            .ok_or_else(|| self.err(format!("unknown value %{name}")))
+            .ok_or(Error::TT_ERROR_VALUE_UNDEFINED)
     }
 
-    fn name(&mut self) -> Result<String, Error> {
-        match self.next()? {
-            Token::Name(s) => Ok(s),
-            t => Err(self.err(format!("expected a %value, found `{}`", t.text()))),
+    fn number(&mut self) -> Result<u32, Error> {
+        self.skip_space();
+        let rest = self.rest();
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if end == 0 {
+            return Err(Error::TT_ERROR_PARSE);
         }
+        let n: u32 = rest[..end].parse().map_err(|_| Error::TT_ERROR_PARSE)?;
+        self.at += end;
+        Ok(n)
     }
 
     fn comma(&mut self) -> Result<(), Error> {
-        match self.next()? {
-            Token::Comma => Ok(()),
-            t => Err(self.err(format!("expected `,`, found `{}`", t.text()))),
+        self.skip_space();
+        if self.peek_char() != Some(',') {
+            return Err(Error::TT_ERROR_PARSE);
         }
-    }
-
-    fn bracket(&mut self, symbols: &BTreeMap<String, ValueId>) -> Result<Dim, Error> {
-        match self.next()? {
-            Token::LBracket => {}
-            t => {
-                return Err(self.err(format!("expected `[`, found `{}`", t.text())));
-            }
-        }
-        let dim = self.term(symbols)?;
-        match self.next()? {
-            Token::RBracket => Ok(dim),
-            t => Err(self.err(format!("expected `]`, found `{}`", t.text()))),
-        }
-    }
-
-    fn term(&mut self, symbols: &BTreeMap<String, ValueId>) -> Result<Dim, Error> {
-        match self.next()? {
-            Token::Name(s) => Ok(Dim::Value(
-                *symbols
-                    .get(&s)
-                    .ok_or_else(|| self.err(format!("unknown value %{s}")))?,
-            )),
-            Token::Int(n) => u32::try_from(n)
-                .map(Dim::Const)
-                .map_err(|_| self.err(format!("{n} is not a non-negative index"))),
-            t => Err(self.err(format!(
-                "expected a literal or a %value, found `{}`",
-                t.text()
-            ))),
-        }
-    }
-
-    fn number_u32(&mut self) -> Result<u32, Error> {
-        match self.next()? {
-            Token::Int(n) => u32::try_from(n).map_err(|_| self.err(format!("{n} is not a u32"))),
-            t => Err(self.err(format!("expected a number, found `{}`", t.text()))),
-        }
-    }
-
-    /// An access shape: `<rows>,<cols>`.
-    fn shape(&mut self) -> Result<[u32; 2], Error> {
-        let rows = self.number_u32()?;
-        self.comma()?;
-        let cols = self.number_u32()?;
-        Ok([rows, cols])
-    }
-
-    fn dtype(&mut self) -> Result<DType, Error> {
-        let name = self.ident()?;
-        match name.as_str() {
-            "f32" => Ok(DType::F32),
-            "bf16" => Ok(DType::Bf16),
-            "i32" => Ok(DType::I32),
-            // A real format, but nothing can carry it yet: the dtype, the Src
-            // selection and the explicit casts all land together.
-            "tf32" => Err(Error::TT_TODO_TF32),
-            other => Err(self.err(format!("unknown dtype `{other}`"))),
-        }
-    }
-
-    fn expect_eq(&mut self) -> Result<(), Error> {
-        match self.next()? {
-            Token::Eq => Ok(()),
-            t => Err(self.err(format!("expected `=`, found `{}`", t.text()))),
-        }
+        self.at += 1;
+        Ok(())
     }
 
     fn dot(&mut self) -> Result<(), Error> {
-        match self.next()? {
-            Token::Dot => Ok(()),
-            t => Err(self.err(format!("expected `.`, found `{}`", t.text()))),
+        self.skip_space();
+        if self.peek_char() != Some('.') {
+            return Err(Error::TT_ERROR_PARSE);
+        }
+        self.at += 1;
+        Ok(())
+    }
+
+    fn eq(&mut self) -> Result<(), Error> {
+        self.skip_space();
+        if self.peek_char() != Some('=') {
+            return Err(Error::TT_ERROR_PARSE);
+        }
+        self.at += 1;
+        Ok(())
+    }
+
+    fn bracket(&mut self, p: &mut Parser) -> Result<OpId, Error> {
+        self.skip_space();
+        if self.peek_char() != Some('[') {
+            return Err(Error::TT_ERROR_PARSE);
+        }
+        self.at += 1;
+        let value = p.term(self)?;
+        self.skip_space();
+        if self.peek_char() != Some(']') {
+            return Err(Error::TT_ERROR_PARSE);
+        }
+        self.at += 1;
+        Ok(value)
+    }
+
+    fn shape2(&mut self) -> Result<[Dim; 2], Error> {
+        let a = self.number()?;
+        self.comma()?;
+        let b = self.number()?;
+        Ok([a, b])
+    }
+
+    fn dtype(&mut self) -> Result<DType, Error> {
+        match self.word() {
+            Some("f32") => Ok(DType::F32),
+            Some("bf16") => Ok(DType::Bf16),
+            Some("i32") => Ok(DType::I32),
+            Some("bool") => Ok(DType::Bool),
+            _ => Err(Error::TT_ERROR_PARSE),
         }
     }
 
-    /// A constant's bits, in its dtype.
     fn literal(&mut self, dtype: DType) -> Result<u32, Error> {
-        if dtype == DType::Bf16 {
-            return Err(self.err("a bf16 constant is not exact; write it as f32 and cast"));
-        }
-        match self.next()? {
-            Token::Int(n) if dtype == DType::I32 => {
-                Ok(u32::try_from(n).map_err(|_| self.err(format!("{n} is not an i32")))?)
-            }
-            Token::Int(n) if dtype == DType::F32 => Ok((n as f32).to_bits()),
-            Token::Float(bits) if dtype == DType::F32 => Ok(bits),
-            t => Err(self.err(format!(
-                "expected a {} literal, found `{}`",
-                dtype.name(),
-                t.text()
-            ))),
+        let word = self.word().ok_or(Error::TT_ERROR_PARSE)?;
+        match dtype {
+            DType::I32 => word
+                .parse::<i32>()
+                .map(|v| v as u32)
+                .map_err(|_| Error::TT_ERROR_PARSE),
+            DType::F32 => word
+                .parse::<f32>()
+                .map(|v| v.to_bits())
+                .map_err(|_| Error::TT_ERROR_PARSE),
+            _ => Err(Error::TT_ERROR_CONST_BF16),
         }
     }
-}
 
-#[derive(Debug, Clone)]
-enum Token {
-    Name(String),
-    Ident(String),
-    Int(i64),
-    Float(u32),
-    Comma,
-    Dot,
-    LBracket,
-    RBracket,
-    Eq,
-}
-
-impl Token {
-    fn text(&self) -> String {
-        match self {
-            Token::Name(n) => format!("%{n}"),
-            Token::Ident(s) => s.clone(),
-            Token::Int(n) => n.to_string(),
-            Token::Float(bits) => literal(DType::F32, *bits),
-            Token::Comma => ",".to_string(),
-            Token::Dot => ".".to_string(),
-            Token::LBracket => "[".to_string(),
-            Token::RBracket => "]".to_string(),
-            Token::Eq => "=".to_string(),
+    fn end(&mut self) -> Result<(), Error> {
+        self.skip_space();
+        if self.rest().is_empty() {
+            Ok(())
+        } else {
+            Err(Error::TT_ERROR_TRAILING_INPUT)
         }
     }
-}
-
-fn tokenize(line: &str) -> Result<Vec<Token>, String> {
-    let mut out = Vec::new();
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if c.is_whitespace() {
-            i += 1;
-            continue;
-        }
-        match c {
-            ',' => {
-                out.push(Token::Comma);
-                i += 1;
-            }
-            '[' => {
-                out.push(Token::LBracket);
-                i += 1;
-            }
-            ']' => {
-                out.push(Token::RBracket);
-                i += 1;
-            }
-            '=' => {
-                out.push(Token::Eq);
-                i += 1;
-            }
-            '.' => {
-                out.push(Token::Dot);
-                i += 1;
-            }
-            '%' => {
-                let start = i + 1;
-                i += 1;
-                let mut end = i;
-                while end < bytes.len()
-                    && ((bytes[end] as char).is_ascii_alphanumeric() || bytes[end] == b'_')
-                {
-                    end += 1;
-                }
-                if end == start {
-                    return Err("a `%` must be followed by a name".into());
-                }
-                out.push(Token::Name(line[start..end].to_string()));
-                i = end;
-            }
-            c if c.is_ascii_digit() || c == '-' => {
-                let start = i;
-                i += 1;
-                let mut float = false;
-                while i < bytes.len() {
-                    let d = bytes[i] as char;
-                    if d.is_ascii_digit() {
-                        i += 1;
-                    } else if d == '.' {
-                        float = true;
-                        i += 1;
-                    } else {
-                        break;
-                    }
-                }
-                let text = &line[start..i];
-                if float {
-                    let v: f32 = text
-                        .parse()
-                        .map_err(|_| format!("`{text}` is not a number"))?;
-                    out.push(Token::Float(v.to_bits()));
-                } else {
-                    let v: i64 = text
-                        .parse()
-                        .map_err(|_| format!("`{text}` is not an integer"))?;
-                    out.push(Token::Int(v));
-                }
-            }
-            c if c.is_ascii_alphabetic() || c == '_' => {
-                let start = i;
-                while i < bytes.len()
-                    && ((bytes[i] as char).is_ascii_alphanumeric() || bytes[i] == b'_')
-                {
-                    i += 1;
-                }
-                out.push(Token::Ident(line[start..i].to_string()));
-            }
-            other => return Err(format!("unexpected `{other}`")),
-        }
-    }
-    Ok(out)
 }
