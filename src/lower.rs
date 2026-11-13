@@ -149,6 +149,15 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
     // Matrix Unit's unpack still points at it.
     let mut pop_here: Vec<Vec<u32>> = vec![Vec::new(); k.ops.len()];
     for (at, op) in k.ops.iter().enumerate() {
+        // A reduce's axis is its accumulator's shape (`ReduceDim::of`); the
+        // verifier has already refused a `32,32` acc there, and a `matmul`
+        // needs that same `32,32`.
+        let reduce_dim = match *op {
+            Op::Sum { acc, .. } | Op::Max { acc, .. } => {
+                Some(crate::ir::ReduceDim::of(types.of(acc).shape).expect("a reduce acc folds"))
+            }
+            _ => None,
+        };
         match *op {
             Op::Const { .. }
             | Op::Param { .. }
@@ -710,14 +719,13 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             // `ReduceDim::ROW` with `PoolType::SUM` is a matmul against the
             // scaler's column of ones, not a pool instruction, so it shares
             // this sequence.
-            Op::Matmul { .. }
-            | Op::Sum {
-                dim: crate::ir::ReduceDim::Row,
-                ..
-            } => {
+            Op::Matmul { .. } | Op::Sum { .. }
+                if matches!(*op, Op::Matmul { .. })
+                    || reduce_dim == Some(crate::ir::ReduceDim::Row) =>
+            {
                 let (acc, a, b) = match *op {
                     Op::Matmul { acc, a, b } => (acc, a, b),
-                    Op::Sum { acc, x, scaler, .. } => (acc, x, scaler),
+                    Op::Sum { acc, x, scaler } => (acc, x, scaler),
                     _ => unreachable!("the arm pattern is matmul and sum row"),
                 };
                 let dt_a = types.of(a).dtype;
@@ -884,16 +892,12 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             // pack's edge mask drops everything below row 0 — tt-metal's
             // `_llk_math_reduce_` for `REDUCE_COL`.
             Op::Sum { .. } | Op::Max { .. } => {
-                let (acc, x, scaler, max, dim) = match *op {
-                    Op::Sum {
-                        acc,
-                        dim,
-                        x,
-                        scaler,
-                    } => (acc, x, Some(scaler), false, dim),
-                    Op::Max { acc, dim, x } => (acc, x, None, true, dim),
+                let (acc, x, scaler, max) = match *op {
+                    Op::Sum { acc, x, scaler } => (acc, x, Some(scaler), false),
+                    Op::Max { acc, x } => (acc, x, None, true),
                     _ => unreachable!("the arm pattern is the two reduce ops"),
                 };
+                let dim = reduce_dim.expect("a reduce's acc has a fold");
                 if dim == crate::ir::ReduceDim::Scalar {
                     let _ = dim;
                     return Err(Error::TT_TODO_REDUCE);
@@ -1247,6 +1251,10 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     acc_mask[acc as usize] = PackMask::Col;
                 }
             }
+            // The arms above cover every `Op`; the matmul/sum-row one is
+            // guarded, so the compiler cannot see it does, and a new variant
+            // lands here loudly rather than in a silent default.
+            _ => unreachable!("every op is handled above"),
         }
         // A page a `matmul` read is released once the last reader of the loaded
         // value has consumed it, which is after the matmul's own unpacks.
@@ -1702,7 +1710,7 @@ mod tests {
     #[test]
     fn a_dst_write_after_a_post_waits_for_the_packer() {
         const PROGRAM: &str = "\
-version 8
+version 9
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -1764,7 +1772,7 @@ copy 32,32 %out [1] = %bo [0]
     #[test]
     fn an_integer_broadcast_is_refused_as_an_sfpu_todo() {
         const PROGRAM: &str = "\
-version 8
+version 9
 grid 1,1
 %pi = param i32 1024
 %po = param i32 1024

@@ -387,7 +387,8 @@ pub enum ttStatus {
     /// `Dst` tile that is named once and accumulated into; an immutable value or
     /// a buffer has no accumulator to write.
     TT_ERROR_MATMUL_ACC = 160,
-    /// An `acc` is declared with a shape other than `32,32`.
+    /// An `acc` is declared with a shape other than `1,32`, `32,1`, `1,1` or
+    /// `32,32`, or a `store_to` fills one with an access that is not a tile.
     TT_ERROR_ACC_SHAPE = 161,
     /// An `acc`'s dtype is neither `f32` nor `bf16`.
     TT_ERROR_ACC_DTYPE = 162,
@@ -434,6 +435,14 @@ pub enum ttStatus {
     /// needs the SFPU route, which is not lowered yet. The FPU takes `f32` and
     /// `bf16`; anything else must not be routed through it.
     TT_TODO_BROADCAST_SFPU = 176,
+    /// A reduce names a `32,32` accumulator. An `acc`'s shape is the fold, and
+    /// `32,32` has none: it is the `matmul` accumulator.
+    TT_ERROR_REDUCE_ACC_SHAPE = 177,
+    /// A `tf32` dtype is not implemented yet: the value is a real format
+    /// (tt-metal's `DataFormat::Tf32`, a 19-bit `Src` layout), but no program
+    /// can name it until the storage, the Src format selection and the
+    /// explicit casts are wired.
+    TT_TODO_TF32 = 178,
 }
 
 impl ttStatus {
@@ -616,6 +625,8 @@ impl ttStatus {
             ttStatus::TT_TODO_ACCESS_SHAPE => "TT_TODO_ACCESS_SHAPE",
             ttStatus::TT_ERROR_COPY_LANES => "TT_ERROR_COPY_LANES",
             ttStatus::TT_TODO_BROADCAST_SFPU => "TT_TODO_BROADCAST_SFPU",
+            ttStatus::TT_ERROR_REDUCE_ACC_SHAPE => "TT_ERROR_REDUCE_ACC_SHAPE",
+            ttStatus::TT_TODO_TF32 => "TT_TODO_TF32",
             ttStatus::TT_ERROR_DST_ROW_ODD => "TT_ERROR_DST_ROW_ODD",
         }
     }

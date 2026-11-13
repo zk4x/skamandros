@@ -105,8 +105,10 @@ pub fn allocate(k: &Kernel, types: &Types) -> Result<Alloc, Error> {
             continue;
         }
         // A scalar is index arithmetic (it names a `Dim`), not a datapath
-        // value: the movers evaluate it in RISC-V and it has no `Dst` home.
-        if types.of(value).shape == crate::ir::RegShape::Scalar {
+        // value: the movers evaluate it in RISC-V and it has no `Dst` home. An
+        // `acc` is the exception: a `1,1` acc still folds in a whole `Dst` tile
+        // region and is packed from it.
+        if types.of(value).shape == crate::ir::RegShape::Scalar && !matches!(op, Op::Acc { .. }) {
             continue;
         }
         let Some(slot) = free.iter().position(|in_use| !in_use) else {

@@ -381,7 +381,7 @@ mod tests {
     use crate::planner::place;
 
     const NEG: &str = "\
-version 8
+version 9
 grid 1,1
 %in = param f32 4096
 %out = param f32 4096

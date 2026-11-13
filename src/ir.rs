@@ -130,21 +130,17 @@ pub enum ReduceDim {
 }
 
 impl ReduceDim {
-    fn from_name(name: &str) -> Option<ReduceDim> {
-        Some(match name {
-            "row" => ReduceDim::Row,
-            "col" => ReduceDim::Col,
-            "scalar" => ReduceDim::Scalar,
-            _ => return None,
-        })
-    }
-
-    fn from_tag(tag: u8) -> Option<ReduceDim> {
-        Some(match tag {
-            0 => ReduceDim::Row,
-            1 => ReduceDim::Col,
-            2 => ReduceDim::Scalar,
-            _ => return None,
+    /// The fold an accumulator's shape asks for. An `acc` is one `Dst` tile
+    /// region whatever its shape; the shape says which part is the result, so
+    /// it is also the fold: a `1,32` row is one value per column, a `32,1`
+    /// column one per row, a `1,1` datum the whole tile. `32,32` names no
+    /// fold — it is the matmul accumulator, and a reduce over it is refused.
+    pub fn of(shape: RegShape) -> Option<ReduceDim> {
+        Some(match shape {
+            RegShape::Row => ReduceDim::Col,
+            RegShape::Column => ReduceDim::Row,
+            RegShape::Scalar => ReduceDim::Scalar,
+            RegShape::Tile => return None,
         })
     }
 }
@@ -364,11 +360,13 @@ pub enum Op {
         dtype: DType,
         shape: [u32; 2],
     },
-    /// A named `Dst` accumulator: one 32x32 tile that `matmul` and `store_to`
-    /// write, read back by `store_to` into a buffer. It is mutable — the whole
-    /// point of it is that a K loop adds into the same rows — and it starts
-    /// unspecified: a program that needs zeros stores them (`store_to %acc from
-    /// %zero`). Every name is its own tile; a name is never redefined.
+    /// A named `Dst` accumulator: one tile region that `matmul`, `sum`/`max` and
+    /// `store_to` write, read back by `store_to` into a buffer. It is mutable —
+    /// the whole point of it is that a K loop adds into the same rows, and a
+    /// reduce's fold accumulates — and it starts unspecified: a program that
+    /// needs zeros stores them (`store_to %acc from %zero`). Its shape is which
+    /// part of the region the program means, and for a reduce it is the fold:
+    /// `1,32`, `32,1` or `1,1`, while `32,32` is `matmul`'s.
     Acc {
         value: ValueId,
         dtype: DType,
@@ -457,33 +455,33 @@ pub enum Op {
         a: ValueId,
         b: ValueId,
     },
-    /// `sum <dim> %acc %x %scaler`: fold `x` with an add, into `acc`, scaled
-    /// by the factors in `scaler` (tt-metal's `PoolType::SUM`).
+    /// `sum %acc %x %scaler`: fold `x` with an add, into `acc`, scaled by the
+    /// factors in `scaler` (tt-metal's `PoolType::SUM`).
     ///
-    /// `x` and `scaler` are `load` pages, because the folding happens on the
-    /// Src path: `Row` is the Matrix Unit's `x @ scaler` (tt-metal's split —
-    /// `SUM` with `ReduceDim::ROW` is a matmul against the scaler's column of
-    /// ones), and `Col`/`Scalar` are `GAPOOL`, whose scaler is its `SrcB`
-    /// operand. The scaler's layout follows the hardware: column 0 for `Row`,
-    /// row 0 otherwise.
+    /// The accumulator's shape picks the axis and the result's home: `1,32`
+    /// folds the rows of each column into row 0 (tt-metal's `ReduceDim::Col`),
+    /// `32,1` folds the columns of each row into column 0 (`ReduceDim::Row`,
+    /// zyx's `TileDim` under the same names), and `1,1` folds the whole tile
+    /// into face 0's `[0,0]`. `x` and `scaler` are `load` pages, because the
+    /// folding happens on the Src path: `Row` is the Matrix Unit's `x @ scaler`
+    /// (tt-metal's split — `SUM` with `ReduceDim::ROW` is a matmul against the
+    /// scaler's column of ones), and `Col`/`Scalar` are `GAPOOL`, whose scaler
+    /// is its `SrcB` operand. The scaler's layout follows the hardware: column
+    /// 0 for `Row`, row 0 otherwise.
     Sum {
         acc: ValueId,
-        dim: ReduceDim,
         x: ValueId,
         scaler: ValueId,
     },
-    /// `max <dim> %acc %x`: fold `x` with a maximum into `acc` (tt-metal's
-    /// `PoolType::MAX`, `GMPOOL`).
+    /// `max %acc %x`: fold `x` with a maximum into `acc` (tt-metal's
+    /// `PoolType::MAX`, `GMPOOL`). The accumulator's shape picks the axis, as
+    /// it does for `sum`.
     ///
     /// No scaler: `GMPOOL` applies only the exponent of a non-unity scaler
     /// (`exp2(floor(log2(|s|)))`), so tt-metal always reduces `MAX` with 1.0
     /// and scales the packed result afterwards with an SFPU multiply. The
     /// compiler supplies the 1.0 tile this op's `SrcB` still needs.
-    Max {
-        acc: ValueId,
-        dim: ReduceDim,
-        x: ValueId,
-    },
+    Max { acc: ValueId, x: ValueId },
 }
 
 impl Op {
@@ -804,10 +802,20 @@ impl Kernel {
                     }
                 }
                 Op::Acc { dtype, shape, .. } => {
-                    if shape != [32, 32] {
-                        let _ = (at, shape);
-                        return Err(Error::TT_ERROR_ACC_SHAPE);
-                    }
+                    // An `acc` is always one `Dst` tile region; its shape says
+                    // which part of it the program means. `32,32` is `matmul`'s,
+                    // and a reduce's shape is the vector it leaves (see
+                    // `ReduceDim::of`).
+                    let reg = match shape {
+                        [1, 32] => RegShape::Row,
+                        [32, 1] => RegShape::Column,
+                        [1, 1] => RegShape::Scalar,
+                        [32, 32] => RegShape::Tile,
+                        _ => {
+                            let _ = (at, shape);
+                            return Err(Error::TT_ERROR_ACC_SHAPE);
+                        }
+                    };
                     if !matches!(dtype, DType::F32 | DType::Bf16) {
                         let _ = (at, dtype);
                         return Err(Error::TT_ERROR_ACC_DTYPE);
@@ -815,7 +823,7 @@ impl Kernel {
                     ValueInfo {
                         kind: ValueKind::Acc,
                         dtype,
-                        shape: RegShape::Tile,
+                        shape: reg,
                     }
                 }
                 Op::Grid { columns, rows } => {
@@ -1045,7 +1053,7 @@ impl Kernel {
                             let _ = (v.dtype, b.dtype);
                             return Err(Error::TT_ERROR_STORE_PARAM_CAST);
                         }
-                        if v.shape != RegShape::Tile {
+                        if v.shape != RegShape::Tile && v.kind != ValueKind::Acc {
                             let _ = v.shape;
                             return Err(Error::TT_ERROR_STORE_PARAM_VALUE_NOT_TILE);
                         }
@@ -1071,7 +1079,7 @@ impl Kernel {
                         let _ = (unit_shape, access);
                         return Err(Error::TT_ERROR_ACCESS_SHAPE);
                     }
-                    if v.shape != unit {
+                    if v.shape != unit && v.kind != ValueKind::Acc {
                         let _ = (unit, v.shape);
                         return Err(Error::TT_ERROR_STORE_BUFFER_SHAPE);
                     }
@@ -1224,8 +1232,8 @@ impl Kernel {
                     let c = *lookup(&values, &visible, acc, at)?;
                     let x = *lookup(&values, &visible, a, at)?;
                     let y = *lookup(&values, &visible, b, at)?;
-                    if c.kind != ValueKind::Acc {
-                        let _ = (at, acc);
+                    if c.kind != ValueKind::Acc || c.shape != RegShape::Tile {
+                        let _ = (at, acc, c.shape);
                         return Err(Error::TT_ERROR_MATMUL_ACC);
                     }
                     if !is_value(x.kind) || !is_value(y.kind) {
@@ -1263,6 +1271,12 @@ impl Kernel {
                     if c.kind != ValueKind::Acc {
                         let _ = (at, acc);
                         return Err(Error::TT_ERROR_REDUCE_ACC);
+                    }
+                    // The accumulator's shape is the fold, so a `32,32` acc has
+                    // none: that is the `matmul` accumulator, not a reduce's.
+                    if ReduceDim::of(c.shape).is_none() {
+                        let _ = (at, acc, c.shape);
+                        return Err(Error::TT_ERROR_REDUCE_ACC_SHAPE);
                     }
                     // The folding happens on the Src path, from an L1 page:
                     // both operands must be `load`s, as a `matmul`'s are.
@@ -1462,7 +1476,7 @@ fn param_elements(k: &Kernel, def: &[usize], param: ValueId) -> Option<u32> {
 /// The byte form's magic.
 pub const MAGIC: [u8; 4] = *b"TTIR";
 /// The IR version this build reads.
-pub const VERSION: u32 = 8;
+pub const VERSION: u32 = 9;
 
 impl Kernel {
     /// Read the byte form. A wrong magic, an unknown version or a truncated
@@ -1617,21 +1631,12 @@ impl Kernel {
                     let acc = r.u32()?;
                     let x = r.u32()?;
                     let scaler = r.u32()?;
-                    let dim =
-                        ReduceDim::from_tag(r.u8()?).ok_or(Error::TT_ERROR_INSTRUCTION_TAG)?;
-                    Op::Sum {
-                        acc,
-                        dim,
-                        x,
-                        scaler,
-                    }
+                    Op::Sum { acc, x, scaler }
                 }
                 18 => {
                     let acc = r.u32()?;
                     let x = r.u32()?;
-                    let dim =
-                        ReduceDim::from_tag(r.u8()?).ok_or(Error::TT_ERROR_INSTRUCTION_TAG)?;
-                    Op::Max { acc, dim, x }
+                    Op::Max { acc, x }
                 }
                 other => {
                     let _ = other;
@@ -1684,6 +1689,10 @@ impl Cursor<'_> {
 
     fn dtype(&mut self) -> Result<DType, Error> {
         let tag = self.u8()?;
+        // tt-metal's `DataFormat::Tf32` is 4; the dtype itself is not wired yet.
+        if tag == 4 {
+            return Err(Error::TT_TODO_TF32);
+        }
         DType::from_tag(tag).ok_or(Error::TT_ERROR_DTYPE_TAG)
     }
 
@@ -1828,21 +1837,13 @@ impl Kernel {
                 continue;
             }
             if first == "sum" || first == "max" {
-                let word = t.ident()?;
-                let dim =
-                    ReduceDim::from_name(&word).ok_or_else(|| t.err("no reduce dimension"))?;
                 let acc = t.value(&p.symbols)?;
                 let x = t.value(&p.symbols)?;
                 let op = if first == "sum" {
                     let scaler = t.value(&p.symbols)?;
-                    Op::Sum {
-                        acc,
-                        dim,
-                        x,
-                        scaler,
-                    }
+                    Op::Sum { acc, x, scaler }
                 } else {
-                    Op::Max { acc, dim, x }
+                    Op::Max { acc, x }
                 };
                 t.end()?;
                 p.ops.push(op);
@@ -2146,6 +2147,9 @@ impl<'a> Tokens<'a> {
             "f32" => Ok(DType::F32),
             "bf16" => Ok(DType::Bf16),
             "i32" => Ok(DType::I32),
+            // A real format, but nothing can carry it yet: the dtype, the Src
+            // selection and the explicit casts all land together.
+            "tf32" => Err(Error::TT_TODO_TF32),
             other => Err(self.err(format!("unknown dtype `{other}`"))),
         }
     }

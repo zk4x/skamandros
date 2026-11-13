@@ -18,7 +18,7 @@ values. It names no processor, no `Dst` slot, no `Src` bank, no lane register,
 no semaphore, no unpacker, no packer and no Tensix word:
 
 ```
-version 8
+version 9
 grid 1,1
 %in  = param f32 1024,128
 %out = param f32 1024,128
@@ -309,24 +309,28 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   width. A `load` that also feeds a datapath op keeps its `Dst` unpack and is
   unpacked once more into `Src` at the matmul; its page is released after the
   Matrix Unit has read it.
-- `sum` and `max` fold a tile into an `acc`, spelled as tt-metal's `ReduceDim`:
-  `sum row %acc %x %scaler`, `sum col %acc %x %scaler`,
-  `sum scalar %acc %x %scaler`, and `max row|col|scalar %acc %x`. `row` is one
-  value per row, in the result tile's column 0; `col` is one per column, in row
-  0; `scalar` is one datum at face 0's `[0,0]`; everything else in the tile is
-  zero. Both operands are `load` pages, because the fold runs on the Src path.
-  `sum row` is the Matrix Unit's `x @ scaler` — tt-metal's `SUM` with
-  `ReduceDim::ROW` is a matmul against the scaler's column of ones, so the
-  scaler page carries the factor in column 0 and zeros elsewhere, which is also
-  how the result ends up in column 0. `sum col` and `max col` are `GAPOOL` and
-  `GMPOOL` over the four 16x16 faces, with the scaler's factor in row 0 of every
-  face (tt-metal's `prepare_reduce_scaler`); `sum` runs four fidelity phases per
+- `sum` and `max` fold a tile into an `acc`, and the accumulator's shape is
+  the fold: `%acc = acc f32 1,32` folds each column's rows into row 0 (one
+  value per column), `32,1` folds each row's columns into column 0 (one per
+  row), `1,1` folds the whole tile into face 0's `[0,0]`, and `32,32` names no
+  fold at all — it is `matmul`'s, and a reduce over one is
+  `TT_ERROR_REDUCE_ACC_SHAPE`. The spelling is `sum %acc %x %scaler` and
+  `max %acc %x`; everything in the result tile except the folded positions
+  leaves as zeros. Both operands are `load` pages, because the fold runs on
+  the Src path. A `32,1` accumulator is the Matrix Unit's `x @ scaler` —
+  tt-metal's `SUM` with `ReduceDim::ROW` is a matmul against the scaler's
+  column of ones, so the scaler page carries the factor in column 0 and zeros
+  elsewhere, which is also how the result ends up in column 0. A `1,32`
+  accumulator is `GAPOOL` and `GMPOOL` over the four 16x16 faces, with the
+  scaler's factor in row 0 of every face (tt-metal's
+  `prepare_reduce_scaler`); `sum` runs four fidelity phases per
   face. `max` takes no scaler — `GMPOOL` applies only the exponent of a non-unity
   scaler, so it always reduces `MAX` with 1.0 — and the compiler owns that page:
   one 32×32 tile of ones, built at kernel start in the last `Dst` slot and packed
   into a CB only the compiler knows. The pack's edge mask keeps row 0 of each
   face (the packer cannot select a face, so the fold's lower half is written as
-  zeros), and the rest of the tile leaves as zeros. `max row` unpacks with the
+  zeros), and the rest of the tile leaves as zeros. `max` with a `32,1`
+  accumulator unpacks with the
   unpacker's haloize transpose (so the fold runs along the tile's rows) and then
   turns the fold's row into column 0 through tt-metal's
   `reduce_row_perform_transpose<true>`: the `Dst` row is moved to `SrcB` rows
@@ -335,8 +339,8 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   halves are restored with `MOVA2D`. The moves run with
   `DISABLE_IMPLIED_SRCA_FMT` and `ALU_FORMAT_SPEC_REG0_SrcA = Float32` (the
   implied `TF32` has no 16-bit half to move), and the pack's mask keeps column
-  0 of every row. `sum scalar` and `max scalar` are refused with
-  `TT_TODO_REDUCE` until the scalar transposes land.
+  0 of every row. A `1,1` accumulator is refused with `TT_TODO_REDUCE` until
+  the scalar transposes land.
 - Broadcast, `eq`/`noteq`, the remaining unary and binary ops, and the `bool`
   datapath in a parameter or buffer are accepted by the format and verifier and
   refused loudly by lowering, not guessed at.
