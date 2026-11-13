@@ -5,21 +5,30 @@
 
 use crate::ir::DType;
 
-/// One SFPU instruction.
+/// One unary SFPU instruction: a lane register into another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SfpOp {
+pub enum UnarySfpOp {
     Neg,
     Abs,
+    BitNot,
+    /// `d = the exponent field of a`, as a two's complement integer and
+    /// without the 127 bias (`SFPEXEXP`, tt-metal's
+    /// `ckernel_sfpu_exp2.h`'s `exexp(·, NoDebias)`).
+    Exexp,
+}
+
+/// One binary SFPU instruction: two lane registers into a third.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinarySfpOp {
     Add,
     Sub,
     Mul,
     BitAnd,
     BitOr,
     BitXor,
-    BitNot,
     /// `d = a << b`, the logical left shift by the amount in lane `b`
     /// (`SFPSHFT`; its amount is signed, so `b` is non-negative here and
-    /// [`SfpOp::Shr`] is the one that negates it).
+    /// [`BinarySfpOp::Shr`] is the one that negates it).
     Shl,
     /// `d = a >> b`, the logical right shift by the amount in lane `b`. The
     /// encoding negates the amount in `b`'s own lane (`SFPSHFT` shifts left for
@@ -27,16 +36,12 @@ pub enum SfpOp {
     /// caller that wants the amount to survive must re-load it.
     Shr,
     /// `d = a + b` over two's complement integers (`SFPIADD`'s add form). The
-    /// SFPU's `SfpOp::Add` is `SFPMAD`'s float add, so a lane holding integer
-    /// bits needs this one.
+    /// SFPU's [`BinarySfpOp::Add`] is `SFPMAD`'s float add, so a lane holding
+    /// integer bits needs this one.
     IAdd,
     /// `d = a - b` over two's complement integers (`SFPIADD`'s two's
-    /// complement form). `SfpOp::Sub` is the float subtract.
+    /// complement form). [`BinarySfpOp::Sub`] is the float subtract.
     ISub,
-    /// `d = the exponent field of a`, as a two's complement integer and
-    /// without the 127 bias (`SFPEXEXP`, tt-metal's
-    /// `ckernel_sfpu_exp2.h`'s `exexp(·, NoDebias)`).
-    Exexp,
     /// `d = a` with `d`'s exponent field replaced by `b & 0xff`: the sign and
     /// mantissa of `a`, the exponent of `b` (`SFPSETEXP`'s integer form,
     /// tt-metal's `setexp`). `d` must not be `a` or `b`.
@@ -108,41 +113,100 @@ pub enum PackMask {
     Row,
 }
 
+/// A writable lane register (`SFPLOAD`/`SFPSTORE` address `L0..L7`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LReg(pub u8);
+
+/// A `Dst` register: one 32x32 tile region of the accumulator file, addressed by
+/// a row inside it ([`Dst::ROWS`] of them in the 32-bit mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Dst(pub u8);
+
+impl Dst {
+    /// `Dst` rows one register holds in 32-bit mode: a 32x32 tile of 16-lane
+    /// rows, two rows per tile row.
+    pub const ROWS: u32 = 64;
+}
+
+/// A circular buffer id: an entry of the `LocalCBInterface` table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CB(pub u8);
+
+impl From<LReg> for u32 {
+    fn from(reg: LReg) -> u32 {
+        u32::from(reg.0)
+    }
+}
+
+impl From<Dst> for u32 {
+    fn from(reg: Dst) -> u32 {
+        u32::from(reg.0)
+    }
+}
+
+impl From<CB> for u32 {
+    fn from(cb: CB) -> u32 {
+        u32::from(cb.0)
+    }
+}
+
 /// One instruction of a compute core's program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MirOp {
     /// `SFPLOAD`: `Dst` row into a lane register. `dtype` picks the lane's
     /// format: `INT32` for a `bool` or `i32` value, `BF16` for a 16-bit `Dst`
     /// datum, `FP32` otherwise.
-    Sfpload { lreg: u8, row: u32, dtype: DType },
+    Sfpload {
+        lreg: LReg,
+        reg: Dst,
+        at: u32,
+        dtype: DType,
+    },
     /// `SFPSTORE`: lane register into a `Dst` row.
-    Sfpstore { lreg: u8, row: u32, dtype: DType },
+    Sfpstore {
+        lreg: LReg,
+        reg: Dst,
+        at: u32,
+        dtype: DType,
+    },
     /// `SFPLOADI` twice: the two halves of `bits` into every lane of `lreg`.
     /// The only way a compile-time constant reaches the `Dst`, so a fill of an
     /// accumulator can name its value.
-    LaneConst { lreg: u8, bits: u32 },
-    /// One SFPU arithmetic instruction; `b` is `None` for a unary op.
-    Sfp {
-        op: SfpOp,
-        a: u8,
-        b: Option<u8>,
-        d: u8,
+    LaneConst { lreg: LReg, bits: u32 },
+    /// One unary SFPU instruction; the operand is a lane register.
+    UnarySfp { op: UnarySfpOp, a: LReg, d: LReg },
+    /// One binary SFPU instruction; both operands are lane registers.
+    BinarySfp {
+        op: BinarySfpOp,
+        a: LReg,
+        b: LReg,
+        d: LReg,
     },
     /// A lanewise comparison, `-1`/`0` into `d`.
-    Compare { op: CmpOp, a: u8, b: u8, d: u8 },
+    Compare {
+        op: CmpOp,
+        a: LReg,
+        b: LReg,
+        d: LReg,
+    },
     /// A lanewise conversion from `from` to `to`, in the SFPU's 32-bit lane,
     /// with the rounding the C type has: `(int)f` truncates, `i32` to `f32`
     /// rounds to nearest, `(bool)x` is `x != 0`.
     Cast {
         from: DType,
         to: DType,
-        a: u8,
-        d: u8,
+        a: LReg,
+        d: LReg,
     },
     /// `cond ? t : f`, lanewise, through the SFPU lane flags.
-    Select { cond: u8, t: u8, f: u8, d: u8 },
+    Select {
+        cond: LReg,
+        t: LReg,
+        f: LReg,
+        d: LReg,
+    },
     /// The lanewise maximum, through the SFPU lane flags.
-    Max { a: u8, b: u8, d: u8 },
+    Max { a: LReg, b: LReg, d: LReg },
     /// The unpacker's `Config` bank for `unit`: the L1 format, which path the
     /// page takes (`Dst` at [`MirOp::Setdst`]'s row, or `SrcA`/`SrcB` at
     /// [`MirOp::Setadczw`]'s face), and — on the `Src` path — the haloize
@@ -157,17 +221,11 @@ pub enum MirOp {
         dtype: DType,
         haloize: bool,
     },
-    /// `UNPACR`: the page at the head of `cb`'s ring into `unit`'s configured
-    /// destination (see [`MirOp::UnpackConfig`]), the face [`MirOp::Setadczw`]
-    /// chose and the run its `count` datums name. `flip` hands the `Src` bank to
-    /// the Matrix Unit. The base is read from the ring's read pointer at run
-    /// time.
-    Unpacr {
-        cb: u32,
-        unit: u8,
-        count: u32,
-        flip: bool,
-    },
+    /// `UNPACR`: the page [`MirOp::SetUnpackBase`] names into `unit`'s
+    /// configured destination (see [`MirOp::UnpackConfig`]), the face
+    /// [`MirOp::Setadczw`] chose and the run its `count` datums name. `flip`
+    /// hands the `Src` bank to the Matrix Unit.
+    Unpacr { unit: u8, count: u32, flip: bool },
     /// `SETADCZW`: which face the unpacker reads next.
     Setadczw { unit: u8, face: u32 },
     /// `SETADCX`: the datum run the unpacker walks.
@@ -177,7 +235,8 @@ pub enum MirOp {
     /// applies afterwards, and the flips hand `SrcA`/`SrcB` back to the
     /// unpacker.
     Mvmul {
-        row: u32,
+        reg: Dst,
+        at: u32,
         addr_mod: u32,
         flip_a: bool,
         flip_b: bool,
@@ -190,7 +249,8 @@ pub enum MirOp {
         op: ElwOp,
         bcast: Bcast,
         addr_mod: u32,
-        dst_row: u32,
+        reg: Dst,
+        at: u32,
     },
     /// `GAPOOL`: the Matrix Unit folds one 16x16 face over its rows into the
     /// destination row, `SrcB`'s row being the weight — tt-metal's `SUM` with
@@ -199,7 +259,8 @@ pub enum MirOp {
         flip_src_b: bool,
         flip_src_a: bool,
         addr_mod: u32,
-        dst_row: u32,
+        reg: Dst,
+        at: u32,
     },
     /// `GMPOOL`: the max fold over one 16x16 face's rows into the destination
     /// row. `arg_max` is always `INDEX_DIS` (0): ttsim refuses the index bit
@@ -209,7 +270,8 @@ pub enum MirOp {
         flip_src_a: bool,
         addr_mod: u32,
         arg_max: u32,
-        dst_row: u32,
+        reg: Dst,
+        at: u32,
     },
     /// `MOVD2B`: `Dst` row `dst_row` into `SrcB` row `src_row`. `move4_rows`
     /// moves four rows instead of one, and `use_dst32b_lo` reads the low half
@@ -219,7 +281,8 @@ pub enum MirOp {
         src_row: u32,
         addr_mod: u32,
         move4_rows: bool,
-        dst_row: u32,
+        reg: Dst,
+        at: u32,
     },
     /// `MOVB2D`: `SrcB` rows from `src_row` into `Dst` rows from `dst_row`, the
     /// inverse of [`MirOp::Movd2b`]. `move4_rows` moves four rows, and
@@ -229,7 +292,8 @@ pub enum MirOp {
         src_row: u32,
         addr_mod: u32,
         move4_rows: bool,
-        dst_row: u32,
+        reg: Dst,
+        at: u32,
     },
     /// `MOVB2A`: `SrcB` rows from `src_b_row` into `SrcA` rows from `src_a_row`.
     /// A four-row move; the way the transposed low halves reach `SrcA` for a
@@ -248,7 +312,8 @@ pub enum MirOp {
         src_row: u32,
         addr_mod: u32,
         move8_rows: bool,
-        dst_row: u32,
+        reg: Dst,
+        at: u32,
     },
     /// `TRNSPSRCB`: transpose the 16x16 block in `SrcB` rows 16..31 in place.
     Trnspsrcb,
@@ -284,30 +349,39 @@ pub enum MirOp {
     /// asynchronous, so a value the Matrix Unit produced is not readable — by
     /// the packer or by the next kernel — until this returns.
     WaitMatrix,
-    /// The base `Dst` row an unpack writes to.
-    Setdst { row: u32 },
-    /// The packer drains into the page at the tail of `cb`'s ring. The base is
-    /// read from the ring's write pointer at run time; `row` is the `Dst` row
-    /// the first packed row comes from, the packer's `W` counter. `dtype` picks
-    /// the read path: `Bf16` reads a 16-bit `Dst`, everything else 32-bit.
-    Pack {
-        cb: u32,
-        rows: u32,
-        row: u32,
-        last: bool,
-        dtype: DType,
-        mask: PackMask,
-    },
+    /// The base `Dst` register an unpack writes to.
+    Setdst { reg: Dst },
+    /// The packer's L1 destination: the page [`MirOp::CbReserve`]s reserved,
+    /// taken from the ring's write pointer at run time and written into
+    /// `THCON_SEC0_REG1_L1_Dest_addr` as a pushed Tensix instruction, so it is
+    /// ordered with the [`MirOp::PackRows`] that read it.
+    SetPackBase { cb: CB },
+    /// The packer's `Config` bank: the fields a pack's formats and edge mask
+    /// decide. Everything a pack does not vary goes here once, so the bank is
+    /// written once per kernel instead of once per pack. `dtype` picks the read
+    /// path: `Bf16` reads a 16-bit `Dst`, everything else 32-bit.
+    SetPackConfig { dtype: DType, mask: PackMask },
+    /// `DEST_TARGET_REG_CFG_PACK_SEC0_Offset`: the `Dst` register and row the
+    /// next pack reads its first row from.
+    SetPackOffset { reg: Dst, at: u32 },
+    /// `PACR` per four `Dst` rows: `rows` rows from the offset
+    /// [`MirOp::SetPackOffset`] set, into the page [`MirOp::SetPackBase`]
+    /// named. `last` closes the packed tile.
+    PackRows { rows: u32, last: bool },
+    /// The unpacker's L1 source: the page [`MirOp::CbWait`] waited for, taken
+    /// from the ring's read pointer at run time and written into
+    /// `THCON_SEC{0,1}_REG3_Base_address` as a pushed Tensix instruction.
+    SetUnpackBase { cb: CB, unit: u8 },
     /// `cb_wait_front`: wait for a page to be published on this ring.
-    CbWait { cb: u32 },
+    CbWait { cb: CB },
     /// `cb_pop_front`: release the page [`MirOp::CbWait`] waited for, after the
     /// unpacker has drained it.
-    CbPop { cb: u32 },
+    CbPop { cb: CB },
     /// `cb_reserve_back`: wait for a free page on this ring.
-    CbReserve { cb: u32 },
+    CbReserve { cb: CB },
     /// `cb_push_back`: publish the page [`MirOp::CbReserve`] reserved, after the
     /// packer has drained `Dst`.
-    CbPush { cb: u32 },
+    CbPush { cb: CB },
     /// `SEMINIT`: the semaphore's initial `Value` and its `Max`. Not an
     /// instruction: the run's setup folds every one of these into the
     /// semaphore table it initialises before the three roles are released. The

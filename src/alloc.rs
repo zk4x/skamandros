@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 
 use crate::ir::{Error, Kernel, Op, OpId, Types, ValueId};
+use crate::mir::{Dst, LReg};
 
 /// `Dst` slots the hardware has (32-bit tiles).
 pub const DST_SLOTS: u8 = 8;
@@ -23,7 +24,7 @@ pub const LREGS: u8 = 8;
 /// Where a register value lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Place {
-    Dst(u8),
+    Dst(Dst),
 }
 
 /// The allocation of one kernel.
@@ -32,7 +33,7 @@ pub struct Alloc {
     /// Home of each value, if it is a register value.
     pub place: BTreeMap<OpId, Place>,
     /// Lane registers a value's own body uses: `(input, output)`.
-    pub lreg: BTreeMap<OpId, (u8, u8)>,
+    pub lreg: BTreeMap<OpId, (LReg, LReg)>,
     /// Peak `Dst` slots in use.
     pub dst_peak: u8,
 }
@@ -47,7 +48,7 @@ impl Alloc {
 /// Allocate homes for the register values of `k`.
 pub fn allocate(k: &Kernel, types: &Types) -> Result<Alloc, Error> {
     let mut place: BTreeMap<OpId, Place> = BTreeMap::new();
-    let mut lreg: BTreeMap<OpId, (u8, u8)> = BTreeMap::new();
+    let mut lreg: BTreeMap<OpId, (LReg, LReg)> = BTreeMap::new();
     // A kernel with a `max` reduce gives the compiler the last slot for its
     // 1.0 page (see `lower`): the page is written at the start of the kernel
     // and packed before any allocated value is live, so the slot must not be
@@ -91,8 +92,8 @@ pub fn allocate(k: &Kernel, types: &Types) -> Result<Alloc, Error> {
                 continue;
             }
             if last_use.get(value).is_some_and(|u| *u <= id) {
-                let Place::Dst(slot) = *home;
-                free[slot as usize] = false;
+                let Place::Dst(reg) = *home;
+                free[usize::from(reg.0)] = false;
                 live = live.saturating_sub(1);
                 freed.push(*value);
             }
@@ -121,8 +122,8 @@ pub fn allocate(k: &Kernel, types: &Types) -> Result<Alloc, Error> {
             return Err(Error::TT_ERROR_DST_SLOTS_EXHAUSTED);
         };
         free[slot] = true;
-        place.insert(value, Place::Dst(slot as u8));
-        lreg.insert(value, (0, 1));
+        place.insert(value, Place::Dst(Dst(slot as u8)));
+        lreg.insert(value, (LReg(0), LReg(1)));
         live += 1;
         peak = peak.max(live);
     }

@@ -14,8 +14,7 @@
 
 use crate::alloc::DST_SLOTS;
 use crate::ir::Error;
-use crate::lower::DST_ROWS;
-use crate::mir::{Machine, MirOp, Role};
+use crate::mir::{Dst, Machine, MirOp, Role};
 
 /// One `Dst` access, in program order: the position of the op in
 /// [`Machine::ops`], the role that issues it, and whether it writes.
@@ -62,39 +61,47 @@ type Edge = (Role, Role);
 pub fn reg_sync(m: &mut Machine) {
     // The unpacker's `Dst` target and, per unit, whether it is configured for
     // `Src`: an `UNPACR` writes `Dst` only when its unit is on the `Dst` path.
-    let mut target: Option<u32> = None;
+    let mut target: Option<Dst> = None;
     let mut to_src = [false; 2];
     let mut touches: Vec<Vec<Access>> = vec![Vec::new(); DST_SLOTS as usize];
     for (at, (role, op)) in m.ops.iter().enumerate() {
-        let mut touched: Vec<(u8, bool)> = Vec::new();
+        let mut touched: Vec<(Dst, bool)> = Vec::new();
         match *op {
-            MirOp::Setdst { row } => target = Some(row),
+            MirOp::Setdst { reg } => target = Some(reg),
             MirOp::UnpackConfig {
                 unit, to_src: src, ..
             } => to_src[unit as usize] = src,
             MirOp::Unpacr { unit, .. } => {
                 if !to_src[unit as usize] {
-                    let row = target.expect("the Dst path names its row with Setdst");
-                    touched.push((slot(row), true));
+                    let reg = target.expect("the Dst path names its register with Setdst");
+                    touched.push((reg, true));
                 }
             }
-            MirOp::Sfpstore { row, .. } => touched.push((slot(row), true)),
-            MirOp::Sfpload { row, .. } => touched.push((slot(row), false)),
-            // The Matrix Unit's accumulator: `MVMUL` carries one row of the
-            // slot it accumulates into.
-            MirOp::Mvmul { row, .. } => touched.push((slot(row), true)),
-            MirOp::Elw { dst_row, .. }
-            | MirOp::Gapool { dst_row, .. }
-            | MirOp::Gmpool { dst_row, .. }
-            | MirOp::Mova2d { dst_row, .. }
-            | MirOp::Movb2d { dst_row, .. } => touched.push((slot(dst_row), true)),
+            MirOp::Sfpstore { reg, .. } => touched.push((reg, true)),
+            MirOp::Sfpload { reg, .. } => touched.push((reg, false)),
+            // The Matrix Unit's accumulator: `MVMUL` carries the register it
+            // accumulates into.
+            MirOp::Mvmul { reg, .. } => touched.push((reg, true)),
+            MirOp::Elw { reg, .. }
+            | MirOp::Gapool { reg, .. }
+            | MirOp::Gmpool { reg, .. }
+            | MirOp::Mova2d { reg, .. }
+            | MirOp::Movb2d { reg, .. } => touched.push((reg, true)),
             // `MOVD2B` reads `Dst` into `SrcB`.
-            MirOp::Movd2b { dst_row, .. } => touched.push((slot(dst_row), false)),
-            MirOp::Pack { row, .. } => touched.push((slot(row), false)),
+            MirOp::Movd2b { reg, .. } => touched.push((reg, false)),
+            // `SetPackOffset` only names the register; the transfer that reads
+            // it is the `PACR`s of `PackRows`, and that is where the read
+            // completes (so the release seam goes after them, not after the
+            // setting).
+            MirOp::SetPackOffset { reg, .. } => target = Some(reg),
+            MirOp::PackRows { .. } => {
+                let reg = target.expect("a pack names its register with SetPackOffset");
+                touched.push((reg, false));
+            }
             _ => {}
         }
-        for (slot, write) in touched {
-            touches[slot as usize].push(Access {
+        for (reg, write) in touched {
+            touches[usize::from(reg.0)].push(Access {
                 at,
                 role: *role,
                 write,
@@ -395,11 +402,6 @@ pub fn reg_sync(m: &mut Machine) {
     m.ops = ops;
 }
 
-/// The `Dst` slot a row belongs to.
-fn slot(row: u32) -> u8 {
-    (row / DST_ROWS) as u8
-}
-
 /// Collapse every run of identical consecutive row triples into one body plus a
 /// [`MirOp::Repeat`].
 ///
@@ -454,63 +456,60 @@ pub fn fuse(m: &mut Machine) {
 fn triple(ops: &[MirOp], at: usize) -> Option<[MirOp; 3]> {
     let [a, b, c] = [*ops.get(at)?, *ops.get(at + 1)?, *ops.get(at + 2)?];
     match (a, b, c) {
-        (MirOp::Sfpload { .. }, MirOp::Sfp { .. }, MirOp::Sfpstore { .. }) => Some([a, b, c]),
+        (
+            MirOp::Sfpload { .. },
+            MirOp::UnarySfp { .. } | MirOp::BinarySfp { .. },
+            MirOp::Sfpstore { .. },
+        ) => Some([a, b, c]),
         _ => None,
     }
 }
 
-/// Is `following` `body` with both `Dst` rows advanced by one, everything else
-/// identical?
+/// Is `following` `body` with both `Dst` addresses two rows further on, and the
+/// lane op itself identical?
 fn same_shifted(body: &[MirOp; 3], following: &[MirOp; 3]) -> bool {
     match (body, following) {
         (
             [
                 MirOp::Sfpload {
                     lreg: la,
-                    row: ra,
+                    reg: ra,
+                    at: aa,
                     dtype: ia,
                 },
-                MirOp::Sfp {
-                    op: oa,
-                    a: aa,
-                    b: ba,
-                    d: da,
-                },
+                op_a,
                 MirOp::Sfpstore {
                     lreg: sa,
-                    row: sa_row,
+                    reg: sra,
+                    at: saa,
                     dtype: isa,
                 },
             ],
             [
                 MirOp::Sfpload {
                     lreg: lb,
-                    row: rb,
+                    reg: rb,
+                    at: ab,
                     dtype: ib,
                 },
-                MirOp::Sfp {
-                    op: ob,
-                    a: ab,
-                    b: bb,
-                    d: db,
-                },
+                op_b,
                 MirOp::Sfpstore {
                     lreg: sb,
-                    row: sb_row,
+                    reg: srb,
+                    at: sab,
                     dtype: isb,
                 },
             ],
         ) => {
             la == lb
-                && sa == sb
+                && ra == rb
                 && ia == ib
+                && *ab == *aa + 2
+                && op_a == op_b
+                && sa == sb
+                && sra == srb
                 && isa == isb
-                && oa == ob
-                && aa == ab
-                && ba == bb
-                && da == db
-                && *rb == ra + 2
-                && *sb_row == *sa_row + 2
+                && *sab == *saa + 2
         }
         _ => false,
     }
@@ -539,25 +538,30 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
     ] {
         let mut at = 0usize;
         let mut depth = 0usize;
+        // The `Dst` row the last `SetPackOffset` named, so `PackRows` can check
+        // that the run it moves stays inside one register.
+        let mut pack_at: Option<u32> = None;
         while at < ops.len() {
             match ops[at] {
-                MirOp::Sfpload { lreg, row, .. } => {
-                    if lreg >= crate::alloc::LREGS {
+                MirOp::Sfpload { lreg, reg, .. } => {
+                    if lreg.0 >= crate::alloc::LREGS {
                         let _ = (name, at, lreg);
                         return Err(Error::TT_ERROR_LANE_REGISTER);
                     }
-                    if row >= u32::from(DST_SLOTS) * DST_ROWS {
-                        let _ = (name, at, row);
+                    if reg.0 >= DST_SLOTS {
+                        let _ = (name, at, reg);
                         return Err(Error::TT_ERROR_DST_ROW);
                     }
                 }
-                MirOp::Sfpstore { lreg, row, .. } => {
-                    if lreg >= crate::alloc::LREGS {
+                MirOp::Sfpstore {
+                    lreg, reg, at: row, ..
+                } => {
+                    if lreg.0 >= crate::alloc::LREGS {
                         let _ = (name, at, lreg);
                         return Err(Error::TT_ERROR_LANE_REGISTER);
                     }
-                    if row >= u32::from(DST_SLOTS) * DST_ROWS {
-                        let _ = (name, at, row);
+                    if reg.0 >= DST_SLOTS || row >= Dst::ROWS {
+                        let _ = (name, at, reg, row);
                         return Err(Error::TT_ERROR_DST_ROW);
                     }
                     // `SFPSTORE`'s `dest_reg_addr` names a row *pair*: the
@@ -569,14 +573,22 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                     }
                 }
                 MirOp::LaneConst { lreg, .. } => {
-                    if lreg >= crate::alloc::LREGS {
+                    if lreg.0 >= crate::alloc::LREGS {
                         let _ = (name, at, lreg);
                         return Err(Error::TT_ERROR_LANE_REGISTER);
                     }
                 }
-                MirOp::Sfp { a, b, d, .. } => {
-                    for lreg in [Some(a), b, Some(d)].into_iter().flatten() {
-                        if lreg >= crate::alloc::LREGS {
+                MirOp::UnarySfp { a, d, .. } => {
+                    for lreg in [a, d] {
+                        if lreg.0 >= crate::alloc::LREGS {
+                            let _ = (name, at, lreg);
+                            return Err(Error::TT_ERROR_LANE_REGISTER);
+                        }
+                    }
+                }
+                MirOp::BinarySfp { a, b, d, .. } => {
+                    for lreg in [a, b, d] {
+                        if lreg.0 >= crate::alloc::LREGS {
                             let _ = (name, at, lreg);
                             return Err(Error::TT_ERROR_LANE_REGISTER);
                         }
@@ -584,15 +596,15 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                 }
                 MirOp::Cast { a, d, .. } => {
                     for lreg in [a, d] {
-                        if lreg >= crate::alloc::LREGS {
+                        if lreg.0 >= crate::alloc::LREGS {
                             let _ = (name, at, lreg);
                             return Err(Error::TT_ERROR_LANE_REGISTER);
                         }
                     }
                 }
-                MirOp::Setdst { row } => {
-                    if row >= u32::from(DST_SLOTS) * DST_ROWS {
-                        let _ = (name, at, row);
+                MirOp::Setdst { reg } => {
+                    if reg.0 >= DST_SLOTS {
+                        let _ = (name, at, reg);
                         return Err(Error::TT_ERROR_DST_ROW);
                     }
                 }
@@ -621,7 +633,7 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                 }
                 MirOp::Compare { a, b, d, .. } => {
                     for lreg in [a, b, d] {
-                        if lreg >= crate::alloc::LREGS {
+                        if lreg.0 >= crate::alloc::LREGS {
                             let _ = (name, at, lreg);
                             return Err(Error::TT_ERROR_LANE_REGISTER);
                         }
@@ -629,7 +641,7 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                 }
                 MirOp::Select { cond, t, f, d } => {
                     for lreg in [cond, t, f, d] {
-                        if lreg >= crate::alloc::LREGS {
+                        if lreg.0 >= crate::alloc::LREGS {
                             let _ = (name, at, lreg);
                             return Err(Error::TT_ERROR_LANE_REGISTER);
                         }
@@ -637,24 +649,49 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                 }
                 MirOp::Max { a, b, d } => {
                     for lreg in [a, b, d] {
-                        if lreg >= crate::alloc::LREGS {
+                        if lreg.0 >= crate::alloc::LREGS {
                             let _ = (name, at, lreg);
                             return Err(Error::TT_ERROR_LANE_REGISTER);
                         }
                     }
                 }
-                MirOp::Unpacr { cb, .. }
-                | MirOp::Pack { cb, .. }
+                MirOp::SetUnpackBase { cb, .. }
+                | MirOp::SetPackBase { cb }
                 | MirOp::CbWait { cb }
                 | MirOp::CbPop { cb }
                 | MirOp::CbReserve { cb }
                 | MirOp::CbPush { cb } => {
                     let _ = cb;
                 }
+                MirOp::Unpacr { unit, count, .. } => {
+                    if count == 0 {
+                        let _ = (name, at, unit);
+                        return Err(Error::TT_ERROR_UNPACK_ZERO_DATUMS);
+                    }
+                }
+                MirOp::SetPackConfig { .. } => {}
+                MirOp::SetPackOffset { reg, at: row } => {
+                    if reg.0 >= DST_SLOTS || row >= Dst::ROWS {
+                        let _ = (name, at, reg, row);
+                        return Err(Error::TT_ERROR_DST_ROW);
+                    }
+                    pack_at = Some(row);
+                }
+                MirOp::PackRows { rows, .. } => {
+                    if rows == 0 {
+                        let _ = (name, at, rows);
+                        return Err(Error::TT_ERROR_PACK_ZERO_ROWS);
+                    }
+                    let row = pack_at.expect("a pack names its row with SetPackOffset");
+                    if row + rows > Dst::ROWS {
+                        let _ = (name, at, row, rows);
+                        return Err(Error::TT_ERROR_DST_ROW);
+                    }
+                }
                 MirOp::Setadczw { .. } | MirOp::Setadcx { .. } => {}
-                MirOp::Mvmul { row, addr_mod, .. } => {
-                    if row >= u32::from(DST_SLOTS) * DST_ROWS {
-                        let _ = (name, at, row);
+                MirOp::Mvmul { reg, addr_mod, .. } => {
+                    if reg.0 >= DST_SLOTS {
+                        let _ = (name, at, reg);
                         return Err(Error::TT_ERROR_DST_ROW);
                     }
                     if addr_mod > 7 {
@@ -662,17 +699,11 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                         return Err(Error::TT_ERROR_ADDR_MOD);
                     }
                 }
-                MirOp::Gapool {
-                    dst_row, addr_mod, ..
-                }
-                | MirOp::Gmpool {
-                    dst_row, addr_mod, ..
-                }
-                | MirOp::Elw {
-                    dst_row, addr_mod, ..
-                } => {
-                    if dst_row >= u32::from(DST_SLOTS) * DST_ROWS {
-                        let _ = (name, at, dst_row);
+                MirOp::Gapool { reg, addr_mod, .. }
+                | MirOp::Gmpool { reg, addr_mod, .. }
+                | MirOp::Elw { reg, addr_mod, .. } => {
+                    if reg.0 >= DST_SLOTS {
+                        let _ = (name, at, reg);
                         return Err(Error::TT_ERROR_DST_ROW);
                     }
                     if addr_mod > 7 {
@@ -682,13 +713,13 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                 }
                 MirOp::Movd2b {
                     src_row,
-                    dst_row,
+                    reg,
                     addr_mod,
                     ..
                 }
                 | MirOp::Movb2d {
                     src_row,
-                    dst_row,
+                    reg,
                     addr_mod,
                     ..
                 } => {
@@ -697,8 +728,8 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                         let _ = (name, at, src_row);
                         return Err(Error::TT_ERROR_SRC_ROW);
                     }
-                    if dst_row >= u32::from(DST_SLOTS) * DST_ROWS {
-                        let _ = (name, at, dst_row);
+                    if reg.0 >= DST_SLOTS {
+                        let _ = (name, at, reg);
                         return Err(Error::TT_ERROR_DST_ROW);
                     }
                     if addr_mod > 7 {
@@ -724,7 +755,7 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                 }
                 MirOp::Mova2d {
                     src_row,
-                    dst_row,
+                    reg,
                     addr_mod,
                     ..
                 } => {
@@ -732,8 +763,8 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                         let _ = (name, at, src_row);
                         return Err(Error::TT_ERROR_SRC_ROW);
                     }
-                    if dst_row >= u32::from(DST_SLOTS) * DST_ROWS {
-                        let _ = (name, at, dst_row);
+                    if reg.0 >= DST_SLOTS {
+                        let _ = (name, at, reg);
                         return Err(Error::TT_ERROR_DST_ROW);
                     }
                     if addr_mod > 7 {
@@ -798,6 +829,7 @@ mod tests {
     use crate::alloc::allocate;
     use crate::ir::Kernel;
     use crate::lower::lower;
+    use crate::mir::LReg;
     use crate::planner::place;
 
     const NEG: &str = "\
@@ -853,8 +885,9 @@ copy 32,32 %out [0] = %b0 [0]
         assert!(matches!(
             math(&m)[2],
             MirOp::Sfpload {
-                lreg: 0,
-                row: 0,
+                lreg: LReg(0),
+                reg: Dst(0),
+                at: 0,
                 dtype: crate::ir::DType::F32
             }
         ));
@@ -880,8 +913,8 @@ copy 32,32 %out [0] = %b0 [0]
         let mut m = machine();
         // Row 1 negated with a different lane register: not the same body.
         let at = math_at(&m, 5);
-        if let MirOp::Sfp { d, .. } = &mut m.ops[at].1 {
-            *d = 5;
+        if let MirOp::UnarySfp { d, .. } = &mut m.ops[at].1 {
+            *d = LReg(5);
         }
         fuse(&mut m);
         let repeats: Vec<u16> = math(&m)
@@ -908,8 +941,9 @@ copy 32,32 %out [0] = %b0 [0]
         m.push(
             Role::Math,
             MirOp::Sfpload {
-                lreg: 9,
-                row: 0,
+                lreg: LReg(9),
+                reg: Dst(0),
+                at: 0,
                 dtype: crate::ir::DType::F32,
             },
         );
@@ -922,8 +956,9 @@ copy 32,32 %out [0] = %b0 [0]
         m.push(
             Role::Math,
             MirOp::Sfpstore {
-                lreg: 0,
-                row: 8 * DST_ROWS,
+                lreg: LReg(0),
+                reg: Dst(DST_SLOTS),
+                at: 0,
                 dtype: crate::ir::DType::F32,
             },
         );
@@ -938,8 +973,9 @@ copy 32,32 %out [0] = %b0 [0]
         m.push(
             Role::Math,
             MirOp::Sfpstore {
-                lreg: 0,
-                row: 1,
+                lreg: LReg(0),
+                reg: Dst(0),
+                at: 1,
                 dtype: crate::ir::DType::F32,
             },
         );

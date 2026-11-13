@@ -14,7 +14,9 @@
 //! stride or a `Dst` address.
 
 use crate::ir::{DType, Error};
-use crate::mir::{Bcast, CmpOp, ElwOp, IOp, Machine, MirOp, PackMask, Role, SfpOp};
+use crate::mir::{
+    Bcast, BinarySfpOp, CB, CmpOp, Dst, ElwOp, IOp, Machine, MirOp, PackMask, Role, UnarySfpOp,
+};
 use crate::riscv::{self as rv, Asm, reg};
 use tt_isa::backend::{
     self, Before, ConfigWords, ThreadConfigEntry, block, cond, wait_for_packer, wait_for_unpacker0,
@@ -206,6 +208,12 @@ fn encode_int(op: &MirOp, out: &mut Stream, loops: &mut Vec<OpenLoop>) -> Result
     Ok(true)
 }
 
+/// The absolute `Dst` row an access names: the register's base plus the offset
+/// inside it, plus a repeat's iteration offset.
+fn dst_row(reg: Dst, at: u32, row_delta: u32) -> u32 {
+    u32::from(reg) * Dst::ROWS + at + row_delta
+}
+
 /// One instruction stream per compute core.
 #[derive(Debug, Clone, Default)]
 pub struct Words {
@@ -369,7 +377,7 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result
                 open_loop(out, &mut loops, count)?;
             }
             MirOp::EndLoop => close_loop(out, &mut loops)?,
-            MirOp::Setdst { row } => state.dst_row = row,
+            MirOp::Setdst { reg } => state.dst_row = u32::from(reg) * Dst::ROWS,
             MirOp::Setadcx { unit, first, count } => {
                 if count == 0 {
                     return Err(Error::TT_ERROR_UNPACK_ZERO_RANGE);
@@ -435,20 +443,17 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result
                 state.cfg[u] = Some(cfg);
                 continue;
             }
-            MirOp::Unpacr {
-                cb,
-                unit,
-                count,
-                flip,
-            } => {
-                if count == 0 {
-                    return Err(Error::TT_ERROR_UNPACK_ZERO_DATUMS);
-                }
-                let u = usize::from(unit);
+            MirOp::SetUnpackBase { cb, unit } => {
                 // The page is at the ring's read pointer, not a compile-time L1
                 // address: write that pointer into the unpacker's base register
                 // after draining the previous unpack.
                 cb_base_unpack(out, cb, unit)?;
+            }
+            MirOp::Unpacr { unit, count, flip } => {
+                if count == 0 {
+                    return Err(Error::TT_ERROR_UNPACK_ZERO_DATUMS);
+                }
+                let u = usize::from(unit);
                 state.x0[u] = 0;
                 state.x1[u] = count - 1;
                 out.push(set_adc_x_unpack(unit, state.x0[u], state.x1[u])?);
@@ -458,7 +463,9 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result
                 out.push(unpack_instruction(unit, flip)?);
             }
             MirOp::CbWait { cb } => {
-                out.asm(|a| rv::cb::wait_front(a, reg::A6, cb, 1, [reg::T0, reg::T1, reg::T2]))?;
+                out.asm(|a| {
+                    rv::cb::wait_front(a, reg::A6, u32::from(cb), 1, [reg::T0, reg::T1, reg::T2])
+                })?;
             }
             MirOp::CbPop { cb } => {
                 // The page is only free once both unpackers have read it.
@@ -473,7 +480,13 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result
                         .map_err(|_| Error::TT_ERROR_STALLWAIT)?,
                 );
                 out.asm(|a| {
-                    rv::cb::pop_front(a, reg::A6, cb, 1, [reg::T0, reg::T1, reg::T2, reg::T6])
+                    rv::cb::pop_front(
+                        a,
+                        reg::A6,
+                        u32::from(cb),
+                        1,
+                        [reg::T0, reg::T1, reg::T2, reg::T6],
+                    )
                 })?;
             }
             MirOp::SemPost { sem } => {
@@ -520,7 +533,7 @@ const INSTRN_BUF: u32 = tt_isa::tensix::INSTRN_BUF_BASE as u32;
 /// The unpacker's read base: the ring's read pointer in 16-byte units, minus the
 /// header unit the unpacker adds (`UNPACR_Regular.md`: `InAddr = (Base_address +
 /// 1 + DigestSize) * 16`).
-fn cb_base_unpack(out: &mut Stream, cb: u32, unit: u8) -> Result<(), Error> {
+fn cb_base_unpack(out: &mut Stream, cb: CB, unit: u8) -> Result<(), Error> {
     out.push(wait_for_unpacker0(Before::EVERYTHING).map_err(|_| Error::TT_ERROR_STALLWAIT)?);
     if unit == 1 {
         out.push(
@@ -540,7 +553,7 @@ fn cb_base_unpack(out: &mut Stream, cb: u32, unit: u8) -> Result<(), Error> {
 }
 
 /// The packer's output base: the ring's write pointer, same 16-byte conversion.
-fn cb_base_pack(out: &mut Stream, cb: u32) -> Result<(), Error> {
+fn cb_base_pack(out: &mut Stream, cb: CB) -> Result<(), Error> {
     out.push(wait_for_packer(Before::EVERYTHING).map_err(|_| Error::TT_ERROR_STALLWAIT)?);
     cb_base(
         out,
@@ -565,12 +578,12 @@ fn cb_base_pack(out: &mut Stream, cb: u32) -> Result<(), Error> {
 /// The caller's `wait_for_unpacker0`/`wait_for_packer` now reaches the write:
 /// because the write is a pushed instruction, `STALLWAIT`'s CONFIG block holds
 /// it until the previous unit has drained.
-fn cb_base(out: &mut Stream, cb: u32, field: i32, config: u16) -> Result<(), Error> {
+fn cb_base(out: &mut Stream, cb: CB, field: i32, config: u16) -> Result<(), Error> {
     out.asm(|a| {
         a.word(rv::lw(
             reg::T0,
             reg::A6,
-            (cb * rv::cb::STRIDE) as i32 + field,
+            (u32::from(cb) * rv::cb::STRIDE) as i32 + field,
         ));
         a.word(rv::srli(reg::T0, reg::T0, 4));
         a.word(rv::addi(reg::T0, reg::T0, -1));
@@ -972,14 +985,34 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
     }
     let bad_isa = |e: tt_isa::isa::EncodeError| bad(e, op);
     match *op {
-        MirOp::Sfpload { lreg, row, dtype } => {
-            let i = encode::sfpload(u32::from(lreg), lane_format(dtype), 0, row + row_delta)
-                .map_err(bad_isa)?;
+        MirOp::Sfpload {
+            lreg,
+            reg,
+            at,
+            dtype,
+        } => {
+            let i = encode::sfpload(
+                u32::from(lreg),
+                lane_format(dtype),
+                0,
+                dst_row(reg, at, row_delta),
+            )
+            .map_err(bad_isa)?;
             out.push(i);
         }
-        MirOp::Sfpstore { lreg, row, dtype } => {
-            let i = encode::sfpstore(u32::from(lreg), lane_format(dtype), 0, row + row_delta)
-                .map_err(bad_isa)?;
+        MirOp::Sfpstore {
+            lreg,
+            reg,
+            at,
+            dtype,
+        } => {
+            let i = encode::sfpstore(
+                u32::from(lreg),
+                lane_format(dtype),
+                0,
+                dst_row(reg, at, row_delta),
+            )
+            .map_err(bad_isa)?;
             out.push(i);
         }
         MirOp::LaneConst { lreg, bits } => {
@@ -988,26 +1021,24 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
                 out.push(i);
             }
         }
-        MirOp::Sfp {
-            op: SfpOp::Neg,
+        MirOp::UnarySfp {
+            op: UnarySfpOp::Neg,
             a,
-            b: None,
             d,
         } => {
             out.push(encode::sfpmov(u32::from(a), u32::from(d), 1).map_err(bad_isa)?);
         }
-        MirOp::Sfp {
-            op: SfpOp::Abs,
+        MirOp::UnarySfp {
+            op: UnarySfpOp::Abs,
             a,
-            b: None,
             d,
         } => {
             out.push(encode::sfpabs(u32::from(a), u32::from(d), 1).map_err(bad_isa)?);
         }
-        MirOp::Sfp {
-            op: SfpOp::Add,
+        MirOp::BinarySfp {
+            op: BinarySfpOp::Add,
             a,
-            b: Some(b),
+            b,
             d,
         } => {
             out.push(
@@ -1015,10 +1046,10 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
                     .map_err(|e| bad(e, op))?,
             );
         }
-        MirOp::Sfp {
-            op: SfpOp::Sub,
+        MirOp::BinarySfp {
+            op: BinarySfpOp::Sub,
             a,
-            b: Some(b),
+            b,
             d,
         } => {
             out.push(
@@ -1026,10 +1057,10 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
                     .map_err(|e| bad(e, op))?,
             );
         }
-        MirOp::Sfp {
-            op: SfpOp::Mul,
+        MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
             a,
-            b: Some(b),
+            b,
             d,
         } => {
             out.push(
@@ -1037,43 +1068,42 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
                     .map_err(|e| bad(e, op))?,
             );
         }
-        MirOp::Sfp {
-            op: SfpOp::BitAnd,
+        MirOp::BinarySfp {
+            op: BinarySfpOp::BitAnd,
             a,
-            b: Some(b),
+            b,
             d,
         } => {
             out.push(encode::sfpand(u32::from(b), u32::from(a), u32::from(d), 1).map_err(bad_isa)?);
         }
-        MirOp::Sfp {
-            op: SfpOp::BitOr,
+        MirOp::BinarySfp {
+            op: BinarySfpOp::BitOr,
             a,
-            b: Some(b),
+            b,
             d,
         } => {
             out.push(encode::sfpor(u32::from(b), u32::from(a), u32::from(d), 1).map_err(bad_isa)?);
         }
-        MirOp::Sfp {
-            op: SfpOp::BitXor,
+        MirOp::BinarySfp {
+            op: BinarySfpOp::BitXor,
             a,
-            b: Some(b),
+            b,
             d,
         } => {
             out.push(encode::sfpmov(u32::from(a), u32::from(d), 0).map_err(bad_isa)?);
             out.push(encode::sfpxor(u32::from(b), u32::from(d)).map_err(bad_isa)?);
         }
-        MirOp::Sfp {
-            op: SfpOp::BitNot,
+        MirOp::UnarySfp {
+            op: UnarySfpOp::BitNot,
             a,
-            b: None,
             d,
         } => {
             out.push(encode::sfpnot(u32::from(a), u32::from(d)).map_err(bad_isa)?);
         }
-        MirOp::Sfp {
-            op: SfpOp::Shl,
+        MirOp::BinarySfp {
+            op: BinarySfpOp::Shl,
             a,
-            b: Some(b),
+            b,
             d,
         } => {
             // `SFPSHFT` shifts its destination in place, so the value is moved
@@ -1081,10 +1111,10 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
             out.push(encode::sfpmov(u32::from(a), u32::from(d), 0).map_err(bad_isa)?);
             out.push(encode::sfpshft(0, u32::from(b), u32::from(d), 0).map_err(bad_isa)?);
         }
-        MirOp::Sfp {
-            op: SfpOp::Shr,
+        MirOp::BinarySfp {
+            op: BinarySfpOp::Shr,
             a,
-            b: Some(b),
+            b,
             d,
         } => {
             out.push(encode::sfpmov(u32::from(a), u32::from(d), 0).map_err(bad_isa)?);
@@ -1097,10 +1127,10 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
             );
             out.push(encode::sfpshft(0, u32::from(b), u32::from(d), 0).map_err(bad_isa)?);
         }
-        MirOp::Sfp {
-            op: SfpOp::IAdd,
+        MirOp::BinarySfp {
+            op: BinarySfpOp::IAdd,
             a,
-            b: Some(b),
+            b,
             d,
         } => {
             // `SFPIADD` adds into its destination, so one operand is moved in:
@@ -1109,10 +1139,10 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
             out.push(encode::sfpmov(u32::from(b), u32::from(d), 0).map_err(bad_isa)?);
             out.push(encode::sfpiadd(0, u32::from(a), u32::from(d), 4).map_err(bad_isa)?);
         }
-        MirOp::Sfp {
-            op: SfpOp::ISub,
+        MirOp::BinarySfp {
+            op: BinarySfpOp::ISub,
             a,
-            b: Some(b),
+            b,
             d,
         } => {
             // `VC - VD` in two's complement, with the flags left alone (6 is
@@ -1120,30 +1150,25 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
             out.push(encode::sfpmov(u32::from(b), u32::from(d), 0).map_err(bad_isa)?);
             out.push(encode::sfpiadd(0, u32::from(a), u32::from(d), 6).map_err(bad_isa)?);
         }
-        MirOp::Sfp {
-            op: SfpOp::Exexp,
+        MirOp::UnarySfp {
+            op: UnarySfpOp::Exexp,
             a,
-            b: None,
             d,
         } => {
             // `SFPEXEXP`'s `NODEBIAS`: the exponent as it sits in the word, not
             // minus 127 (tt-metal's `ExponentMode::NoDebias`).
             out.push(encode::sfpexexp(u32::from(a), u32::from(d), 1).map_err(bad_isa)?);
         }
-        MirOp::Sfp {
-            op: SfpOp::Setexp,
+        MirOp::BinarySfp {
+            op: BinarySfpOp::Setexp,
             a,
-            b: Some(b),
+            b,
             d,
         } => {
             // The exponent comes from the destination lane's low eight bits, so
             // it is moved in first; the sign and mantissa then come from `a`.
             out.push(encode::sfpmov(u32::from(b), u32::from(d), 0).map_err(bad_isa)?);
             out.push(encode::sfpsetexp(0, u32::from(a), u32::from(d), 0).map_err(bad_isa)?);
-        }
-        MirOp::Sfp { .. } => {
-            let _ = op;
-            return Err(Error::TT_ERROR_NO_ENCODING);
         }
         MirOp::Compare { op: cmp, a, b, d } => {
             let set_vd = 8u32;
@@ -1182,7 +1207,7 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
             out.push(cc_mask(false).map_err(bad_isa)?);
         }
         MirOp::Cast { from, to, a, d } => {
-            cast_lanes(from, to, a, d, out)?;
+            cast_lanes(from, to, a.0, d.0, out)?;
         }
         MirOp::Max { a, b, d } => {
             out.push(encode::sfpmov(u32::from(b), u32::from(d), 0).map_err(bad_isa)?);
@@ -1195,13 +1220,14 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
             out.push(cc_mask(false).map_err(bad_isa)?);
         }
         MirOp::Mvmul {
-            row,
+            reg,
+            at,
             addr_mod,
             flip_a,
             flip_b,
         } => {
             let i = encode::Mvmul::ZERO
-                .dst_row(row + row_delta)
+                .dst_row(dst_row(reg, at, row_delta))
                 .addr_mod(addr_mod)
                 .flip_src_a(u32::from(flip_a))
                 .flip_src_b(u32::from(flip_b))
@@ -1214,12 +1240,14 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
             op,
             bcast,
             addr_mod,
-            dst_row,
+            reg,
+            at,
         } => {
             // The two broadcast bits are the instruction's: a row broadcast
             // reads `SrcB`'s row 0, a column broadcast its column 0, and both
             // together are the one-datum scalar broadcast.
-            let (row, col) = match bcast {
+            let row = dst_row(reg, at, row_delta);
+            let (brow, col) = match bcast {
                 Bcast::Row => (1, 0),
                 Bcast::Col => (0, 1),
                 Bcast::Scalar => (1, 1),
@@ -1227,23 +1255,23 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
             let encoded = match op {
                 ElwOp::Add => encode::Elwadd::ZERO
                     .add_dst(0)
-                    .broadcast_src_b_row(row)
+                    .broadcast_src_b_row(brow)
                     .broadcast_src_b_col0(col)
                     .addr_mod(addr_mod)
-                    .dst_row(dst_row + row_delta)
+                    .dst_row(row)
                     .encode(),
                 ElwOp::Sub => encode::Elwsub::ZERO
                     .add_dst(0)
-                    .broadcast_src_b_row(row)
+                    .broadcast_src_b_row(brow)
                     .broadcast_src_b_col0(col)
                     .addr_mod(addr_mod)
-                    .dst_row(dst_row + row_delta)
+                    .dst_row(row)
                     .encode(),
                 ElwOp::Mul => encode::Elwmul::ZERO
-                    .broadcast_src_b_row(row)
+                    .broadcast_src_b_row(brow)
                     .broadcast_src_b_col0(col)
                     .addr_mod(addr_mod)
-                    .dst_row(dst_row + row_delta)
+                    .dst_row(row)
                     .encode(),
             };
             out.push(encoded.map_err(bad_isa)?);
@@ -1252,14 +1280,15 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
             flip_src_b,
             flip_src_a,
             addr_mod,
-            dst_row,
+            reg,
+            at,
         } => {
             out.push(
                 encode::gapool(
                     u32::from(flip_src_b),
                     u32::from(flip_src_a),
                     addr_mod,
-                    dst_row + row_delta,
+                    dst_row(reg, at, row_delta),
                 )
                 .map_err(bad_isa)?,
             );
@@ -1269,7 +1298,8 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
             flip_src_a,
             addr_mod,
             arg_max,
-            dst_row,
+            reg,
+            at,
         } => {
             out.push(
                 encode::Gmpool::ZERO
@@ -1277,7 +1307,7 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
                     .flip_src_a(u32::from(flip_src_a))
                     .addr_mod(addr_mod)
                     .arg_max(arg_max)
-                    .dst_row(dst_row + row_delta)
+                    .dst_row(dst_row(reg, at, row_delta))
                     .encode()
                     .map_err(bad_isa)?,
             );
@@ -1287,7 +1317,8 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
             src_row,
             addr_mod,
             move4_rows,
-            dst_row,
+            reg,
+            at,
         } => {
             out.push(
                 encode::Movd2B::ZERO
@@ -1295,7 +1326,7 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
                     .src_row(src_row)
                     .addr_mod(addr_mod)
                     .move4_rows(u32::from(move4_rows))
-                    .dst_row(dst_row + row_delta)
+                    .dst_row(dst_row(reg, at, row_delta))
                     .encode()
                     .map_err(bad_isa)?,
             );
@@ -1305,7 +1336,8 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
             src_row,
             addr_mod,
             move4_rows,
-            dst_row,
+            reg,
+            at,
         } => {
             out.push(
                 encode::Movb2D::ZERO
@@ -1313,7 +1345,7 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
                     .src_row(src_row)
                     .addr_mod(addr_mod)
                     .move4_rows(u32::from(move4_rows))
-                    .dst_row(dst_row + row_delta)
+                    .dst_row(dst_row(reg, at, row_delta))
                     .encode()
                     .map_err(bad_isa)?,
             );
@@ -1334,7 +1366,8 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
             src_row,
             addr_mod,
             move8_rows,
-            dst_row,
+            reg,
+            at,
         } => {
             out.push(
                 encode::Mova2D::ZERO
@@ -1342,7 +1375,7 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
                     .src_row(src_row)
                     .addr_mod(addr_mod)
                     .move8_rows(u32::from(move8_rows))
-                    .dst_row(dst_row + row_delta)
+                    .dst_row(dst_row(reg, at, row_delta))
                     .encode()
                     .map_err(bad_isa)?,
             );
@@ -1565,13 +1598,24 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(
     thread_config(out);
     // `a0` = the launch arguments; word 2 is the CB interface table.
     out.rv(rv::lw(reg::A6, reg::A0, crate::mover::ARG_IFACE as i32 * 4));
+    // What the packer's `Config` bank and its `Dst` offset already hold, so a
+    // pack that wants the same values again writes nothing. Both caches are
+    // dropped at a loop head, where the previous execution is the loop's own
+    // tail rather than the instruction before it (the unpacker's
+    // `UnpackState.cfg` keeps the same rule).
+    let mut last_config: Option<(DType, PackMask)> = None;
+    let mut last_offset: Option<(Dst, u32)> = None;
     let mut loops = Vec::new();
     for op in ops {
         if encode_int(op, out, &mut loops)? {
             continue;
         }
         match *op {
-            MirOp::Loop { count } => open_loop(out, &mut loops, count)?,
+            MirOp::Loop { count } => {
+                last_config = None;
+                last_offset = None;
+                open_loop(out, &mut loops, count)?;
+            }
             MirOp::EndLoop => close_loop(out, &mut loops)?,
             MirOp::SemWait { sem, .. } => {
                 out.extend(sync::take(semaphore(sem)?, Before::EVERYTHING));
@@ -1583,7 +1627,9 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(
                 out.push(sync::wait_below_max(semaphore(sem)?, Before::EVERYTHING));
             }
             MirOp::CbReserve { cb } => {
-                out.asm(|a| rv::cb::reserve_back(a, reg::A6, cb, 1, [reg::T0, reg::T1, reg::T2]))?;
+                out.asm(|a| {
+                    rv::cb::reserve_back(a, reg::A6, u32::from(cb), 1, [reg::T0, reg::T1, reg::T2])
+                })?;
             }
             MirOp::CbPush { cb } => {
                 // The page is only visible to the writer once the pack has
@@ -1593,27 +1639,49 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(
                 out.push(wait_for_packer(Before::EVERYTHING).expect("named bits"));
                 out.asm(rv::coprocessor_done)?;
                 out.asm(|a| {
-                    rv::cb::push_back(a, reg::A6, cb, 1, [reg::T0, reg::T1, reg::T2, reg::T6])
+                    rv::cb::push_back(
+                        a,
+                        reg::A6,
+                        u32::from(cb),
+                        1,
+                        [reg::T0, reg::T1, reg::T2, reg::T6],
+                    )
                 })?;
             }
-            MirOp::Pack {
-                cb,
-                rows,
-                row,
-                last,
-                dtype,
-                mask,
-            } => {
-                if rows == 0 {
-                    return Err(Error::TT_ERROR_PACK_ZERO_ROWS);
-                }
+            MirOp::SetPackBase { cb } => {
                 // The destination is the ring's write pointer, converted to
                 // 16-byte units minus the header unit the packer adds.
                 cb_base_pack(out, cb)?;
+            }
+            MirOp::SetPackConfig { dtype, mask } => {
+                if last_config == Some((dtype, mask)) {
+                    continue;
+                }
                 let mut words = ConfigWords::new();
-                pack_config(&mut words, dtype, row, dst_is_16_bit, mask);
+                pack_config(&mut words, dtype, dst_is_16_bit, mask);
                 out.extend(config_program(&words));
                 out.push(stallwait(block::PACKER | block::CONFIG, cond::CONFIG_BUSY)?);
+                last_config = Some((dtype, mask));
+            }
+            MirOp::SetPackOffset { reg, at } => {
+                if last_offset == Some((reg, at)) {
+                    continue;
+                }
+                let mut words = ConfigWords::new();
+                words
+                    .set(
+                        global::DEST_TARGET_REG_CFG_PACK_SEC0_Offset,
+                        dst_row(reg, at, 0),
+                    )
+                    .expect("the row fits its field");
+                out.extend(config_program(&words));
+                out.push(stallwait(block::PACKER | block::CONFIG, cond::CONFIG_BUSY)?);
+                last_offset = Some((reg, at));
+            }
+            MirOp::PackRows { rows, last } => {
+                if rows == 0 {
+                    return Err(Error::TT_ERROR_PACK_ZERO_ROWS);
+                }
                 pack_rows(out, rows, last)?;
             }
             other => {
@@ -1628,26 +1696,23 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(
     Ok(())
 }
 
-/// The packer's `Config` for one unit: read `Dst` as 32-bit from row `row`,
-/// write FP32 to the ring's page. The output address is in 16-byte units and
-/// the generator always adds the one 16-byte tile header unit it never writes;
-/// the base store takes the same `- 1`.
+/// The packer's `Config` for one unit: read `Dst` as 32-bit, write FP32 to the
+/// ring's page. The output address is in 16-byte units and the generator always
+/// adds the one 16-byte tile header unit it never writes; the base store takes
+/// the same `- 1`.
 ///
-/// `DEST_TARGET_REG_CFG_PACK_SEC0_Offset` is the `Dst` row the packer reads
-/// from (`Dst` addresses are 16-word rows, and tt-metal's own values for this
-/// field — 0 and `DEST_REGISTER_HALF_SIZE`, 512 — are row counts). tt-metal
-/// splits the same job: this field holds the half base, and
-/// `set_dst_write_addr(tile_index)` puts the tile within it in the packer's `W`
-/// address counter (`TT_SETADC(PAC, CH_0, SET_W, tile_index)`). The simulator
-/// does not model that counter — a `SETADC` there leaves the pack reading row
-/// 0 — so the row is written here, per pack, which is also what zyx did.
-fn pack_config(
-    words: &mut ConfigWords,
-    dtype: DType,
-    row: u32,
-    dst_is_16_bit: bool,
-    mask: PackMask,
-) {
+/// The `Dst` row is *not* written here: `DEST_TARGET_REG_CFG_PACK_SEC0_Offset`
+/// is [`MirOp::SetPackOffset`], so a pack changes one word of the bank rather
+/// than all of it, and the fields below (formats, strides, the edge mask) are
+/// only rewritten when a pack's dtype or mask differs from the last one.
+/// (`Dst` addresses are 16-word rows, and tt-metal's own values for that field —
+/// 0 and `DEST_REGISTER_HALF_SIZE`, 512 — are row counts. tt-metal splits the
+/// same job: the field holds the half base, and `set_dst_write_addr(tile_index)`
+/// puts the tile within it in the packer's `W` address counter
+/// (`TT_SETADC(PAC, CH_0, SET_W, tile_index)`). The simulator does not model
+/// that counter — a `SETADC` there leaves the pack reading row 0 — so the row is
+/// written in that field, which is also what zyx did.)
+fn pack_config(words: &mut ConfigWords, dtype: DType, dst_is_16_bit: bool, mask: PackMask) {
     // `Out_data_format` is the L1 datum's own format; `In_data_format` is the
     // kernel's `Dst` width. In 16-bit mode the packer reads a 16-bit `Dst` (two
     // bytes per datum, so half the row stride) and its conversion is the
@@ -1711,8 +1776,6 @@ fn pack_config(
         .set(pack0::PCK_DEST_RD_CTRL_Round_10b_mant, 0)
         .unwrap()
         .set(pack0::PACK_COUNTERS_SEC0_pack_reads_per_xy_plane, 16)
-        .unwrap()
-        .set(global::DEST_TARGET_REG_CFG_PACK_SEC0_Offset, row)
         .unwrap()
         .set(pack0::PCK_EDGE_MODE_mode, 0)
         .unwrap()
@@ -1786,8 +1849,13 @@ fn pack_config(
     }
 }
 
-/// Pack `rows` rows of FP32 `Dst` from the row `pack_config` set, to the run it
-/// set up.
+/// Pack `rows` rows of `Dst` from the offset [`MirOp::SetPackOffset`] set, to
+/// the page [`MirOp::SetPackBase`] named.
+///
+/// The address generators' per-program setup (`ADDR_MOD_PACK_*_YsrcIncr`,
+/// `SETADCXX`) is in `encode_pack`'s prologue, like every other invariant
+/// `Config` word; only the Y reset is per pack, because the `PACR`s leave Y at
+/// the end of the run they moved.
 fn pack_rows(out: &mut Stream, rows: u32, last: bool) -> Result<(), Error> {
     out.push(thread_entry(thread::ADDR_MOD_PACK_SEC0_YsrcIncr, 0));
     out.push(thread_entry(thread::ADDR_MOD_PACK_SEC1_YsrcIncr, 4));
@@ -1850,4 +1918,73 @@ fn pack_done(sem: Semaphore) -> [Instruction; 2] {
 #[allow(dead_code)]
 fn unpack_done() -> Instruction {
     wait_for_unpacker0(Before::EVERYTHING).expect("named bits")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A packer program with `packs` identical packs, each of the same 32x32
+    /// `f32` tile shape with a different `Dst` row.
+    fn packs(count: u8) -> Machine {
+        let mut m = Machine::default();
+        for pack in 0..count {
+            let at = u32::from(pack) * 2;
+            m.push(Role::Pack, MirOp::CbReserve { cb: CB(0) });
+            m.push(Role::Pack, MirOp::SetPackBase { cb: CB(0) });
+            m.push(
+                Role::Pack,
+                MirOp::SetPackConfig {
+                    dtype: DType::F32,
+                    mask: PackMask::None,
+                },
+            );
+            m.push(Role::Pack, MirOp::SetPackOffset { reg: Dst(0), at });
+            m.push(
+                Role::Pack,
+                MirOp::PackRows {
+                    rows: Dst::ROWS,
+                    last: true,
+                },
+            );
+            m.push(Role::Pack, MirOp::CbPush { cb: CB(0) });
+        }
+        m
+    }
+
+    fn pack_words(count: u8) -> usize {
+        let words = encode(&packs(count))
+            .expect("the packer program encodes")
+            .words()
+            .expect("the words are inline");
+        words[2].len()
+    }
+
+    /// The packer's `Config` bank is written once for a run of packs that share
+    /// a format and edge mask: a pack that changes only its `Dst` row rewrites
+    /// that one field, not the 32 the bank holds (`pack_config`). This is the
+    /// point of the split into `SetPackConfig`/`SetPackOffset`/`PackRows`; with
+    /// one `Pack` op every pack paid for the whole bank.
+    #[test]
+    fn a_second_pack_rewrites_only_the_row() {
+        let one = pack_words(1);
+        let two = pack_words(2);
+        let whole_bank = pack_config_words() * 3 + 1;
+        // Measured: a pack is 131 words, a second identical one 82 (its base,
+        // its row, the Y reset and the sixteen `PACR`s), and the bank alone is
+        // 130 — so a run of packs no longer pays for the bank per pack.
+        let second = two - one;
+        assert!(
+            second < whole_bank,
+            "the second pack costs {second} words, the bank alone is {whole_bank}"
+        );
+    }
+
+    /// The words `pack_config` seeds, i.e. what a full bank write costs before
+    /// the `SETDMAREG` pairs are counted.
+    fn pack_config_words() -> usize {
+        let mut words = ConfigWords::new();
+        pack_config(&mut words, DType::F32, false, PackMask::None);
+        words.program_len()
+    }
 }

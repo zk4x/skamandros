@@ -22,7 +22,10 @@ use crate::ir::{
     BinOp, DType, Dim, Error, Kernel, Op, OpId, RegShape, Types, UnOp, ValueId, access_shape,
     unit_of,
 };
-use crate::mir::{Bcast, CmpOp, ElwOp, IOp, Machine, MirOp, PackMask, Role, SfpOp};
+use crate::mir::{
+    Bcast, BinarySfpOp, CB, CmpOp, Dst, ElwOp, IOp, LReg, Machine, MirOp, PackMask, Role,
+    UnarySfpOp,
+};
 use crate::planner::Plan;
 use crate::riscv::reg;
 use tt_isa::cfg::generated::thread;
@@ -160,7 +163,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
     // The page of a load that a `matmul` also reads is released at the last
     // reader, not at the load: the ring's read pointer must not move while the
     // Matrix Unit's unpack still points at it.
-    let mut pop_here: BTreeMap<crate::ir::OpId, Vec<u32>> = BTreeMap::new();
+    let mut pop_here: BTreeMap<crate::ir::OpId, Vec<CB>> = BTreeMap::new();
     for (at, op) in k.ops() {
         // A reduce's axis is its accumulator's shape (`ReduceDim::of`); the
         // verifier has already refused a `32,32` acc there, and a `matmul`
@@ -258,7 +261,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     }
                 };
                 let unit_shape = access_shape(access)?;
-                let row = dst_row(alloc, owner(k, value));
+                let reg = dst_reg(alloc, owner(k, value));
                 // A value only an `Src` reader consumes never enters `Dst`: the
                 // unpack goes straight into `SrcA`/`SrcB` at the op that reads
                 // it, and this load only reserves the page.
@@ -273,10 +276,10 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     return Err(Error::TT_TODO_ACCESS_SHAPE);
                 }
                 let rows = rows_of(unit_shape, at)?;
-                let cb = plan.cb.get(&buffer).copied().ok_or_else(|| {
+                let cb = cb_id(plan.cb.get(&buffer).copied().ok_or_else(|| {
                     let _ = buffer;
                     Error::TT_ERROR_BUFFER_NOT_PLACED
-                })?;
+                })?);
                 if lands_in_dst {
                     // A bf16 page can only be unpacked into a bf16 `Dst`
                     // (`BF16 -> BF16` is the unpacker's only Dst-path conversion
@@ -291,7 +294,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     // push, unpack, then release the page. Who may write this
                     // `Dst` slot, and when, is `reg_sync`'s to decide.
                     m.push(Role::Unpack, MirOp::CbWait { cb });
-                    m.push(Role::Unpack, MirOp::Setdst { row });
+                    m.push(Role::Unpack, MirOp::Setdst { reg });
                     m.push(Role::Unpack, MirOp::Setadczw { unit: 0, face: 0 });
                     m.push(
                         Role::Unpack,
@@ -310,10 +313,10 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                             haloize: false,
                         },
                     );
+                    m.push(Role::Unpack, MirOp::SetUnpackBase { cb, unit: 0 });
                     m.push(
                         Role::Unpack,
                         MirOp::Unpacr {
-                            cb,
                             unit: 0,
                             count: unit_shape.datums(),
                             flip: false,
@@ -359,18 +362,25 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     let acc_dtype = types.of(buffer).dtype;
                     let (unit_shape, _, _) = unit_of([32, 32], acc_dtype)?;
                     let rows = rows_of(unit_shape, at)?;
-                    let base = dst_row(alloc, buffer);
+                    let reg = dst_reg(alloc, buffer);
                     // The fill writes `Dst` rows; `reg_sync` places the wait
                     // for a packer that still reads them.
-                    m.push(Role::Math, MirOp::LaneConst { lreg: 0, bits });
+                    m.push(
+                        Role::Math,
+                        MirOp::LaneConst {
+                            lreg: LReg(0),
+                            bits,
+                        },
+                    );
                     // An SFPU store covers a row pair (`SFPSTORE` refuses an odd
                     // row and writes two), the same step the datapath uses.
                     for row in (0..rows).step_by(2) {
                         m.push(
                             Role::Math,
                             MirOp::Sfpstore {
-                                lreg: 0,
-                                row: base + row,
+                                lreg: LReg(0),
+                                reg,
+                                at: row,
                                 dtype: acc_dtype,
                             },
                         );
@@ -399,28 +409,33 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     return Err(Error::TT_TODO_ACCESS_SHAPE);
                 }
                 let rows = rows_of(unit_shape, at)?;
-                let cb = plan.cb.get(&buffer).copied().ok_or_else(|| {
+                let cb = cb_id(plan.cb.get(&buffer).copied().ok_or_else(|| {
                     let _ = buffer;
                     Error::TT_ERROR_BUFFER_NOT_PLACED
-                })?;
+                })?);
                 // The page comes from the ring: reserve a free one, pack into
                 // it, then publish it to the writer. The `Dst` hand-off is
                 // `reg_sync`'s: the math thread has published the section and
                 // the packer reads it here.
                 m.push(Role::Pack, MirOp::CbReserve { cb });
+                m.push(Role::Pack, MirOp::SetPackBase { cb });
                 m.push(
                     Role::Pack,
-                    MirOp::Pack {
-                        cb,
-                        rows,
-                        row: dst_row(alloc, owner(k, value)),
-                        last: true,
+                    MirOp::SetPackConfig {
                         dtype,
-                        // A pack of a reduced accumulator carries the reduce's edge
-                        // mask; every other pack keeps the whole tile.
+                        // A pack of a reduced accumulator carries the reduce's
+                        // edge mask; every other pack keeps the whole tile.
                         mask: acc_mask[&owner(k, value)],
                     },
                 );
+                m.push(
+                    Role::Pack,
+                    MirOp::SetPackOffset {
+                        reg: dst_reg(alloc, owner(k, value)),
+                        at: 0,
+                    },
+                );
+                m.push(Role::Pack, MirOp::PackRows { rows, last: true });
                 m.push(Role::Pack, MirOp::CbPush { cb });
                 let _ = offset;
             }
@@ -428,8 +443,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 let from = types.of(src).dtype;
                 let shape = types.of(src).shape;
                 let rows = sfp_rows(shape, at)?;
-                let s = dst_row(alloc, owner(k, src));
-                let out = dst_row(alloc, owner(k, value));
+                let s = dst_reg(alloc, owner(k, src));
+                let out = dst_reg(alloc, owner(k, value));
                 let (la, ld) = alloc.lreg[&owner(k, value)];
                 // The conversion happens in the lane. 16-bit mode stores every
                 // value as a bf16 datum, so a `bool` lane *is* `-1.0`/`0.0` there
@@ -448,7 +463,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         Role::Math,
                         MirOp::Sfpload {
                             lreg: la,
-                            row: s + row,
+                            reg: s,
+                            at: row,
                             dtype: storage(from),
                         },
                     );
@@ -465,7 +481,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         Role::Math,
                         MirOp::Sfpstore {
                             lreg: ld,
-                            row: out + row,
+                            reg: out,
+                            at: row,
                             dtype: storage(dtype),
                         },
                     );
@@ -476,8 +493,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             Op::Unary { value, op, a } => {
                 let shape = types.of(a).shape;
                 let rows = sfp_rows(shape, at)?;
-                let src = dst_row(alloc, owner(k, a));
-                let out = dst_row(alloc, owner(k, value));
+                let src = dst_reg(alloc, owner(k, a));
+                let out = dst_reg(alloc, owner(k, value));
                 let (la, ld) = alloc.lreg[&owner(k, value)];
                 let dtype = storage(types.of(a).dtype);
                 // `exp2` is the one transcendental no IR op spells: its
@@ -505,16 +522,16 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         Role::Math,
                         MirOp::Sfpload {
                             lreg: la,
-                            row: src + row,
+                            reg: src,
+                            at: row,
                             dtype,
                         },
                     );
                     m.push(
                         Role::Math,
-                        MirOp::Sfp {
+                        MirOp::UnarySfp {
                             op: sfp,
                             a: la,
-                            b: None,
                             d: ld,
                         },
                     );
@@ -522,7 +539,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         Role::Math,
                         MirOp::Sfpstore {
                             lreg: ld,
-                            row: out + row,
+                            reg: out,
+                            at: row,
                             dtype,
                         },
                     );
@@ -639,9 +657,9 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     }
                 };
                 let rows = sfp_rows(shape, at)?;
-                let out = dst_row(alloc, owner(k, value));
+                let out = dst_reg(alloc, owner(k, value));
                 let (la, ld) = alloc.lreg[&owner(k, value)];
-                let lb = 2u8;
+                let lb = LReg(2);
                 // A comparison writes `-1`/`0` lanes, so its result is stored in
                 // the integer format; everything else keeps the operands'.
                 let out_dtype = if matches!(
@@ -672,7 +690,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                             Role::Math,
                             MirOp::Sfpload {
                                 lreg: la,
-                                row: dst_row(alloc, owner(k, a)) + row,
+                                reg: dst_reg(alloc, owner(k, a)),
+                                at: row,
                                 dtype,
                             },
                         );
@@ -682,7 +701,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                             Role::Math,
                             MirOp::Sfpload {
                                 lreg: lb,
-                                row: dst_row(alloc, owner(k, b)) + row,
+                                reg: dst_reg(alloc, owner(k, b)),
+                                at: row,
                                 dtype,
                             },
                         );
@@ -724,7 +744,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                                     op: CmpOp::Gt,
                                     a: la,
                                     b: lb,
-                                    d: 3,
+                                    d: LReg(3),
                                 },
                             );
                             m.push(
@@ -733,25 +753,24 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                                     op: CmpOp::Lt,
                                     a: la,
                                     b: lb,
-                                    d: 4,
+                                    d: LReg(4),
                                 },
                             );
                             m.push(
                                 Role::Math,
-                                MirOp::Sfp {
-                                    op: SfpOp::BitOr,
-                                    a: 3,
-                                    b: Some(4),
+                                MirOp::BinarySfp {
+                                    op: BinarySfpOp::BitOr,
+                                    a: LReg(3),
+                                    b: LReg(4),
                                     d: ld,
                                 },
                             );
                             if matches!(op, BinOp::Eq) {
                                 m.push(
                                     Role::Math,
-                                    MirOp::Sfp {
-                                        op: SfpOp::BitNot,
+                                    MirOp::UnarySfp {
+                                        op: UnarySfpOp::BitNot,
                                         a: ld,
-                                        b: None,
                                         d: ld,
                                     },
                                 );
@@ -767,21 +786,21 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         ),
                         _ => m.push(
                             Role::Math,
-                            MirOp::Sfp {
+                            MirOp::BinarySfp {
                                 // An `i32` lane is a raw 32-bit word, so its add and
                                 // subtract are the integer instruction rather than
                                 // `SFPMAD`'s float ones.
                                 op: if left.dtype == crate::ir::DType::I32 {
                                     match op {
-                                        BinOp::Add => SfpOp::IAdd,
-                                        BinOp::Sub => SfpOp::ISub,
+                                        BinOp::Add => BinarySfpOp::IAdd,
+                                        BinOp::Sub => BinarySfpOp::ISub,
                                         other => binary(other, at)?,
                                     }
                                 } else {
                                     binary(op, at)?
                                 },
                                 a: la,
-                                b: Some(lb),
+                                b: lb,
                                 d: ld,
                             },
                         ),
@@ -790,7 +809,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         Role::Math,
                         MirOp::Sfpstore {
                             lreg: ld,
-                            row: out + row,
+                            reg: out,
+                            at: row,
                             dtype: out_dtype,
                         },
                     );
@@ -804,14 +824,14 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             } => {
                 let shape = types.of(if_true).shape;
                 let rows = sfp_rows(shape, at)?;
-                let sc = dst_row(alloc, owner(k, cond));
-                let st = dst_row(alloc, owner(k, if_true));
-                let sf = dst_row(alloc, owner(k, if_false));
-                let out = dst_row(alloc, owner(k, value));
+                let sc = dst_reg(alloc, owner(k, cond));
+                let st = dst_reg(alloc, owner(k, if_true));
+                let sf = dst_reg(alloc, owner(k, if_false));
+                let out = dst_reg(alloc, owner(k, value));
                 let ld = alloc.lreg[&owner(k, value)].1;
-                let lc = 3u8;
-                let lt = 0u8;
-                let lf = 2u8;
+                let lc = LReg(3);
+                let lt = LReg(0);
+                let lf = LReg(2);
                 if types.of(cond).dtype != crate::ir::DType::Bool {
                     let _ = at;
                     return Err(Error::TT_ERROR_CONDITION_NOT_BOOL);
@@ -821,7 +841,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         Role::Math,
                         MirOp::Sfpload {
                             lreg: lc,
-                            row: sc + row,
+                            reg: sc,
+                            at: row,
                             dtype: storage(crate::ir::DType::Bool),
                         },
                     );
@@ -829,7 +850,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         Role::Math,
                         MirOp::Sfpload {
                             lreg: lt,
-                            row: st + row,
+                            reg: st,
+                            at: row,
                             dtype: storage(types.of(if_true).dtype),
                         },
                     );
@@ -837,7 +859,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         Role::Math,
                         MirOp::Sfpload {
                             lreg: lf,
-                            row: sf + row,
+                            reg: sf,
+                            at: row,
                             dtype: storage(types.of(if_false).dtype),
                         },
                     );
@@ -854,7 +877,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         Role::Math,
                         MirOp::Sfpstore {
                             lreg: ld,
-                            row: out + row,
+                            reg: out,
+                            at: row,
                             dtype: storage(types.of(value).dtype),
                         },
                     );
@@ -892,7 +916,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 if stage_b {
                     stage(&mut m, k, types, alloc, &acc_mask, b, cb_b);
                 }
-                let base = dst_row(alloc, acc);
+                let base = dst_reg(alloc, acc);
                 // Scratch for `mvmul_group`, which emits a run of math ops: the
                 // run is appended to the one IR as it is produced.
                 let mut math_scratch: Vec<MirOp> = Vec::new();
@@ -988,10 +1012,10 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                                 haloize: false,
                             },
                         );
+                        m.push(Role::Unpack, MirOp::SetUnpackBase { cb: cb_a, unit: 1 });
                         m.push(
                             Role::Unpack,
                             MirOp::Unpacr {
-                                cb: cb_a,
                                 unit: 1,
                                 count: FACE_DATUMS,
                                 flip: true,
@@ -1013,23 +1037,24 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                                 haloize: false,
                             },
                         );
+                        m.push(Role::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 0 });
                         m.push(
                             Role::Unpack,
                             MirOp::Unpacr {
-                                cb: cb_b,
                                 unit: 0,
                                 count: FACE_DATUMS,
                                 flip: true,
                             },
                         );
-                        mvmul_group(&mut math_scratch, base);
+                        mvmul_group(&mut math_scratch, base, 0);
                         for op in math_scratch.drain(..) {
                             m.push(Role::Math, op);
                         }
                         m.push(
                             Role::Math,
                             MirOp::Mvmul {
-                                row: base + 8,
+                                reg: base,
+                                at: 8,
                                 addr_mod: MATMUL_AM_GROUP,
                                 flip_a: true,
                                 flip_b: false,
@@ -1042,16 +1067,16 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                                 face: 2 * kk + 1,
                             },
                         );
+                        m.push(Role::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 0 });
                         m.push(
                             Role::Unpack,
                             MirOp::Unpacr {
-                                cb: cb_b,
                                 unit: 0,
                                 count: FACE_DATUMS,
                                 flip: true,
                             },
                         );
-                        mvmul_group(&mut math_scratch, base + 16);
+                        mvmul_group(&mut math_scratch, base, 16);
                         for op in math_scratch.drain(..) {
                             m.push(Role::Math, op);
                         }
@@ -1063,7 +1088,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         m.push(
                             Role::Math,
                             MirOp::Mvmul {
-                                row: base + 24,
+                                reg: base,
+                                at: 24,
                                 addr_mod: end,
                                 flip_a: true,
                                 flip_b: true,
@@ -1134,7 +1160,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                             let _ = (ones.dtype, dt_x);
                             return Err(Error::TT_ERROR_REDUCE_DTYPE);
                         }
-                        (ones.cb, false, ones.dtype)
+                        (cb_id(ones.cb), false, ones.dtype)
                     }
                 };
                 // The 1.0 page is pushed once at kernel start; a `max` waits
@@ -1155,7 +1181,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     }
                     m.push(Role::Unpack, MirOp::CbWait { cb: cb_b });
                 }
-                let base = dst_row(alloc, acc);
+                let base = dst_reg(alloc, acc);
                 // The accumulator's rows are written; `reg_sync` places the
                 // wait for the packer to give the section back.
                 // `reduce_configure_addrmod`: entry 0 clears the phase, 1 and 2
@@ -1226,27 +1252,27 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         },
                     );
                     for group in 0..2u32 {
-                        let dst = base + 32 * group;
+                        let dst_off = 32 * group;
                         for half in 0..2u32 {
                             let face = 2 * group + half;
                             // One face into `SrcA` and one row of the scaler
                             // into `SrcB` (16 datums): tt-metal's AB-reduce
                             // unpack.
                             m.push(Role::Unpack, MirOp::Setadczw { unit: 0, face });
+                            m.push(Role::Unpack, MirOp::SetUnpackBase { cb: cb_x, unit: 0 });
                             m.push(
                                 Role::Unpack,
                                 MirOp::Unpacr {
-                                    cb: cb_x,
                                     unit: 0,
                                     count: FACE_DATUMS,
                                     flip: true,
                                 },
                             );
                             m.push(Role::Unpack, MirOp::Setadczw { unit: 1, face });
+                            m.push(Role::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 1 });
                             m.push(
                                 Role::Unpack,
                                 MirOp::Unpacr {
-                                    cb: cb_b,
                                     unit: 1,
                                     count: 16,
                                     flip: true,
@@ -1263,7 +1289,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                                     flip_src_a: half == 0,
                                     addr_mod: 0,
                                     arg_max: 0,
-                                    dst_row: dst,
+                                    reg: base,
+                                    at: dst_off,
                                 },
                             );
                         }
@@ -1306,7 +1333,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                                 src_row: 16,
                                 addr_mod: 0,
                                 move4_rows: false,
-                                dst_row: dst,
+                                reg: base,
+                                at: dst_off,
                             },
                         );
                         m.push(Role::Math, MirOp::Trnspsrcb);
@@ -1329,7 +1357,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                                 src_row: 16,
                                 addr_mod: 0,
                                 move4_rows: false,
-                                dst_row: dst,
+                                reg: base,
+                                at: dst_off,
                             },
                         );
                         m.push(Role::Math, MirOp::Trnspsrcb);
@@ -1340,7 +1369,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                                 src_row: 16,
                                 addr_mod: 0,
                                 move4_rows: false,
-                                dst_row: dst,
+                                reg: base,
+                                at: dst_off,
                             },
                         );
                         for chunk in 0..4u32 {
@@ -1351,7 +1381,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                                     src_row: 16 + 4 * chunk,
                                     addr_mod: 0,
                                     move4_rows: true,
-                                    dst_row: dst + 4 * chunk,
+                                    reg: base,
+                                    at: dst_off + 4 * chunk,
                                 },
                             );
                         }
@@ -1364,7 +1395,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                                     src_row: 8 * half,
                                     addr_mod: 0,
                                     move8_rows: true,
-                                    dst_row: dst + 8 * half,
+                                    reg: base,
+                                    at: dst_off + 8 * half,
                                 },
                             );
                         }
@@ -1401,7 +1433,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     m.push(
                         Role::Math,
                         MirOp::LaneConst {
-                            lreg: 0,
+                            lreg: LReg(0),
                             bits: 0.0f32.to_bits(),
                         },
                     );
@@ -1409,8 +1441,9 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         m.push(
                             Role::Math,
                             MirOp::Sfpstore {
-                                lreg: 0,
-                                row: base + row,
+                                lreg: LReg(0),
+                                reg: base,
+                                at: row,
                                 dtype: storage(crate::ir::DType::F32),
                             },
                         );
@@ -1445,10 +1478,10 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                                 haloize: false,
                             },
                         );
+                        m.push(Role::Unpack, MirOp::SetUnpackBase { cb: cb_x, unit: 0 });
                         m.push(
                             Role::Unpack,
                             MirOp::Unpacr {
-                                cb: cb_x,
                                 unit: 0,
                                 count: FACE_DATUMS,
                                 flip: true,
@@ -1464,10 +1497,10 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                                 haloize: false,
                             },
                         );
+                        m.push(Role::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 1 });
                         m.push(
                             Role::Unpack,
                             MirOp::Unpacr {
-                                cb: cb_b,
                                 unit: 1,
                                 count: 16,
                                 flip: true,
@@ -1476,7 +1509,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         // Faces 0 and 2 fold into the first half of row 0, faces 1
                         // and 3 into the second (tt-metal's `SETRWC(CR_D, 8)`
                         // twice).
-                        let dst = base + if face % 2 == 0 { 0 } else { 16 };
+                        let dst_off = if face % 2 == 0 { 0u32 } else { 16 };
                         if max {
                             m.push(
                                 Role::Math,
@@ -1485,7 +1518,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                                     flip_src_a: false,
                                     addr_mod: 0,
                                     arg_max: 0,
-                                    dst_row: dst,
+                                    reg: base,
+                                    at: dst_off,
                                 },
                             );
                         } else {
@@ -1498,7 +1532,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                                         flip_src_b: false,
                                         flip_src_a: false,
                                         addr_mod,
-                                        dst_row: dst,
+                                        reg: base,
+                                        at: dst_off,
                                     },
                                 );
                             }
@@ -1525,7 +1560,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     m.push(
                         Role::Math,
                         MirOp::LaneConst {
-                            lreg: 0,
+                            lreg: LReg(0),
                             bits: 0.0f32.to_bits(),
                         },
                     );
@@ -1533,8 +1568,9 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         m.push(
                             Role::Math,
                             MirOp::Sfpstore {
-                                lreg: 0,
-                                row: base + row,
+                                lreg: LReg(0),
+                                reg: base,
+                                at: row,
                                 dtype: storage(crate::ir::DType::F32),
                             },
                         );
@@ -1577,11 +1613,12 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
     // copies into each L1 face's row 0; the rest of the packed tile is the
     // scratch slot's old contents, which nothing reads.
     if let Some(ones) = plan.ones {
-        let row = u32::from(crate::alloc::DST_SLOTS - 1) * DST_ROWS;
+        let reg = Dst(crate::alloc::DST_SLOTS - 1);
+        let ones_cb = cb_id(ones.cb);
         let mut prologue: Vec<(Role, MirOp)> = vec![(
             Role::Math,
             MirOp::LaneConst {
-                lreg: 0,
+                lreg: LReg(0),
                 bits: 1.0f32.to_bits(),
             },
         )];
@@ -1589,23 +1626,26 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             prologue.push((
                 Role::Math,
                 MirOp::Sfpstore {
-                    lreg: 0,
-                    row: row + row_off,
+                    lreg: LReg(0),
+                    reg,
+                    at: row_off,
                     dtype: storage(ones.dtype),
                 },
             ));
         }
         for op in [
-            MirOp::CbReserve { cb: ones.cb },
-            MirOp::Pack {
-                cb: ones.cb,
-                rows: DST_ROWS,
-                row,
-                last: true,
+            MirOp::CbReserve { cb: ones_cb },
+            MirOp::SetPackBase { cb: ones_cb },
+            MirOp::SetPackConfig {
                 dtype: ones.dtype,
                 mask: PackMask::None,
             },
-            MirOp::CbPush { cb: ones.cb },
+            MirOp::SetPackOffset { reg, at: 0 },
+            MirOp::PackRows {
+                rows: DST_ROWS,
+                last: true,
+            },
+            MirOp::CbPush { cb: ones_cb },
         ] {
             prologue.push((Role::Pack, op));
         }
@@ -1626,7 +1666,7 @@ const MATMUL_AM_FI: u32 = 4;
 /// One `MVMUL` group into `Dst` rows `base..base + 16`: both `SrcB` halves and
 /// every fidelity phase, all but the group's last multiply, which the caller
 /// issues with its flips.
-fn mvmul_group(role: &mut Vec<MirOp>, base: u32) {
+fn mvmul_group(role: &mut Vec<MirOp>, reg: Dst, at: u32) {
     for half in 0..2u32 {
         let phases = if half == 0 { 4 } else { 3 };
         for phase in 0..phases {
@@ -1636,7 +1676,8 @@ fn mvmul_group(role: &mut Vec<MirOp>, base: u32) {
                 MATMUL_AM_PHASE
             };
             role.push(MirOp::Mvmul {
-                row: base + 8 * half,
+                reg,
+                at: at + 8 * half,
                 addr_mod,
                 flip_a: false,
                 flip_b: false,
@@ -1669,7 +1710,7 @@ fn fpu_page(
     value: crate::ir::ValueId,
     at: OpId,
     err: Error,
-) -> Result<(u32, bool), Error> {
+) -> Result<(CB, bool), Error> {
     let id = owner(k, value);
     if k.op(id).is_none() {
         let _ = (at, value);
@@ -1677,10 +1718,10 @@ fn fpu_page(
     }
     if let Some(Op::Load { buffer, .. }) = k.op(id) {
         return Ok((
-            plan.cb.get(buffer).copied().ok_or_else(|| {
+            cb_id(plan.cb.get(buffer).copied().ok_or_else(|| {
                 let _ = buffer;
                 Error::TT_ERROR_BUFFER_NOT_PLACED
-            })?,
+            })?),
             false,
         ));
     }
@@ -1688,10 +1729,10 @@ fn fpu_page(
     // the compiler packs it into a page it owns. The verifier admits only
     // f32/bf16 operands, which is also what a staging `Pack` takes.
     let _ = at;
-    let cb = plan.staged.get(&id).copied().ok_or_else(|| {
+    let cb = cb_id(plan.staged.get(&id).copied().ok_or_else(|| {
         let _ = (id, value);
         err
-    })?;
+    })?);
     Ok((cb, true))
 }
 
@@ -1729,7 +1770,7 @@ fn fpu_broadcast(
     }
     let dt_a = types.of(tile).dtype;
     let dt_b = types.of(narrow).dtype;
-    let out = dst_row(alloc, owner(k, value));
+    let out = dst_reg(alloc, owner(k, value));
     // The `Src` banks are filled from the pages the unpacker owns.
     for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
         if staged {
@@ -1803,7 +1844,7 @@ fn fpu_broadcast(
         m.push(
             Role::Math,
             MirOp::LaneConst {
-                lreg: 0,
+                lreg: LReg(0),
                 bits: 0.0f32.to_bits(),
             },
         );
@@ -1811,8 +1852,9 @@ fn fpu_broadcast(
             m.push(
                 Role::Math,
                 MirOp::Sfpstore {
-                    lreg: 0,
-                    row: out + row,
+                    lreg: LReg(0),
+                    reg: out,
+                    at: row,
                     dtype: if m.dst_is_16_bit {
                         crate::ir::DType::Bf16
                     } else {
@@ -1833,10 +1875,10 @@ fn fpu_broadcast(
                 haloize: false,
             },
         );
+        m.push(Role::Unpack, MirOp::SetUnpackBase { cb: cb_a, unit: 0 });
         m.push(
             Role::Unpack,
             MirOp::Unpacr {
-                cb: cb_a,
                 unit: 0,
                 count: FACE_DATUMS,
                 flip: true,
@@ -1868,10 +1910,10 @@ fn fpu_broadcast(
                 haloize: false,
             },
         );
+        m.push(Role::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 1 });
         m.push(
             Role::Unpack,
             MirOp::Unpacr {
-                cb: cb_b,
                 unit: 1,
                 count: FACE_DATUMS,
                 flip: true,
@@ -1901,7 +1943,8 @@ fn fpu_broadcast(
                         },
                         bcast,
                         addr_mod: if phase + 1 == phases { 0 } else { 1 },
-                        dst_row: out + 16 * face + 8 * half,
+                        reg: out,
+                        at: 16 * face + 8 * half,
                     },
                 );
             }
@@ -1955,20 +1998,31 @@ fn stage(
     alloc: &Alloc,
     acc_mask: &BTreeMap<OpId, PackMask>,
     value: crate::ir::ValueId,
-    cb: u32,
+    cb: CB,
 ) {
     let id = owner(k, value);
     let dtype = types.of(id).dtype;
     m.push(Role::Pack, MirOp::CbReserve { cb });
+    m.push(Role::Pack, MirOp::SetPackBase { cb });
     m.push(
         Role::Pack,
-        MirOp::Pack {
-            cb,
-            rows: DST_ROWS,
-            row: dst_row(alloc, id),
-            last: true,
+        MirOp::SetPackConfig {
             dtype,
             mask: acc_mask[&id],
+        },
+    );
+    m.push(
+        Role::Pack,
+        MirOp::SetPackOffset {
+            reg: dst_reg(alloc, id),
+            at: 0,
+        },
+    );
+    m.push(
+        Role::Pack,
+        MirOp::PackRows {
+            rows: DST_ROWS,
+            last: true,
         },
     );
     m.push(Role::Pack, MirOp::CbPush { cb });
@@ -2119,70 +2173,71 @@ fn scalar_const(k: &Kernel, v: crate::ir::ValueId) -> Option<u32> {
 /// the allocator pass will fold.
 fn exp2_body(
     role: &mut Vec<MirOp>,
-    src: u32,
-    out: u32,
+    src: Dst,
+    out: Dst,
     rows: &[u32],
-    la: u8,
+    la: LReg,
     dtype: crate::ir::DType,
 ) {
     const C231: u32 = 0x4B40_0000; // 1.5 * 2^23, exact
     const NEG_C231: u32 = 0xB4C0_0000; // the same bits, two's complement negated
-    debug_assert!(la < 2, "the body's scratch lanes start at 2");
+    debug_assert!(la.0 < 2, "the body's scratch lanes start at 2");
     // `n = bits(x + c231) - bits(c231)`: the integer subtraction tt-metal's
     // `_sfpu_round_to_nearest_int32_` does, and the exponent it adds.
     role.push(MirOp::LaneConst {
-        lreg: 2,
+        lreg: LReg(2),
         bits: C231,
     });
     role.push(MirOp::LaneConst {
-        lreg: 6,
+        lreg: LReg(6),
         bits: NEG_C231,
     });
     for &row in rows {
         role.push(MirOp::Sfpload {
             lreg: la,
-            row: src + row,
+            reg: src,
+            at: row,
             dtype,
         });
         // tmp = x + c231, nf = tmp - c231, f = x - nf.
-        role.push(MirOp::Sfp {
-            op: SfpOp::Add,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Add,
             a: la,
-            b: Some(2),
-            d: 3,
+            b: LReg(2),
+            d: LReg(3),
         });
-        role.push(MirOp::Sfp {
-            op: SfpOp::Sub,
-            a: 3,
-            b: Some(2),
-            d: 4,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Sub,
+            a: LReg(3),
+            b: LReg(2),
+            d: LReg(4),
         });
-        role.push(MirOp::Sfp {
-            op: SfpOp::Sub,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Sub,
             a: la,
-            b: Some(4),
-            d: 5,
+            b: LReg(4),
+            d: LReg(5),
         });
         // n = bits(tmp) - bits(c231), as a two's complement integer.
-        role.push(MirOp::Sfp {
-            op: SfpOp::IAdd,
-            a: 3,
-            b: Some(6),
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::IAdd,
+            a: LReg(3),
+            b: LReg(6),
             d: la,
         });
         // s = f ln 2, then the Horner chain into lane 4.
         role.push(MirOp::LaneConst {
-            lreg: 7,
+            lreg: LReg(7),
             bits: std::f32::consts::LN_2.to_bits(),
         });
-        role.push(MirOp::Sfp {
-            op: SfpOp::Mul,
-            a: 5,
-            b: Some(7),
-            d: 3,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: LReg(5),
+            b: LReg(7),
+            d: LReg(3),
         });
         role.push(MirOp::LaneConst {
-            lreg: 4,
+            lreg: LReg(4),
             bits: (1.0f32 / 5040.0).to_bits(),
         });
         for c in [
@@ -2195,44 +2250,44 @@ fn exp2_body(
             1.0,
         ] {
             role.push(MirOp::LaneConst {
-                lreg: 7,
+                lreg: LReg(7),
                 bits: c.to_bits(),
             });
-            role.push(MirOp::Sfp {
-                op: SfpOp::Mul,
-                a: 4,
-                b: Some(3),
-                d: 5,
+            role.push(MirOp::BinarySfp {
+                op: BinarySfpOp::Mul,
+                a: LReg(4),
+                b: LReg(3),
+                d: LReg(5),
             });
-            role.push(MirOp::Sfp {
-                op: SfpOp::Add,
-                a: 5,
-                b: Some(7),
-                d: 4,
+            role.push(MirOp::BinarySfp {
+                op: BinarySfpOp::Add,
+                a: LReg(5),
+                b: LReg(7),
+                d: LReg(4),
             });
         }
         // The result's exponent is the polynomial's plus n.
-        role.push(MirOp::Sfp {
-            op: SfpOp::Exexp,
-            a: 4,
-            b: None,
-            d: 3,
+        role.push(MirOp::UnarySfp {
+            op: UnarySfpOp::Exexp,
+            a: LReg(4),
+            d: LReg(3),
         });
-        role.push(MirOp::Sfp {
-            op: SfpOp::IAdd,
-            a: 3,
-            b: Some(la),
-            d: 5,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::IAdd,
+            a: LReg(3),
+            b: la,
+            d: LReg(5),
         });
-        role.push(MirOp::Sfp {
-            op: SfpOp::Setexp,
-            a: 4,
-            b: Some(5),
-            d: 5,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Setexp,
+            a: LReg(4),
+            b: LReg(5),
+            d: LReg(5),
         });
         role.push(MirOp::Sfpstore {
-            lreg: 5,
-            row: out + row,
+            lreg: LReg(5),
+            reg: out,
+            at: row,
             dtype,
         });
     }
@@ -2259,10 +2314,10 @@ fn exp2_body(
 /// so the sequence fits the same per-row loop as every other SFPU body.
 fn rsqrt_body(
     role: &mut Vec<MirOp>,
-    src: u32,
-    out: u32,
+    src: Dst,
+    out: Dst,
     rows: &[u32],
-    la: u8,
+    la: LReg,
     dtype: crate::ir::DType,
 ) {
     // `_init_sqrt_`'s accurate-mode constants.
@@ -2271,11 +2326,12 @@ fn rsqrt_body(
     const P2: f32 = 2.2533049;
     const INF_BITS: u32 = 0x7f80_0000;
     const NAN_BITS: u32 = 0x7fc0_0000;
-    debug_assert!(la < 2, "the body's scratch lanes start at 2");
+    debug_assert!(la.0 < 2, "the body's scratch lanes start at 2");
     for &row in rows {
         role.push(MirOp::Sfpload {
             lreg: la,
-            row: src + row,
+            reg: src,
+            at: row,
             dtype,
         });
         // `x` lives in lane 2 for the rest of the row: the lane a `cast` picks
@@ -2285,131 +2341,132 @@ fn rsqrt_body(
             from: crate::ir::DType::F32,
             to: crate::ir::DType::F32,
             a: la,
-            d: 2,
+            d: LReg(2),
         });
         // `i = bits(x) >> 1`, logically: the amount lane holds the integer 1 and
         // `SFPSHFT` negates it in its own lane.
-        role.push(MirOp::LaneConst { lreg: 7, bits: 1 });
-        role.push(MirOp::Sfp {
-            op: SfpOp::Shr,
-            a: 2,
-            b: Some(7),
-            d: 3,
+        role.push(MirOp::LaneConst {
+            lreg: LReg(7),
+            bits: 1,
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Shr,
+            a: LReg(2),
+            b: LReg(7),
+            d: LReg(3),
         });
         // `y = reinterpret(MAGIC - i)`.
         role.push(MirOp::LaneConst {
-            lreg: 0,
+            lreg: LReg(0),
             bits: MAGIC,
         });
-        role.push(MirOp::Sfp {
-            op: SfpOp::ISub,
-            a: 0,
-            b: Some(3),
-            d: 3,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::ISub,
+            a: LReg(0),
+            b: LReg(3),
+            d: LReg(3),
         });
         // `xy = x y`, `c = (-y) xy`.
-        role.push(MirOp::Sfp {
-            op: SfpOp::Mul,
-            a: 2,
-            b: Some(3),
-            d: 4,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: LReg(2),
+            b: LReg(3),
+            d: LReg(4),
         });
-        role.push(MirOp::Sfp {
-            op: SfpOp::Neg,
-            a: 3,
-            b: None,
-            d: 5,
+        role.push(MirOp::UnarySfp {
+            op: UnarySfpOp::Neg,
+            a: LReg(3),
+            d: LReg(5),
         });
-        role.push(MirOp::Sfp {
-            op: SfpOp::Mul,
-            a: 5,
-            b: Some(4),
-            d: 4,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: LReg(5),
+            b: LReg(4),
+            d: LReg(4),
         });
         // `y = y (P1 + c (P2 + c))`.
         role.push(MirOp::LaneConst {
-            lreg: 6,
+            lreg: LReg(6),
             bits: P2.to_bits(),
         });
-        role.push(MirOp::Sfp {
-            op: SfpOp::Add,
-            a: 6,
-            b: Some(4),
-            d: 6,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Add,
+            a: LReg(6),
+            b: LReg(4),
+            d: LReg(6),
         });
-        role.push(MirOp::Sfp {
-            op: SfpOp::Mul,
-            a: 6,
-            b: Some(4),
-            d: 6,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: LReg(6),
+            b: LReg(4),
+            d: LReg(6),
         });
         role.push(MirOp::LaneConst {
-            lreg: 7,
+            lreg: LReg(7),
             bits: P1.to_bits(),
         });
-        role.push(MirOp::Sfp {
-            op: SfpOp::Add,
-            a: 6,
-            b: Some(7),
-            d: 6,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Add,
+            a: LReg(6),
+            b: LReg(7),
+            d: LReg(6),
         });
-        role.push(MirOp::Sfp {
-            op: SfpOp::Mul,
-            a: 3,
-            b: Some(6),
-            d: 3,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: LReg(3),
+            b: LReg(6),
+            d: LReg(3),
         });
         // `xy = x y`, `one_minus_xyy = 1 + (-y) xy`.
-        role.push(MirOp::Sfp {
-            op: SfpOp::Mul,
-            a: 2,
-            b: Some(3),
-            d: 4,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: LReg(2),
+            b: LReg(3),
+            d: LReg(4),
         });
-        role.push(MirOp::Sfp {
-            op: SfpOp::Neg,
-            a: 3,
-            b: None,
-            d: 5,
+        role.push(MirOp::UnarySfp {
+            op: UnarySfpOp::Neg,
+            a: LReg(3),
+            d: LReg(5),
         });
         role.push(MirOp::LaneConst {
-            lreg: 6,
+            lreg: LReg(6),
             bits: 1.0f32.to_bits(),
         });
-        role.push(MirOp::Sfp {
-            op: SfpOp::Mul,
-            a: 5,
-            b: Some(4),
-            d: 5,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: LReg(5),
+            b: LReg(4),
+            d: LReg(5),
         });
-        role.push(MirOp::Sfp {
-            op: SfpOp::Add,
-            a: 5,
-            b: Some(6),
-            d: 5,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Add,
+            a: LReg(5),
+            b: LReg(6),
+            d: LReg(5),
         });
         // `y = one_minus_xyy (y/2) + y`.
         role.push(MirOp::LaneConst {
-            lreg: 6,
+            lreg: LReg(6),
             bits: 0.5f32.to_bits(),
         });
-        role.push(MirOp::Sfp {
-            op: SfpOp::Mul,
-            a: 3,
-            b: Some(6),
-            d: 6,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: LReg(3),
+            b: LReg(6),
+            d: LReg(6),
         });
-        role.push(MirOp::Sfp {
-            op: SfpOp::Mul,
-            a: 5,
-            b: Some(6),
-            d: 5,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: LReg(5),
+            b: LReg(6),
+            d: LReg(5),
         });
-        role.push(MirOp::Sfp {
-            op: SfpOp::Add,
-            a: 5,
-            b: Some(3),
-            d: 3,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Add,
+            a: LReg(5),
+            b: LReg(3),
+            d: LReg(3),
         });
         // The guard: `bits(x) != 0 && bits(x) != +inf`. The integer difference
         // `inf_bits - bits(x)` is the other branch's value, reinterpreted. The
@@ -2419,108 +2476,109 @@ fn rsqrt_body(
         // SFPU's own integer predicate, `SFPSETCC`'s `NE0`, has no IR op
         // expressing it.
         role.push(MirOp::LaneConst {
-            lreg: 4,
+            lreg: LReg(4),
             bits: INF_BITS,
         });
-        role.push(MirOp::Sfp {
-            op: SfpOp::ISub,
-            a: 4,
-            b: Some(2),
-            d: 5,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::ISub,
+            a: LReg(4),
+            b: LReg(2),
+            d: LReg(5),
         });
         role.push(MirOp::Cast {
             from: DType::I32,
             to: DType::F32,
-            a: 5,
-            d: 6,
+            a: LReg(5),
+            d: LReg(6),
         });
         role.push(MirOp::LaneConst {
-            lreg: 7,
+            lreg: LReg(7),
             bits: 0.0f32.to_bits(),
         });
         role.push(MirOp::Compare {
             op: CmpOp::Gt,
-            a: 6,
-            b: 7,
-            d: 6,
+            a: LReg(6),
+            b: LReg(7),
+            d: LReg(6),
         });
         role.push(MirOp::Compare {
             op: CmpOp::Lt,
-            a: 6,
-            b: 7,
-            d: 7,
+            a: LReg(6),
+            b: LReg(7),
+            d: LReg(7),
         });
-        role.push(MirOp::Sfp {
-            op: SfpOp::BitOr,
-            a: 6,
-            b: Some(7),
-            d: 6,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::BitOr,
+            a: LReg(6),
+            b: LReg(7),
+            d: LReg(6),
         });
         role.push(MirOp::Cast {
             from: DType::I32,
             to: DType::F32,
-            a: 2,
-            d: 7,
+            a: LReg(2),
+            d: LReg(7),
         });
         role.push(MirOp::LaneConst {
-            lreg: 4,
+            lreg: LReg(4),
             bits: 0.0f32.to_bits(),
         });
         role.push(MirOp::Compare {
             op: CmpOp::Gt,
-            a: 7,
-            b: 4,
-            d: 7,
+            a: LReg(7),
+            b: LReg(4),
+            d: LReg(7),
         });
         role.push(MirOp::Compare {
             op: CmpOp::Lt,
-            a: 7,
-            b: 4,
-            d: 4,
+            a: LReg(7),
+            b: LReg(4),
+            d: LReg(4),
         });
-        role.push(MirOp::Sfp {
-            op: SfpOp::BitOr,
-            a: 7,
-            b: Some(4),
-            d: 7,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::BitOr,
+            a: LReg(7),
+            b: LReg(4),
+            d: LReg(7),
         });
-        role.push(MirOp::Sfp {
-            op: SfpOp::BitAnd,
-            a: 6,
-            b: Some(7),
-            d: 6,
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::BitAnd,
+            a: LReg(6),
+            b: LReg(7),
+            d: LReg(6),
         });
         role.push(MirOp::Select {
-            cond: 6,
-            t: 3,
-            f: 5,
-            d: 1,
+            cond: LReg(6),
+            t: LReg(3),
+            f: LReg(5),
+            d: LReg(1),
         });
         // A negative input (but not `-0`) is NaN: tt-metal's `!FAST_APPROX`
         // tail.
         role.push(MirOp::LaneConst {
-            lreg: 6,
+            lreg: LReg(6),
             bits: 0.0f32.to_bits(),
         });
         role.push(MirOp::Compare {
             op: CmpOp::Lt,
-            a: 2,
-            b: 6,
-            d: 7,
+            a: LReg(2),
+            b: LReg(6),
+            d: LReg(7),
         });
         role.push(MirOp::LaneConst {
-            lreg: 6,
+            lreg: LReg(6),
             bits: NAN_BITS,
         });
         role.push(MirOp::Select {
-            cond: 7,
-            t: 6,
-            f: 1,
-            d: 3,
+            cond: LReg(7),
+            t: LReg(6),
+            f: LReg(1),
+            d: LReg(3),
         });
         role.push(MirOp::Sfpstore {
-            lreg: 3,
-            row: out + row,
+            lreg: LReg(3),
+            reg: out,
+            at: row,
             dtype,
         });
     }
@@ -2557,10 +2615,18 @@ fn rows_of(shape: RegShape, at: OpId) -> Result<u32, Error> {
     }
 }
 
-fn dst_row(alloc: &Alloc, value: crate::ir::ValueId) -> u32 {
+/// The `Dst` register a value lives in. A bitcast has no home of its own, so
+/// the caller passes the owning definition ([`owner`]).
+fn dst_reg(alloc: &Alloc, value: crate::ir::ValueId) -> Dst {
     match alloc.place_of(value) {
-        crate::alloc::Place::Dst(slot) => u32::from(slot) * DST_ROWS,
+        crate::alloc::Place::Dst(reg) => reg,
     }
+}
+
+/// The machine IR's cb id for one the planner numbered. The planner refuses a
+/// table larger than the interface's `COUNT` entries, so the id fits a byte.
+fn cb_id(cb: u32) -> CB {
+    CB(u8::try_from(cb).expect("the planner numbers at most `cb::COUNT` buffers"))
 }
 
 /// Follow a bitcast to the value that owns the `Dst` slot: a bitcast has no
@@ -2574,11 +2640,11 @@ fn owner(k: &Kernel, value: ValueId) -> ValueId {
     at
 }
 
-fn unary(op: UnOp, at: OpId) -> Result<SfpOp, Error> {
+fn unary(op: UnOp, at: OpId) -> Result<UnarySfpOp, Error> {
     match op {
-        UnOp::Neg => Ok(SfpOp::Neg),
-        UnOp::Abs => Ok(SfpOp::Abs),
-        UnOp::BitNot => Ok(SfpOp::BitNot),
+        UnOp::Neg => Ok(UnarySfpOp::Neg),
+        UnOp::Abs => Ok(UnarySfpOp::Abs),
+        UnOp::BitNot => Ok(UnarySfpOp::BitNot),
         other => {
             let _ = (at, other);
             Err(Error::TT_TODO_UNARY_SFPU)
@@ -2586,16 +2652,16 @@ fn unary(op: UnOp, at: OpId) -> Result<SfpOp, Error> {
     }
 }
 
-fn binary(op: BinOp, at: OpId) -> Result<SfpOp, Error> {
+fn binary(op: BinOp, at: OpId) -> Result<BinarySfpOp, Error> {
     match op {
-        BinOp::Add => Ok(SfpOp::Add),
-        BinOp::Sub => Ok(SfpOp::Sub),
-        BinOp::Mul => Ok(SfpOp::Mul),
-        BinOp::And | BinOp::BitAnd => Ok(SfpOp::BitAnd),
-        BinOp::Or | BinOp::BitOr => Ok(SfpOp::BitOr),
-        BinOp::BitXor => Ok(SfpOp::BitXor),
-        BinOp::BitShiftLeft => Ok(SfpOp::Shl),
-        BinOp::BitShiftRight => Ok(SfpOp::Shr),
+        BinOp::Add => Ok(BinarySfpOp::Add),
+        BinOp::Sub => Ok(BinarySfpOp::Sub),
+        BinOp::Mul => Ok(BinarySfpOp::Mul),
+        BinOp::And | BinOp::BitAnd => Ok(BinarySfpOp::BitAnd),
+        BinOp::Or | BinOp::BitOr => Ok(BinarySfpOp::BitOr),
+        BinOp::BitXor => Ok(BinarySfpOp::BitXor),
+        BinOp::BitShiftLeft => Ok(BinarySfpOp::Shl),
+        BinOp::BitShiftRight => Ok(BinarySfpOp::Shr),
         other => {
             let _ = (at, other);
             Err(Error::TT_TODO_BINARY_SFPU)
@@ -2650,7 +2716,7 @@ copy 32,32 %out [1] = %bo [0]
         let ops = &m.ops;
         let pack = ops
             .iter()
-            .position(|(role, op)| *role == Role::Pack && matches!(op, MirOp::Pack { .. }))
+            .position(|(role, op)| *role == Role::Pack && matches!(op, MirOp::SetPackOffset { .. }))
             .expect("the first store packs") as usize;
         let release = ops[pack..]
             .iter()
