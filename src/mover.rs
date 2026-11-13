@@ -3,10 +3,11 @@
 
 //! The boundary programs: DRAM <-> L1 over the NoC.
 //!
-//! Every `copy_to` between a parameter and a buffer becomes one NOC request:
-//! the ten initiator registers are written in `tt_isa`'s order, `CMD_CTRL`
-//! triggers it, and the program waits on that word and then on the transaction
-//! ID's outstanding counter before the next copy. The parameter's address is its
+//! Every `copy` between a parameter and a buffer becomes one NoC request per
+//! lane — one for a scalar index, one per datum of a vector index — and the ten
+//! initiator registers are written in `tt_isa`'s order, `CMD_CTRL` triggers it,
+//! and the program waits on that word and then on the transaction ID's
+//! outstanding counter before the next copy. The parameter's address is its
 //! launch argument plus the copy's datum offset; the local address is the
 //! planned L1 buffer plus the same datum offset. Both sides are 64-byte aligned
 //! and add the same byte offset, so a request's two addresses are congruent.
@@ -56,12 +57,21 @@ struct Copy {
 }
 
 /// The parameter side of a copy: a literal byte offset, or a value computed
-/// each iteration of an enclosing loop (the address a loop index names).
+/// each iteration of an enclosing loop (the address a loop index names), or one
+/// base per lane read out of a page the mover copied (a gather's row of ids).
 enum ParamOffset {
     Const(u32),
-    /// `value` is the index expression, in datums; `dtype_bytes` scales it.
+    /// `value` is the index expression, in units of the access; `dtype_bytes`
+    /// scales it to bytes.
     Index {
         value: ValueId,
+        dtype_bytes: u32,
+    },
+    /// `load` names a vector read out of L1: `lanes` bases, each in units of the
+    /// access, one NoC request per base.
+    Lanes {
+        load: ValueId,
+        lanes: u32,
         dtype_bytes: u32,
     },
 }
@@ -505,28 +515,52 @@ fn program(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
                 } else {
                     rv::cb::wait_front(&mut a, reg::A6, cb, 1, sync3);
                 }
-                let offset = match copy.offset {
-                    ParamOffset::Const(bytes) => CopyOffset::Const(bytes),
-                    ParamOffset::Index { value, dtype_bytes } => {
-                        eval_value(
-                            &mut a,
-                            k,
-                            plan,
-                            &def,
-                            &param_index,
-                            &loops,
-                            value,
-                            reg::A5,
-                            &mut eval_temps,
+                match copy.offset {
+                    ParamOffset::Lanes {
+                        load,
+                        lanes,
+                        dtype_bytes,
+                    } => emit_lanes(
+                        &mut a,
+                        k,
+                        plan,
+                        &def,
+                        at,
+                        copy,
+                        load,
+                        lanes,
+                        dtype_bytes,
+                        loops.len(),
+                        inbound,
+                    )?,
+                    ref single => {
+                        let offset = match *single {
+                            ParamOffset::Const(bytes) => CopyOffset::Const(bytes),
+                            ParamOffset::Index { value, dtype_bytes } => {
+                                eval_value(
+                                    &mut a,
+                                    k,
+                                    plan,
+                                    &def,
+                                    &param_index,
+                                    &loops,
+                                    value,
+                                    reg::A5,
+                                    &mut eval_temps,
+                                )?;
+                                if dtype_bytes != 1 {
+                                    a.li(reg::T4, dtype_bytes);
+                                    a.word(rv::mul(reg::A5, reg::A5, reg::T4));
+                                }
+                                CopyOffset::Reg(reg::A5)
+                            }
+                            ParamOffset::Lanes { .. } => unreachable!("the arm above took it"),
+                        };
+                        emit_copy(
+                            &mut a, at, copy.param, offset, None, cb, copy.bytes, inbound,
                         )?;
-                        if dtype_bytes != 1 {
-                            a.li(reg::T4, dtype_bytes);
-                            a.word(rv::mul(reg::A5, reg::A5, reg::T4));
-                        }
-                        CopyOffset::Reg(reg::A5)
                     }
-                };
-                emit_copy(&mut a, at, copy.param, offset, cb, copy.bytes, inbound)?;
+                }
                 if inbound {
                     rv::cb::push_back(&mut a, reg::A6, cb, 1, sync4);
                 } else {
@@ -784,6 +818,12 @@ fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
                 let unit = (access[0] * access[1])
                     .checked_mul(dtype.bytes())
                     .ok_or(Error::TT_ERROR_PARAM_OFFSET_OVERFLOW)?;
+                // A vector index is one base per datum: a gather reads them out
+                // of the page it copied, one datum per lane.
+                let lanes = match param_offset {
+                    Dim::Const(_) => 1,
+                    Dim::Value(v) => crate::ir::lanes(types.of(v).shape),
+                };
                 let offset = match param_offset {
                     Dim::Const(n) => ParamOffset::Const(n.checked_mul(unit).ok_or_else(|| {
                         let _ = (at, n);
@@ -796,6 +836,11 @@ fn collect(k: &Kernel, types: &Types, plan: &Plan, inbound: bool) -> Result<Vec<
                                 .checked_mul(unit)
                                 .ok_or(Error::TT_ERROR_PARAM_OFFSET_OVERFLOW)?,
                         ),
+                        _ if lanes > 1 => ParamOffset::Lanes {
+                            load: value,
+                            lanes,
+                            dtype_bytes: unit,
+                        },
                         _ => {
                             // The value depends on a loop index; the loop
                             // carries it in a register and the copy scales it
@@ -842,11 +887,125 @@ fn prologue(a: &mut Asm, niu: Niu) {
     a.word(rv::lw(reg::A6, reg::A0, ARG_IFACE as i32 * 4));
 }
 
+/// One NoC request per lane: a copy whose parameter index names `lanes` bases.
+///
+/// The bases are data, not an expression: they sit in the page the mover copied
+/// (a row of ids), so each lane reads its own datum out of L1 and names a span
+/// of `dtype_bytes`. The L1 side is the ring's page, so the lane's span starts
+/// one request past the one before it.
+#[allow(clippy::too_many_arguments)]
+fn emit_lanes(
+    a: &mut Asm,
+    k: &Kernel,
+    plan: &Plan,
+    def: &[Option<usize>],
+    at: usize,
+    copy: &Copy,
+    load: ValueId,
+    lanes: u32,
+    dtype_bytes: u32,
+    depth: usize,
+    inbound: bool,
+) -> Result<(), Error> {
+    let (base, el) = lane_page(k, plan, def, load, at)?;
+    // A lane loop is one more nesting level: it takes the next counter pair, so
+    // two program loops around a lane copy do not fit.
+    let (counter, limit) = match depth {
+        0 => (reg::A1, reg::A2),
+        1 => (reg::A3, reg::A4),
+        _ => return Err(Error::TT_TODO_LOOP_DEPTH),
+    };
+    a.li(counter, 0);
+    a.li(limit, lanes);
+    let top = format!("lane{at}");
+    a.label(top.clone());
+    // This lane's base: the id row's datum, in units of the access.
+    a.li(reg::T1, base);
+    a.li(reg::T0, el);
+    a.word(rv::mul(reg::T0, counter, reg::T0));
+    a.word(rv::add(reg::T1, reg::T1, reg::T0));
+    a.word(rv::lw(reg::T1, reg::T1, 0));
+    a.li(reg::T0, dtype_bytes);
+    a.word(rv::mul(reg::A5, reg::T1, reg::T0));
+    // And this lane's span of the ring's page.
+    a.li(reg::T0, copy.bytes);
+    a.word(rv::mul(reg::T0, counter, reg::T0));
+    emit_copy(
+        a,
+        at,
+        copy.param,
+        CopyOffset::Reg(reg::A5),
+        Some(reg::T0),
+        copy.cb,
+        copy.bytes,
+        inbound,
+    )?;
+    a.word(rv::addi(counter, counter, 1));
+    a.bltu_label(counter, limit, top);
+    Ok(())
+}
+
+/// The L1 address of the vector a lane index reads and its datum width: the
+/// page the `load` names, on a one-page ring. A deeper ring's pointer moves at
+/// run time, so its page is refused rather than read from the wrong one.
+fn lane_page(
+    k: &Kernel,
+    plan: &Plan,
+    def: &[Option<usize>],
+    load: ValueId,
+    at: usize,
+) -> Result<(u32, u32), Error> {
+    let Some(op) = def[load as usize].map(|d| &k.ops[d]) else {
+        let _ = (at, load);
+        return Err(Error::TT_TODO_MULTI_LANE);
+    };
+    let Op::Load {
+        buffer, ref offset, ..
+    } = *op
+    else {
+        let _ = (at, load);
+        return Err(Error::TT_TODO_MULTI_LANE);
+    };
+    let Some(Op::Buffer { dtype, .. }) = def[buffer as usize].map(|d| &k.ops[d]) else {
+        let _ = buffer;
+        return Err(Error::TT_ERROR_NOT_A_BUFFER);
+    };
+    let cb = plan.cb[buffer as usize].ok_or_else(|| {
+        let _ = (at, buffer);
+        Error::TT_ERROR_BUFFER_NOT_PLACED
+    })?;
+    let ring = plan.cbs[cb as usize];
+    if ring.pages != 1 {
+        let _ = (at, ring.pages);
+        return Err(Error::TT_TODO_LOOP_ADDRESS);
+    }
+    let units = match *offset {
+        Dim::Const(n) => n,
+        Dim::Value(v) => k
+            .const_i32(v)
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| {
+                let _ = (at, v);
+                Error::TT_TODO_LOOP_ADDRESS
+            })?,
+    };
+    let el = dtype.bytes();
+    let bytes = units
+        .checked_mul(el)
+        .ok_or(Error::TT_ERROR_PARAM_OFFSET_OVERFLOW)?;
+    let base = ring
+        .base
+        .checked_add(bytes)
+        .ok_or(Error::TT_ERROR_PARAM_OFFSET_OVERFLOW)?;
+    Ok((base, el))
+}
+
 fn emit_copy(
     a: &mut Asm,
     at: usize,
     param: u32,
     offset: CopyOffset,
+    l1_offset: Option<u8>,
     cb: u32,
     bytes: u32,
     read: bool,
@@ -878,6 +1037,9 @@ fn emit_copy(
         reg::A6,
         (cb * rv::cb::STRIDE) as i32 + field,
     ));
+    if let Some(reg) = l1_offset {
+        a.word(rv::add(reg::T4, reg::T4, reg));
+    }
     // `TARG_ADDR` is the request's source and `RET_ADDR` its destination: a
     // read has the parameter as source and L1 as destination, a write the
     // other way round.

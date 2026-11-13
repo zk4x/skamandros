@@ -3179,29 +3179,31 @@ copy 32,32 %out [0] = %bo [0]
     }
 }
 
-/// The embedding gather as pure data movement: the row index is copied in as a
-/// whole row, read back as a scalar, and selects the weight page, which is
-/// copied out. No compute role runs.
+/// The embedding gather as pure data movement: the row of ids is copied in as a
+/// whole row, and the copy that follows names that row as its index — one base
+/// per lane — so each lane pulls one weight row into the tile the last copy
+/// drains. No compute role runs.
 const GATHER: &str = "\
 version 8
 grid 1,1
-%ids = param i32 1024
+%ids = param i32 32
 %w = param f32 32768
 %out = param f32 1024
 %ib = buffer i32 1,32
 %wb = buffer f32 32,32
 copy 1,32 %ib [0] = %ids [0]
-%i = const i32 0
-load 1,1 %id = %ib [%i]
-copy 32,32 %wb [0] = %w [%id]
+load 1,32 %rows = %ib [0]
+copy 1,32 %wb [0] = %w [%rows]
 copy 32,32 %out [0] = %wb [0]
 ";
 
 #[test]
 fn a_gather_is_pure_data_movement() {
-    const TOKEN: usize = 3;
-    let mut ids = vec![0u8; 1024 * 4];
-    ids[..4].copy_from_slice(&(TOKEN as i32).to_le_bytes());
+    // A token's embedding is one 32x32 tile, so its row base is `token * 32`
+    // rows of 32 datums; the weight is 32 tiles of rows.
+    let tokens: Vec<i32> = (0..32).map(|lane| ((lane * 7 + 3) % 32) as i32).collect();
+    let rows: Vec<i32> = tokens.iter().map(|token| token * 32).collect();
+    let ids: Vec<u8> = rows.iter().flat_map(|v| v.to_le_bytes()).collect();
     let w: Vec<f32> = (0..32768).map(|i| i as f32).collect();
     let weight: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
     let out = run_kernel_tensors(GATHER, &[&ids, &weight], 1024 * 4);
@@ -3209,7 +3211,13 @@ fn a_gather_is_pure_data_movement() {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    for (i, &g) in got.iter().enumerate() {
-        assert_eq!(g, w[TOKEN * 1024 + i], "datum {i}");
+    for (lane, &token) in tokens.iter().enumerate() {
+        for column in 0..32 {
+            assert_eq!(
+                got[lane * 32 + column],
+                w[token as usize * 1024 + column],
+                "lane {lane} datum {column}"
+            );
+        }
     }
 }

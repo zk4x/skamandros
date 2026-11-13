@@ -389,7 +389,9 @@ pub enum Op {
     /// own index (zyx's `Op::Copy` carries `src_idx`/`dst_idx`). `shape` is the
     /// unit one base moves: `32,32` a tile, `1,32` a row, `32,1` a column, `1,1`
     /// one datum. A copy's unit has to be a whole NoC request, so it is a tile
-    /// or a row and nothing narrower.
+    /// or a row and nothing narrower. A vector index on the parameter side names
+    /// one base per datum, and the lanes fill the buffer's page: a `1,32` copy
+    /// with 32 bases is 32 rows, one `32,32` page.
     CopyTo {
         dst: ValueId,
         src: ValueId,
@@ -893,21 +895,24 @@ impl Kernel {
                     if !matches!(unit, RegShape::Row | RegShape::Tile) {
                         return Err(Error::TT_ERROR_COPY_UNIT);
                     }
+                    // The parameter side names one base per datum of its index,
+                    // so a vector index is one request per lane; the L1 side
+                    // names the ring's page, which is one.
                     let lanes = check_index(
                         &values,
                         &visible,
-                        dst_offset,
+                        param_offset,
                         at,
                         Error::TT_ERROR_OFFSET_NOT_INDEX,
                     )?;
-                    let src_lanes = check_index(
+                    let page = check_index(
                         &values,
                         &visible,
-                        src_offset,
+                        buffer_offset,
                         at,
                         Error::TT_ERROR_OFFSET_NOT_INDEX,
                     )?;
-                    if lanes != 1 || src_lanes != 1 {
+                    if page != 1 {
                         return Err(Error::TT_TODO_MULTI_LANE);
                     }
                     let Op::Buffer { shape, .. } = self.ops[def[buffer as usize]] else {
@@ -916,9 +921,11 @@ impl Kernel {
                     };
                     let (unit_shape, _, _) = unit_of(shape, b.dtype)?;
                     let datums = access[0] * access[1];
-                    if unit_shape.datums() != datums {
-                        let _ = (unit_shape, access);
-                        return Err(Error::TT_ERROR_ACCESS_SHAPE);
+                    // One lane moves one unit, and the lanes fill exactly one
+                    // L1 page: `page_datums / lanes` datums each.
+                    if lanes.checked_mul(datums) != Some(unit_shape.datums()) {
+                        let _ = (lanes, datums, unit_shape);
+                        return Err(Error::TT_ERROR_COPY_LANES);
                     }
                     let total = shape[0] * shape[1];
                     check_offset(buffer_offset, total, datums, at)?;
@@ -1410,11 +1417,16 @@ fn check_index(
         let _ = i;
         return Err(bad);
     }
-    Ok(match i.shape {
+    Ok(lanes(i.shape))
+}
+
+/// How many bases an index of this shape names: one per datum.
+pub(crate) fn lanes(shape: RegShape) -> u32 {
+    match shape {
         RegShape::Scalar => 1,
         RegShape::Row | RegShape::Column => 32,
         RegShape::Tile => 1024,
-    })
+    }
 }
 
 /// A bracket must leave room for one unit. A symbolic offset cannot be checked

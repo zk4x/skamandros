@@ -421,11 +421,15 @@ pub enum ttStatus {
     /// A `copy` unit is not 64-byte congruent: a datum or a column cannot be a
     /// NoC request.
     TT_ERROR_COPY_UNIT = 172,
-    /// More than one base per access (a shaped index) is not lowered yet.
+    /// A shaped index on the L1 side of a copy (one page per base) is not
+    /// lowered yet.
     TT_TODO_MULTI_LANE = 173,
     /// A `load`/`store` unit that is not a tile (a row, a column, one datum) is
     /// not lowered yet.
     TT_TODO_ACCESS_SHAPE = 174,
+    /// A copy's lanes do not fill one L1 page: every lane moves one unit, and
+    /// `lanes` units have to be exactly the page's datums.
+    TT_ERROR_COPY_LANES = 175,
 }
 
 impl ttStatus {
@@ -606,6 +610,7 @@ impl ttStatus {
             ttStatus::TT_ERROR_COPY_UNIT => "TT_ERROR_COPY_UNIT",
             ttStatus::TT_TODO_MULTI_LANE => "TT_TODO_MULTI_LANE",
             ttStatus::TT_TODO_ACCESS_SHAPE => "TT_TODO_ACCESS_SHAPE",
+            ttStatus::TT_ERROR_COPY_LANES => "TT_ERROR_COPY_LANES",
             ttStatus::TT_ERROR_DST_ROW_ODD => "TT_ERROR_DST_ROW_ODD",
         }
     }

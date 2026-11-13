@@ -117,9 +117,19 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
     let mut last_use: Vec<Option<usize>> = vec![None; types.values.len()];
     let mut matmul_use: Vec<bool> = vec![false; types.values.len()];
     let mut non_matmul_use: Vec<bool> = vec![false; types.values.len()];
+    // A value read only as a copy's index is the mover's: it is an address
+    // expression, or a row of bases the mover reads one datum of per lane.
+    let mut index_use: Vec<bool> = vec![false; types.values.len()];
+    let mut other_use: Vec<bool> = vec![false; types.values.len()];
     for (at, op) in k.ops.iter().enumerate() {
         for v in op.used() {
             last_use[v as usize] = Some(at);
+            // A copy's ends are its operands; its other reads are indices.
+            if matches!(*op, Op::CopyTo { dst, src, .. } if v != dst && v != src) {
+                index_use[v as usize] = true;
+                continue;
+            }
+            other_use[v as usize] = true;
             match *op {
                 Op::Matmul { a, b, .. } if v == a || v == b => matmul_use[v as usize] = true,
                 // A reduce's operands are Src operands too: the fold runs on
@@ -191,6 +201,12 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 // A scalar load is an index read: the mover evaluates it from
                 // the page it copied, in RISC-V (see `mover::eval_value`).
                 if types.of(value).shape == RegShape::Scalar {
+                    continue;
+                }
+                // A vector load that nothing reads but a copy's index is the
+                // mover's lane bases: it reads one datum per lane out of the
+                // page it just copied, so no `Dst` slot ever holds it.
+                if index_use[value as usize] && !other_use[value as usize] {
                     continue;
                 }
                 let info = types.of(buffer);

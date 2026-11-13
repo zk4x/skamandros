@@ -284,8 +284,8 @@ load 1,32 %y = %ib [0]
 }
 
 /// The access shape is the unit: a copy's unit has to be one NoC request, a
-/// shape between the four is refused, and more than one base per access is a
-/// named TODO rather than a silent narrowing.
+/// shape between the four is refused, and the lanes of a vector index fill one
+/// `L1` page exactly.
 #[test]
 fn an_access_shape_is_the_unit_a_copy_moves() {
     use ttStatus as S;
@@ -317,22 +317,61 @@ copy 16,16 %b [0] = %p [0]
         S::TT_ERROR_ACCESS_SHAPE,
         "`16,16` is not one of the four units"
     );
+    // One base per datum of a vector index, one request per lane: the lanes
+    // fill the page exactly, so 32 rows of a tile-sized buffer gather in 32
+    // requests.
+    const GATHER: &str = "\
+version 8
+grid 1,1
+%ids = param i32 32
+%w = param f32 32768
+%out = param f32 1024
+%ib = buffer i32 1,32
+%wb = buffer f32 32,32
+copy 1,32 %ib [0] = %ids [0]
+load 1,32 %rows = %ib [0]
+copy 1,32 %wb [0] = %w [%rows]
+copy 32,32 %out [0] = %wb [0]
+";
+    let k = Kernel::parse(GATHER).expect("the vector index is 32 lanes");
+    let m = compile::compile(&k).expect("the lanes compile");
+    assert!(!m.reader.is_empty(), "the gather is data movement");
+
+    // A tile per lane would need 32 pages, not one.
     assert_eq!(
         refused(
             "\
 version 8
 grid 1,1
-%pid = param i32 1024
-%idxb = buffer i32 1,32
+%pid = param i32 32
 %w = param f32 32768
 %b = buffer f32 32,32
+%idxb = buffer i32 1,32
 copy 1,32 %idxb [0] = %pid [0]
 load 1,32 %i = %idxb [0]
 copy 32,32 %b [0] = %w [%i]
 "
         ),
+        S::TT_ERROR_COPY_LANES,
+        "32 tiles are not the page's 32 rows"
+    );
+    // The L1 side is the ring's page, so it names one base, not a vector.
+    assert_eq!(
+        refused(
+            "\
+version 8
+grid 1,1
+%pid = param i32 32
+%w = param f32 32768
+%b = buffer f32 32,32
+%idxb = buffer i32 1,32
+copy 1,32 %idxb [0] = %pid [0]
+load 1,32 %i = %idxb [0]
+copy 1,32 %b [%i] = %w [%i]
+"
+        ),
         S::TT_TODO_MULTI_LANE,
-        "a vector index names 32 bases"
+        "a vector names 32 destination pages"
     );
 }
 

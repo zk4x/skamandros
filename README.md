@@ -82,6 +82,11 @@ form (`TTIR`).
   source's bracket is optional and defaults to the destination's. The staged copy
   above puts the access index on the parameter side and `0` on the buffer side,
   because a buffer is a ring page while the parameter names the access.
+- **An index names one base per lane.** An `i32` vector is not one index but one
+  per datum, so `copy 1,32 %b [0] = %w [%rows]` issues one row per datum of
+  `%rows`, and the lanes fill the buffer's page exactly: 32 rows make one
+  `32,32` page. The bases are data, so the mover reads each one out of the page
+  it copied — that is the embedding gather, with no compute role at all.
 - **Every buffer has one producer and one consumer**: the reader publishes and
   the unpacker consumes an input buffer; the packer publishes and the writer
   consumes an output buffer; a compute-free DRAM-to-DRAM transfer is one buffer
@@ -259,9 +264,9 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   the section after the pack has retired.
 - A tensor parameter is **tiled**: its bytes are the tile layout below, not a
   row-major matrix, exactly as tt-metal's DRAM tensors are in `TILE_LAYOUT`.
-  `copy` moves one page of `page` bytes contiguously, so a kernel never
-  gathers a tile out of row-major data; the host does that when it fills the
-  parameter.
+  A `32,32` copy moves one tile of `page` bytes contiguously, so a tile access
+  needs that layout; a `1,32` copy moves one row, which is how a gather reads
+  rows out of a row-major weight.
 - A launch runs the module's whole grid: every tile of it gets the module's
   programs and arguments, and all of them run concurrently. A symbolic grid
   (`grid %nx,%ny`) is resolved at launch from the scalar arguments before any
