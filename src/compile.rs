@@ -37,10 +37,13 @@ pub fn compile(k: &Kernel) -> Result<Module, Error> {
     let plan = place(k, &types)?;
     let alloc = allocate(k, &types)?;
     let mut machine = lower(k, &types, &plan, &alloc)?;
+    // The role hand-offs are derived from the accesses, before fusion replaces
+    // the cross-role order with the three per-role streams.
+    optimize::reg_sync(&mut machine);
     optimize::fuse(&mut machine);
     optimize::verify(&machine)?;
     let words = encode::encode(&machine)?;
-    let setup = encode::setup(alloc.dst_peak.max(1))?;
+    let setup = encode::setup(&machine.sems())?;
     let reader = mover::inbound(k, &types, &plan)?;
     let writer = mover::outbound(k, &types, &plan)?;
     let params = parameter_kinds(k, &types);

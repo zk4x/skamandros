@@ -1,19 +1,404 @@
 // Copyright (C) 2025 zk4x
 // SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
 
-//! The passes over the machine IR: fusion and verification.
+//! The passes over the machine IR: role synchronization, fusion and
+//! verification.
 //!
-//! Allocation (`Dst` slots, `Src` banks, lane registers, the cross-core
-//! semaphores) happens in [`crate::alloc`], before lowering, because it is an SSA
-//! property. What is left to do after the machine IR exists is the row body: the
-//! lowering emits one load/op/store triple per `Dst` row, and fusion collapses a
-//! run of them into one body plus a repeat, which is what the hardware's replay
-//! expander and row-address modifier execute.
+//! Allocation (`Dst` slots, `Src` banks, lane registers) happens in
+//! [`crate::alloc`], before lowering, because it is an SSA property. What is
+//! left to do after the machine IR exists is the row body: the lowering emits
+//! one load/op/store triple per `Dst` row, and fusion collapses a run of them
+//! into one body plus a repeat, which is what the hardware's replay expander and
+//! row-address modifier execute. The hand-offs between the three roles are
+//! derived here too ([`reg_sync`]), from the accesses themselves.
 
 use crate::alloc::DST_SLOTS;
 use crate::ir::Error;
 use crate::lower::DST_ROWS;
 use crate::mir::{Machine, MirOp, Role};
+
+/// One `Dst` access, in program order: the position of the op in
+/// [`Machine::ops`], the role that issues it, and whether it writes.
+#[derive(Debug, Clone, Copy)]
+struct Access {
+    at: usize,
+    role: Role,
+    write: bool,
+}
+
+/// An ordered `(producer, consumer)` role edge: one Sync Unit semaphore carries
+/// every seam between those two roles.
+type Edge = (Role, Role);
+
+/// The role hand-offs over the `Dst` slots.
+///
+/// The hardware has no `Dst` lock: the Sync Unit holds eight flat 4-bit
+/// counters, and the only ordering between the unpacker, the math thread and
+/// the packer is one `SEMPOST`/`SEMWAIT` per direction. So the pass derives,
+/// per physical slot, who writes it and who reads it, in program order, and
+/// emits the seams that are actually needed:
+///
+/// - a **data** seam when a reader in another role follows a writer: the writer
+///   posts after its last write, the reader takes before its first read;
+/// - a **reuse** seam when a later epoch overwrites a slot some other role read:
+///   the reader posts after its last read, the next writer takes before its
+///   first write;
+/// - a **loop** seam when both ends are in the same loop body: the body runs
+///   `count` times, so the writer may not overwrite the slot until the reader
+///   has taken the previous iteration's. Such an edge starts with one token per
+///   hand-off the body performs, so the first iteration's writes have nothing to
+///   wait for.
+///
+/// All three are counting hand-offs, so one semaphore serves one ordered edge —
+/// every slot and epoch on that edge shares it. The consumer's takes are counted
+/// against the producer's posts up to the one it needs, so a consumer that reads
+/// the second slot the producer wrote first takes two tokens at once rather than
+/// waiting for a post that already happened. Reads by the role that wrote the
+/// slot need no seam: they are the same stream. Initial values are zero unless
+/// the edge paces a loop; a producer always posts before any take of its edge.
+///
+/// This must run before [`fuse`]: it reads the cross-role program order, which
+/// fusion replaces with the three per-role streams.
+pub fn reg_sync(m: &mut Machine) {
+    // The unpacker's `Dst` target and, per unit, whether it is configured for
+    // `Src`: an `UNPACR` writes `Dst` only when its unit is on the `Dst` path.
+    let mut target: Option<u32> = None;
+    let mut to_src = [false; 2];
+    let mut touches: Vec<Vec<Access>> = vec![Vec::new(); DST_SLOTS as usize];
+    for (at, (role, op)) in m.ops.iter().enumerate() {
+        let mut touched: Vec<(u8, bool)> = Vec::new();
+        match *op {
+            MirOp::Setdst { row } => target = Some(row),
+            MirOp::UnpackConfig {
+                unit, to_src: src, ..
+            } => to_src[unit as usize] = src,
+            MirOp::Unpacr { unit, .. } => {
+                if !to_src[unit as usize] {
+                    let row = target.expect("the Dst path names its row with Setdst");
+                    touched.push((slot(row), true));
+                }
+            }
+            MirOp::Sfpstore { row, .. } => touched.push((slot(row), true)),
+            MirOp::Sfpload { row, .. } => touched.push((slot(row), false)),
+            // The Matrix Unit's accumulator: `MVMUL` carries one row of the
+            // slot it accumulates into.
+            MirOp::Mvmul { row, .. } => touched.push((slot(row), true)),
+            MirOp::Elw { dst_row, .. }
+            | MirOp::Gapool { dst_row, .. }
+            | MirOp::Gmpool { dst_row, .. }
+            | MirOp::Mova2d { dst_row, .. }
+            | MirOp::Movb2d { dst_row, .. } => touched.push((slot(dst_row), true)),
+            // `MOVD2B` reads `Dst` into `SrcB`.
+            MirOp::Movd2b { dst_row, .. } => touched.push((slot(dst_row), false)),
+            MirOp::Pack { row, .. } => touched.push((slot(row), false)),
+            _ => {}
+        }
+        for (slot, write) in touched {
+            touches[slot as usize].push(Access {
+                at,
+                role: *role,
+                write,
+            });
+        }
+    }
+    // The loop bodies. Every role emits a marker for every IR loop at the same
+    // point in the program, so the n-th loop a role opens is the n-th loop every
+    // other role opens: pairing the roles by that ordinal gives one region per
+    // IR loop, spanning all three roles' body ops. (A symbolic bound puts the
+    // role's RISC-V count computation between the markers, so the three markers
+    // of one loop are not adjacent in the list.)
+    let mut levels: Vec<(usize, usize)> = Vec::new();
+    let mut stacks: Vec<Vec<usize>> = vec![Vec::new(); 3];
+    let mut opened = [0usize; 3];
+    for (at, (role, op)) in m.ops.iter().enumerate() {
+        let r = *role as usize;
+        match op {
+            MirOp::Loop { .. } | MirOp::LoopReg { .. } => {
+                let ordinal = opened[r];
+                opened[r] += 1;
+                stacks[r].push(ordinal);
+                if ordinal == levels.len() {
+                    levels.push((at, 0));
+                } else {
+                    levels[ordinal].0 = levels[ordinal].0.min(at);
+                }
+            }
+            MirOp::EndLoop => {
+                let ordinal = stacks[r].pop().expect("EndLoop matches a Loop");
+                levels[ordinal].1 = levels[ordinal].1.max(at);
+            }
+            _ => {}
+        }
+    }
+    // A data seam whose two ends are in different bodies happens once for the
+    // whole loop, not once per iteration: the post goes after the innermost body
+    // that holds the writer but not the reader, the take before the innermost
+    // body that holds the reader but not the writer. Positions are `insert`
+    // indices into `Machine::ops`.
+    let hoist_end = |writer: usize, reader: usize| -> usize {
+        let mut bodies: Vec<(usize, usize)> = levels
+            .iter()
+            .filter(|(start, end)| *start < writer && writer < *end)
+            .copied()
+            .collect();
+        bodies.sort_by(|a, b| b.0.cmp(&a.0));
+        match bodies
+            .into_iter()
+            .find(|(start, end)| !(*start < reader && reader < *end))
+        {
+            Some((_, end)) => end + 1,
+            None => writer + 1,
+        }
+    };
+    let hoist_begin = |writer: usize, reader: usize| -> usize {
+        let mut bodies: Vec<(usize, usize)> = levels
+            .iter()
+            .filter(|(start, end)| *start < reader && reader < *end)
+            .copied()
+            .collect();
+        bodies.sort_by(|a, b| b.0.cmp(&a.0));
+        match bodies
+            .into_iter()
+            .find(|(start, end)| !(*start < writer && writer < *end))
+        {
+            Some((start, _)) => start,
+            None => reader,
+        }
+    };
+    // The innermost body containing `at`.
+    let scope = |at: usize| -> Option<(usize, usize)> {
+        levels
+            .iter()
+            .filter(|(start, end)| *start < at && at < *end)
+            .max_by_key(|(start, _)| *start)
+            .copied()
+    };
+    // A seam names the ordered edge it carries; the semaphore index is assigned
+    // once all edges are known. A data seam counts its posts, because the
+    // consumer's take count must match them (see below); a reuse or pacing seam
+    // is one post and one take, in role order.
+    let mut data: Vec<(Edge, usize, usize, usize)> = Vec::new();
+    let mut posts: Vec<(usize, Edge)> = Vec::new();
+    let mut takes: Vec<(usize, Edge)> = Vec::new();
+    // Loop-pacing edges, counted per body: the semaphore starts with one token
+    // per hand-off the body performs.
+    let mut reuse: Vec<(Edge, usize, u8)> = Vec::new();
+    for events in &touches {
+        // One epoch per write: the data an epoch publishes is what the reads
+        // that follow it (before the next write) consume.
+        let mut epochs: Vec<((Role, usize), Vec<(Role, usize, usize)>)> = Vec::new();
+        for &Access { at, role, write } in events {
+            if write {
+                epochs.push(((role, at), Vec::new()));
+            } else if let Some(((writer, _), readers)) = epochs.last_mut() {
+                if *writer != role {
+                    match readers.iter_mut().find(|r| r.0 == role) {
+                        Some(r) => r.2 = at,
+                        None => readers.push((role, at, at)),
+                    }
+                }
+            }
+        }
+        for (n, ((writer, write_at), readers)) in epochs.iter().enumerate() {
+            for &(reader, first, _) in readers {
+                data.push((
+                    (*writer, reader),
+                    hoist_end(*write_at, first),
+                    hoist_begin(*write_at, first),
+                    *write_at,
+                ));
+            }
+            // The reuse edge: a slot written again in the next epoch must not be
+            // overwritten while this epoch's readers still need it. Only within
+            // one body: a next write in another body is the loop wrap, which the
+            // pacing seam below covers once per iteration.
+            if let Some(((next_writer, next_write), _)) = epochs.get(n + 1) {
+                for &(reader, _, last) in readers {
+                    if reader != *next_writer && scope(last) == scope(*next_write) {
+                        posts.push((last + 1, (reader, *next_writer)));
+                        takes.push((*next_write, (reader, *next_writer)));
+                    }
+                }
+            }
+        }
+        // A body runs its accesses `count` times, so the previous iteration's
+        // content is still being read when the first write of the next one
+        // starts. The reader that releases the slot is the body's last reader,
+        // and the write that overwrites it is the body's first write.
+        for (start, end) in &levels {
+            let in_body = |a: &Access| *start < a.at && a.at < *end;
+            let first_write = events.iter().find(|a| in_body(a) && a.write);
+            let last_read = events.iter().rev().find(|a| in_body(a) && !a.write);
+            let (Some(w), Some(r)) = (first_write, last_read) else {
+                continue;
+            };
+            if w.role == r.role {
+                continue;
+            }
+            posts.push((r.at + 1, (r.role, w.role)));
+            takes.push((w.at, (r.role, w.role)));
+            match reuse
+                .iter_mut()
+                .find(|(edge, body, _)| *edge == (r.role, w.role) && *body == *start)
+            {
+                Some(count) => count.2 += 1,
+                None => reuse.push(((r.role, w.role), *start, 1)),
+            }
+        }
+    }
+    if data.is_empty() && posts.is_empty() && takes.is_empty() {
+        return;
+    }
+    let mut edges: Vec<Edge> = Vec::new();
+    for &(edge, _, _, _) in &data {
+        if !edges.contains(&edge) {
+            edges.push(edge);
+        }
+    }
+    for &(_, edge) in posts.iter().chain(takes.iter()) {
+        if !edges.contains(&edge) {
+            edges.push(edge);
+        }
+    }
+    edges.sort_unstable();
+    assert!(
+        edges.len() <= tt_isa::sync::Semaphore::COUNT as usize,
+        "reg_sync: {} role hand-off edges need more than the {} semaphores of the Sync Unit",
+        edges.len(),
+        tt_isa::sync::Semaphore::COUNT
+    );
+    let sem = |edge: Edge| -> u8 {
+        edges
+            .iter()
+            .position(|e| *e == edge)
+            .expect("every seam's edge is in `edges`") as u8
+    };
+    // A counting hand-off pairs posts with takes in the producer's order, but a
+    // consumer can read a slot the producer wrote *second* before one it wrote
+    // first: `div` reads the divisor (the second page) to form the reciprocal
+    // before it reads the dividend. So a take needs as many tokens as there are
+    // posts up to the one it needs, and the takes are batched at the read that
+    // needs them. Within one body the ranks are local; a seam whose ends are in
+    // different bodies is a single shot (`hoist_end`/`hoist_begin` have already
+    // moved it out), so one token is its whole count.
+    //
+    // The rank of each data post on its edge within its body: the n-th post of
+    // that edge in that scope.
+    let mut rank: Vec<(usize, Option<(usize, usize)>, usize)> = Vec::new();
+    let mut counted: Vec<(Edge, Option<(usize, usize)>, usize)> = Vec::new();
+    let mut data_posts: Vec<&(Edge, usize, usize, usize)> = data.iter().collect();
+    data_posts.sort_by_key(|(_, post, _, _)| *post);
+    for (edge, post, _, epoch) in &data_posts {
+        let at = scope(*post);
+        let n = match counted.iter().position(|(e, s, _)| e == edge && *s == at) {
+            Some(i) => {
+                counted[i].2 += 1;
+                counted[i].2
+            }
+            None => {
+                counted.push((*edge, at, 1));
+                1
+            }
+        };
+        rank.push((*epoch, at, n));
+    }
+    let mut taken: Vec<(Edge, Option<(usize, usize)>, usize)> = Vec::new();
+    let mut data_takes: Vec<&(Edge, usize, usize, usize)> = data.iter().collect();
+    data_takes.sort_by_key(|(_, _, take, _)| *take);
+    let mut inserts: Vec<(usize, (Role, MirOp))> = Vec::new();
+    for (edge, post, take, epoch) in &data_takes {
+        let at = scope(*take);
+        let hops = *post == *epoch + 1 && scope(*epoch) == at;
+        let need = if hops {
+            rank.iter()
+                .find(|(e, s, _)| e == epoch && *s == at)
+                .map(|(_, _, n)| *n)
+                .unwrap_or(1)
+        } else {
+            1
+        };
+        let seen = match taken.iter().position(|(e, s, _)| e == edge && *s == at) {
+            Some(i) => &mut taken[i].2,
+            None => {
+                taken.push((*edge, at, 0));
+                let i = taken.len() - 1;
+                &mut taken[i].2
+            }
+        };
+        for _ in *seen..need {
+            inserts.push((
+                *take,
+                (
+                    edge.1,
+                    MirOp::SemWait {
+                        sem: sem(*edge),
+                        before: 0,
+                    },
+                ),
+            ));
+        }
+        *seen = (*seen).max(need);
+    }
+    for (at, edge) in takes {
+        inserts.push((
+            at,
+            (
+                edge.1,
+                MirOp::SemWait {
+                    sem: sem(edge),
+                    before: 0,
+                },
+            ),
+        ));
+    }
+    for (at, edge) in posts {
+        // Inserted in this order because `insert(at, ..)` puts the new op in
+        // front of what is already there: the post goes in first, so the guard
+        // ends up before it.
+        inserts.push((at, (edge.0, MirOp::SemPost { sem: sem(edge) })));
+        inserts.push((at, (edge.0, MirOp::SemWaitFree { sem: sem(edge) })));
+    }
+    // Each data post is one token, guarded like every other post.
+    for (edge, post, _, _) in &data {
+        inserts.push((*post, (edge.0, MirOp::SemPost { sem: sem(*edge) })));
+        inserts.push((*post, (edge.0, MirOp::SemWaitFree { sem: sem(*edge) })));
+    }
+    // Apply from the back, so the earlier positions stay valid.
+    inserts.sort_by(|a, b| b.0.cmp(&a.0));
+    for (at, op) in inserts {
+        m.ops.insert(at, op);
+    }
+    // `Semset` is not an instruction: `encode::setup` folds the table below into
+    // the run's semaphore inits, before any role is released.
+    let mut ops: Vec<(Role, MirOp)> = Vec::new();
+    for (index, edge) in edges.iter().enumerate() {
+        let value = reuse
+            .iter()
+            .filter(|(e, _, _)| e == edge)
+            .map(|(_, _, count)| *count)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            value <= tt_isa::sync::MAX_VALUE,
+            "reg_sync: edge {edge:?} performs {value} loop hand-offs per iteration, more than the {} a semaphore can start with",
+            tt_isa::sync::MAX_VALUE
+        );
+        ops.push((
+            Role::Unpack,
+            MirOp::Semset {
+                sem: index as u8,
+                value,
+            },
+        ));
+    }
+    ops.extend(m.ops.drain(..));
+    m.ops = ops;
+}
+
+/// The `Dst` slot a row belongs to.
+fn slot(row: u32) -> u8 {
+    (row / DST_ROWS) as u8
+}
 
 /// Collapse every run of identical consecutive row triples into one body plus a
 /// [`MirOp::Repeat`].
@@ -23,6 +408,14 @@ use crate::mir::{Machine, MirOp, Role};
 /// repeat walks the rest.
 pub fn fuse(m: &mut Machine) {
     let mut fused: Vec<(Role, MirOp)> = Vec::with_capacity(m.ops.len());
+    // The semaphore inits are not instructions and have no stream; they stay at
+    // the front, which is where `reg_sync` put them.
+    fused.extend(
+        m.ops
+            .iter()
+            .filter(|(_, op)| matches!(op, MirOp::Semset { .. }))
+            .copied(),
+    );
     for role in [Role::Unpack, Role::Math, Role::Pack] {
         let ops = m.stream(role);
         let mut out: Vec<MirOp> = Vec::with_capacity(ops.len());
@@ -126,6 +519,19 @@ fn same_shifted(body: &[MirOp; 3], following: &[MirOp; 3]) -> bool {
 /// Check every machine-IR invariant. A kernel that fails this must not be
 /// encoded.
 pub fn verify(m: &Machine) -> Result<(), Error> {
+    // The semaphore table: every index a stream names must be initialised, and
+    // every init names a semaphore the Sync Unit has.
+    let sems = m.sems();
+    for (i, (sem, value)) in sems.iter().enumerate() {
+        if tt_isa::sync::Semaphore::new(*sem).is_none() || *value > tt_isa::sync::MAX_VALUE {
+            let _ = (sem, value);
+            return Err(Error::TT_ERROR_SEMAPHORE);
+        }
+        if sems[..i].iter().any(|(s, _)| s == sem) {
+            let _ = sem;
+            return Err(Error::TT_ERROR_SEMAPHORE);
+        }
+    }
     for (name, ops) in [
         ("unpack", m.stream(Role::Unpack)),
         ("math", m.stream(Role::Math)),
@@ -195,10 +601,15 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                 | MirOp::SemWaitFree { sem }
                 | MirOp::SemWaitData { sem }
                 | MirOp::SemGet { sem } => {
-                    if sem >= tt_isa::sync::Semaphore::COUNT {
+                    if tt_isa::sync::Semaphore::new(sem).is_none()
+                        || !sems.iter().any(|(s, _)| *s == sem)
+                    {
                         let _ = (name, at, sem);
                         return Err(Error::TT_ERROR_SEMAPHORE);
                     }
+                }
+                MirOp::Semset { .. } => {
+                    unreachable!("a semaphore init is not an instruction and has no role stream")
                 }
                 MirOp::Repeat { len, count } => {
                     if len == 0 || count == 0 {
@@ -409,7 +820,11 @@ copy 32,32 %out [0] = %b0 [0]
         let types = k.verify().unwrap();
         let plan = place(&k, &types).unwrap();
         let alloc = allocate(&k, &types).unwrap();
-        lower(&k, &types, &plan, &alloc).unwrap()
+        let mut m = lower(&k, &types, &plan, &alloc).unwrap();
+        // The same order `compile` uses: the seams are derived from the
+        // accesses, then fusion collapses the row bodies around them.
+        reg_sync(&mut m);
+        m
     }
 
     /// The math core's program, which is what the row-body tests look at.

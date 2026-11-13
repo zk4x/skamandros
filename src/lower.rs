@@ -30,13 +30,6 @@ pub const DST_ROWS: u32 = 64;
 pub const TILE_DATUMS: u32 = 1024;
 /// Datums in one 16x16 face: one `Src` unpack's run.
 pub const FACE_DATUMS: u32 = TILE_DATUMS / 4;
-/// Semaphore the unpacker publishes a loaded unit on.
-pub const SEM_UNPACKED: u8 = 0;
-/// Semaphore the math core publishes a stored unit on.
-pub const SEM_READY: u8 = 1;
-/// Semaphore the packer hands a `Dst` slot back on. It starts at 1: the first
-/// load has one slot to fill.
-pub const SEM_SLOT: u8 = 2;
 
 /// The RISC-V register a loop counts in, by nesting depth. `encode` uses the
 /// same two for a constant bound, so a dynamic bound leaves its count there.
@@ -284,18 +277,9 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         let _ = (at, buffer);
                         return Err(Error::TT_ERROR_BF16_WIDEN);
                     }
-                    // The unpacker writes `Dst`: it waits for a slot the packer
-                    // has given back, so the first unit's result cannot be
-                    // overwritten before it has been packed. The page itself
-                    // comes from the ring: wait for the producer's push, unpack,
-                    // then release the page.
-                    m.push(
-                        Role::Unpack,
-                        MirOp::SemWait {
-                            sem: SEM_SLOT,
-                            before: 0,
-                        },
-                    );
+                    // The page comes from the ring: wait for the producer's
+                    // push, unpack, then release the page. Who may write this
+                    // `Dst` slot, and when, is `reg_sync`'s to decide.
                     m.push(Role::Unpack, MirOp::CbWait { cb });
                     m.push(Role::Unpack, MirOp::Setdst { row });
                     m.push(Role::Unpack, MirOp::Setadczw { unit: 0, face: 0 });
@@ -323,14 +307,6 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                             unit: 0,
                             count: unit_shape.datums(),
                             flip: false,
-                        },
-                    );
-                    m.push(Role::Unpack, MirOp::SemPost { sem: SEM_UNPACKED });
-                    m.push(
-                        Role::Math,
-                        MirOp::SemWait {
-                            sem: SEM_UNPACKED,
-                            before: 0,
                         },
                     );
                 } else {
@@ -371,11 +347,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     let (unit_shape, _, _) = unit_of([32, 32], acc_dtype)?;
                     let rows = rows_of(unit_shape, at)?;
                     let base = dst_row(alloc, buffer);
-                    // The fill writes `Dst` rows. If those rows were packed
-                    // since their last write, the packer may still be reading
-                    // them, so the math thread waits for the section to drain
-                    // first (`wait_math_semaphores`).
-                    m.push(Role::Math, MirOp::SemWaitFree { sem: SEM_READY });
+                    // The fill writes `Dst` rows; `reg_sync` places the wait
+                    // for a packer that still reads them.
                     m.push(Role::Math, MirOp::LaneConst { lreg: 0, bits });
                     // An SFPU store covers a row pair (`SFPSTORE` refuses an odd
                     // row and writes two), the same step the datapath uses.
@@ -414,19 +387,10 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     let _ = buffer;
                     Error::TT_ERROR_BUFFER_NOT_PLACED
                 })?;
-                // One `Dst` section is in flight at a time, as in tt_llk: the
-                // math thread waits until the packer has released the previous
-                // one before it offers this one. Without the wait two posts
-                // coalesce in the one-deep pack hand-off and the packer waits
-                // for a section that never comes.
-                m.push(Role::Math, MirOp::SemWaitFree { sem: SEM_READY });
-                m.push(Role::Math, MirOp::SemPost { sem: SEM_READY });
-                // The packer claims the unit, packs it, and only then releases
-                // the semaphore — so the math core cannot overwrite `Dst` until
-                // the pack has actually read it (`_llk_pack_dest_section_done_`).
-                m.push(Role::Pack, MirOp::SemWaitData { sem: SEM_READY });
                 // The page comes from the ring: reserve a free one, pack into
-                // it, then publish it to the writer.
+                // it, then publish it to the writer. The `Dst` hand-off is
+                // `reg_sync`'s: the math thread has published the section and
+                // the packer reads it here.
                 m.push(Role::Pack, MirOp::CbReserve { cb });
                 m.push(
                     Role::Pack,
@@ -441,10 +405,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         mask: acc_mask[resolve(&alias, value) as usize],
                     },
                 );
-                m.push(Role::Pack, MirOp::SemGet { sem: SEM_READY });
                 m.push(Role::Pack, MirOp::CbPush { cb });
-                // The pack has retired, so the `Dst` slot is free again.
-                m.push(Role::Pack, MirOp::SemPost { sem: SEM_SLOT });
                 let _ = offset;
             }
             Op::Cast { value, src, dtype } => {
@@ -921,11 +882,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 // Scratch for `mvmul_group`, which emits a run of math ops: the
                 // run is appended to the one IR as it is produced.
                 let mut math_scratch: Vec<MirOp> = Vec::new();
-                // The Matrix Unit writes the accumulator's rows. If they were
-                // packed since their last write, the packer may still be
-                // reading them; wait for the section to drain
-                // (`_llk_math_wait_for_dest_available_`).
-                m.push(Role::Math, MirOp::SemWaitFree { sem: SEM_READY });
+                // The Matrix Unit writes the accumulator's rows; `reg_sync`
+                // places the wait for a packer that still reads them.
                 // The Matrix Unit's address modifiers, fidelity phase and row
                 // counters are this thread's `ThreadConfig` and RWC state. Every
                 // word goes out as a whole `SETC16`, so an entry carrying several
@@ -1192,9 +1150,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     m.push(Role::Unpack, MirOp::CbWait { cb: cb_b });
                 }
                 let base = dst_row(alloc, acc);
-                // The accumulator's rows are written, so wait for the packer to
-                // give the section back.
-                m.push(Role::Math, MirOp::SemWaitFree { sem: SEM_READY });
+                // The accumulator's rows are written; `reg_sync` places the
+                // wait for the packer to give the section back.
                 // `reduce_configure_addrmod`: entry 0 clears the phase, 1 and 2
                 // step `SrcB`/`Dst`, and 3 steps only the phase.
                 for entry in [
@@ -1287,14 +1244,6 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                                     unit: 1,
                                     count: 16,
                                     flip: true,
-                                },
-                            );
-                            m.push(Role::Unpack, MirOp::SemPost { sem: SEM_UNPACKED });
-                            m.push(
-                                Role::Math,
-                                MirOp::SemWait {
-                                    sem: SEM_UNPACKED,
-                                    before: 0,
                                 },
                             );
                             // The first face of a pair hands both banks back
@@ -1518,14 +1467,6 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                                 flip: true,
                             },
                         );
-                        m.push(Role::Unpack, MirOp::SemPost { sem: SEM_UNPACKED });
-                        m.push(
-                            Role::Math,
-                            MirOp::SemWait {
-                                sem: SEM_UNPACKED,
-                                before: 0,
-                            },
-                        );
                         // Faces 0 and 2 fold into the first half of row 0, faces 1
                         // and 3 into the second (tt-metal's `SETRWC(CR_D, 8)`
                         // twice).
@@ -1631,15 +1572,13 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
     // scratch slot's old contents, which nothing reads.
     if let Some(ones) = plan.ones {
         let row = u32::from(crate::alloc::DST_SLOTS - 1) * DST_ROWS;
-        let mut prologue: Vec<(Role, MirOp)> =
-            vec![(Role::Math, MirOp::SemWaitFree { sem: SEM_READY })];
-        prologue.push((
+        let mut prologue: Vec<(Role, MirOp)> = vec![(
             Role::Math,
             MirOp::LaneConst {
                 lreg: 0,
                 bits: 1.0f32.to_bits(),
             },
-        ));
+        )];
         for row_off in (0..DST_ROWS).step_by(2) {
             prologue.push((
                 Role::Math,
@@ -1650,12 +1589,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 },
             ));
         }
-        prologue.push((Role::Math, MirOp::SemPost { sem: SEM_READY }));
-        // The slot is reused by the program, so the math does not proceed
-        // until the packer has retired this section.
-        prologue.push((Role::Math, MirOp::SemWaitFree { sem: SEM_READY }));
         for op in [
-            MirOp::SemWaitData { sem: SEM_READY },
             MirOp::CbReserve { cb: ones.cb },
             MirOp::Pack {
                 cb: ones.cb,
@@ -1665,30 +1599,12 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                 dtype: ones.dtype,
                 mask: PackMask::None,
             },
-            MirOp::SemGet { sem: SEM_READY },
             MirOp::CbPush { cb: ones.cb },
         ] {
             prologue.push((Role::Pack, op));
         }
         prologue.extend(m.ops.drain(..));
         m.ops = prologue;
-    }
-    if std::env::var_os("SKAMANDROS_DUMP").is_some() {
-        eprintln!("cbs: {}", plan.cbs.len());
-        for (i, cb) in plan.cbs.iter().enumerate() {
-            eprintln!("  {i}: page {} pages {}", cb.page, cb.pages);
-        }
-        for (v, cb) in plan.cb.iter().enumerate() {
-            if cb.is_some() {
-                eprintln!("cb {v} {} {:?}", k.names[v], cb);
-            }
-        }
-        for role in [Role::Unpack, Role::Math, Role::Pack] {
-            eprintln!("--- {role:?}");
-            for op in m.stream(role) {
-                eprintln!("{op:?}");
-            }
-        }
     }
     Ok(m)
 }
@@ -1875,8 +1791,8 @@ fn fpu_broadcast(
             (thread::ADDR_MOD_DST_SEC1_FidelityIncr, 1),
         ]),
     );
-    // The section is written, never accumulated into.
-    m.push(Role::Math, MirOp::SemWaitFree { sem: SEM_READY });
+    // The section is written, never accumulated into; `reg_sync` places the wait
+    // for a packer that still reads it.
     // `ELWMUL`'s word carries bit 21 set, so the hardware accumulates into the
     // destination (tt-isa's measured encoding; `ELWADD`/`ELWSUB` overwrite).
     // That is also how the four fidelity phases add up, so the result section is
@@ -1957,14 +1873,6 @@ fn fpu_broadcast(
                 unit: 1,
                 count: FACE_DATUMS,
                 flip: true,
-            },
-        );
-        m.push(Role::Unpack, MirOp::SemPost { sem: SEM_UNPACKED });
-        m.push(
-            Role::Math,
-            MirOp::SemWait {
-                sem: SEM_UNPACKED,
-                before: 0,
             },
         );
         // One face is two instructions of eight rows. `ELWMUL` is the Matrix
@@ -2049,9 +1957,6 @@ fn stage(
 ) {
     let id = resolve(alias, value);
     let dtype = types.of(id).dtype;
-    m.push(Role::Math, MirOp::SemWaitFree { sem: SEM_READY });
-    m.push(Role::Math, MirOp::SemPost { sem: SEM_READY });
-    m.push(Role::Pack, MirOp::SemWaitData { sem: SEM_READY });
     m.push(Role::Pack, MirOp::CbReserve { cb });
     m.push(
         Role::Pack,
@@ -2064,10 +1969,7 @@ fn stage(
             mask: acc_mask[id as usize],
         },
     );
-    m.push(Role::Pack, MirOp::SemGet { sem: SEM_READY });
     m.push(Role::Pack, MirOp::CbPush { cb });
-    // The pack has retired, so the `Dst` slot is free again.
-    m.push(Role::Pack, MirOp::SemPost { sem: SEM_SLOT });
 }
 
 /// The literal trip count of a bound, if it has one.
@@ -2372,17 +2274,6 @@ fn rsqrt_body(
     const INF_BITS: u32 = 0x7f80_0000;
     const NAN_BITS: u32 = 0x7fc0_0000;
     debug_assert!(la < 2, "the body's scratch lanes start at 2");
-    // TEMP probe: stop the body at stage `N` and store lane `L` (`RSQRT_STAGE`
-    // / `RSQRT_LANE`). Removed before finishing.
-    let stage: u32 = std::env::var("RSQRT_STAGE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let stop_at: u8 = std::env::var("RSQRT_LANE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let mut step = 0u32;
     for &row in rows {
         role.push(MirOp::Sfpload {
             lreg: la,
@@ -2398,15 +2289,6 @@ fn rsqrt_body(
             a: la,
             d: 2,
         });
-        step += 1;
-        if stage == step {
-            role.push(MirOp::Sfpstore {
-                lreg: stop_at,
-                row: out + row,
-                dtype,
-            });
-            continue;
-        }
         // `i = bits(x) >> 1`, logically: the amount lane holds the integer 1 and
         // `SFPSHFT` negates it in its own lane.
         role.push(MirOp::LaneConst { lreg: 7, bits: 1 });
@@ -2427,15 +2309,6 @@ fn rsqrt_body(
             b: Some(3),
             d: 3,
         });
-        step += 1;
-        if stage == step {
-            role.push(MirOp::Sfpstore {
-                lreg: stop_at,
-                row: out + row,
-                dtype,
-            });
-            continue;
-        }
         // `xy = x y`, `c = (-y) xy`.
         role.push(MirOp::Sfp {
             op: SfpOp::Mul,
@@ -2488,15 +2361,6 @@ fn rsqrt_body(
             b: Some(6),
             d: 3,
         });
-        step += 1;
-        if stage == step {
-            role.push(MirOp::Sfpstore {
-                lreg: stop_at,
-                row: out + row,
-                dtype,
-            });
-            continue;
-        }
         // `xy = x y`, `one_minus_xyy = 1 + (-y) xy`.
         role.push(MirOp::Sfp {
             op: SfpOp::Mul,
@@ -2549,15 +2413,6 @@ fn rsqrt_body(
             b: Some(3),
             d: 3,
         });
-        step += 1;
-        if stage == step {
-            role.push(MirOp::Sfpstore {
-                lreg: stop_at,
-                row: out + row,
-                dtype,
-            });
-            continue;
-        }
         // The guard: `bits(x) != 0 && bits(x) != +inf`. The integer difference
         // `inf_bits - bits(x)` is the other branch's value, reinterpreted. The
         // two "not zero" tests go through `i32 -> f32` and two ordered compares
@@ -2575,15 +2430,6 @@ fn rsqrt_body(
             b: Some(2),
             d: 5,
         });
-        step += 1;
-        if stage == step {
-            role.push(MirOp::Sfpstore {
-                lreg: stop_at,
-                row: out + row,
-                dtype,
-            });
-            continue;
-        }
         role.push(MirOp::Cast {
             from: DType::I32,
             to: DType::F32,
@@ -2759,9 +2605,11 @@ mod tests {
     use super::*;
 
     /// `matmul`, the fill and the SFPU all write `Dst` rows the packer reads.
-    /// Once a `store_to` posts its section, the next `Dst` write must wait for
-    /// the packer to release it — otherwise the two posts coalesce in the
-    /// one-deep hand-off and the write lands while the pack is still reading.
+    /// Once a `store_to` has offered its section, the next `Dst` write must wait
+    /// for the packer to release it — otherwise the write lands while the pack is
+    /// still reading. `reg_sync` derives that seam from the accesses: the packer
+    /// posts after its pack, the math thread takes before its next write, and
+    /// the post is guarded by the back-pressure wait.
     #[test]
     fn a_dst_write_after_a_post_waits_for_the_packer() {
         const PROGRAM: &str = "\
@@ -2794,30 +2642,43 @@ copy 32,32 %out [1] = %bo [0]
         let types = k.verify().expect("it verifies");
         let plan = crate::planner::place(&k, &types).expect("it places");
         let alloc = crate::alloc::allocate(&k, &types).expect("it allocates");
-        let m = lower(&k, &types, &plan, &alloc).expect("it lowers");
-
-        let mut released = false;
-        let mut posts = 0;
-        let mut writes = 0;
-        for op in m.stream(Role::Math) {
-            match op {
-                MirOp::SemPost { sem } if sem == SEM_READY => {
-                    posts += 1;
-                    released = false;
-                }
-                MirOp::SemWaitFree { sem } if sem == SEM_READY => released = true,
-                MirOp::Mvmul { .. } | MirOp::Sfpstore { .. } => {
-                    writes += 1;
-                    assert!(
-                        released,
-                        "a Dst write follows a section post with no drain wait: {op:?}"
-                    );
-                }
-                _ => {}
-            }
-        }
-        assert_eq!(posts, 2, "one post per pack");
-        assert!(writes > 2, "the program writes Dst");
+        let mut m = lower(&k, &types, &plan, &alloc).expect("it lowers");
+        crate::optimize::reg_sync(&mut m);
+        let ops = &m.ops;
+        let pack = ops
+            .iter()
+            .position(|(role, op)| *role == Role::Pack && matches!(op, MirOp::Pack { .. }))
+            .expect("the first store packs") as usize;
+        let release = ops[pack..]
+            .iter()
+            .position(|(_, op)| matches!(op, MirOp::SemPost { .. }))
+            .map(|i| i + pack)
+            .expect("the packer releases the slot it read");
+        let sem = match ops[release].1 {
+            MirOp::SemPost { sem } => sem,
+            _ => unreachable!("an index found by the SemPost match"),
+        };
+        // The counter is four bits, so the producer waits below its maximum
+        // before it posts.
+        assert!(
+            matches!(ops[release - 1].1, MirOp::SemWaitFree { sem: s } if s == sem),
+            "no back-pressure wait before the post: {:?}",
+            ops[release - 1]
+        );
+        // The next epoch's first write to that slot takes the same edge first.
+        let next_write = ops[release..]
+            .iter()
+            .position(|(role, op)| {
+                *role == Role::Math && matches!(op, MirOp::Mvmul { .. } | MirOp::Sfpstore { .. })
+            })
+            .map(|i| i + release)
+            .expect("the second matmul writes Dst again");
+        assert!(
+            ops[release..next_write].iter().any(|(role, op)| {
+                *role == Role::Math && matches!(op, MirOp::SemWait { sem: s, .. } if *s == sem)
+            }),
+            "a Dst write follows the packer's release with no take"
+        );
     }
 
     /// A broadcast is an FPU op, and the FPU's `Src` path takes `f32` and

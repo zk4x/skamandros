@@ -239,10 +239,11 @@ pub fn encode(m: &Machine) -> Result<Words, Error> {
 /// `t6_semaphore_init(sem, 0, 1)` for each semaphore and only then releases the
 /// three TRISCs. Initialising from one core *before* the others start is what
 /// makes it race-free; a `SEMINIT` issued by a role itself could reset a value
-/// another role has already posted. The semaphore that counts free `Dst` slots
-/// starts at one instead of zero, because the first load has a slot to fill.
-pub fn setup(slots: u8) -> Result<Vec<u32>, Error> {
-    let mut out: Vec<u32> = semaphore_init(slots)?
+/// another role has already posted. The table is the machine IR's `Semset` ops,
+/// which `reg_sync` derives with the seams: an edge that paces a loop starts with
+/// one token per hand-off the body performs, every other edge at zero.
+pub fn setup(sems: &[(u8, u8)]) -> Result<Vec<u32>, Error> {
+    let mut out: Vec<u32> = semaphore_init(sems)?
         .into_iter()
         .map(|i| {
             i.ttinsn_word().ok_or_else(|| {
@@ -257,28 +258,15 @@ pub fn setup(slots: u8) -> Result<Vec<u32>, Error> {
     Ok(out)
 }
 
-/// `SEMINIT` each semaphore with the maximum its wait condition reads.
-fn semaphore_init(slots: u8) -> Result<Vec<Instruction>, Error> {
+/// `SEMINIT` each semaphore in the machine IR's table. The `Max` is the Sync
+/// Unit's for every edge: back-pressure comes from the `SemWaitFree` before each
+/// post, not from a per-edge maximum.
+fn semaphore_init(sems: &[(u8, u8)]) -> Result<Vec<Instruction>, Error> {
     let mut out = Vec::new();
-    for (index, value, max) in [
-        // One unpacked unit, taken by the math thread.
-        (crate::lower::SEM_UNPACKED, 0, 1),
-        // Posted by the math thread when it has a `Dst` section to pack, taken
-        // (back to zero) by the packer once that section has drained. The
-        // math thread's `SemWaitFree` waits for `Value < Max`, so `Max` is one:
-        // a zero means the packer is done with `Dst` and the math thread may
-        // write it again.
-        (crate::lower::SEM_READY, 0, 1),
-        // Every `Dst` slot this kernel uses is free at the start; the packer
-        // hands each back. The count is the allocation's peak liveness, not the
-        // whole bank: with more tokens than the program can have live units, the
-        // unpacker would run a second unit into a slot the packer is still
-        // reading.
-        (crate::lower::SEM_SLOT, slots, sync::MAX_VALUE),
-    ] {
+    for &(index, value) in sems {
         let sem = semaphore(index)?;
-        out.push(sync::init(sem, value, max).map_err(|_| {
-            let _ = index;
+        out.push(sync::init(sem, value, sync::MAX_VALUE).map_err(|_| {
+            let _ = (index, value);
             Error::TT_ERROR_SEMINIT
         })?);
     }
@@ -502,6 +490,9 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result
             }
             MirOp::SemWait { sem, .. } => {
                 out.extend(sync::take(semaphore(sem)?, Before::EVERYTHING));
+            }
+            MirOp::SemWaitFree { sem } => {
+                out.push(sync::wait_below_max(semaphore(sem)?, Before::EVERYTHING));
             }
             other => {
                 let _ = other;
@@ -1603,6 +1594,9 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(
             }
             MirOp::SemPost { sem } => {
                 out.extend(sync::post_after(sync::Unit::Packer, semaphore(sem)?));
+            }
+            MirOp::SemWaitFree { sem } => {
+                out.push(sync::wait_below_max(semaphore(sem)?, Before::EVERYTHING));
             }
             MirOp::CbReserve { cb } => {
                 out.asm(|a| rv::cb::reserve_back(a, reg::A6, cb, 1, [reg::T0, reg::T1, reg::T2]))?;

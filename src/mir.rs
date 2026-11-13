@@ -308,6 +308,12 @@ pub enum MirOp {
     /// `cb_push_back`: publish the page [`MirOp::CbReserve`] reserved, after the
     /// packer has drained `Dst`.
     CbPush { cb: u32 },
+    /// `SEMINIT`: the semaphore's initial `Value` and its `Max`. Not an
+    /// instruction: the run's setup folds every one of these into the
+    /// semaphore table it initialises before the three roles are released. The
+    /// edge it belongs to is not named here — the semaphore index is the whole
+    /// of it, exactly as on the Sync Unit.
+    Semset { sem: u8, value: u8 },
     /// `SEMPOST` on this core.
     SemPost { sem: u8 },
     /// `SEMWAIT` on this core, holding `before`'s blocks.
@@ -379,12 +385,28 @@ impl Machine {
         self.ops.push((role, op));
     }
 
-    /// One core's program, in program order.
+    /// One core's program, in program order. The semaphore inits are not
+    /// instructions and have no program of their own, so they are not here;
+    /// [`Machine::sems`] is where they go.
     pub fn stream(&self, role: Role) -> Vec<MirOp> {
         self.ops
             .iter()
-            .filter(|(r, _)| *r == role)
+            .filter(|(r, op)| *r == role && !matches!(op, MirOp::Semset { .. }))
             .map(|(_, op)| *op)
             .collect()
+    }
+
+    /// The semaphore table, in index order: `(index, initial value)`.
+    pub fn sems(&self) -> Vec<(u8, u8)> {
+        let mut sems: Vec<(u8, u8)> = self
+            .ops
+            .iter()
+            .filter_map(|(_, op)| match *op {
+                MirOp::Semset { sem, value } => Some((sem, value)),
+                _ => None,
+            })
+            .collect();
+        sems.sort_unstable();
+        sems
     }
 }

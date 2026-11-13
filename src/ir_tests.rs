@@ -605,9 +605,16 @@ grid 1,1
 ";
     let k = Kernel::parse(SAME).expect("a bitcast between 32-bit dtypes");
     let m = compile::compile(&k).expect("a bitcast lowers to nothing");
+    // The unpacker copies the page into `Dst` and the packer reads it back out;
+    // a bitcast issues no instruction of its own, so no math program exists —
+    // and the runtime does not start a role it has no words for.
     assert!(
-        m.cores.iter().all(|c| !c.is_empty()),
-        "unpack, math and pack"
+        !m.cores[0].is_empty() && !m.cores[2].is_empty(),
+        "unpack and pack"
+    );
+    assert!(
+        m.cores[1].is_empty(),
+        "a bitcast is a copy, not a math program"
     );
 
     // 32 bits do not fit a 16-bit dtype, and a bitcast may not convert.
