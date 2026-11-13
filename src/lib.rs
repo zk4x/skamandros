@@ -20,7 +20,6 @@ pub mod alloc;
 pub mod compile;
 pub mod device;
 pub mod encode;
-pub mod images;
 pub mod ir;
 pub mod lower;
 pub mod mir;
