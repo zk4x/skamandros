@@ -162,9 +162,6 @@ pub enum MirOp {
         flip_a: bool,
         flip_b: bool,
     },
-    /// `ZEROACC` on one eight-row block of the 32-bit `Dst` (`block` is the
-    /// block index, eight rows each).
-    Zeroacc { block: u32 },
     /// `GAPOOL`: the Matrix Unit folds one 16x16 face over its rows into the
     /// destination row, `SrcB`'s row being the weight — tt-metal's `SUM` with
     /// `REDUCE_COL` (and, after the transposes, the other dims).

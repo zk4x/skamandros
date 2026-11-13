@@ -1698,7 +1698,7 @@ copy_to %out from %bo [1024] [0]
                     released = false;
                 }
                 MirOp::SemWaitFree { sem } if sem == SEM_READY => released = true,
-                MirOp::Mvmul { .. } | MirOp::Sfpstore { .. } | MirOp::Zeroacc { .. } => {
+                MirOp::Mvmul { .. } | MirOp::Sfpstore { .. } => {
                     writes += 1;
                     assert!(
                         released,

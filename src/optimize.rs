@@ -245,13 +245,6 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                         return Err(Error::TT_ERROR_ADDR_MOD);
                     }
                 }
-                MirOp::Zeroacc { block } => {
-                    // `CLR_16` names one of 64 sixteen-row blocks of `Dst`.
-                    if block >= 64 {
-                        let _ = (name, at, block);
-                        return Err(Error::TT_ERROR_DST_ROW);
-                    }
-                }
                 MirOp::Gapool {
                     dst_row, addr_mod, ..
                 }

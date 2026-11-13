@@ -1187,9 +1187,6 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
                 .map_err(bad_isa)?;
             out.push(i);
         }
-        MirOp::Zeroacc { block } => {
-            out.push(encode::zeroacc(1, 0, 0, block).map_err(bad_isa)?);
-        }
         MirOp::Gapool {
             flip_src_b,
             flip_src_a,
