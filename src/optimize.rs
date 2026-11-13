@@ -272,8 +272,49 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                     dst_row,
                     addr_mod,
                     ..
+                }
+                | MirOp::Movb2d {
+                    src_row,
+                    dst_row,
+                    addr_mod,
+                    ..
                 } => {
                     // `SrcB` is 64 rows of 16 datums.
+                    if src_row >= 64 {
+                        let _ = (name, at, src_row);
+                        return Err(Error::TT_ERROR_SRC_ROW);
+                    }
+                    if dst_row >= u32::from(DST_SLOTS) * DST_ROWS {
+                        let _ = (name, at, dst_row);
+                        return Err(Error::TT_ERROR_DST_ROW);
+                    }
+                    if addr_mod > 7 {
+                        let _ = (name, at, addr_mod);
+                        return Err(Error::TT_ERROR_ADDR_MOD);
+                    }
+                }
+                MirOp::Movb2a {
+                    src_a_row,
+                    addr_mod,
+                    src_b_row,
+                    ..
+                } => {
+                    // `SrcA` and `SrcB` are 64 rows of 16 datums.
+                    if src_a_row >= 64 || src_b_row >= 64 {
+                        let _ = (name, at, src_a_row, src_b_row);
+                        return Err(Error::TT_ERROR_SRC_ROW);
+                    }
+                    if addr_mod > 7 {
+                        let _ = (name, at, addr_mod);
+                        return Err(Error::TT_ERROR_ADDR_MOD);
+                    }
+                }
+                MirOp::Mova2d {
+                    src_row,
+                    dst_row,
+                    addr_mod,
+                    ..
+                } => {
                     if src_row >= 64 {
                         let _ = (name, at, src_row);
                         return Err(Error::TT_ERROR_SRC_ROW);
@@ -297,6 +338,10 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                     }
                 }
                 MirOp::ThreadWord { .. } | MirOp::WaitMatrix => {}
+                MirOp::Trnspsrcb
+                | MirOp::AluAccCtrl { .. }
+                | MirOp::SrcAFormat { .. }
+                | MirOp::UnpackConfig { .. } => {}
                 MirOp::Loop { count } => {
                     let _ = count;
                     depth += 1;

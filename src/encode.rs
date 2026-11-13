@@ -309,9 +309,27 @@ fn semaphore(index: u8) -> Result<Semaphore, Error> {
 // The unpack core (T0)
 // ---------------------------------------------------------------------------
 
+/// What one unpacker's `Config` bank currently holds, so a repeated
+/// [`MirOp::UnpackConfig`] costs nothing. A `Src` config depends only on the
+/// format and the haloize transpose; a `Dst` config also carries the run and the
+/// row it lands in, because the unpacker bakes both into that bank.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnpackCfg {
+    Src {
+        dtype: DType,
+        haloize: bool,
+    },
+    Dst {
+        dtype: DType,
+        datums: u32,
+        row: u32,
+        dst_is_16_bit: bool,
+    },
+}
+
 /// What the next `UNPACR` is going to read and where it lands. The `SET*`
-/// machine ops before it set these; the descriptor is written just before the
-/// unpack that uses it.
+/// machine ops before it set these; [`MirOp::UnpackConfig`] writes the bank and
+/// the descriptor, and the transfer reads them.
 #[derive(Default)]
 struct UnpackState {
     /// The `Dst` row an unpack with `to_src` clear lands in.
@@ -321,6 +339,8 @@ struct UnpackState {
     face: [u32; 2],
     x0: [u32; 2],
     x1: [u32; 2],
+    /// Per unpacker: the `Config` bank in effect.
+    cfg: [Option<UnpackCfg>; 2],
 }
 
 fn encode_unpack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(), Error> {
@@ -354,18 +374,37 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result
                 state.x1[u] = first + count - 1;
             }
             MirOp::Setadczw { unit, face } => state.face[usize::from(unit)] = face,
-            MirOp::Unpacr {
-                cb,
+            MirOp::UnpackConfig {
                 unit,
-                count,
-                dtype,
                 to_src,
-                flip,
+                dtype,
+                haloize,
             } => {
-                if count == 0 {
-                    return Err(Error::TT_ERROR_UNPACK_ZERO_DATUMS);
-                }
                 let u = usize::from(unit);
+                let cfg = if to_src {
+                    UnpackCfg::Src { dtype, haloize }
+                } else {
+                    // A `Dst` config bakes the page's datum count and landing
+                    // row into the descriptor, so both come from the `SETADCX`
+                    // and `SETDST` in effect.
+                    let datums = state.x1[u]
+                        .checked_sub(state.x0[u])
+                        .and_then(|span| span.checked_add(1))
+                        .filter(|datums| *datums != 0)
+                        .ok_or_else(|| {
+                            let _ = (unit, u);
+                            Error::TT_ERROR_UNPACK_ZERO_DATUMS
+                        })?;
+                    UnpackCfg::Dst {
+                        dtype,
+                        datums,
+                        row: state.dst_row,
+                        dst_is_16_bit,
+                    }
+                };
+                if state.cfg[u] == Some(cfg) {
+                    continue;
+                }
                 // `SRCA_SET_SetOvrdWithAddr`: the Src path wants it set, the Dst
                 // path clear, and the unpacker reads it at execution time, so a
                 // role that does both toggles it here. ttsim refuses either
@@ -374,42 +413,43 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result
                     thread::SRCA_SET_SetOvrdWithAddr,
                     u16::from(to_src),
                 ));
-                // The page is at the ring's read pointer, not a compile-time L1
-                // address: write that pointer into the unpacker's base register
-                // after draining the previous unpack.
-                cb_base_unpack(out, cb, unit)?;
                 let mut words = ConfigWords::new();
-                if to_src {
-                    // One 16x16 face: the descriptor's X run of the Z plane
-                    // `SETADCZW` selected. The unpacker's datum count comes from
-                    // `SETADCX`, not from the descriptor, so `count` is the run
-                    // (256 datums for a face, 16 for a reduce's single-row
-                    // `SrcB` scaler).
-                    state.x0[u] = 0;
-                    state.x1[u] = count - 1;
-                    src_unpack_config(&mut words, unit, dtype);
-                } else {
-                    state.x0[u] = 0;
-                    state.x1[u] = count - 1;
-                    unpack_config(&mut words, count, state.dst_row, dtype, dst_is_16_bit);
+                match cfg {
+                    UnpackCfg::Src { dtype, haloize } => {
+                        src_unpack_config(&mut words, unit, dtype, haloize)
+                    }
+                    UnpackCfg::Dst { datums, row, .. } => {
+                        unpack_config(&mut words, datums, row, dtype, dst_is_16_bit)
+                    }
                 }
                 out.extend(config_program(&words));
                 out.push(stallwait(
                     block::UNPACKER | block::CONFIG,
                     cond::CONFIG_BUSY,
                 )?);
-                if to_src {
-                    // The Src path walks the descriptor's Z planes, one face
-                    // each; the face is always named, because the two unpackers
-                    // keep their own counter.
-                    out.push(set_adc_x_unpack(unit, state.x0[u], state.x1[u])?);
-                    out.push(set_adc_z_unpack(unit, state.face[u])?);
-                } else {
-                    out.push(set_adc_x_unpack(unit, state.x0[u], state.x1[u])?);
-                    // Always named: the address counters outlive the program, so
-                    // a face a previous kernel left behind would be read again.
-                    out.push(set_adc_z_unpack(unit, state.face[u])?);
+                state.cfg[u] = Some(cfg);
+                continue;
+            }
+            MirOp::Unpacr {
+                cb,
+                unit,
+                count,
+                flip,
+            } => {
+                if count == 0 {
+                    return Err(Error::TT_ERROR_UNPACK_ZERO_DATUMS);
                 }
+                let u = usize::from(unit);
+                // The page is at the ring's read pointer, not a compile-time L1
+                // address: write that pointer into the unpacker's base register
+                // after draining the previous unpack.
+                cb_base_unpack(out, cb, unit)?;
+                state.x0[u] = 0;
+                state.x1[u] = count - 1;
+                out.push(set_adc_x_unpack(unit, state.x0[u], state.x1[u])?);
+                // Always named: the address counters outlive the program, so a
+                // face a previous kernel left behind would be read again.
+                out.push(set_adc_z_unpack(unit, state.face[u])?);
                 out.push(unpack_instruction(unit, flip)?);
             }
             MirOp::CbWait { cb } => {
@@ -604,6 +644,40 @@ fn stallwait(block_mask: u32, condition: u32) -> Result<Instruction, Error> {
     })
 }
 
+/// `MOVB2D_BH` from its diagram fields, in the order the diagram draws them.
+///
+/// The instruction set's own table is the encoding; this places the five
+/// operands and names the failure as the project's status, so a value that does
+/// not fit its field is a `TT_ERROR_ENCODE` at the call site rather than a
+/// second error type.
+fn movb2d(
+    use_dst32b_lo: bool,
+    src_row: u32,
+    addr_mod: u32,
+    move4_rows: bool,
+    dst_row: u32,
+) -> Result<Instruction, Error> {
+    let def = &defs::MOVB2D;
+    let operands = [
+        (0usize, u32::from(use_dst32b_lo)),
+        (1, src_row),
+        (2, addr_mod),
+        (3, u32::from(move4_rows)),
+        // `Broadcast1RowTo8` and `BroadcastCol0` stay clear: nothing in the
+        // compiler uses them.
+        (6, dst_row),
+    ];
+    let mut word = def.skeleton();
+    for (index, value) in operands {
+        let field = def.fields()[index];
+        if !field.fits(value) {
+            return Err(Error::TT_ERROR_ENCODE);
+        }
+        word |= field.place(value);
+    }
+    Ok(Instruction::new(word, def))
+}
+
 /// The `SFPLOAD`/`SFPSTORE` lane format of one datum: the conversion the lane
 /// makes on the way in or out.
 fn lane_format(dtype: DType) -> u32 {
@@ -743,11 +817,12 @@ fn unpack_config(
 /// out of the unpacker is `TF32` for an `f32` operand (FP32 *into* `Src` is
 /// undefined) and `BF16` for a bf16 one; the Matrix Unit learns it from the
 /// implied format the handover sets, not from `ALU_FORMAT_SPEC`.
-fn src_unpack_config(words: &mut ConfigWords, unit: u8, dtype: DType) {
+fn src_unpack_config(words: &mut ConfigWords, unit: u8, dtype: DType, haloize: bool) {
     let out = match dtype {
         DType::Bf16 => DATA_FORMAT_BF16,
         _ => DATA_FORMAT_TF32,
     };
+    let haloize = u32::from(haloize);
     let descriptor = tile_descriptor(l1_format(dtype), 16, 16, 4);
     let span = match unit {
         0 => {
@@ -762,6 +837,11 @@ fn src_unpack_config(words: &mut ConfigWords, unit: u8, dtype: DType) {
                 .set(thcon::THCON_SEC0_REG2_Unpack_if_sel_cntx0, 0)
                 .unwrap()
                 .set(thcon::THCON_SEC0_REG2_Disable_zero_compress_cntx0, 1)
+                .unwrap()
+                // `THCON_SEC0_REG2_Haloize_mode`: tt-metal's
+                // `_llk_unpack_AB_reduce_init_` enables it for `REDUCE_ROW`, so
+                // the unpacker transposes each face on the way into `SrcA`.
+                .set(thcon::THCON_SEC0_REG2_Haloize_mode, haloize)
                 .unwrap()
                 // With `UnpackToDst` clear this *replaces* the output address;
                 // `SrcA` row 0 is `OutAddr / 16 - 4`, so 64 is row 0.
@@ -781,6 +861,8 @@ fn src_unpack_config(words: &mut ConfigWords, unit: u8, dtype: DType) {
                 .set(thcon::THCON_SEC1_REG2_Out_data_format, out)
                 .unwrap()
                 .set(thcon::THCON_SEC1_REG2_Disable_zero_compress_cntx0, 1)
+                .unwrap()
+                .set(thcon::THCON_SEC1_REG2_Haloize_mode, haloize)
                 .unwrap()
                 .set(unpack1::UNP1_ADDR_CTRL_ZW_REG_1_Zstride, 0)
                 .unwrap();
@@ -1200,6 +1282,92 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
                 .map_err(bad_isa)?,
             );
         }
+        MirOp::Movb2d {
+            use_dst32b_lo,
+            src_row,
+            addr_mod,
+            move4_rows,
+            dst_row,
+        } => {
+            out.push(movb2d(
+                use_dst32b_lo,
+                src_row,
+                addr_mod,
+                move4_rows,
+                dst_row + row_delta,
+            )?);
+        }
+        MirOp::Movb2a {
+            src_a_row,
+            addr_mod,
+            move4_rows,
+            src_b_row,
+        } => {
+            out.push(
+                encode::movb2_a(src_a_row, addr_mod, u32::from(move4_rows), src_b_row)
+                    .map_err(bad_isa)?,
+            );
+        }
+        MirOp::Mova2d {
+            use_dst32b_lo,
+            src_row,
+            addr_mod,
+            move8_rows,
+            dst_row,
+        } => {
+            out.push(
+                encode::Mova2D::ZERO
+                    .use_dst32b_lo(u32::from(use_dst32b_lo))
+                    .src_row(src_row)
+                    .addr_mod(addr_mod)
+                    .move8_rows(u32::from(move8_rows))
+                    .dst_row(dst_row + row_delta)
+                    .encode()
+                    .map_err(bad_isa)?,
+            );
+        }
+        MirOp::Trnspsrcb => {
+            out.push(encode::trnspsrcb().map_err(bad_isa)?);
+        }
+        MirOp::AluAccCtrl {
+            fp32,
+            zero_flag_src,
+        } => {
+            // The `Dst` width the moves address and the denormal policy of the
+            // `Src` reads: tt-metal clears `Fp32_enabled` around the high-half
+            // `MOVD2B`/`MOVB2D` transposes on Blackhole (issue #449), and keeps
+            // source denormals so the low-half bits survive the moves.
+            let mut words = ConfigWords::new();
+            words
+                .set(alu::ALU_ACC_CTRL_Fp32_enabled, u32::from(fp32))
+                .expect("the value fits its field")
+                .set(
+                    alu::ALU_ACC_CTRL_Zero_Flag_disabled_src,
+                    u32::from(zero_flag_src),
+                )
+                .expect("the value fits its field");
+            out.extend(config_program(&words));
+        }
+        MirOp::SrcAFormat { dtype } => {
+            // The moves take `SrcA`'s format while
+            // `DISABLE_IMPLIED_SRCA_FMT` is set; the override pair is the
+            // field the format switch writes.
+            let format = match dtype {
+                DType::F32 => DATA_FORMAT_FP32,
+                DType::Bf16 => DATA_FORMAT_BF16,
+                other => {
+                    let _ = other;
+                    return Err(Error::TT_ERROR_ENCODE);
+                }
+            };
+            let mut words = ConfigWords::new();
+            words
+                .set(alu::ALU_FORMAT_SPEC_REG_SrcA_override, 1)
+                .expect("the value fits its field")
+                .set(alu::ALU_FORMAT_SPEC_REG_SrcA_val, format)
+                .expect("the value fits its field");
+            out.extend(config_program(&words));
+        }
         MirOp::Setrwc {
             src_a,
             src_b,
@@ -1542,7 +1710,7 @@ fn pack_config(
             pack0::PCK_EDGE_OFFSET_SEC0_mask,
             match mask {
                 PackMask::None => 0xFFFF,
-                PackMask::Col => 0x0000,
+                PackMask::Col | PackMask::Row => 0x0000,
             },
         )
         .unwrap()
@@ -1551,6 +1719,8 @@ fn pack_config(
             match mask {
                 PackMask::None => 0xFFFF,
                 PackMask::Col => 0xFFFF,
+                // tt-metal's `REDUCE_ROW`: only datum 0 of the row survives.
+                PackMask::Row => 0x0001,
             },
         )
         .unwrap()
@@ -1561,6 +1731,8 @@ fn pack_config(
                 // Each packer's two-bit field is the mapping register it
                 // reads: packers 0 and 1 both use `TILE_ROW_SET_MAPPING_1`.
                 PackMask::Col => 0b0101,
+                // `REDUCE_ROW` gives every packer mapping 1.
+                PackMask::Row => 0b0101_0101,
             },
         )
         .unwrap()
@@ -1569,11 +1741,35 @@ fn pack_config(
             match mask {
                 PackMask::None => 0,
                 PackMask::Col => 1,
+                // Every one of a face's sixteen rows selects the `SEC1`
+                // mask, i.e. keeps column 0.
+                PackMask::Row => 1,
             },
         )
         .unwrap()
         .set(alu::ALU_ACC_CTRL_Fp32_enabled, u32::from(!narrow))
         .unwrap();
+    if mask == PackMask::Row {
+        for field in [
+            pack0::TILE_ROW_SET_MAPPING_1_row_set_mapping_1,
+            pack0::TILE_ROW_SET_MAPPING_1_row_set_mapping_2,
+            pack0::TILE_ROW_SET_MAPPING_1_row_set_mapping_3,
+            pack0::TILE_ROW_SET_MAPPING_1_row_set_mapping_4,
+            pack0::TILE_ROW_SET_MAPPING_1_row_set_mapping_5,
+            pack0::TILE_ROW_SET_MAPPING_1_row_set_mapping_6,
+            pack0::TILE_ROW_SET_MAPPING_1_row_set_mapping_7,
+            pack0::TILE_ROW_SET_MAPPING_1_row_set_mapping_8,
+            pack0::TILE_ROW_SET_MAPPING_1_row_set_mapping_9,
+            pack0::TILE_ROW_SET_MAPPING_1_row_set_mapping_10,
+            pack0::TILE_ROW_SET_MAPPING_1_row_set_mapping_11,
+            pack0::TILE_ROW_SET_MAPPING_1_row_set_mapping_12,
+            pack0::TILE_ROW_SET_MAPPING_1_row_set_mapping_13,
+            pack0::TILE_ROW_SET_MAPPING_1_row_set_mapping_14,
+            pack0::TILE_ROW_SET_MAPPING_1_row_set_mapping_15,
+        ] {
+            words.set(field, 1).unwrap();
+        }
+    }
 }
 
 /// Pack `rows` rows of FP32 `Dst` from the row `pack_config` set, to the run it

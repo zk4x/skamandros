@@ -2530,6 +2530,56 @@ store_to %bo from %acc [0]
 copy_to %out from %bo [0]
 ";
 
+/// The same, seeded below every datum: the accumulator is the fold's other
+/// operand, so every row's own maximum survives.
+const REDUCE_MAX_ROW: &str = "\
+version 7
+grid 1,1
+%px = param f32 1024
+%out = param f32 1024
+%bx = buffer f32 32,32
+%bo = buffer f32 32,32
+copy_to %bx from %px [0]
+%acc = acc f32 32,32
+%low = const f32 -1000
+store_to %acc from %low
+%x = load %bx [0]
+max row %acc %x
+store_to %bo from %acc [0]
+copy_to %out from %bo [0]
+";
+
+/// The same with a seed above every datum.
+const REDUCE_MAX_ROW_SEEDED: &str = "\
+version 7
+grid 1,1
+%px = param f32 1024
+%out = param f32 1024
+%bx = buffer f32 32,32
+%bo = buffer f32 32,32
+copy_to %bx from %px [0]
+%acc = acc f32 32,32
+%high = const f32 1000
+store_to %acc from %high
+%x = load %bx [0]
+max row %acc %x
+store_to %bo from %acc [0]
+copy_to %out from %bo [0]
+";
+
+/// The `row` result: column 0 holds one fold per row, every other datum zero.
+fn row_reduce_oracle(input: &[f32]) -> Vec<f32> {
+    let mut out = vec![0.0f32; 1024];
+    for row in 0..32 {
+        let mut folded = f32::NEG_INFINITY;
+        for column in 0..32 {
+            folded = folded.max(input[tile_index(row, column)]);
+        }
+        out[tile_index(row, 0)] = folded;
+    }
+    out
+}
+
 /// The `col` result: row 0 holds one fold per column, every other datum zero.
 fn col_reduce_oracle(input: &[f32], max: bool, scaler: Option<f32>) -> Vec<f32> {
     let mut out = vec![0.0f32; 1024];
@@ -2610,6 +2660,48 @@ fn max_col_runs_on_the_simulator() {
         assert_eq!(
             got[i], want,
             "seeded max col, datum {i} at ({row}, {column})"
+        );
+    }
+}
+
+#[test]
+fn max_row_runs_on_the_simulator() {
+    // Fractional magnitudes: below 1, so every value is exact in TF32 (the
+    // format the unpacker puts into `Src`), and the low half of each f32 word
+    // carries real mantissa bits, so the hi/lo transposes are not a no-op.
+    let x: Vec<f32> = (0..1024)
+        .map(|i| {
+            let value = (i % 97) as f32 / 1024.0;
+            if i % 3 == 0 { -value } else { value }
+        })
+        .collect();
+    let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let want = row_reduce_oracle(&x);
+    assert_ne!(want, vec![0.0; 1024], "negative control");
+    let out = run_kernel_tensors(REDUCE_MAX_ROW, &[&x_bytes], 4096);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for i in 0..1024 {
+        let (row, column) = tile_rc(i);
+        assert_eq!(got[i], want[i], "max row, datum {i} at ({row}, {column})");
+    }
+
+    // The accumulator is the fold's seed: a seed above every datum survives in
+    // every row, and the masked datums are still zero.
+    let out = run_kernel_tensors(REDUCE_MAX_ROW_SEEDED, &[&x_bytes], 4096);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for i in 0..1024 {
+        let (row, column) = tile_rc(i);
+        let want = if column == 0 { 1000.0 } else { 0.0 };
+        assert_eq!(
+            got[i], want,
+            "seeded max row, datum {i} at ({row}, {column})"
         );
     }
 }

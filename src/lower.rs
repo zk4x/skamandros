@@ -231,12 +231,16 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         first: 0,
                         count: unit_shape.datums(),
                     });
+                    m.t0.push(MirOp::UnpackConfig {
+                        unit: 0,
+                        to_src: false,
+                        dtype,
+                        haloize: false,
+                    });
                     m.t0.push(MirOp::Unpacr {
                         cb,
                         unit: 0,
                         count: unit_shape.datums(),
-                        dtype,
-                        to_src: false,
                         flip: false,
                     });
                     m.t0.push(MirOp::SemPost { sem: SEM_UNPACKED });
@@ -756,24 +760,32 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                             unit: 1,
                             face: 2 * fi + kk,
                         });
+                        m.t0.push(MirOp::UnpackConfig {
+                            unit: 1,
+                            to_src: true,
+                            dtype: dt_a,
+                            haloize: false,
+                        });
                         m.t0.push(MirOp::Unpacr {
                             cb: cb_a,
                             unit: 1,
                             count: FACE_DATUMS,
-                            dtype: dt_a,
-                            to_src: true,
                             flip: true,
                         });
                         m.t0.push(MirOp::Setadczw {
                             unit: 0,
                             face: 2 * kk,
                         });
+                        m.t0.push(MirOp::UnpackConfig {
+                            unit: 0,
+                            to_src: true,
+                            dtype: dt_b,
+                            haloize: false,
+                        });
                         m.t0.push(MirOp::Unpacr {
                             cb: cb_b,
                             unit: 0,
                             count: FACE_DATUMS,
-                            dtype: dt_b,
-                            to_src: true,
                             flip: true,
                         });
                         mvmul_group(&mut m.t1, base);
@@ -791,8 +803,6 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                             cb: cb_b,
                             unit: 0,
                             count: FACE_DATUMS,
-                            dtype: dt_b,
-                            to_src: true,
                             flip: true,
                         });
                         mvmul_group(&mut m.t1, base + 16);
@@ -839,7 +849,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     Op::Max { acc, dim, x } => (acc, x, None, true, dim),
                     _ => unreachable!("the arm pattern is the two reduce ops"),
                 };
-                if dim != crate::ir::ReduceDim::Col {
+                if dim == crate::ir::ReduceDim::Scalar {
                     let _ = dim;
                     return Err(Error::TT_TODO_REDUCE);
                 }
@@ -918,96 +928,279 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     flip_src_b: false,
                     dst_cr: false,
                 });
-                // Four faces, `SrcA` (256 datums) and the scaler's row (16
-                // datums) each: tt-metal's AB-reduce unpack, then the fold. The
-                // scaler carries the factor in row 0 of each face
-                // (`prepare_reduce_scaler`'s row-0 fill).
-                for face in 0..4u32 {
-                    // One face into `SrcA` and one row of the scaler into
-                    // `SrcB` (16 datums): tt-metal's AB-reduce unpack.
-                    m.t0.push(MirOp::Setadczw { unit: 0, face });
-                    m.t0.push(MirOp::Unpacr {
-                        cb: cb_x,
+                if dim == crate::ir::ReduceDim::Row {
+                    // tt-metal's `_llk_math_reduce_` for `REDUCE_ROW`: each
+                    // face pair folds into one row of the accumulator (the
+                    // haloized unpack presents the face transposed, so the fold
+                    // runs along the tile's original rows), and
+                    // `reduce_row_perform_transpose` turns that row into the
+                    // result's column 0. Only `max` reaches this arm: `sum row`
+                    // is the Matrix Unit's matmul above.
+                    m.t0.push(MirOp::UnpackConfig {
                         unit: 0,
-                        count: FACE_DATUMS,
+                        to_src: true,
                         dtype: dt_x,
-                        to_src: true,
-                        flip: true,
+                        haloize: true,
                     });
-                    m.t0.push(MirOp::Setadczw { unit: 1, face });
-                    m.t0.push(MirOp::Unpacr {
-                        cb: cb_b,
+                    m.t0.push(MirOp::UnpackConfig {
                         unit: 1,
-                        count: 16,
-                        dtype: dt_b,
                         to_src: true,
-                        flip: true,
+                        dtype: dt_b,
+                        haloize: false,
                     });
-                    m.t0.push(MirOp::SemPost { sem: SEM_UNPACKED });
-                    m.t1.push(MirOp::SemWait {
-                        sem: SEM_UNPACKED,
-                        before: 0,
-                    });
-                    // Faces 0 and 2 fold into the first half of row 0, faces 1
-                    // and 3 into the second (tt-metal's `SETRWC(CR_D, 8)`
-                    // twice).
-                    let dst = base + if face % 2 == 0 { 0 } else { 16 };
-                    if max {
-                        m.t1.push(MirOp::Gmpool {
-                            flip_src_b: false,
-                            flip_src_a: false,
-                            addr_mod: 0,
-                            arg_max: 0,
-                            dst_row: dst,
-                        });
-                    } else {
-                        // Four fidelity phases, the last clearing the phase
-                        // (tt-metal's `reduce_configure_mop`).
-                        for addr_mod in [3u32, 3, 3, 0] {
-                            m.t1.push(MirOp::Gapool {
-                                flip_src_b: false,
-                                flip_src_a: false,
-                                addr_mod,
+                    for group in 0..2u32 {
+                        let dst = base + 32 * group;
+                        for half in 0..2u32 {
+                            let face = 2 * group + half;
+                            // One face into `SrcA` and one row of the scaler
+                            // into `SrcB` (16 datums): tt-metal's AB-reduce
+                            // unpack.
+                            m.t0.push(MirOp::Setadczw { unit: 0, face });
+                            m.t0.push(MirOp::Unpacr {
+                                cb: cb_x,
+                                unit: 0,
+                                count: FACE_DATUMS,
+                                flip: true,
+                            });
+                            m.t0.push(MirOp::Setadczw { unit: 1, face });
+                            m.t0.push(MirOp::Unpacr {
+                                cb: cb_b,
+                                unit: 1,
+                                count: 16,
+                                flip: true,
+                            });
+                            m.t0.push(MirOp::SemPost { sem: SEM_UNPACKED });
+                            m.t1.push(MirOp::SemWait {
+                                sem: SEM_UNPACKED,
+                                before: 0,
+                            });
+                            // The first face of a pair hands both banks back
+                            // (`CLR_AB`); the second leaves them, because
+                            // `TRNSPSRCB` reads the `SrcB` bank the fold just
+                            // consumed (tt-metal's `CLR_AB` then `CLR_NONE`).
+                            m.t1.push(MirOp::Gmpool {
+                                flip_src_b: half == 0,
+                                flip_src_a: half == 0,
+                                addr_mod: 0,
+                                arg_max: 0,
                                 dst_row: dst,
                             });
                         }
+                        // `reduce_row_perform_transpose<true>`: the fold's row
+                        // goes to `SrcB` rows 16..31, is transposed there, and
+                        // comes back as `Dst` column 0. A 32-bit `Dst` datum is
+                        // moved as its two 16-bit halves — the only way a
+                        // 16-bit `SrcB` carries all of it. The moves read the
+                        // format tt-metal's transpose names explicitly
+                        // (`DISABLE_IMPLIED_SRCA_FMT`, then `Float32`), because
+                        // the implied `TF32` of the unpacked operand has no
+                        // 16-bit half to move.
+                        //
+                        // The low halves are saved in `SrcA` first: writing the
+                        // high halves zeroes them in `Dst`, exactly as
+                        // tt-metal's `transpose_dest_32b` orders it.
+                        m.t1.push(thread_word(&[(thread::DISABLE_IMPLIED_SRCA_FMT_Base, 1)]));
+                        m.t1.push(MirOp::SrcAFormat {
+                            dtype: crate::ir::DType::F32,
+                        });
+                        m.t1.push(MirOp::AluAccCtrl {
+                            fp32: true,
+                            zero_flag_src: true,
+                        });
+                        // The transposed low halves, parked in `SrcA` rows
+                        // 0..15.
+                        m.t1.push(MirOp::Movd2b {
+                            use_dst32b_lo: true,
+                            src_row: 16,
+                            addr_mod: 0,
+                            move4_rows: false,
+                            dst_row: dst,
+                        });
+                        m.t1.push(MirOp::Trnspsrcb);
+                        for chunk in 0..4u32 {
+                            m.t1.push(MirOp::Movb2a {
+                                src_a_row: 4 * chunk,
+                                addr_mod: 0,
+                                move4_rows: true,
+                                src_b_row: 16 + 4 * chunk,
+                            });
+                        }
+                        // The high halves, back into the `Dst` column.
+                        m.t1.push(MirOp::Movd2b {
+                            use_dst32b_lo: false,
+                            src_row: 16,
+                            addr_mod: 0,
+                            move4_rows: false,
+                            dst_row: dst,
+                        });
+                        m.t1.push(MirOp::Trnspsrcb);
+                        m.t1.push(MirOp::Movd2b {
+                            use_dst32b_lo: false,
+                            src_row: 16,
+                            addr_mod: 0,
+                            move4_rows: false,
+                            dst_row: dst,
+                        });
+                        for chunk in 0..4u32 {
+                            m.t1.push(MirOp::Movb2d {
+                                use_dst32b_lo: false,
+                                src_row: 16 + 4 * chunk,
+                                addr_mod: 0,
+                                move4_rows: true,
+                                dst_row: dst + 4 * chunk,
+                            });
+                        }
+                        // The low halves, restored from the parked column.
+                        for half in 0..2u32 {
+                            m.t1.push(MirOp::Mova2d {
+                                use_dst32b_lo: true,
+                                src_row: 8 * half,
+                                addr_mod: 0,
+                                move8_rows: true,
+                                dst_row: dst + 8 * half,
+                            });
+                        }
+                        m.t1.push(MirOp::AluAccCtrl {
+                            fp32: true,
+                            zero_flag_src: false,
+                        });
+                        m.t1.push(thread_word(&[(thread::DISABLE_IMPLIED_SRCA_FMT_Base, 0)]));
+                        // `SETRWC(CLR_AB, 0, 0, 0, 0, SET_BD)`: hand both banks
+                        // back before the next pair unpacks.
+                        m.t1.push(MirOp::Setrwc {
+                            src_a: 0,
+                            src_b: 0,
+                            dst: 0,
+                            flip_src_a: true,
+                            flip_src_b: true,
+                            dst_cr: false,
+                        });
                     }
-                    // `SETRWC(CLR_AB, 0, 0, 0, 0, SET_AD)`: hand both banks back
-                    // and leave the counters where the face started.
+                    m.t1.push(MirOp::WaitMatrix);
+                    // The pack's edge mask keeps column 0 of every row, and the
+                    // fold's column lands at rows 0..15 and 32..47; the rows
+                    // between (16..31 and 48..63) would pack stale datums, so
+                    // they are written as the zeros the result defines.
+                    m.t1.push(MirOp::LaneConst {
+                        lreg: 0,
+                        bits: 0.0f32.to_bits(),
+                    });
+                    for row in (16..32).chain(48..DST_ROWS).step_by(2) {
+                        m.t1.push(MirOp::Sfpstore {
+                            lreg: 0,
+                            row: base + row,
+                            dtype: storage(crate::ir::DType::F32),
+                        });
+                    }
                     m.t1.push(MirOp::Setrwc {
                         src_a: 0,
                         src_b: 0,
                         dst: 0,
-                        flip_src_a: true,
-                        flip_src_b: true,
+                        flip_src_a: false,
+                        flip_src_b: false,
                         dst_cr: false,
                     });
-                }
-                m.t1.push(MirOp::WaitMatrix);
-                // The pack's edge mask keeps the first row of *every* face,
-                // and the fold only writes faces 0 and 1; the packer cannot
-                // select faces, so faces 2 and 3 (the lower half of the tile)
-                // are written as the zeros the result defines.
-                m.t1.push(MirOp::LaneConst {
-                    lreg: 0,
-                    bits: 0.0f32.to_bits(),
-                });
-                for row in (32..DST_ROWS).step_by(2) {
-                    m.t1.push(MirOp::Sfpstore {
+                    acc_mask[acc as usize] = PackMask::Row;
+                } else {
+                    // Four faces, `SrcA` (256 datums) and the scaler's row (16
+                    // datums) each: tt-metal's AB-reduce unpack, then the fold.
+                    // The scaler carries the factor in row 0 of each face
+                    // (`prepare_reduce_scaler`'s row-0 fill).
+                    for face in 0..4u32 {
+                        // One face into `SrcA` and one row of the scaler into
+                        // `SrcB` (16 datums): tt-metal's AB-reduce unpack.
+                        m.t0.push(MirOp::Setadczw { unit: 0, face });
+                        m.t0.push(MirOp::UnpackConfig {
+                            unit: 0,
+                            to_src: true,
+                            dtype: dt_x,
+                            haloize: false,
+                        });
+                        m.t0.push(MirOp::Unpacr {
+                            cb: cb_x,
+                            unit: 0,
+                            count: FACE_DATUMS,
+                            flip: true,
+                        });
+                        m.t0.push(MirOp::Setadczw { unit: 1, face });
+                        m.t0.push(MirOp::UnpackConfig {
+                            unit: 1,
+                            to_src: true,
+                            dtype: dt_b,
+                            haloize: false,
+                        });
+                        m.t0.push(MirOp::Unpacr {
+                            cb: cb_b,
+                            unit: 1,
+                            count: 16,
+                            flip: true,
+                        });
+                        m.t0.push(MirOp::SemPost { sem: SEM_UNPACKED });
+                        m.t1.push(MirOp::SemWait {
+                            sem: SEM_UNPACKED,
+                            before: 0,
+                        });
+                        // Faces 0 and 2 fold into the first half of row 0, faces 1
+                        // and 3 into the second (tt-metal's `SETRWC(CR_D, 8)`
+                        // twice).
+                        let dst = base + if face % 2 == 0 { 0 } else { 16 };
+                        if max {
+                            m.t1.push(MirOp::Gmpool {
+                                flip_src_b: false,
+                                flip_src_a: false,
+                                addr_mod: 0,
+                                arg_max: 0,
+                                dst_row: dst,
+                            });
+                        } else {
+                            // Four fidelity phases, the last clearing the phase
+                            // (tt-metal's `reduce_configure_mop`).
+                            for addr_mod in [3u32, 3, 3, 0] {
+                                m.t1.push(MirOp::Gapool {
+                                    flip_src_b: false,
+                                    flip_src_a: false,
+                                    addr_mod,
+                                    dst_row: dst,
+                                });
+                            }
+                        }
+                        // `SETRWC(CLR_AB, 0, 0, 0, 0, SET_AD)`: hand both banks back
+                        // and leave the counters where the face started.
+                        m.t1.push(MirOp::Setrwc {
+                            src_a: 0,
+                            src_b: 0,
+                            dst: 0,
+                            flip_src_a: true,
+                            flip_src_b: true,
+                            dst_cr: false,
+                        });
+                    }
+                    m.t1.push(MirOp::WaitMatrix);
+                    // The pack's edge mask keeps the first row of *every* face,
+                    // and the fold only writes faces 0 and 1; the packer cannot
+                    // select faces, so faces 2 and 3 (the lower half of the tile)
+                    // are written as the zeros the result defines.
+                    m.t1.push(MirOp::LaneConst {
                         lreg: 0,
-                        row: base + row,
-                        dtype: storage(crate::ir::DType::F32),
+                        bits: 0.0f32.to_bits(),
                     });
+                    for row in (32..DST_ROWS).step_by(2) {
+                        m.t1.push(MirOp::Sfpstore {
+                            lreg: 0,
+                            row: base + row,
+                            dtype: storage(crate::ir::DType::F32),
+                        });
+                    }
+                    m.t1.push(MirOp::Setrwc {
+                        src_a: 0,
+                        src_b: 0,
+                        dst: 0,
+                        flip_src_a: false,
+                        flip_src_b: false,
+                        dst_cr: false,
+                    });
+                    acc_mask[acc as usize] = PackMask::Col;
                 }
-                m.t1.push(MirOp::Setrwc {
-                    src_a: 0,
-                    src_b: 0,
-                    dst: 0,
-                    flip_src_a: false,
-                    flip_src_b: false,
-                    dst_cr: false,
-                });
-                acc_mask[acc as usize] = PackMask::Col;
             }
         }
         // A page a `matmul` read is released once the last reader of the loaded

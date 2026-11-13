@@ -316,9 +316,17 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   one 32×32 tile of ones, built at kernel start in the last `Dst` slot and packed
   into a CB only the compiler knows. The pack's edge mask keeps row 0 of each
   face (the packer cannot select a face, so the fold's lower half is written as
-  zeros), and the rest of the tile leaves as zeros. `sum scalar`,
-  `max row|scalar` are refused with `TT_TODO_REDUCE` until the Dst/Src
-  transposes land.
+  zeros), and the rest of the tile leaves as zeros. `max row` unpacks with the
+  unpacker's haloize transpose (so the fold runs along the tile's rows) and then
+  turns the fold's row into column 0 through tt-metal's
+  `reduce_row_perform_transpose<true>`: the `Dst` row is moved to `SrcB` rows
+  16..31 and `TRNSPSRCB`-transposed; the low 16 bits of each 32-bit datum are
+  saved in `SrcA` first, the high halves come back with `MOVB2D`, and the low
+  halves are restored with `MOVA2D`. The moves run with
+  `DISABLE_IMPLIED_SRCA_FMT` and `ALU_FORMAT_SPEC_REG0_SrcA = Float32` (the
+  implied `TF32` has no 16-bit half to move), and the pack's mask keeps column
+  0 of every row. `sum scalar` and `max scalar` are refused with
+  `TT_TODO_REDUCE` until the scalar transposes land.
 - Broadcast, `eq`/`noteq`, the remaining unary and binary ops, and the `bool`
   datapath in a parameter or buffer are accepted by the format and verifier and
   refused loudly by lowering, not guessed at.

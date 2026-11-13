@@ -83,6 +83,9 @@ pub enum PackMask {
     /// Only row 0: one value per column, the rest zero. This is a reduce's
     /// `col` result.
     Col,
+    /// Only column 0: one value per row, the rest zero. This is a reduce's
+    /// `row` result.
+    Row,
 }
 
 /// One instruction of a compute core's program.
@@ -120,20 +123,29 @@ pub enum MirOp {
     Select { cond: u8, t: u8, f: u8, d: u8 },
     /// The lanewise maximum, through the SFPU lane flags.
     Max { a: u8, b: u8, d: u8 },
-    /// `UNPACR`: the page at the head of `cb`'s ring into the destination
-    /// `unit` names. With `to_src` clear it lands in `Dst` at the row
-    /// [`MirOp::Setdst`] chose (`unit` is 0 then); with `to_src` set it lands in
-    /// `SrcA` (`unit` 0) or `SrcB` (`unit` 1) at the face
-    /// [`MirOp::Setadczw`] chose, and `flip` hands the bank to the Matrix Unit.
-    /// `dtype` picks the L1 format: `Bf16` for a 16-bit datum, `Fp32` otherwise
-    /// (an `i32` datum is opaque 32 bits). The base is read from the ring's read
-    /// pointer at run time.
+    /// The unpacker's `Config` bank for `unit`: the L1 format, which path the
+    /// page takes (`Dst` at [`MirOp::Setdst`]'s row, or `SrcA`/`SrcB` at
+    /// [`MirOp::Setadczw`]'s face), and — on the `Src` path — the haloize
+    /// transpose the unpacker applies to each face. Written when it changes; a
+    /// `Dst` config also takes the datum run from the [`MirOp::Setadcx`] in
+    /// effect, so the caller sets that first. `dtype` picks the L1 format:
+    /// `Bf16` for a 16-bit datum, `Fp32` otherwise (an `i32` datum is opaque 32
+    /// bits).
+    UnpackConfig {
+        unit: u8,
+        to_src: bool,
+        dtype: DType,
+        haloize: bool,
+    },
+    /// `UNPACR`: the page at the head of `cb`'s ring into `unit`'s configured
+    /// destination (see [`MirOp::UnpackConfig`]), the face [`MirOp::Setadczw`]
+    /// chose and the run its `count` datums name. `flip` hands the `Src` bank to
+    /// the Matrix Unit. The base is read from the ring's read pointer at run
+    /// time.
     Unpacr {
         cb: u32,
         unit: u8,
         count: u32,
-        dtype: DType,
-        to_src: bool,
         flip: bool,
     },
     /// `SETADCZW`: which face the unpacker reads next.
@@ -182,6 +194,48 @@ pub enum MirOp {
         move4_rows: bool,
         dst_row: u32,
     },
+    /// `MOVB2D`: `SrcB` rows from `src_row` into `Dst` rows from `dst_row`, the
+    /// inverse of [`MirOp::Movd2b`]. `move4_rows` moves four rows, and
+    /// `use_dst32b_lo` writes the low half of a 32-bit `Dst` datum.
+    Movb2d {
+        use_dst32b_lo: bool,
+        src_row: u32,
+        addr_mod: u32,
+        move4_rows: bool,
+        dst_row: u32,
+    },
+    /// `MOVB2A`: `SrcB` rows from `src_b_row` into `SrcA` rows from `src_a_row`.
+    /// A four-row move; the way the transposed low halves reach `SrcA` for a
+    /// `MOVA2D`.
+    Movb2a {
+        src_a_row: u32,
+        addr_mod: u32,
+        move4_rows: bool,
+        src_b_row: u32,
+    },
+    /// `MOVA2D`: `SrcA` rows from `src_row` into `Dst` rows from `dst_row`.
+    /// `move8_rows` moves eight rows, and `use_dst32b_lo` writes the low half of
+    /// a 32-bit `Dst` datum.
+    Mova2d {
+        use_dst32b_lo: bool,
+        src_row: u32,
+        addr_mod: u32,
+        move8_rows: bool,
+        dst_row: u32,
+    },
+    /// `TRNSPSRCB`: transpose the 16x16 block in `SrcB` rows 16..31 in place.
+    Trnspsrcb,
+    /// `ALU_ACC_CTRL`: the `Dst` width the Matrix Unit and the moves address.
+    /// tt-metal clears `Fp32_enabled` around the high-half `MOVD2B`/`MOVB2D`
+    /// transposes on Blackhole (issue #449) and sets it back; the transposes
+    /// also keep source denormals (`Zero_Flag_disabled_src`), which the moves
+    /// would otherwise flush.
+    AluAccCtrl { fp32: bool, zero_flag_src: bool },
+    /// `ALU_FORMAT_SPEC_REG0_SrcA`, through the override bit: the format the
+    /// moves see while implied-format inference is off (see
+    /// `DISABLE_IMPLIED_SRCA_FMT`). tt-metal's transpose sets it to `Float32`
+    /// for the low-16-bit pass and `Tf32` for the high one.
+    SrcAFormat { dtype: DType },
     /// `SETRWC`: the `SrcA`/`SrcB`/`Dst` row counters and the fidelity phase,
     /// which is how the Matrix Unit is told where its operands and accumulator
     /// start. The SFPU addresses `Dst` relative to the same counter, so the
