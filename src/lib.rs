@@ -7,6 +7,7 @@
 //! consumer links `libTT.so` and calls `ttCompile`, `ttLaunch` and the transfers
 //! beside them, exactly as the header describes. Nothing in this crate is a Rust
 //! library, and nothing outside it should need to be.
+#![allow(non_snake_case)] // the crate is `TT`, and the artifact is `libTT.so`.
 
 pub mod abi;
 

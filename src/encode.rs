@@ -222,12 +222,6 @@ impl Words {
 }
 
 /// Encode only the math core.
-pub fn math(m: &Machine) -> Result<Vec<u32>, Error> {
-    let mut out = Stream::default();
-    encode_math(&m.t1, &mut out, m.dst_is_16_bit)?;
-    out.words()
-}
-
 /// Encode all three compute programs.
 pub fn encode(m: &Machine) -> Result<Words, Error> {
     let mut out = Words::default();

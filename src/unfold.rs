@@ -530,8 +530,7 @@ copy_to %out from %bo [0]
                     ..
                 }
             )),
-            "the unfolded program still has a transcendental:\n{}",
-            out.to_text()
+            "the unfolded program still has a transcendental"
         );
     }
 }

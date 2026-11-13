@@ -333,10 +333,3 @@ pub struct Machine {
     /// the packer and the SFPU's load/store format are picked from it.
     pub dst_is_16_bit: bool,
 }
-
-impl Machine {
-    /// Every core's program in order: T0, T1, T2.
-    pub fn cores(&self) -> [&[MirOp]; 3] {
-        [&self.t0, &self.t1, &self.t2]
-    }
-}

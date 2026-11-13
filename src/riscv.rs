@@ -11,7 +11,6 @@
 /// leaf: no `sp`, `gp`, `tp`, `ra`, `s0..s11`.
 pub mod reg {
     pub const ZERO: u8 = 0;
-    pub const RA: u8 = 1;
     pub const A0: u8 = 10;
     pub const A1: u8 = 11;
     pub const A2: u8 = 12;
@@ -19,7 +18,6 @@ pub mod reg {
     pub const A4: u8 = 14;
     pub const A5: u8 = 15;
     pub const A6: u8 = 16;
-    pub const A7: u8 = 17;
     pub const T0: u8 = 5;
     pub const T1: u8 = 6;
     pub const T2: u8 = 7;
@@ -69,30 +67,12 @@ fn u_type(imm20: u32, rd: u8, opcode: u32) -> u32 {
     (imm20 << 12) | (u32::from(rd) << 7) | opcode
 }
 
-fn j_type(imm: i32, rd: u8, opcode: u32) -> u32 {
-    let imm = imm as u32;
-    (((imm >> 20) & 1) << 31)
-        | (((imm >> 1) & 0x3ff) << 21)
-        | (((imm >> 11) & 1) << 20)
-        | (((imm >> 12) & 0xff) << 12)
-        | (u32::from(rd) << 7)
-        | opcode
-}
-
 pub fn lui(rd: u8, imm20: u32) -> u32 {
     u_type(imm20, rd, 0x37)
 }
 
-pub fn auipc(rd: u8, imm20: u32) -> u32 {
-    u_type(imm20, rd, 0x17)
-}
-
 pub fn addi(rd: u8, rs1: u8, imm: i32) -> u32 {
     i_type(imm, rs1, 0, rd, 0x13)
-}
-
-pub fn andi(rd: u8, rs1: u8, imm: i32) -> u32 {
-    i_type(imm, rs1, 7, rd, 0x13)
 }
 
 pub fn ori(rd: u8, rs1: u8, imm: i32) -> u32 {
@@ -143,10 +123,6 @@ pub fn sll(rd: u8, rs1: u8, rs2: u8) -> u32 {
     r_type(0, rs2, rs1, 1, rd, 0x33)
 }
 
-pub fn srl(rd: u8, rs1: u8, rs2: u8) -> u32 {
-    r_type(0, rs2, rs1, 5, rd, 0x33)
-}
-
 pub fn sra(rd: u8, rs1: u8, rs2: u8) -> u32 {
     r_type(0x20, rs2, rs1, 5, rd, 0x33)
 }
@@ -173,26 +149,6 @@ pub fn beq(rs1: u8, rs2: u8, imm: i32) -> u32 {
 
 pub fn bne(rs1: u8, rs2: u8, imm: i32) -> u32 {
     b_type(imm, rs2, rs1, 1, 0x63)
-}
-
-pub fn bltu(rs1: u8, rs2: u8, imm: i32) -> u32 {
-    b_type(imm, rs2, rs1, 6, 0x63)
-}
-
-pub fn bgeu(rs1: u8, rs2: u8, imm: i32) -> u32 {
-    b_type(imm, rs2, rs1, 7, 0x63)
-}
-
-pub fn jal(rd: u8, imm: i32) -> u32 {
-    j_type(imm, rd, 0x6f)
-}
-
-pub fn jalr(rd: u8, rs1: u8, imm: i32) -> u32 {
-    i_type(imm, rs1, 0, rd, 0x67)
-}
-
-pub fn fence() -> u32 {
-    0x0000_000f
 }
 
 /// `ret`: `jalr x0, 0(x1)`.
@@ -245,7 +201,6 @@ pub mod cb {
     pub const WR_PTR: i32 = 20;
     /// `tiles_acked` (low 16) and `tiles_received` (high 16) share this word.
     pub const COUNTERS: i32 = 24;
-    pub const WR_TILE_PTR: i32 = 28;
     /// Bytes per interface entry.
     pub const STRIDE: u32 = 32;
     /// Entries in the table: tt-metal's `NUM_CIRCULAR_BUFFERS`.
@@ -354,7 +309,6 @@ pub struct Asm {
 #[derive(Clone, Copy)]
 enum Fixup {
     Branch { funct3: u32, rs1: u8, rs2: u8 },
-    Jal { rd: u8 },
 }
 
 impl Asm {
@@ -409,24 +363,6 @@ impl Asm {
         ));
     }
 
-    pub fn beq_label(&mut self, rs1: u8, rs2: u8, label: impl Into<String>) {
-        let at = self.word(0);
-        self.fixups.push((
-            at,
-            label.into(),
-            Fixup::Branch {
-                funct3: 0,
-                rs1,
-                rs2,
-            },
-        ));
-    }
-
-    pub fn j_label(&mut self, label: impl Into<String>) {
-        let at = self.word(0);
-        self.fixups.push((at, label.into(), Fixup::Jal { rd: 0 }));
-    }
-
     /// Patch every fixup and return the words. An unknown label is an error,
     /// never a silently zero branch.
     pub fn finish(mut self) -> Result<Vec<u32>, String> {
@@ -439,7 +375,6 @@ impl Asm {
                 i32::try_from(delta).map_err(|_| format!("branch to `{label}` is out of range"))?;
             self.words[at] = match kind {
                 Fixup::Branch { funct3, rs1, rs2 } => b_type(delta, rs2, rs1, funct3, 0x63),
-                Fixup::Jal { rd } => j_type(delta, rd, 0x6f),
             };
         }
         Ok(self.words)

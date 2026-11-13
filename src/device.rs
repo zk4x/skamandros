@@ -222,11 +222,13 @@ pub type Image = (Core, &'static [u8], u64);
 
 /// Where `link.x` places an image: RISCV T0's default reset PC, which every image
 /// but the role images and the per-core probes uses.
+#[cfg(test)]
 pub const LOAD_ADDRESS: u64 = Core::T0.default_reset_pc() as u64;
 
 /// The three role images -- unpack on T0, math on T1, pack on T2 -- each linked
 /// at its own slot (`tt_isa::l1::roles`), so all three fit in one tile's L1 at
 /// once and each starts through its reset-PC override.
+#[cfg(test)]
 pub const ROLES: [Image; 3] = [
     (
         Core::T0,
@@ -288,15 +290,18 @@ pub const EXEC_SUBORDINATES: [Image; 4] = [
 
 /// RISCV NC's mover image (`tt_isa::dm::nc`), reached through the stub at NC's
 /// reset PC.
+#[cfg(test)]
 pub const DM_NC: &[u8] = include_bytes!(env!("FIRMWARE_DM_NC"));
 
 /// RISCV B's data mover (`tt_isa::dm`), loaded at L1 offset 0.
+#[cfg(test)]
 pub const DM_B: &[u8] = include_bytes!(env!("FIRMWARE_DM_B"));
 
 /// Every image this build produced, by name, with its load address.
 ///
 /// The list exists so a test can name every image the build gate judged, rather
 /// than trusting that the one it embeds was among them.
+#[cfg(test)]
 pub fn all_images() -> Vec<(&'static str, &'static [u8])> {
     vec![
         ("exec_b", EXEC_B),
@@ -405,14 +410,11 @@ impl Device {
     /// what of `tt-mapping`/`tt-host` carries over, the wall-clock budget, and the
     /// DRAM base — so this refuses rather than quietly opening the simulator under
     /// a second name.
+    #[allow(dead_code)]
     pub fn open_hardware() -> Result<Device, Error> {
         Err(Error::TT_ERROR_UNSUPPORTED)
     }
 
-    /// The tile the low-level accessors currently target.
-    pub fn tile(&self) -> NocCoord {
-        self.tile
-    }
     /// This chip's live Tensix columns, from the ARC's telemetry table.
     ///
     /// tt-metal's `ArcTelemetryReader` (`umd/device/arc/arc_telemetry_reader.cpp`)
@@ -477,11 +479,6 @@ impl Device {
     /// tiles in turn.
     pub fn select(&mut self, tile: NocCoord) {
         self.tile = tile;
-    }
-
-    /// Tensix columns in the logical grid (`grid.x` runs `0..columns`).
-    pub fn columns(&self) -> usize {
-        self.columns
     }
 
     /// Tensix rows in the logical grid (`grid.y` runs `0..rows`).
@@ -578,13 +575,6 @@ impl Device {
         self.window_write(tile, address, bytes)
     }
 
-    /// Read from this tile's L1.
-    pub fn l1_read(&mut self, address: u64, out: &mut [u8]) -> Result<(), Error> {
-        self.check_l1(address, out.len())?;
-        let tile = self.tile;
-        self.window_read(tile, address, out)
-    }
-
     /// Read one dword from the tile (an L1 word or a core register).
     pub fn read32(&mut self, address: u64) -> Result<u32, Error> {
         let mut b = [0u8; 4];
@@ -636,18 +626,6 @@ impl Device {
             }
         }
         Ok(())
-    }
-
-    /// Load every image and release all their cores with **one** write to
-    /// `SOFT_RESET_0`, so cores meant to run alongside each other do.
-    pub fn load_and_start_together(&mut self, images: &[Image]) -> Result<(), Error> {
-        let mut release = 0u32;
-        for &(core, image, at) in images {
-            self.load_held(core, image, at)?;
-            release |= core.soft_reset_mask();
-        }
-        let current = self.read32(tensix::SOFT_RESET_0)?;
-        self.write32(tensix::SOFT_RESET_0, current & !release)
     }
 
     /// Release the Tensix backend — unpackers, packers, Matrix Unit, Vector Unit
@@ -908,6 +886,7 @@ impl Device {
 
     /// Place a RISC-V program and its launch arguments, run it on RISCV B to
     /// completion, and report a refusal.
+    #[allow(dead_code)]
     pub fn run_program(
         &mut self,
         program_at: u32,

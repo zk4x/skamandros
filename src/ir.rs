@@ -69,15 +69,6 @@ impl DType {
         }
     }
 
-    fn tag(self) -> u8 {
-        match self {
-            DType::F32 => 0,
-            DType::Bf16 => 1,
-            DType::I32 => 2,
-            DType::Bool => 3,
-        }
-    }
-
     fn from_tag(tag: u8) -> Option<DType> {
         match tag {
             0 => Some(DType::F32),
@@ -118,15 +109,6 @@ impl RegShape {
             RegShape::Tile => 32 * 32,
         }
     }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            RegShape::Scalar => "scalar",
-            RegShape::Column => "column",
-            RegShape::Row => "row",
-            RegShape::Tile => "tile",
-        }
-    }
 }
 
 /// Which axis a reduce folds, and where its result lands: tt-metal's
@@ -148,14 +130,6 @@ pub enum ReduceDim {
 }
 
 impl ReduceDim {
-    pub fn name(self) -> &'static str {
-        match self {
-            ReduceDim::Row => "row",
-            ReduceDim::Col => "col",
-            ReduceDim::Scalar => "scalar",
-        }
-    }
-
     fn from_name(name: &str) -> Option<ReduceDim> {
         Some(match name {
             "row" => ReduceDim::Row,
@@ -163,14 +137,6 @@ impl ReduceDim {
             "scalar" => ReduceDim::Scalar,
             _ => return None,
         })
-    }
-
-    fn tag(self) -> u8 {
-        match self {
-            ReduceDim::Row => 0,
-            ReduceDim::Col => 1,
-            ReduceDim::Scalar => 2,
-        }
     }
 
     fn from_tag(tag: u8) -> Option<ReduceDim> {
@@ -242,30 +208,6 @@ pub enum BinOp {
 }
 
 impl BinOp {
-    pub fn name(self) -> &'static str {
-        match self {
-            BinOp::Add => "add",
-            BinOp::Sub => "sub",
-            BinOp::Mul => "mul",
-            BinOp::Div => "div",
-            BinOp::Pow => "pow",
-            BinOp::Mod => "mod",
-            BinOp::Cmplt => "cmplt",
-            BinOp::Cmpgt => "cmpgt",
-            BinOp::Cmpge => "cmpge",
-            BinOp::Max => "max",
-            BinOp::Or => "or",
-            BinOp::And => "and",
-            BinOp::BitXor => "bitxor",
-            BinOp::BitOr => "bitor",
-            BinOp::BitAnd => "bitand",
-            BinOp::BitShiftLeft => "bitshiftleft",
-            BinOp::BitShiftRight => "bitshiftright",
-            BinOp::NotEq => "noteq",
-            BinOp::Eq => "eq",
-        }
-    }
-
     fn from_name(name: &str) -> Option<BinOp> {
         Some(match name {
             "add" => BinOp::Add,
@@ -289,30 +231,6 @@ impl BinOp {
             "eq" => BinOp::Eq,
             _ => return None,
         })
-    }
-
-    fn tag(self) -> u8 {
-        match self {
-            BinOp::Add => 0,
-            BinOp::Sub => 1,
-            BinOp::Mul => 2,
-            BinOp::Div => 3,
-            BinOp::Pow => 4,
-            BinOp::Mod => 5,
-            BinOp::Cmplt => 6,
-            BinOp::Cmpgt => 7,
-            BinOp::Cmpge => 8,
-            BinOp::Max => 9,
-            BinOp::Or => 10,
-            BinOp::And => 11,
-            BinOp::BitXor => 12,
-            BinOp::BitOr => 13,
-            BinOp::BitAnd => 14,
-            BinOp::BitShiftLeft => 15,
-            BinOp::BitShiftRight => 16,
-            BinOp::NotEq => 17,
-            BinOp::Eq => 18,
-        }
     }
 
     fn from_tag(tag: u8) -> Option<BinOp> {
@@ -386,24 +304,6 @@ pub enum UnOp {
 }
 
 impl UnOp {
-    pub fn name(self) -> &'static str {
-        match self {
-            UnOp::Neg => "neg",
-            UnOp::Not => "not",
-            UnOp::BitNot => "bitnot",
-            UnOp::Exp2 => "exp2",
-            UnOp::Log2 => "log2",
-            UnOp::Reciprocal => "reciprocal",
-            UnOp::Sqrt => "sqrt",
-            UnOp::Rsqrt => "rsqrt",
-            UnOp::Sin => "sin",
-            UnOp::Cos => "cos",
-            UnOp::Floor => "floor",
-            UnOp::Trunc => "trunc",
-            UnOp::Abs => "abs",
-        }
-    }
-
     fn from_name(name: &str) -> Option<UnOp> {
         Some(match name {
             "neg" => UnOp::Neg,
@@ -421,24 +321,6 @@ impl UnOp {
             "abs" => UnOp::Abs,
             _ => return None,
         })
-    }
-
-    fn tag(self) -> u8 {
-        match self {
-            UnOp::Neg => 0,
-            UnOp::Not => 1,
-            UnOp::BitNot => 2,
-            UnOp::Exp2 => 3,
-            UnOp::Log2 => 4,
-            UnOp::Reciprocal => 5,
-            UnOp::Sqrt => 6,
-            UnOp::Rsqrt => 7,
-            UnOp::Sin => 8,
-            UnOp::Cos => 9,
-            UnOp::Floor => 10,
-            UnOp::Trunc => 11,
-            UnOp::Abs => 12,
-        }
     }
 
     fn from_tag(tag: u8) -> Option<UnOp> {
@@ -1502,172 +1384,6 @@ pub const MAGIC: [u8; 4] = *b"TTIR";
 pub const VERSION: u32 = 7;
 
 impl Kernel {
-    /// The byte form: the same program as [`Kernel::to_text`], little-endian and
-    /// length-prefixed. Values are referenced by id; every definition carries
-    /// its name.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut b = Vec::new();
-        b.extend_from_slice(&MAGIC);
-        put_u32(&mut b, VERSION);
-        put_u32(&mut b, self.ops.len() as u32);
-        for op in &self.ops {
-            match op {
-                Op::Const { value, dtype, bits } => {
-                    b.push(0);
-                    put_name(&mut b, &self.names[*value as usize]);
-                    b.push(dtype.tag());
-                    put_u32(&mut b, *bits);
-                }
-                Op::Param { value, dtype, dims } => {
-                    b.push(1);
-                    put_name(&mut b, &self.names[*value as usize]);
-                    b.push(dtype.tag());
-                    put_u32(&mut b, dims.len() as u32);
-                    for d in dims {
-                        put_dim(&mut b, *d);
-                    }
-                }
-                Op::Buffer {
-                    value,
-                    dtype,
-                    shape,
-                } => {
-                    b.push(2);
-                    put_name(&mut b, &self.names[*value as usize]);
-                    b.push(dtype.tag());
-                    put_u32(&mut b, shape[0]);
-                    put_u32(&mut b, shape[1]);
-                }
-                Op::Grid { columns, rows } => {
-                    b.push(3);
-                    put_dim(&mut b, *columns);
-                    put_dim(&mut b, *rows);
-                }
-                Op::Loop { value, bound } => {
-                    b.push(4);
-                    put_name(&mut b, &self.names[*value as usize]);
-                    put_dim(&mut b, *bound);
-                }
-                Op::EndLoop => b.push(5),
-                Op::GridCoord { value, axis } => {
-                    b.push(14);
-                    put_name(&mut b, &self.names[*value as usize]);
-                    b.push(*axis);
-                }
-                Op::CopyTo {
-                    dst,
-                    src,
-                    dst_offset,
-                    src_offset,
-                } => {
-                    b.push(6);
-                    put_u32(&mut b, *dst);
-                    put_u32(&mut b, *src);
-                    put_dim(&mut b, *dst_offset);
-                    put_dim(&mut b, *src_offset);
-                }
-                Op::Load {
-                    value,
-                    buffer,
-                    offset,
-                } => {
-                    b.push(7);
-                    put_name(&mut b, &self.names[*value as usize]);
-                    put_u32(&mut b, *buffer);
-                    put_dim(&mut b, *offset);
-                }
-                Op::StoreTo {
-                    value,
-                    buffer,
-                    offset,
-                } => {
-                    b.push(8);
-                    put_u32(&mut b, *buffer);
-                    put_u32(&mut b, *value);
-                    put_dim(&mut b, *offset);
-                }
-                Op::Cast { value, src, dtype } => {
-                    b.push(9);
-                    put_name(&mut b, &self.names[*value as usize]);
-                    put_u32(&mut b, *src);
-                    b.push(dtype.tag());
-                }
-                Op::Unary { value, op, a } => {
-                    b.push(10);
-                    put_name(&mut b, &self.names[*value as usize]);
-                    b.push(op.tag());
-                    put_u32(&mut b, *a);
-                }
-                Op::Binary {
-                    value,
-                    op,
-                    a,
-                    b: rhs,
-                } => {
-                    b.push(11);
-                    put_name(&mut b, &self.names[*value as usize]);
-                    b.push(op.tag());
-                    put_u32(&mut b, *a);
-                    put_u32(&mut b, *rhs);
-                }
-                Op::Select {
-                    value,
-                    cond,
-                    if_true,
-                    if_false,
-                } => {
-                    b.push(13);
-                    put_name(&mut b, &self.names[*value as usize]);
-                    put_u32(&mut b, *cond);
-                    put_u32(&mut b, *if_true);
-                    put_u32(&mut b, *if_false);
-                }
-                Op::Matmul { acc, a, b: rhs } => {
-                    b.push(12);
-                    put_u32(&mut b, *acc);
-                    put_u32(&mut b, *a);
-                    put_u32(&mut b, *rhs);
-                }
-                Op::Sum {
-                    acc,
-                    dim,
-                    x,
-                    scaler,
-                } => {
-                    b.push(17);
-                    put_u32(&mut b, *acc);
-                    put_u32(&mut b, *x);
-                    put_u32(&mut b, *scaler);
-                    b.push(dim.tag());
-                }
-                Op::Max { acc, dim, x } => {
-                    b.push(18);
-                    put_u32(&mut b, *acc);
-                    put_u32(&mut b, *x);
-                    b.push(dim.tag());
-                }
-                Op::Acc {
-                    value,
-                    dtype,
-                    shape,
-                } => {
-                    b.push(16);
-                    put_name(&mut b, &self.names[*value as usize]);
-                    b.push(dtype.tag());
-                    put_u32(&mut b, shape[0]);
-                    put_u32(&mut b, shape[1]);
-                }
-                Op::Bitcast { value, src, dtype } => {
-                    b.push(15);
-                    put_name(&mut b, &self.names[*value as usize]);
-                    put_u32(&mut b, *src);
-                    b.push(dtype.tag());
-                }
-            }
-        }
-        b
-    }
-
     /// Read the byte form. A wrong magic, an unknown version or a truncated
     /// record is refused, never guessed at.
     pub fn from_bytes(bytes: &[u8]) -> Result<Kernel, Error> {
@@ -1855,28 +1571,6 @@ fn define(names: &mut Vec<String>, name: String) -> Result<ValueId, Error> {
     let value = names.len() as ValueId;
     names.push(name);
     Ok(value)
-}
-
-fn put_u32(out: &mut Vec<u8>, v: u32) {
-    out.extend_from_slice(&v.to_le_bytes());
-}
-
-fn put_name(out: &mut Vec<u8>, name: &str) {
-    put_u32(out, name.len() as u32);
-    out.extend_from_slice(name.as_bytes());
-}
-
-fn put_dim(out: &mut Vec<u8>, dim: Dim) {
-    match dim {
-        Dim::Const(n) => {
-            out.push(0);
-            put_u32(out, n);
-        }
-        Dim::Value(v) => {
-            out.push(1);
-            put_u32(out, v);
-        }
-    }
 }
 
 struct Cursor<'a> {
@@ -2070,211 +1764,6 @@ impl Kernel {
         };
         k.verify()?;
         Ok(k)
-    }
-
-    /// The canonical text form.
-    pub fn to_text(&self) -> String {
-        let mut s = String::new();
-        s.push_str(&format!("version {VERSION}\n"));
-        for op in &self.ops {
-            let name = |v: ValueId| self.names[v as usize].as_str();
-            match op {
-                Op::Const { value, dtype, bits } => {
-                    s.push_str(&format!(
-                        "%{} = const {} {}\n",
-                        name(*value),
-                        dtype.name(),
-                        literal(*dtype, *bits)
-                    ));
-                }
-                Op::Param { value, dtype, dims } => {
-                    let shape = if dims.is_empty() {
-                        "0".to_string()
-                    } else {
-                        dims.iter()
-                            .map(|d| self.dim_text(*d))
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    };
-                    s.push_str(&format!(
-                        "%{} = param {} {shape}\n",
-                        name(*value),
-                        dtype.name()
-                    ));
-                }
-                Op::Buffer {
-                    value,
-                    dtype,
-                    shape,
-                } => {
-                    s.push_str(&format!(
-                        "%{} = buffer {} {},{}\n",
-                        name(*value),
-                        dtype.name(),
-                        shape[0],
-                        shape[1]
-                    ));
-                }
-                Op::Acc {
-                    value,
-                    dtype,
-                    shape,
-                } => {
-                    s.push_str(&format!(
-                        "%{} = acc {} {},{}\n",
-                        name(*value),
-                        dtype.name(),
-                        shape[0],
-                        shape[1]
-                    ));
-                }
-                Op::Grid { columns, rows } => {
-                    s.push_str(&format!(
-                        "grid {},{}\n",
-                        self.dim_text(*columns),
-                        self.dim_text(*rows)
-                    ));
-                }
-                Op::Loop { value, bound } => {
-                    s.push_str(&format!(
-                        "%{} = loop {}\n",
-                        name(*value),
-                        self.dim_text(*bound)
-                    ));
-                }
-                Op::EndLoop => s.push_str("endloop\n"),
-                Op::GridCoord { value, axis } => {
-                    let axis = if *axis == 0 { "x" } else { "y" };
-                    s.push_str(&format!("%{} = grid.{}\n", name(*value), axis));
-                }
-                Op::CopyTo {
-                    dst,
-                    src,
-                    dst_offset,
-                    src_offset,
-                } => {
-                    s.push_str(&format!(
-                        "copy_to %{} from %{} [{}]",
-                        name(*dst),
-                        name(*src),
-                        self.dim_text(*dst_offset)
-                    ));
-                    if dst_offset != src_offset {
-                        s.push_str(&format!(" [{}]", self.dim_text(*src_offset)));
-                    }
-                    s.push('\n');
-                }
-                Op::Load {
-                    value,
-                    buffer,
-                    offset,
-                } => {
-                    s.push_str(&format!(
-                        "%{} = load %{} [{}]\n",
-                        name(*value),
-                        name(*buffer),
-                        self.dim_text(*offset)
-                    ));
-                }
-                Op::StoreTo {
-                    value,
-                    buffer,
-                    offset,
-                } => {
-                    s.push_str(&format!(
-                        "store_to %{} from %{} [{}]\n",
-                        name(*buffer),
-                        name(*value),
-                        self.dim_text(*offset)
-                    ));
-                }
-                Op::Cast { value, src, dtype } => {
-                    s.push_str(&format!(
-                        "%{} = cast %{} to {}\n",
-                        name(*value),
-                        name(*src),
-                        dtype.name()
-                    ));
-                }
-                Op::Bitcast { value, src, dtype } => {
-                    s.push_str(&format!(
-                        "%{} = bitcast %{} to {}\n",
-                        name(*value),
-                        name(*src),
-                        dtype.name()
-                    ));
-                }
-                Op::Unary { value, op, a } => {
-                    s.push_str(&format!(
-                        "%{} = {} %{}\n",
-                        name(*value),
-                        op.name(),
-                        name(*a)
-                    ));
-                }
-                Op::Binary { value, op, a, b } => {
-                    s.push_str(&format!(
-                        "%{} = {} %{} %{}\n",
-                        name(*value),
-                        op.name(),
-                        name(*a),
-                        name(*b)
-                    ));
-                }
-                Op::Select {
-                    value,
-                    cond,
-                    if_true,
-                    if_false,
-                } => {
-                    s.push_str(&format!(
-                        "%{} = sel %{} %{} %{}\n",
-                        name(*value),
-                        name(*cond),
-                        name(*if_true),
-                        name(*if_false)
-                    ));
-                }
-                Op::Matmul { acc, a, b } => {
-                    s.push_str(&format!(
-                        "matmul %{} %{} %{}\n",
-                        name(*acc),
-                        name(*a),
-                        name(*b)
-                    ));
-                }
-                Op::Sum {
-                    acc,
-                    dim,
-                    x,
-                    scaler,
-                } => {
-                    s.push_str(&format!(
-                        "sum {} %{} %{} %{}\n",
-                        dim.name(),
-                        name(*acc),
-                        name(*x),
-                        name(*scaler)
-                    ));
-                }
-                Op::Max { acc, dim, x } => {
-                    s.push_str(&format!(
-                        "max {} %{} %{}\n",
-                        dim.name(),
-                        name(*acc),
-                        name(*x)
-                    ));
-                }
-            }
-        }
-        s
-    }
-
-    fn dim_text(&self, dim: Dim) -> String {
-        match dim {
-            Dim::Const(n) => n.to_string(),
-            Dim::Value(v) => format!("%{}", self.names[v as usize]),
-        }
     }
 }
 

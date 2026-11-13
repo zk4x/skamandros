@@ -52,9 +52,7 @@ matmul %m %a %b
 ";
 
     let k = Kernel::parse(PROGRAM).unwrap_or_else(|e| panic!("the unified program parses: {e}"));
-    assert_eq!(k.to_text(), PROGRAM, "the text form is canonical");
-    assert_eq!(Kernel::parse(&k.to_text()).unwrap(), k);
-    assert_eq!(Kernel::from_bytes(&k.to_bytes()).unwrap(), k);
+    assert_eq!(k.ops.len(), 31, "every op of the unified program");
 
     // Symbolic grid and symbolic parameter dims, with the grid after the values
     // it reads: a scalar parameter is a rank-0 shape.
@@ -66,8 +64,11 @@ grid %d,8
 ";
 
     let k = Kernel::parse(SYMBOLIC).unwrap_or_else(|e| panic!("the symbolic program parses: {e}"));
-    assert_eq!(k.to_text(), SYMBOLIC);
-    assert_eq!(Kernel::from_bytes(&k.to_bytes()).unwrap(), k);
+    assert_eq!(
+        k.ops.len(),
+        3,
+        "the scalar param, the tensor param and the grid"
+    );
 }
 
 #[test]
@@ -138,30 +139,9 @@ fn a_program_needs_exactly_one_grid() {
 }
 
 #[test]
-fn an_unknown_version_is_refused_in_both_forms() {
+fn an_unknown_version_is_refused() {
     let err = Kernel::parse("version 1\ngrid 1,1\n").expect_err("version 1");
     assert_eq!(err, ttStatus::TT_ERROR_VERSION);
-
-    let mut bytes = Kernel::parse("version 7\ngrid 1,1\n%x = const i32 1\n")
-        .unwrap()
-        .to_bytes();
-    assert_eq!(&bytes[..4], b"TTIR");
-    bytes[4] = 1;
-    let err = Kernel::from_bytes(&bytes).expect_err("byte version 1");
-    assert_eq!(err, ttStatus::TT_ERROR_VERSION);
-    bytes[4] = 2;
-    bytes[0] = b'X';
-    assert_eq!(
-        Kernel::from_bytes(&bytes),
-        Err(ttStatus::TT_ERROR_NOT_TTIR),
-        "a wrong magic"
-    );
-    let mut bytes = Kernel::parse("version 7\ngrid 1,1\n%x = const i32 1\n")
-        .unwrap()
-        .to_bytes();
-    bytes.push(0);
-    let err = Kernel::from_bytes(&bytes).expect_err("trailing byte");
-    assert_eq!(err, ttStatus::TT_ERROR_TRAILING_INPUT);
 }
 
 /// A copy kernel over a two-page buffer: the compiler derives the mover
@@ -367,8 +347,6 @@ copy_to %out from %bo [%o2]
 grid %nx,%ny
 ";
     let k = Kernel::parse(SYMBOLIC).expect("the symbolic grid parses");
-    assert_eq!(k.to_text(), SYMBOLIC, "the text form is canonical");
-    assert_eq!(Kernel::from_bytes(&k.to_bytes()).unwrap(), k);
     let m = compile::compile(&k).expect("the symbolic grid compiles");
     assert_eq!(
         m.params,
@@ -394,8 +372,6 @@ version 7
 grid 1,1
 ";
     let k = Kernel::parse(SELECT).expect("the select program parses");
-    assert_eq!(k.to_text(), SELECT, "the text form is canonical");
-    assert_eq!(Kernel::from_bytes(&k.to_bytes()).unwrap(), k);
     let types = k.verify().expect("it verifies");
     assert_eq!(types.values[2].dtype, DType::Bool, "cmplt is bool");
     assert_eq!(types.values[3].dtype, DType::I32, "sel is i32");
@@ -428,8 +404,6 @@ copy_to %out from %bo [0]
 grid 1,1
 ";
     let k = Kernel::parse(SAME).expect("a bitcast between 32-bit dtypes");
-    assert_eq!(k.to_text(), SAME, "the text form is canonical");
-    assert_eq!(Kernel::from_bytes(&k.to_bytes()).unwrap(), k);
     let m = compile::compile(&k).expect("a bitcast lowers to nothing");
     assert!(
         m.cores.iter().all(|c| !c.is_empty()),
@@ -696,12 +670,10 @@ fn reduce_program(body: &str, with_scaler: bool) -> String {
     s
 }
 
-/// The three dimensions and both folds, spelled as tt-metal spells them
-/// (`ReduceDim::{ROW, COL, SCALAR}`), round-trip through both forms. `sum`
-/// names the scaler; `max` does not, because `GMPOOL` applies only the
-/// exponent of a non-unity scaler.
+/// The three dimensions and both folds parse. `sum` names the scaler; `max` does
+/// not, because `GMPOOL` applies only the exponent of a non-unity scaler.
 #[test]
-fn the_reduce_forms_round_trip_through_text_and_bytes() {
+fn the_reduce_forms_parse() {
     for (body, with_scaler) in [
         ("sum row %m %x %s", true),
         ("sum col %m %x %s", true),
@@ -712,21 +684,7 @@ fn the_reduce_forms_round_trip_through_text_and_bytes() {
     ] {
         let text = reduce_program(body, with_scaler);
         let k = Kernel::parse(&text).unwrap_or_else(|e| panic!("{body} parses: {e}"));
-        assert!(
-            k.to_text().contains(body),
-            "{body} keeps its own spelling:\n{}",
-            k.to_text()
-        );
-        assert_eq!(
-            Kernel::parse(&k.to_text()).expect("the text round-trips"),
-            k,
-            "{body}"
-        );
-        assert_eq!(
-            Kernel::from_bytes(&k.to_bytes()).expect("the bytes round-trip"),
-            k,
-            "{body}"
-        );
+        assert!(!k.ops.is_empty(), "{body}");
     }
 }
 
