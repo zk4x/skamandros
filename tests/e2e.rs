@@ -2468,6 +2468,118 @@ fn sum_row_runs_on_the_simulator() {
     }
 }
 
+/// `sum col %acc %x %scaler` and `max col %acc %x`: `GAPOOL`/`GMPOOL` fold
+/// each 16x16 face over its rows into row 0, one value per column, and the
+/// pack's edge mask drops the rest. `sum`'s scaler carries the factor in row 0
+/// of each face (tt-metal's row-0 fill); `max` carries none and the compiler
+/// moves 1.0 into `SrcB` itself.
+const REDUCE_SUM_COL: &str = "\
+version 7
+grid 1,1
+%px = param f32 1024
+%ps = param f32 1024
+%out = param f32 1024
+%bx = buffer f32 32,32
+%bs = buffer f32 32,32
+%bo = buffer f32 32,32
+copy_to %bx from %px [0]
+copy_to %bs from %ps [0]
+%acc = acc f32 32,32
+%zero = const f32 0
+store_to %acc from %zero
+%x = load %bx [0]
+%s = load %bs [0]
+sum col %acc %x %s
+store_to %bo from %acc [0]
+copy_to %out from %bo [0]
+";
+
+const REDUCE_MAX_COL: &str = "\
+version 7
+grid 1,1
+%px = param f32 1024
+%out = param f32 1024
+%bx = buffer f32 32,32
+%bo = buffer f32 32,32
+copy_to %bx from %px [0]
+%acc = acc f32 32,32
+%low = const f32 -1000
+store_to %acc from %low
+%x = load %bx [0]
+max col %acc %x
+store_to %bo from %acc [0]
+copy_to %out from %bo [0]
+";
+
+/// The `col` result: row 0 holds one fold per column, every other datum zero.
+fn col_reduce_oracle(input: &[f32], max: bool, scaler: Option<f32>) -> Vec<f32> {
+    let mut out = vec![0.0f32; 1024];
+    for column in 0..32 {
+        let mut folded = if max { f32::NEG_INFINITY } else { 0.0 };
+        for row in 0..32 {
+            let value = input[tile_index(row, column)];
+            folded = if max {
+                folded.max(value)
+            } else {
+                folded + value
+            };
+        }
+        out[tile_index(0, column)] = folded * scaler.unwrap_or(1.0);
+    }
+    out
+}
+
+#[test]
+fn sum_col_runs_on_the_simulator() {
+    // Integers: exact through the four fidelity phases and the accumulator.
+    let x: Vec<f32> = (0..1024).map(|i| (i % 23) as f32 - 11.0).collect();
+    let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    for factor in [1.0f32, 2.0f32] {
+        let mut scaler = vec![0.0f32; 1024];
+        for column in 0..32 {
+            // Row 0 of each face: the face's first row.
+            scaler[tile_index(0, column)] = factor;
+            scaler[tile_index(16, column)] = factor;
+        }
+        let want = col_reduce_oracle(&x, false, Some(factor));
+        assert_ne!(want, vec![0.0; 1024], "negative control");
+        let s_bytes: Vec<u8> = scaler.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let out = run_kernel_tensors(REDUCE_SUM_COL, &[&x_bytes, &s_bytes], 4096);
+        let got: Vec<f32> = out
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        for i in 0..1024 {
+            let (row, column) = tile_rc(i);
+            assert_eq!(
+                got[i], want[i],
+                "sum col, scaler {factor}, datum {i} at ({row}, {column})"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "max col needs a compiler-built 1.0 SrcB page: the MOVD2B route needs an SRCB_CLR wait the simulator refuses, and UNPACR_NOP_SETDVALID is refused too"]
+fn max_col_runs_on_the_simulator() {
+    // Integers, with negatives on both sides of the accumulator's seed.
+    let x: Vec<f32> = (0..1024).map(|i| (i % 23) as f32 - 11.0).collect();
+    let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let want = col_reduce_oracle(&x, true, None);
+    assert_ne!(want, vec![0.0; 1024], "negative control");
+    let out = run_kernel_tensors(REDUCE_MAX_COL, &[&x_bytes], 4096);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for i in 0..1024 {
+        let (row, column) = tile_rc(i);
+        assert_eq!(got[i], want[i], "max col, datum {i} at ({row}, {column})");
+    }
+}
+
 /// Two products into one accumulator: `matmul` adds into the tile it names, so
 /// the second one does not clear what the first wrote. No loop — the only thing
 /// exercised is that `acc` holds its value from one `matmul` to the next.

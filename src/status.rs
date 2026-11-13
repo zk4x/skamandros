@@ -413,6 +413,9 @@ pub enum ttStatus {
     TT_ERROR_REDUCE_DTYPE = 168,
     /// A reduce form that is not lowered yet.
     TT_TODO_REDUCE = 169,
+    /// A machine `MOVD2B` names a `SrcB` row the bank does not have (64 rows of
+    /// 16 datums).
+    TT_ERROR_SRC_ROW = 170,
 }
 
 impl ttStatus {
@@ -588,6 +591,7 @@ impl ttStatus {
             ttStatus::TT_ERROR_REDUCE_OPERAND => "TT_ERROR_REDUCE_OPERAND",
             ttStatus::TT_ERROR_REDUCE_DTYPE => "TT_ERROR_REDUCE_DTYPE",
             ttStatus::TT_TODO_REDUCE => "TT_TODO_REDUCE",
+            ttStatus::TT_ERROR_SRC_ROW => "TT_ERROR_SRC_ROW",
             ttStatus::TT_ERROR_DST_ROW_ODD => "TT_ERROR_DST_ROW_ODD",
         }
     }

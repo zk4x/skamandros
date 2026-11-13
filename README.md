@@ -308,10 +308,13 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   `sum row` is the Matrix Unit's `x @ scaler` — tt-metal's `SUM` with
   `ReduceDim::ROW` is a matmul against the scaler's column of ones, so the
   scaler page carries the factor in column 0 and zeros elsewhere, which is also
-  how the result ends up in column 0. `max` takes no scaler: `GMPOOL` applies
+  how the result ends up in column 0. `sum col` is `GAPOOL` over the four
+  16x16 faces, four fidelity phases each, with the scaler's factor in row 0 of
+  every face (tt-metal's `prepare_reduce_scaler`); the pack's edge mask keeps
+  row 0 and writes the rest as zeros. `max` takes no scaler: `GMPOOL` applies
   only the exponent of a non-unity scaler, so tt-metal always reduces `MAX` with
-  1.0 and scales the packed result afterwards. The other dims and `max` lower to
-  `GAPOOL`/`GMPOOL` next; until then they are refused with `TT_TODO_REDUCE`.
+  1.0 — a page the compiler has to build. `sum scalar`, `max row|col|scalar` are
+  refused with `TT_TODO_REDUCE` until that page and the Dst/Src transposes land.
 - Broadcast, `eq`/`noteq`, the remaining unary and binary ops, and the `bool`
   datapath in a parameter or buffer are accepted by the format and verifier and
   refused loudly by lowering, not guessed at.

@@ -17,7 +17,7 @@
 
 use crate::alloc::Alloc;
 use crate::ir::{BinOp, Dim, Error, Kernel, Op, RegShape, Types, UnOp, unit_of};
-use crate::mir::{CmpOp, IOp, Machine, MirOp, SfpOp};
+use crate::mir::{CmpOp, IOp, Machine, MirOp, PackMask, SfpOp};
 use crate::planner::Plan;
 use crate::riscv::reg;
 use tt_isa::cfg::generated::thread;
@@ -26,6 +26,8 @@ use tt_isa::cfg::generated::thread;
 pub const DST_ROWS: u32 = 64;
 /// Datums in one 32x32 tile.
 pub const TILE_DATUMS: u32 = 1024;
+/// Datums in one 16x16 face: one `Src` unpack's run.
+pub const FACE_DATUMS: u32 = TILE_DATUMS / 4;
 /// Semaphore the unpacker publishes a loaded unit on.
 pub const SEM_UNPACKED: u8 = 0;
 /// Semaphore the math core publishes a stored unit on.
@@ -106,6 +108,9 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
             alias[value as usize] = Some(resolve(&alias, src));
         }
     }
+    // The edge mask a pack of each accumulator carries: a reduce's result keeps
+    // only its folded positions, everything else leaves as zeros.
+    let mut acc_mask: Vec<PackMask> = vec![PackMask::None; types.values.len()];
     // Who reads each value, and where it last does: a `matmul` reads its
     // operands' CB pages straight into `SrcA`/`SrcB`, so a page stays reserved
     // until the last of its readers, and only then is popped.
@@ -331,6 +336,9 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     row: dst_row(alloc, resolve(&alias, value)),
                     last: true,
                     dtype,
+                    // A pack of a reduced accumulator carries the reduce's edge
+                    // mask; every other pack keeps the whole tile.
+                    mask: acc_mask[resolve(&alias, value) as usize],
                 });
                 m.t2.push(MirOp::SemGet { sem: SEM_READY });
                 m.t2.push(MirOp::CbPush { cb });
@@ -649,26 +657,19 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     });
                 }
             }
-            // `max` is `GMPOOL`, which lands next; the refusal is loud.
-            Op::Max { .. } => return Err(Error::TT_TODO_REDUCE),
             // `sum row` is the Matrix Unit's `x @ scaler`: tt-metal's
             // `ReduceDim::ROW` with `PoolType::SUM` is a matmul against the
             // scaler's column of ones, not a pool instruction, so it shares
-            // this sequence. The other dims are `GAPOOL`.
-            Op::Matmul { .. } | Op::Sum { .. } => {
+            // this sequence.
+            Op::Matmul { .. }
+            | Op::Sum {
+                dim: crate::ir::ReduceDim::Row,
+                ..
+            } => {
                 let (acc, a, b) = match *op {
                     Op::Matmul { acc, a, b } => (acc, a, b),
-                    Op::Sum {
-                        acc,
-                        dim: crate::ir::ReduceDim::Row,
-                        x,
-                        scaler,
-                    } => (acc, x, scaler),
-                    Op::Sum { dim, .. } => {
-                        let _ = dim;
-                        return Err(Error::TT_TODO_REDUCE);
-                    }
-                    _ => unreachable!("the arm pattern is matmul and sum"),
+                    Op::Sum { acc, x, scaler, .. } => (acc, x, scaler),
+                    _ => unreachable!("the arm pattern is matmul and sum row"),
                 };
                 let dt_a = types.of(a).dtype;
                 let dt_b = types.of(b).dtype;
@@ -738,6 +739,9 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     src_a: 0,
                     src_b: 0,
                     dst: 0,
+                    flip_src_a: false,
+                    flip_src_b: false,
+                    dst_cr: false,
                 });
                 // The accumulator's rows are added to, never cleared: an `acc`
                 // holds whatever the program last put there, and zeroing it is a
@@ -755,7 +759,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         m.t0.push(MirOp::Unpacr {
                             cb: cb_a,
                             unit: 1,
-                            count: TILE_DATUMS,
+                            count: FACE_DATUMS,
                             dtype: dt_a,
                             to_src: true,
                             flip: true,
@@ -767,7 +771,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         m.t0.push(MirOp::Unpacr {
                             cb: cb_b,
                             unit: 0,
-                            count: TILE_DATUMS,
+                            count: FACE_DATUMS,
                             dtype: dt_b,
                             to_src: true,
                             flip: true,
@@ -786,7 +790,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         m.t0.push(MirOp::Unpacr {
                             cb: cb_b,
                             unit: 0,
-                            count: TILE_DATUMS,
+                            count: FACE_DATUMS,
                             dtype: dt_b,
                             to_src: true,
                             flip: true,
@@ -815,7 +819,162 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     src_a: 0,
                     src_b: 0,
                     dst: 0,
+                    flip_src_a: false,
+                    flip_src_b: false,
+                    dst_cr: false,
                 });
+            }
+            // `sum col`/`max col`: `GAPOOL`/`GMPOOL` fold each 16x16 face over
+            // its rows into the destination row, one value per column, and the
+            // pack's edge mask drops everything below row 0 — tt-metal's
+            // `_llk_math_reduce_` for `REDUCE_COL`.
+            Op::Sum { .. } | Op::Max { .. } => {
+                let (acc, x, scaler, max, dim) = match *op {
+                    Op::Sum {
+                        acc,
+                        dim,
+                        x,
+                        scaler,
+                    } => (acc, x, Some(scaler), false, dim),
+                    Op::Max { acc, dim, x } => (acc, x, None, true, dim),
+                    _ => unreachable!("the arm pattern is the two reduce ops"),
+                };
+                if dim != crate::ir::ReduceDim::Col {
+                    let _ = dim;
+                    return Err(Error::TT_TODO_REDUCE);
+                }
+                // `max` needs a `SrcB` row of exactly 1.0 (`GMPOOL` scales by
+                // the exponent). The move-in route is refused: `MOVD2B` into a
+                // bank an unpacker filled needs the `SRCB_CLR` wait, which the
+                // simulator refuses, and `UNPACR_NOP_SETDVALID` is refused too.
+                // The page has to be built by the compiler; until it is, the
+                // form is refused loudly.
+                if max {
+                    let _ = (x, scaler);
+                    return Err(Error::TT_TODO_REDUCE);
+                }
+                let dt_x = types.of(x).dtype;
+                let dtype = types.of(acc).dtype;
+                if dtype == crate::ir::DType::Bf16 && wide {
+                    let _ = at;
+                    return Err(Error::TT_ERROR_MATMUL_ACCUM_WIDE);
+                }
+                let cb_x = matmul_page(k, plan, &def, &alias, x, at)?;
+                let cb_b = matmul_page(
+                    k,
+                    plan,
+                    &def,
+                    &alias,
+                    scaler.expect("sum names a scaler"),
+                    at,
+                )?;
+                let base = dst_row(alloc, acc);
+                // The accumulator's rows are written, so wait for the packer to
+                // give the section back.
+                m.t1.push(MirOp::SemWaitFree { sem: SEM_READY });
+                // `reduce_configure_addrmod`: entry 0 clears the phase, 1 and 2
+                // step `SrcB`/`Dst`, and 3 steps only the phase.
+                for entry in [
+                    // `ADDR_MOD_0`: no increments, and the phase is cleared.
+                    vec![
+                        (thread::ADDR_MOD_AB_SEC0_SrcAIncr, 0u16),
+                        (thread::ADDR_MOD_AB_SEC0_SrcBIncr, 0),
+                        (thread::ADDR_MOD_AB_SEC0_SrcBClear, 0),
+                    ],
+                    vec![
+                        (thread::ADDR_MOD_DST_SEC0_DestIncr, 0),
+                        (thread::ADDR_MOD_DST_SEC0_DestCR, 0),
+                        (thread::ADDR_MOD_DST_SEC0_FidelityClear, 1),
+                    ],
+                    // `ADDR_MOD_1`: one `SrcB` row and one `Dst` row.
+                    vec![(thread::ADDR_MOD_AB_SEC1_SrcBIncr, 1)],
+                    vec![(thread::ADDR_MOD_DST_SEC1_DestIncr, 1)],
+                    // `ADDR_MOD_2`: eight of each.
+                    vec![(thread::ADDR_MOD_AB_SEC2_SrcBIncr, 8)],
+                    vec![(thread::ADDR_MOD_DST_SEC2_DestIncr, 8)],
+                    // `ADDR_MOD_3`: no increments, the next phase.
+                    vec![(thread::ADDR_MOD_AB_SEC3_SrcBIncr, 0)],
+                    vec![
+                        (thread::ADDR_MOD_DST_SEC3_DestIncr, 0),
+                        (thread::ADDR_MOD_DST_SEC3_FidelityIncr, 1),
+                    ],
+                    vec![(thread::FIDELITY_BASE_Phase, 0)],
+                ] {
+                    m.t1.push(thread_word(&entry));
+                }
+                m.t1.push(MirOp::Setrwc {
+                    src_a: 0,
+                    src_b: 0,
+                    dst: 0,
+                    flip_src_a: false,
+                    flip_src_b: false,
+                    dst_cr: false,
+                });
+                // Four faces, `SrcA` (256 datums) and the scaler's row (16
+                // datums) each: tt-metal's AB-reduce unpack, then `GAPOOL`'s
+                // four fidelity phases. The scaler carries the factor in row 0
+                // of each face (`prepare_reduce_scaler`'s row-0 fill).
+                for face in 0..4u32 {
+                    // One face into `SrcA` and one row of the scaler into
+                    // `SrcB` (16 datums): tt-metal's AB-reduce unpack.
+                    m.t0.push(MirOp::Setadczw { unit: 0, face });
+                    m.t0.push(MirOp::Unpacr {
+                        cb: cb_x,
+                        unit: 0,
+                        count: FACE_DATUMS,
+                        dtype: dt_x,
+                        to_src: true,
+                        flip: true,
+                    });
+                    m.t0.push(MirOp::Setadczw { unit: 1, face });
+                    m.t0.push(MirOp::Unpacr {
+                        cb: cb_b,
+                        unit: 1,
+                        count: 16,
+                        dtype: dt_x,
+                        to_src: true,
+                        flip: true,
+                    });
+                    m.t0.push(MirOp::SemPost { sem: SEM_UNPACKED });
+                    m.t1.push(MirOp::SemWait {
+                        sem: SEM_UNPACKED,
+                        before: 0,
+                    });
+                    // Faces 0 and 2 fold into the first half of row 0, faces 1
+                    // and 3 into the second (tt-metal's `SETRWC(CR_D, 8)`
+                    // twice).
+                    let dst = base + if face % 2 == 0 { 0 } else { 16 };
+                    // Four fidelity phases, the last clearing the phase
+                    // (tt-metal's `reduce_configure_mop`).
+                    for addr_mod in [3u32, 3, 3, 0] {
+                        m.t1.push(MirOp::Gapool {
+                            flip_src_b: false,
+                            flip_src_a: false,
+                            addr_mod,
+                            dst_row: dst,
+                        });
+                    }
+                    // `SETRWC(CLR_AB, 0, 0, 0, 0, SET_AD)`: hand both banks back
+                    // and leave the counters where the face started.
+                    m.t1.push(MirOp::Setrwc {
+                        src_a: 0,
+                        src_b: 0,
+                        dst: 0,
+                        flip_src_a: true,
+                        flip_src_b: true,
+                        dst_cr: false,
+                    });
+                }
+                m.t1.push(MirOp::WaitMatrix);
+                m.t1.push(MirOp::Setrwc {
+                    src_a: 0,
+                    src_b: 0,
+                    dst: 0,
+                    flip_src_a: false,
+                    flip_src_b: false,
+                    dst_cr: false,
+                });
+                acc_mask[acc as usize] = PackMask::Col;
             }
         }
         // A page a `matmul` read is released once the last reader of the loaded

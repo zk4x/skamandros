@@ -14,7 +14,7 @@
 //! stride or a `Dst` address.
 
 use crate::ir::{DType, Error};
-use crate::mir::{CmpOp, IOp, Machine, MirOp, SfpOp};
+use crate::mir::{CmpOp, IOp, Machine, MirOp, PackMask, SfpOp};
 use crate::riscv::{self as rv, Asm, reg};
 use tt_isa::backend::{
     self, Before, ConfigWords, ThreadConfigEntry, block, cond, wait_for_packer, wait_for_unpacker0,
@@ -382,9 +382,11 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result
                 if to_src {
                     // One 16x16 face: the descriptor's X run of the Z plane
                     // `SETADCZW` selected. The unpacker's datum count comes from
-                    // `SETADCX`, not from the descriptor.
+                    // `SETADCX`, not from the descriptor, so `count` is the run
+                    // (256 datums for a face, 16 for a reduce's single-row
+                    // `SrcB` scaler).
                     state.x0[u] = 0;
-                    state.x1[u] = 255;
+                    state.x1[u] = count - 1;
                     src_unpack_config(&mut words, unit, dtype);
                 } else {
                     state.x0[u] = 0;
@@ -1146,7 +1148,66 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
         MirOp::Zeroacc { block } => {
             out.push(encode::zeroacc(1, 0, 0, block).map_err(bad_isa)?);
         }
-        MirOp::Setrwc { src_a, src_b, dst } => {
+        MirOp::Gapool {
+            flip_src_b,
+            flip_src_a,
+            addr_mod,
+            dst_row,
+        } => {
+            out.push(
+                encode::gapool(
+                    u32::from(flip_src_b),
+                    u32::from(flip_src_a),
+                    addr_mod,
+                    dst_row + row_delta,
+                )
+                .map_err(bad_isa)?,
+            );
+        }
+        MirOp::Gmpool {
+            flip_src_b,
+            flip_src_a,
+            addr_mod,
+            arg_max,
+            dst_row,
+        } => {
+            out.push(
+                encode::Gmpool::ZERO
+                    .flip_src_b(u32::from(flip_src_b))
+                    .flip_src_a(u32::from(flip_src_a))
+                    .addr_mod(addr_mod)
+                    .arg_max(arg_max)
+                    .dst_row(dst_row + row_delta)
+                    .encode()
+                    .map_err(bad_isa)?,
+            );
+        }
+        MirOp::Movd2b {
+            use_dst32b_lo,
+            src_row,
+            addr_mod,
+            move4_rows,
+            dst_row,
+        } => {
+            out.push(
+                encode::movd2_b(
+                    u32::from(use_dst32b_lo),
+                    src_row,
+                    addr_mod,
+                    u32::from(move4_rows),
+                    dst_row + row_delta,
+                )
+                .map_err(bad_isa)?,
+            );
+        }
+        MirOp::Setrwc {
+            src_a,
+            src_b,
+            dst,
+            flip_src_a,
+            flip_src_b,
+            dst_cr,
+        } => {
             let i = encode::Setrwc::ZERO
                 .src_a(1)
                 .src_a_val(src_a)
@@ -1155,6 +1216,9 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), Er
                 .dst(1)
                 .dst_val(dst)
                 .fidelity(1)
+                .flip_src_a(u32::from(flip_src_a))
+                .flip_src_b(u32::from(flip_src_b))
+                .dst_cr(u32::from(dst_cr))
                 .encode()
                 .map_err(bad_isa)?;
             out.push(i);
@@ -1356,6 +1420,7 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(
                 row,
                 last,
                 dtype,
+                mask,
             } => {
                 if rows == 0 {
                     return Err(Error::TT_ERROR_PACK_ZERO_ROWS);
@@ -1364,7 +1429,7 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(
                 // 16-byte units minus the header unit the packer adds.
                 cb_base_pack(out, cb)?;
                 let mut words = ConfigWords::new();
-                pack_config(&mut words, dtype, row, dst_is_16_bit);
+                pack_config(&mut words, dtype, row, dst_is_16_bit, mask);
                 out.extend(config_program(&words));
                 out.push(stallwait(block::PACKER | block::CONFIG, cond::CONFIG_BUSY)?);
                 pack_rows(out, rows, last)?;
@@ -1394,7 +1459,13 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(
 /// address counter (`TT_SETADC(PAC, CH_0, SET_W, tile_index)`). The simulator
 /// does not model that counter — a `SETADC` there leaves the pack reading row
 /// 0 — so the row is written here, per pack, which is also what zyx did.
-fn pack_config(words: &mut ConfigWords, dtype: DType, row: u32, dst_is_16_bit: bool) {
+fn pack_config(
+    words: &mut ConfigWords,
+    dtype: DType,
+    row: u32,
+    dst_is_16_bit: bool,
+    mask: PackMask,
+) {
     // `Out_data_format` is the L1 datum's own format; `In_data_format` is the
     // kernel's `Dst` width. In 16-bit mode the packer reads a 16-bit `Dst` (two
     // bytes per datum, so half the row stride) and its conversion is the
@@ -1463,7 +1534,43 @@ fn pack_config(words: &mut ConfigWords, dtype: DType, row: u32, dst_is_16_bit: b
         .unwrap()
         .set(pack0::PCK_EDGE_MODE_mode, 0)
         .unwrap()
-        .set(pack0::PCK_EDGE_OFFSET_SEC0_mask, 0xFFFF)
+        // The edge mask is rewritten on every pack: the packer's `Config` bank
+        // outlives one pack, so a reduce's mask must not leak into the next
+        // pack. `None` is tt-metal's `_llk_pack_reduce_mask_clear_`: both masks
+        // pass everything and no row selects the second one.
+        .set(
+            pack0::PCK_EDGE_OFFSET_SEC0_mask,
+            match mask {
+                PackMask::None => 0xFFFF,
+                PackMask::Col => 0x0000,
+            },
+        )
+        .unwrap()
+        .set(
+            pack0::PCK_EDGE_OFFSET_SEC1_mask,
+            match mask {
+                PackMask::None => 0xFFFF,
+                PackMask::Col => 0xFFFF,
+            },
+        )
+        .unwrap()
+        .set(
+            pack0::PCK_EDGE_TILE_ROW_SET_SELECT_select,
+            match mask {
+                PackMask::None => 0,
+                // Each packer's two-bit field is the mapping register it
+                // reads: packers 0 and 1 both use `TILE_ROW_SET_MAPPING_1`.
+                PackMask::Col => 0b0101,
+            },
+        )
+        .unwrap()
+        .set(
+            pack0::TILE_ROW_SET_MAPPING_1_row_set_mapping_0,
+            match mask {
+                PackMask::None => 0,
+                PackMask::Col => 1,
+            },
+        )
         .unwrap()
         .set(alu::ALU_ACC_CTRL_Fp32_enabled, u32::from(!narrow))
         .unwrap();

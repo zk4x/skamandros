@@ -252,7 +252,44 @@ pub fn verify(m: &Machine) -> Result<(), Error> {
                         return Err(Error::TT_ERROR_DST_ROW);
                     }
                 }
-                MirOp::Setrwc { src_a, src_b, dst } => {
+                MirOp::Gapool {
+                    dst_row, addr_mod, ..
+                }
+                | MirOp::Gmpool {
+                    dst_row, addr_mod, ..
+                } => {
+                    if dst_row >= u32::from(DST_SLOTS) * DST_ROWS {
+                        let _ = (name, at, dst_row);
+                        return Err(Error::TT_ERROR_DST_ROW);
+                    }
+                    if addr_mod > 7 {
+                        let _ = (name, at, addr_mod);
+                        return Err(Error::TT_ERROR_ADDR_MOD);
+                    }
+                }
+                MirOp::Movd2b {
+                    src_row,
+                    dst_row,
+                    addr_mod,
+                    ..
+                } => {
+                    // `SrcB` is 64 rows of 16 datums.
+                    if src_row >= 64 {
+                        let _ = (name, at, src_row);
+                        return Err(Error::TT_ERROR_SRC_ROW);
+                    }
+                    if dst_row >= u32::from(DST_SLOTS) * DST_ROWS {
+                        let _ = (name, at, dst_row);
+                        return Err(Error::TT_ERROR_DST_ROW);
+                    }
+                    if addr_mod > 7 {
+                        let _ = (name, at, addr_mod);
+                        return Err(Error::TT_ERROR_ADDR_MOD);
+                    }
+                }
+                MirOp::Setrwc {
+                    src_a, src_b, dst, ..
+                } => {
                     // Each counter's field is four bits: sixteen rows.
                     if src_a >= 16 || src_b >= 16 || dst >= 16 {
                         let _ = (name, at, src_a, src_b, dst);

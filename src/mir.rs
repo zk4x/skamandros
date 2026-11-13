@@ -72,6 +72,19 @@ pub enum IOp {
 /// the launch. `x` is at this address, `y` four bytes after it.
 pub const CORE_INFO: u32 = tt_isa::mailbox::MAILBOX_BASE as u32 + 0x100;
 
+/// The edge mask a pack applies: which datums of each 32x32 tile survive, the
+/// rest leaving as zeros. tt-metal's `_llk_pack_reduce_mask_config_`: the
+/// packer's two `PCK_EDGE_OFFSET` masks and `TILE_ROW_SET_MAPPING_1` select
+/// the surviving rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackMask {
+    /// Every datum of the tile.
+    None,
+    /// Only row 0: one value per column, the rest zero. This is a reduce's
+    /// `col` result.
+    Col,
+}
+
 /// One instruction of a compute core's program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MirOp {
@@ -140,10 +153,49 @@ pub enum MirOp {
     /// `ZEROACC` on one eight-row block of the 32-bit `Dst` (`block` is the
     /// block index, eight rows each).
     Zeroacc { block: u32 },
-    /// `SETRWC`: the `SrcA`/`SrcB`/`Dst` row counters and the fidelity phase,    /// which is how the Matrix Unit is told where its operands and accumulator
+    /// `GAPOOL`: the Matrix Unit folds one 16x16 face over its rows into the
+    /// destination row, `SrcB`'s row being the weight — tt-metal's `SUM` with
+    /// `REDUCE_COL` (and, after the transposes, the other dims).
+    Gapool {
+        flip_src_b: bool,
+        flip_src_a: bool,
+        addr_mod: u32,
+        dst_row: u32,
+    },
+    /// `GMPOOL`: the max fold over one 16x16 face's rows into the destination
+    /// row. `arg_max` is always `INDEX_DIS` (0): ttsim refuses the index bit
+    /// and both cards publish no index bits.
+    Gmpool {
+        flip_src_b: bool,
+        flip_src_a: bool,
+        addr_mod: u32,
+        arg_max: u32,
+        dst_row: u32,
+    },
+    /// `MOVD2B`: `Dst` row `dst_row` into `SrcB` row `src_row`. `move4_rows`
+    /// moves four rows instead of one, and `use_dst32b_lo` reads the low half
+    /// of a 32-bit `Dst` datum.
+    Movd2b {
+        use_dst32b_lo: bool,
+        src_row: u32,
+        addr_mod: u32,
+        move4_rows: bool,
+        dst_row: u32,
+    },
+    /// `SETRWC`: the `SrcA`/`SrcB`/`Dst` row counters and the fidelity phase,
+    /// which is how the Matrix Unit is told where its operands and accumulator
     /// start. The SFPU addresses `Dst` relative to the same counter, so the
-    /// matmul restores it after its groups.
-    Setrwc { src_a: u32, src_b: u32, dst: u32 },
+    /// matmul restores it after its groups. `flip_src_a`/`flip_src_b` release
+    /// the Src banks after a consumer (tt-metal's `CLR_A`/`CLR_B`), and
+    /// `dst_cr` resets the `Dst` counter instead of incrementing it.
+    Setrwc {
+        src_a: u32,
+        src_b: u32,
+        dst: u32,
+        flip_src_a: bool,
+        flip_src_b: bool,
+        dst_cr: bool,
+    },
     /// One whole `SETC16` `ThreadConfig` word (address and value), which is how
     /// the Matrix Unit's address modifiers and fidelity phase are set.
     ThreadWord { addr: u16, value: u16 },
@@ -163,6 +215,7 @@ pub enum MirOp {
         row: u32,
         last: bool,
         dtype: DType,
+        mask: PackMask,
     },
     /// `cb_wait_front`: wait for a page to be published on this ring.
     CbWait { cb: u32 },
