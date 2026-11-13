@@ -24,6 +24,7 @@ pub mod images;
 pub mod ir;
 pub mod lower;
 pub mod mir;
+pub mod module;
 pub mod mover;
 pub mod optimize;
 pub mod planner;
