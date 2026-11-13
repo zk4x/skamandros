@@ -2511,6 +2511,25 @@ store_to %bo from %acc [0]
 copy_to %out from %bo [0]
 ";
 
+/// The same, seeded above every datum: the accumulator is the fold's other
+/// operand, so every column keeps the seed.
+const REDUCE_MAX_COL_SEEDED: &str = "\
+version 7
+grid 1,1
+%px = param f32 1024
+%out = param f32 1024
+%bx = buffer f32 32,32
+%bo = buffer f32 32,32
+copy_to %bx from %px [0]
+%acc = acc f32 32,32
+%high = const f32 1000
+store_to %acc from %high
+%x = load %bx [0]
+max col %acc %x
+store_to %bo from %acc [0]
+copy_to %out from %bo [0]
+";
+
 /// The `col` result: row 0 holds one fold per column, every other datum zero.
 fn col_reduce_oracle(input: &[f32], max: bool, scaler: Option<f32>) -> Vec<f32> {
     let mut out = vec![0.0f32; 1024];
@@ -2561,7 +2580,6 @@ fn sum_col_runs_on_the_simulator() {
 }
 
 #[test]
-#[ignore = "max col needs a compiler-built 1.0 SrcB page: the MOVD2B route needs an SRCB_CLR wait the simulator refuses, and UNPACR_NOP_SETDVALID is refused too"]
 fn max_col_runs_on_the_simulator() {
     // Integers, with negatives on both sides of the accumulator's seed.
     let x: Vec<f32> = (0..1024).map(|i| (i % 23) as f32 - 11.0).collect();
@@ -2577,6 +2595,22 @@ fn max_col_runs_on_the_simulator() {
     for i in 0..1024 {
         let (row, column) = tile_rc(i);
         assert_eq!(got[i], want[i], "max col, datum {i} at ({row}, {column})");
+    }
+
+    // The accumulator is the fold's seed: a seed above every datum survives in
+    // every column, while faces 2 and 3 are still zero.
+    let out = run_kernel_tensors(REDUCE_MAX_COL_SEEDED, &[&x_bytes], 4096);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for i in 0..1024 {
+        let (row, column) = tile_rc(i);
+        let want = if row == 0 { 1000.0 } else { 0.0 };
+        assert_eq!(
+            got[i], want,
+            "seeded max col, datum {i} at ({row}, {column})"
+        );
     }
 }
 

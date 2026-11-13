@@ -844,15 +844,8 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     return Err(Error::TT_TODO_REDUCE);
                 }
                 // `max` needs a `SrcB` row of exactly 1.0 (`GMPOOL` scales by
-                // the exponent). The move-in route is refused: `MOVD2B` into a
-                // bank an unpacker filled needs the `SRCB_CLR` wait, which the
-                // simulator refuses, and `UNPACR_NOP_SETDVALID` is refused too.
-                // The page has to be built by the compiler; until it is, the
-                // form is refused loudly.
-                if max {
-                    let _ = (x, scaler);
-                    return Err(Error::TT_TODO_REDUCE);
-                }
+                // the exponent). It names no scaler, so the compiler's own
+                // page (`plan.ones`) is the operand.
                 let dt_x = types.of(x).dtype;
                 let dtype = types.of(acc).dtype;
                 if dtype == crate::ir::DType::Bf16 && wide {
@@ -860,14 +853,29 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     return Err(Error::TT_ERROR_MATMUL_ACCUM_WIDE);
                 }
                 let cb_x = matmul_page(k, plan, &def, &alias, x, at)?;
-                let cb_b = matmul_page(
-                    k,
-                    plan,
-                    &def,
-                    &alias,
-                    scaler.expect("sum names a scaler"),
-                    at,
-                )?;
+                let (cb_b, dt_b) = match scaler {
+                    Some(scaler) => (
+                        matmul_page(k, plan, &def, &alias, scaler, at)?,
+                        types.of(scaler).dtype,
+                    ),
+                    None => {
+                        let ones = plan.ones.ok_or_else(|| {
+                            let _ = at;
+                            Error::TT_TODO_REDUCE
+                        })?;
+                        if ones.dtype != dt_x {
+                            let _ = (ones.dtype, dt_x);
+                            return Err(Error::TT_ERROR_REDUCE_DTYPE);
+                        }
+                        (ones.cb, ones.dtype)
+                    }
+                };
+                // The 1.0 page is pushed once at kernel start; a `max` waits
+                // for it before the first face and never pops it, so every
+                // `max` in the program re-reads the same page.
+                if scaler.is_none() {
+                    m.t0.push(MirOp::CbWait { cb: cb_b });
+                }
                 let base = dst_row(alloc, acc);
                 // The accumulator's rows are written, so wait for the packer to
                 // give the section back.
@@ -911,9 +919,9 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     dst_cr: false,
                 });
                 // Four faces, `SrcA` (256 datums) and the scaler's row (16
-                // datums) each: tt-metal's AB-reduce unpack, then `GAPOOL`'s
-                // four fidelity phases. The scaler carries the factor in row 0
-                // of each face (`prepare_reduce_scaler`'s row-0 fill).
+                // datums) each: tt-metal's AB-reduce unpack, then the fold. The
+                // scaler carries the factor in row 0 of each face
+                // (`prepare_reduce_scaler`'s row-0 fill).
                 for face in 0..4u32 {
                     // One face into `SrcA` and one row of the scaler into
                     // `SrcB` (16 datums): tt-metal's AB-reduce unpack.
@@ -931,7 +939,7 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                         cb: cb_b,
                         unit: 1,
                         count: 16,
-                        dtype: dt_x,
+                        dtype: dt_b,
                         to_src: true,
                         flip: true,
                     });
@@ -944,15 +952,25 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     // and 3 into the second (tt-metal's `SETRWC(CR_D, 8)`
                     // twice).
                     let dst = base + if face % 2 == 0 { 0 } else { 16 };
-                    // Four fidelity phases, the last clearing the phase
-                    // (tt-metal's `reduce_configure_mop`).
-                    for addr_mod in [3u32, 3, 3, 0] {
-                        m.t1.push(MirOp::Gapool {
+                    if max {
+                        m.t1.push(MirOp::Gmpool {
                             flip_src_b: false,
                             flip_src_a: false,
-                            addr_mod,
+                            addr_mod: 0,
+                            arg_max: 0,
                             dst_row: dst,
                         });
+                    } else {
+                        // Four fidelity phases, the last clearing the phase
+                        // (tt-metal's `reduce_configure_mop`).
+                        for addr_mod in [3u32, 3, 3, 0] {
+                            m.t1.push(MirOp::Gapool {
+                                flip_src_b: false,
+                                flip_src_a: false,
+                                addr_mod,
+                                dst_row: dst,
+                            });
+                        }
                     }
                     // `SETRWC(CLR_AB, 0, 0, 0, 0, SET_AD)`: hand both banks back
                     // and leave the counters where the face started.
@@ -966,6 +984,21 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
                     });
                 }
                 m.t1.push(MirOp::WaitMatrix);
+                // The pack's edge mask keeps the first row of *every* face,
+                // and the fold only writes faces 0 and 1; the packer cannot
+                // select faces, so faces 2 and 3 (the lower half of the tile)
+                // are written as the zeros the result defines.
+                m.t1.push(MirOp::LaneConst {
+                    lreg: 0,
+                    bits: 0.0f32.to_bits(),
+                });
+                for row in (32..DST_ROWS).step_by(2) {
+                    m.t1.push(MirOp::Sfpstore {
+                        lreg: 0,
+                        row: base + row,
+                        dtype: storage(crate::ir::DType::F32),
+                    });
+                }
                 m.t1.push(MirOp::Setrwc {
                     src_a: 0,
                     src_b: 0,
@@ -982,6 +1015,50 @@ pub fn lower(k: &Kernel, types: &Types, plan: &Plan, alloc: &Alloc) -> Result<Ma
         for cb in std::mem::take(&mut pop_here[at]) {
             m.t0.push(MirOp::CbPop { cb });
         }
+    }
+    // The compiler's 1.0 page: written once, at the start of the kernel, into
+    // the last `Dst` slot (the allocator keeps it free), and packed into the
+    // page a `max` reduce unpacks. The fills cover the face rows the packer
+    // copies into each L1 face's row 0; the rest of the packed tile is the
+    // scratch slot's old contents, which nothing reads.
+    if let Some(ones) = plan.ones {
+        let row = u32::from(crate::alloc::DST_SLOTS - 1) * DST_ROWS;
+        let mut t1 = vec![
+            MirOp::SemWaitFree { sem: SEM_READY },
+            MirOp::LaneConst {
+                lreg: 0,
+                bits: 1.0f32.to_bits(),
+            },
+        ];
+        for row_off in (0..DST_ROWS).step_by(2) {
+            t1.push(MirOp::Sfpstore {
+                lreg: 0,
+                row: row + row_off,
+                dtype: storage(ones.dtype),
+            });
+        }
+        t1.push(MirOp::SemPost { sem: SEM_READY });
+        // The slot is reused by the program, so the math does not proceed
+        // until the packer has retired this section.
+        t1.push(MirOp::SemWaitFree { sem: SEM_READY });
+        let mut t2 = vec![
+            MirOp::SemWaitData { sem: SEM_READY },
+            MirOp::CbReserve { cb: ones.cb },
+            MirOp::Pack {
+                cb: ones.cb,
+                rows: DST_ROWS,
+                row,
+                last: true,
+                dtype: ones.dtype,
+                mask: PackMask::None,
+            },
+            MirOp::SemGet { sem: SEM_READY },
+            MirOp::CbPush { cb: ones.cb },
+        ];
+        t1.append(&mut m.t1);
+        t2.append(&mut m.t2);
+        m.t1 = t1;
+        m.t2 = t2;
     }
     Ok(m)
 }

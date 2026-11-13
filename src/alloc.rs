@@ -47,7 +47,16 @@ pub fn allocate(k: &Kernel, types: &Types) -> Result<Alloc, Error> {
     let n = types.values.len();
     let mut place: Vec<Option<Place>> = vec![None; n];
     let mut lreg: Vec<(u8, u8)> = vec![(0, 1); n];
-    let mut free: Vec<bool> = vec![false; DST_SLOTS as usize];
+    // A kernel with a `max` reduce gives the compiler the last slot for its
+    // 1.0 page (see `lower`): the page is written at the start of the kernel
+    // and packed before any allocated value is live, so the slot must not be
+    // handed out.
+    let slots = if k.ops.iter().any(|op| matches!(op, Op::Max { .. })) {
+        DST_SLOTS - 1
+    } else {
+        DST_SLOTS
+    };
+    let mut free: Vec<bool> = vec![false; slots as usize];
     let mut last_use: Vec<Option<usize>> = vec![None; n];
     let mut freed: Vec<bool> = vec![false; n];
     let mut live = 0usize;
@@ -101,7 +110,7 @@ pub fn allocate(k: &Kernel, types: &Types) -> Result<Alloc, Error> {
             continue;
         }
         let Some(slot) = free.iter().position(|in_use| !in_use) else {
-            let _ = (value, DST_SLOTS);
+            let _ = (value, slots);
             return Err(Error::TT_ERROR_DST_SLOTS_EXHAUSTED);
         };
         free[slot] = true;

@@ -1528,7 +1528,7 @@ fn pack_config(
         .unwrap()
         .set(pack0::PCK_DEST_RD_CTRL_Round_10b_mant, 0)
         .unwrap()
-        .set(pack0::PACK_COUNTERS_SEC0_pack_reads_per_xy_plane, 4)
+        .set(pack0::PACK_COUNTERS_SEC0_pack_reads_per_xy_plane, 16)
         .unwrap()
         .set(global::DEST_TARGET_REG_CFG_PACK_SEC0_Offset, row)
         .unwrap()

@@ -748,6 +748,14 @@ fn a_sum_col_compiles_to_the_gapool() {
 }
 
 #[test]
+fn a_max_col_compiles_to_the_gmpool() {
+    let k = Kernel::parse(&reduce_program("max col %m %x", false)).expect("it parses");
+    let m = TT::compile::compile(&k).unwrap_or_else(|e| panic!("it compiles: {e}"));
+    // The compiler owns one extra page for `max`'s 1.0 `SrcB`.
+    assert_eq!(m.params.len(), 2);
+}
+
+#[test]
 fn a_reduce_is_refused_for_what_the_src_path_cannot_take() {
     use TT::status::ttStatus as S;
     let case = |what: &str, text: &str, want: S| {
@@ -830,11 +838,6 @@ copy_to %out from %bo [0]
     case(
         "max row",
         &reduce_program("max row %m %x", false),
-        S::TT_TODO_REDUCE,
-    );
-    case(
-        "max col",
-        &reduce_program("max col %m %x", false),
         S::TT_TODO_REDUCE,
     );
 }

@@ -30,6 +30,19 @@ pub struct Cb {
     pub pages: u32,
 }
 
+/// The compiler's 1.0 scaler page: a reduce's `max` needs a `SrcB` row of
+/// exactly 1.0, which no caller page provides, so the compiler owns one 32x32
+/// page of ones and packs it once per kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnesPage {
+    /// The CB id of the page's one-page ring.
+    pub cb: u32,
+    /// The ring itself.
+    pub ring: Cb,
+    /// The datum format the page was sized and packed in: the operand's.
+    pub dtype: crate::ir::DType,
+}
+
 /// Where each declared buffer lives in L1, by value id, and the CB interface
 /// table the host writes before the launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +55,8 @@ pub struct Plan {
     /// Byte address of the `LocalCBInterface` table (`riscv::cb::COUNT` entries,
     /// 32 bytes each).
     pub iface: u32,
+    /// The compiler's 1.0 page, when a reduce needs one.
+    pub ones: Option<OnesPage>,
 }
 
 const ALIGN: u32 = 64;
@@ -86,6 +101,34 @@ pub fn place(k: &Kernel, types: &Types) -> Result<Plan, Error> {
         });
         at = end;
     }
+    // A `max` reduce's `SrcB` must be a row of exactly 1.0, and the caller
+    // names no scaler for it: the compiler owns one 32x32 page of ones, in the
+    // datum format of the operand.
+    let ones_dtype = k.ops.iter().find_map(|op| match *op {
+        Op::Max { x, .. } => Some(types.of(x).dtype),
+        _ => None,
+    });
+    let mut ones = None;
+    if let Some(dtype) = ones_dtype {
+        let bytes = 1024u32
+            .checked_mul(dtype.bytes())
+            .ok_or(Error::TT_ERROR_L1_OVERFLOW)?;
+        let base = at.div_ceil(ALIGN) * ALIGN;
+        let end = base.checked_add(bytes).ok_or(Error::TT_ERROR_L1_OVERFLOW)?;
+        if u64::from(end) > tt_isa::l1::DATA.end {
+            let _ = (base, end);
+            return Err(Error::TT_ERROR_L1_ARENA);
+        }
+        let cb = cbs.len() as u32;
+        let ring = Cb {
+            base,
+            page: bytes,
+            pages: 1,
+        };
+        ones = Some(OnesPage { cb, ring, dtype });
+        cbs.push(ring);
+        at = end;
+    }
     // The interface table follows the buffers: one `LocalCBInterface` per CB, as
     // many entries as tt-metal's table has, and only `cbs.len()` of them used.
     let iface = at.div_ceil(ALIGN) * ALIGN;
@@ -104,6 +147,7 @@ pub fn place(k: &Kernel, types: &Types) -> Result<Plan, Error> {
         cb,
         cbs,
         iface,
+        ones,
     })
 }
 
