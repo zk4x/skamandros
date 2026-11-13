@@ -375,6 +375,79 @@ copy 1,32 %b [%i] = %w [%i]
     );
 }
 
+/// A narrow `load`/`store` names a shape the format has, but no lowering yet:
+/// every form is a loud `TT_TODO_ACCESS_SHAPE`, never a whole-tile move. The
+/// one narrow load that does run is the mover's lane bases (`load 1,32` whose
+/// only reader is a copy's index), which `an_access_shape_is_the_unit_a_copy_moves`
+/// gates.
+#[test]
+fn a_narrow_access_is_refused_until_its_lowering_lands() {
+    use ttStatus as S;
+    let case = |what: &str, text: &str, want: S| {
+        let err = match Kernel::parse(text) {
+            Ok(k) => compile::compile(&k).expect_err(what),
+            Err(e) => e,
+        };
+        assert_eq!(err, want, "{what}");
+    };
+    // A `1,32` row and a `32,1` column have no machine path yet: a row is one
+    // face-row run per half, and a column has no unpack form at all (tt-metal
+    // materialises one only through a transpose). A `1,1` access is not here:
+    // it is the mover's scalar read (`a_symbolic_offset_into_a_row_buffer_reads_one_datum`).
+    for shape in ["1,32", "32,1"] {
+        let text = format!(
+            "\
+version 9
+grid 1,1
+%p = param f32 1024
+%b = buffer f32 32,32
+copy 32,32 %b [0] = %p [0]
+load {shape} %x = %b [0]
+%y = neg %x
+"
+        );
+        case(&format!("a {shape} load"), &text, S::TT_TODO_ACCESS_SHAPE);
+    }
+    // A page with no faces (`1,32`/`32,1` buffer) is refused the same way: its
+    // unit is 32 datums, not a tile.
+    case(
+        "a 1,32 load from a row page",
+        "\
+version 9
+grid 1,1
+%p = param f32 1024
+%v = buffer f32 1,32
+copy 1,32 %v [0] = %p [0]
+load 1,32 %x = %v [0]
+%y = neg %x
+",
+        S::TT_TODO_ACCESS_SHAPE,
+    );
+    // A store of an accumulator is the one narrow store the verifier admits
+    // (the region is packed whole and the mask trims it); the pack of a narrow
+    // access is the whole masked page, so it has no lowering either.
+    for shape in ["1,32", "32,1", "1,1"] {
+        let text = format!(
+            "\
+version 9
+grid 1,1
+%out = param f32 1024
+%bo = buffer f32 32,32
+%acc = acc f32 {shape}
+%zero = const f32 0
+store 32,32 %acc = %zero
+store {shape} %bo [0] = %acc
+copy 32,32 %out [0] = %bo [0]
+"
+        );
+        case(
+            &format!("a {shape} acc store"),
+            &text,
+            S::TT_TODO_ACCESS_SHAPE,
+        );
+    }
+}
+
 /// A constant-bound loop stays a loop: the movers and the compute roles get a
 /// RISC-V branch, not a copy of the body per iteration.
 #[test]

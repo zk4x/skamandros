@@ -270,6 +270,13 @@ loaded `.so`. Unit tests exist under the modules; they are not the measure.
   A `32,32` copy moves one tile of `page` bytes contiguously, so a tile access
   needs that layout; a `1,32` copy moves one row, which is how a gather reads
   rows out of a row-major weight.
+- All four units parse and their indices count in those units, but only a tile
+  `load`/`store` has a machine path. A narrow `load` is lowered where it is an
+  address: a `1,1` scalar read out of a page, and a vector whose only reader is
+  a copy's index (the mover reads one datum per lane). A narrow unit used as a
+  datapath value is `TT_TODO_ACCESS_SHAPE`, and so is every narrow `store`: a
+  pack writes the whole masked page, so a row or column write into a shared
+  page cannot leave the rest of it alone.
 - A launch runs the module's whole grid: every tile of it gets the module's
   programs and arguments, and all of them run concurrently. A symbolic grid
   (`grid %nx,%ny`) is resolved at launch from the scalar arguments before any
