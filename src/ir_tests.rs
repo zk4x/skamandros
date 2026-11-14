@@ -332,15 +332,11 @@ copy 1,32 %wb [0] = %w [%rows]
 copy 32,32 %out [0] = %wb [0]
 ";
     // The gather is one request per lane, and the mover reads the lane bases out
-    // of the page it copied: a compile-time L1 address, which the re-model moved
-    // to `plan_cbs` (after the lowering). Until the mover's program is emitted
-    // after the placement, the form is refused as that TODO rather than
-    // mis-lowered.
+    // of the page it copied: a compile-time L1 address, which `plan_cbs` places
+    // before the lowering so the mover can name it.
     let k = Kernel::parse(GATHER).expect("the vector index is 32 lanes");
-    assert_eq!(
-        compile::compile(&k).expect_err("the gather is data movement"),
-        S::TT_TODO_MULTI_LANE
-    );
+    let m = compile::compile(&k).expect("the gather is data movement");
+    assert!(!m.reader.is_empty(), "the gather is data movement");
 
     // A tile per lane would need 32 pages, not one.
     assert_eq!(

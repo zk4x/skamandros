@@ -25,17 +25,8 @@ use tt_isa::backend::{
 use tt_isa::cfg::generated::{alu, global, pack0, thcon, thread, unpack1};
 use tt_isa::isa::Instruction;
 use tt_isa::isa::generated::{defs, encode};
-use tt_isa::noc::niu::{
-    CMD_RD, CMD_WR, Niu, RESP_MARKED, STATIC_VC_1, TxnId, initiator, reqs_outstanding,
-};
+use tt_isa::noc::niu::Niu;
 use tt_isa::sync::{self, Semaphore};
-
-/// Transaction ID every request uses. The programs issue in order and drain
-/// after each copy, so one ID is enough.
-const TXN: TxnId = match TxnId::new(1) {
-    Some(txn) => txn,
-    None => panic!("transaction id 1 exists"),
-};
 
 /// The GPR the configuration program stages each word through.
 pub const SCRATCH_GPR: u32 = 8;
@@ -230,6 +221,7 @@ fn encode_int(op: &MirOp, out: &mut Stream, loops: &mut Vec<OpenLoop>) -> Result
     match *op {
         MirOp::Li { reg, value } => out.li(reg, value),
         MirOp::LoadArg { reg, arg } => out.rv(rv::lw(reg, reg::A0, arg)),
+        MirOp::Lw { reg, base, at } => out.rv(rv::lw(reg, base, at)),
         MirOp::LoadCoord { reg, axis } => {
             out.li(reg, crate::mir::CORE_INFO + u32::from(axis) * 4);
             out.rv(rv::lw(reg, reg, 0));
@@ -335,21 +327,14 @@ fn encode_mover(
             MirOp::Loop { count } => open_loop_with(out, &mut loops, count, &MOVER_PAIRS)?,
             MirOp::LoopReg { reg } => open_loop_reg(out, &mut loops, reg, &MOVER_PAIRS)?,
             MirOp::EndLoop => close_loop(out, &mut loops)?,
-            MirOp::Copy {
-                cb,
-                param,
-                bytes,
-                offset,
-                inbound,
-            } => {
-                let mut out_asm = Asm::default();
-                mover_copy(&mut out_asm, param, u32::from(cb.0), bytes, offset, inbound)?;
-                for word in out_asm
-                    .finish()
-                    .map_err(|_| Error::TT_ERROR_MOVER_PROGRAM)?
-                {
-                    out.rv(word);
-                }
+            // A word store, and the NoC's spin: one instruction and one fixed
+            // pair, so neither is a macro op.
+            MirOp::Sw { value, base, at } => out.rv(rv::sw(value, base, at)),
+            MirOp::NiuPoll { reg, field } => {
+                let top = out.len();
+                out.rv(rv::lw(reg, reg::T5, field));
+                let here = out.len();
+                out.rv(rv::bne(reg, reg::ZERO, ((top as i32) - (here as i32)) * 4));
             }
             // The ring hand-offs are ordinary ops of the machine kernel: the
             // lowering puts each one on the core that performs it.
@@ -387,79 +372,6 @@ fn encode_mover(
         return Err(Error::TT_ERROR_ENDLOOP_MACHINE);
     }
     Ok(())
-}
-
-/// One NoC request: the parameter's range base plus the byte offset in `offset`,
-/// and the ring's write pointer for a publish or its read pointer for a drain.
-fn mover_copy(
-    a: &mut Asm,
-    param: u32,
-    cb: u32,
-    bytes: u32,
-    offset: u8,
-    read: bool,
-) -> Result<(), Error> {
-    use tt_isa::noc::niu::initiator;
-    if bytes == 0 || bytes > tt_isa::noc::niu::MAX_REQUEST_BYTES {
-        return Err(Error::TT_ERROR_NOC_REQUEST_BYTES);
-    }
-    let (lo_arg, hi_arg) = crate::mover::param_arg(param);
-    a.word(rv::lw(reg::T1, reg::A0, lo_arg));
-    a.word(rv::add(reg::T1, reg::T1, offset));
-    a.word(rv::lw(reg::T2, reg::A0, hi_arg));
-    // A read from DRAM publishes into the ring (its write pointer); a write to
-    // DRAM drains the page the ring's read pointer names.
-    let field = if read { rv::cb::WR_PTR } else { rv::cb::RD_PTR };
-    a.word(rv::lw(
-        reg::T4,
-        reg::A6,
-        (cb * rv::cb::STRIDE) as i32 + field,
-    ));
-    if read {
-        store_reg(a, initiator::TARG_ADDR_LO, reg::T1);
-        store_zero(a, initiator::TARG_ADDR_MID);
-        store_reg(a, initiator::TARG_ADDR_HI, reg::T2);
-        store_reg(a, initiator::RET_ADDR_LO, reg::T4);
-        store_zero(a, initiator::RET_ADDR_MID);
-        store_reg(a, initiator::RET_ADDR_HI, reg::T3);
-    } else {
-        store_reg(a, initiator::TARG_ADDR_LO, reg::T4);
-        store_zero(a, initiator::TARG_ADDR_MID);
-        store_reg(a, initiator::TARG_ADDR_HI, reg::T3);
-        store_reg(a, initiator::RET_ADDR_LO, reg::T1);
-        store_zero(a, initiator::RET_ADDR_MID);
-        store_reg(a, initiator::RET_ADDR_HI, reg::T2);
-    }
-    a.li(reg::T4, (TXN.index() as u32) << 10);
-    store_reg(a, initiator::PACKET_TAG, reg::T4);
-    let ctrl = if read { CMD_RD } else { CMD_WR } | RESP_MARKED | STATIC_VC_1;
-    a.li(reg::T4, ctrl);
-    store_reg(a, initiator::CTRL, reg::T4);
-    a.li(reg::T4, bytes);
-    store_reg(a, initiator::AT_LEN_BE, reg::T4);
-    store_zero(a, initiator::AT_DATA);
-    // Trigger, then wait until the hardware takes the request, then for the
-    // transaction to complete.
-    a.word(rv::addi(reg::T4, reg::ZERO, 1));
-    store_reg(a, initiator::CMD_CTRL, reg::T4);
-    let poll = a.fresh_label();
-    a.label(poll.clone());
-    a.word(rv::lw(reg::T6, reg::T5, initiator::CMD_CTRL as i32));
-    a.bne_label(reg::T6, reg::ZERO, poll);
-    a.word(rv::lw(reg::T6, reg::T5, initiator::CMD_CTRL as i32));
-    let drain = a.fresh_label();
-    a.label(drain.clone());
-    a.word(rv::lw(reg::T6, reg::T5, reqs_outstanding(TXN) as i32));
-    a.bne_label(reg::T6, reg::ZERO, drain);
-    Ok(())
-}
-
-fn store_reg(a: &mut Asm, at: u64, src: u8) {
-    a.word(rv::sw(src, reg::T5, at as i32));
-}
-
-fn store_zero(a: &mut Asm, at: u64) {
-    a.word(rv::sw(reg::ZERO, reg::T5, at as i32));
 }
 
 /// The setup program thread 0 pushes before the three roles are released: the

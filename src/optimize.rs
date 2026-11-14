@@ -837,13 +837,10 @@ pub fn verify(m: &MachineKernel) -> Result<(), Error> {
                 MirOp::Li { .. }
                 | MirOp::LoadArg { .. }
                 | MirOp::LoadCoord { .. }
+                | MirOp::Lw { .. }
+                | MirOp::Sw { .. }
+                | MirOp::NiuPoll { .. }
                 | MirOp::IArith { .. } => {}
-                MirOp::Copy { bytes, .. } => {
-                    if bytes == 0 {
-                        let _ = (name, at, bytes);
-                        return Err(Error::TT_ERROR_NOC_REQUEST_BYTES);
-                    }
-                }
                 MirOp::EndLoop => {
                     depth = depth.checked_sub(1).ok_or_else(|| {
                         let _ = (name, at);

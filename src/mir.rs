@@ -424,23 +424,21 @@ pub enum MirOp {
     Li { reg: u8, value: u32 },
     /// `reg = *(a0 + arg)`: a launch argument word.
     LoadArg { reg: u8, arg: i32 },
+    /// `reg = *(base + at)`: a word read out of L1. The movers read a ring's
+    /// page pointer out of the CB table and a program value out of a page.
+    Lw { reg: u8, base: u8, at: i32 },
+    /// `*(base + at) = value`: a word stored to L1 — one of the NoC initiator
+    /// registers, or a value the program asked for.
+    Sw { value: u8, base: u8, at: i32 },
+    /// Wait until the NoC word at `field(t5)` reads zero: `lw` then `bne` back.
+    /// A spin has no trip count, so it is not a [`MirOp::Loop`].
+    NiuPoll { reg: u8, field: i32 },
     /// `reg = core_info[axis]`: this core's logical grid coordinate.
     LoadCoord { reg: u8, axis: u8 },
     /// `d = a op b`, in RISC-V.
     IArith { op: IOp, d: u8, a: u8, b: u8 },
     /// The branch back to the matching [`MirOp::Loop`] or [`MirOp::LoopReg`].
     EndLoop,
-    /// One NoC request the movers issue: `bytes` from the parameter at launch
-    /// argument `param`, whose byte offset is in `offset` (a RISC-V register the
-    /// surrounding ops filled), into (`inbound`) or out of the page `cb`'s ring
-    /// pointer names.
-    Copy {
-        cb: Cb,
-        param: u32,
-        bytes: u32,
-        offset: u8,
-        inbound: bool,
-    },
 }
 
 /// One kernel's machine program: the ops, in one total order, and what they
@@ -837,24 +835,21 @@ fn write_op(f: &mut dyn fmt::Write, op: &MirOp) -> fmt::Result {
         MirOp::LoopReg { reg } => write!(f, "loop {}", rx(reg)),
         MirOp::Li { reg, value } => write!(f, "li {}, {value}", rx(reg)),
         MirOp::LoadArg { reg, arg } => write!(f, "lw {}, {arg}(a0)", rx(reg)),
+        MirOp::Lw { reg, base, at } => write!(f, "lw {}, {at}({})", rx(reg), rx(base)),
+        MirOp::Sw { value, base, at } => write!(f, "sw {}, {at}({})", rx(value), rx(base)),
+        MirOp::NiuPoll { reg, field } => {
+            write!(
+                f,
+                "poll {}, {field}({})",
+                rx(reg),
+                rx(crate::riscv::reg::T5)
+            )
+        }
         MirOp::LoadCoord { reg, axis } => write!(f, "lw {}, core_info+{}(0)", rx(reg), axis * 4),
         MirOp::IArith { op, d, a, b } => {
             write!(f, "{} {}, {}, {}", iop_name(op), rx(d), rx(a), rx(b))
         }
         MirOp::EndLoop => write!(f, "endloop"),
-        MirOp::Copy {
-            cb,
-            param,
-            bytes,
-            offset,
-            inbound,
-        } => write!(
-            f,
-            "copy {} {} param{param}[{}] {bytes} bytes",
-            if inbound { "<-" } else { "->" },
-            cb_name(cb),
-            rx(offset)
-        ),
     }
 }
 

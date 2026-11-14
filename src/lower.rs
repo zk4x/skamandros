@@ -52,10 +52,38 @@ const MOVER_INDEX: [u8; 2] = [MOVER_PAIRS[0].0, MOVER_PAIRS[1].0];
 /// and the sync scratch `encode` uses.
 const SCRATCH: [u8; 6] = [reg::A1, reg::A2, reg::A3, reg::A4, reg::A5, reg::T3];
 
-/// A mover program's loop counters and temporaries. `t5` is that program's NIU
-/// base and `a0`/`a6` its arguments and CB table, so the compute roles'
-/// registers are not free there.
-const MOVER_TEMPS: [u8; 5] = [reg::T6, reg::T4, reg::T0, reg::T1, reg::T2];
+/// A mover program's temporaries: everything it does not keep across ops. `t5`
+/// is its NIU base, `t3` this tile's NOC word, `a0`/`a6` its arguments and CB
+/// table, and `a1..a4` its loop counters, so those are not in the pool. A copy's
+/// whole NoC request — its addresses, its page pointer, its config words and its
+/// spin — allocates from here too.
+const MOVER_POOL: [u8; 6] = [reg::T6, reg::T4, reg::T0, reg::T1, reg::T2, reg::A5];
+
+/// The registers a role's index expressions may use, and the simplest allocator
+/// there is: take one before evaluating an operand, give it back the moment the
+/// op that consumes it is emitted. Its depth is the expression's nesting, not
+/// its size, so a right-nested sum over nine values costs three registers rather
+/// than nine. An empty pool is a compile error, never a silent reuse: there is
+/// no spill slot, because a role's program has no frame.
+struct Pool {
+    free: Vec<u8>,
+}
+
+impl Pool {
+    fn new(regs: &[u8]) -> Pool {
+        Pool {
+            free: regs.to_vec(),
+        }
+    }
+
+    fn take(&mut self) -> Result<u8, Error> {
+        self.free.pop().ok_or(Error::TT_TODO_LOOP_ADDRESS)
+    }
+
+    fn give(&mut self, reg: u8) {
+        self.free.push(reg);
+    }
+}
 
 /// What the program means, recomputed from the op that defines each value.
 /// Lowering reads `dtype`/`shape` through here and never builds a table.
@@ -287,18 +315,14 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
         std::collections::BTreeSet::new();
     let mut non_matmul_use: std::collections::BTreeSet<crate::ir::OpId> =
         std::collections::BTreeSet::new();
-    // A value read only as a copy's index is the mover's: it is an address
-    // expression, or a row of bases the mover reads one datum of per lane.
-    let mut index_use: std::collections::BTreeSet<crate::ir::OpId> =
-        std::collections::BTreeSet::new();
+    // Whether anything but a copy's index reads a value: a copy's ends are its
+    // operands, every other read is an index or a datapath operand.
     let mut other_use: std::collections::BTreeSet<crate::ir::OpId> =
         std::collections::BTreeSet::new();
     for (at, op) in k.ops() {
         for v in op.parameters() {
             last_use.insert(v, at);
-            // A copy's ends are its operands; its other reads are indices.
             if matches!(*op, Op::CopyTo { dst, src, .. } if v != dst && v != src) {
-                index_use.insert(v);
                 continue;
             }
             other_use.insert(v);
@@ -376,7 +400,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                         Some(count) => m.push(core, MirOp::Loop { count }),
                         None => {
                             let mut ops = Vec::new();
-                            let mut scratch = MOVER_TEMPS.iter().copied();
+                            let mut scratch = Pool::new(&MOVER_POOL);
                             scalar_with(
                                 k,
                                 types,
@@ -387,6 +411,8 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                                 limit,
                                 &mut scratch,
                                 &MOVER_INDEX,
+                                &plan,
+                                &m.cbs,
                             )?;
                             ops.push(MirOp::LoopReg { reg: limit });
                             for op in ops {
@@ -414,7 +440,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                         // in the pair's limit register and the branch reads it.
                         for role in [Core::Unpack, Core::Math, Core::Pack] {
                             let mut ops = Vec::new();
-                            let mut scratch = SCRATCH.iter().copied();
+                            let mut scratch = Pool::new(&SCRATCH);
                             scalar_with(
                                 k,
                                 types,
@@ -425,6 +451,8 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                                 COMPUTE_PAIR.1,
                                 &mut scratch,
                                 &COMPUTE_INDEX,
+                                &plan,
+                                &m.cbs,
                             )?;
                             ops.push(MirOp::LoopReg {
                                 reg: COMPUTE_PAIR.1,
@@ -515,10 +543,12 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                 if types.of(value).shape == RegShape::Scalar {
                     continue;
                 }
-                // A vector load that nothing reads but a copy's index is the
-                // mover's lane bases: it reads one datum per lane out of the
-                // page it just copied, so no `Dst` slot ever holds it.
-                if index_use.contains(&value) && !other_use.contains(&value) {
+                // A vector load no datapath op reads is the mover's lane bases:
+                // it reads one datum per lane out of the page it just copied, so
+                // no `Dst` slot ever holds it. (The movers clone the load into
+                // their own segment to name that page, which is why a copy's
+                // index is a second such load.)
+                if !other_use.contains(&value) {
                     continue;
                 }
                 let info = types.of(buffer);
@@ -2305,31 +2335,6 @@ fn bound_const(k: &Kernel, bound: OpId) -> Option<u32> {
 /// expression over literals, scalar parameters, grid coordinates, enclosing
 /// loop indices and ordinary arithmetic.
 #[allow(clippy::too_many_arguments)]
-fn scalar(
-    k: &Kernel,
-    types: &Types,
-    role: &mut Vec<MirOp>,
-    param: &BTreeMap<OpId, u32>,
-    loops: &[crate::ir::OpId],
-    dim: OpId,
-    dest: u8,
-    scratch: &mut impl Iterator<Item = u8>,
-) -> Result<(), Error> {
-    scalar_with(
-        k,
-        types,
-        role,
-        param,
-        loops,
-        dim,
-        dest,
-        scratch,
-        &COMPUTE_INDEX,
-    )
-}
-
-/// [`scalar`] with an explicit set of loop counters.
-#[allow(clippy::too_many_arguments)]
 fn scalar_with(
     k: &Kernel,
     types: &Types,
@@ -2338,18 +2343,14 @@ fn scalar_with(
     loops: &[crate::ir::OpId],
     dim: OpId,
     dest: u8,
-    scratch: &mut impl Iterator<Item = u8>,
+    scratch: &mut Pool,
     counters: &[u8],
+    plan: &Plan,
+    cbs: &crate::slab::Slab<Cb, crate::mir::CbInfo>,
 ) -> Result<(), Error> {
-    if let Some(n) = k.const_i32(dim) {
-        let n = u32::try_from(n).map_err(|_| Error::TT_ERROR_NEGATIVE_INDEX)?;
-        role.push(MirOp::Li {
-            reg: dest,
-            value: n,
-        });
-        return Ok(());
-    }
-    eval(k, types, role, param, loops, dim, dest, scratch, counters)
+    eval(
+        k, types, role, param, loops, dim, dest, scratch, counters, plan, cbs,
+    )
 }
 
 /// Emit the value `value` into `dest`; `scratch` supplies the temporaries a
@@ -2363,8 +2364,10 @@ fn eval(
     loops: &[crate::ir::OpId],
     value: crate::ir::OpId,
     dest: u8,
-    scratch: &mut impl Iterator<Item = u8>,
+    scratch: &mut Pool,
     counters: &[u8],
+    plan: &Plan,
+    cbs: &crate::slab::Slab<Cb, crate::mir::CbInfo>,
 ) -> Result<(), Error> {
     // An enclosing loop's induction value is in that loop's counter register.
     if let Some(depth) = loops.iter().rposition(|v| *v == value) {
@@ -2404,19 +2407,104 @@ fn eval(
         }
         Op::Binary { op, a, b, .. } => {
             let op = int_op(op).ok_or(Error::TT_TODO_LOOP_ADDRESS)?;
-            eval(k, types, role, param, loops, a, dest, scratch, counters)?;
-            let right = scratch.next().ok_or(Error::TT_TODO_LOOP_ADDRESS)?;
-            eval(k, types, role, param, loops, b, right, scratch, counters)?;
+            eval(
+                k, types, role, param, loops, a, dest, scratch, counters, plan, cbs,
+            )?;
+            let right = scratch.take()?;
+            eval(
+                k, types, role, param, loops, b, right, scratch, counters, plan, cbs,
+            )?;
             role.push(MirOp::IArith {
                 op,
                 d: dest,
                 a: dest,
                 b: right,
             });
+            scratch.give(right);
+            Ok(())
+        }
+        // A value the program put in a page: the movers read it out of L1, one
+        // word. The page's address is known because the rings are placed before
+        // the walk; a ring deeper than one page moves at run time, so its page
+        // is refused rather than read from the wrong one.
+        Op::Load { buffer, offset, .. } => {
+            let (dtype, len) = match *k.at(buffer) {
+                Op::Cb { dtype, len, .. } => (dtype, len),
+                _ => {
+                    let _ = buffer;
+                    return Err(Error::TT_ERROR_NOT_A_BUFFER);
+                }
+            };
+            if len != 1 {
+                let _ = (at_len(len), buffer);
+                return Err(Error::TT_TODO_LOOP_ADDRESS);
+            }
+            let cb = *plan
+                .cb
+                .get(&buffer)
+                .ok_or(Error::TT_ERROR_BUFFER_NOT_PLACED)?;
+            let ring = cbs.get(cb).ok_or(Error::TT_ERROR_BUFFER_NOT_PLACED)?;
+            let el = dtype.bytes();
+            match k.const_i32(offset) {
+                Some(n) if n >= 0 => {
+                    let bytes = u32::try_from(n)
+                        .ok()
+                        .and_then(|n| n.checked_mul(el))
+                        .ok_or(Error::TT_ERROR_PARAM_OFFSET_OVERFLOW)?;
+                    role.push(MirOp::Li {
+                        reg: dest,
+                        value: ring
+                            .base
+                            .checked_add(bytes)
+                            .ok_or(Error::TT_ERROR_PARAM_OFFSET_OVERFLOW)?,
+                    });
+                }
+                _ => {
+                    let off = scratch.take()?;
+                    role.push(MirOp::Li {
+                        reg: dest,
+                        value: ring.base,
+                    });
+                    eval(
+                        k, types, role, param, loops, offset, off, scratch, counters, plan, cbs,
+                    )?;
+                    if el != 1 {
+                        let scale = scratch.take()?;
+                        role.push(MirOp::Li {
+                            reg: scale,
+                            value: el,
+                        });
+                        role.push(MirOp::IArith {
+                            op: IOp::Mul,
+                            d: off,
+                            a: off,
+                            b: scale,
+                        });
+                        scratch.give(scale);
+                    }
+                    role.push(MirOp::IArith {
+                        op: IOp::Add,
+                        d: dest,
+                        a: dest,
+                        b: off,
+                    });
+                    scratch.give(off);
+                }
+            }
+            role.push(MirOp::Lw {
+                reg: dest,
+                base: dest,
+                at: 0,
+            });
             Ok(())
         }
         _ => Err(Error::TT_TODO_LOOP_ADDRESS),
     }
+}
+
+/// The ring's page count as a number the error messages can print.
+fn at_len(len: Dim) -> Dim {
+    len
 }
 
 /// The RISC-V form of an index arithmetic op; a comparison, `max` or `pow` is
@@ -2923,7 +3011,8 @@ fn cb_id(cb: Cb) -> Cb {
 }
 
 /// One copy of a mover segment: the parameter-side byte offset evaluated into a
-/// RISC-V register, then the NoC request itself.
+/// RISC-V register, then the NoC request itself — one request, or one per lane
+/// when the index names a base per datum.
 #[allow(clippy::too_many_arguments)]
 fn copy_to(
     k: &Kernel,
@@ -2958,48 +3047,306 @@ fn copy_to(
     let bytes = (access[0] * access[1])
         .checked_mul(dtype.bytes())
         .ok_or(Error::TT_ERROR_PARAM_OFFSET_OVERFLOW)?;
-    // A vector index is one base per datum: a gather reads them out of the page
-    // it copied, one datum per lane, which the mover does not do yet.
-    if types.of(offset).shape != RegShape::Scalar {
-        let _ = offset;
-        return Err(Error::TT_TODO_MULTI_LANE);
-    }
+    // A vector index is one base per datum: one request per lane, each base read
+    // out of the page the index load copied.
+    let lanes = match types.of(offset).shape {
+        RegShape::Scalar => 1,
+        RegShape::Row | RegShape::Column => 32,
+        RegShape::Tile => 1024,
+    };
     // A mover's program has its own counters: `t5` is its NIU base, so the
     // compute roles' counters and its own `a1..a4` are not interchangeable.
     let mut ops = Vec::new();
-    let mut scratch = MOVER_TEMPS.iter().copied();
-    scalar_with(
-        k,
-        types,
-        &mut ops,
-        param,
-        loops,
-        offset,
-        reg::A5,
-        &mut scratch,
-        &MOVER_INDEX,
-    )?;
-    ops.push(MirOp::Li {
-        reg: reg::T4,
-        value: bytes,
-    });
-    ops.push(MirOp::IArith {
-        op: IOp::Mul,
-        d: reg::A5,
-        a: reg::A5,
-        b: reg::T4,
-    });
-    ops.push(MirOp::Copy {
-        cb,
-        param: index,
-        bytes,
-        offset: reg::A5,
-        inbound,
-    });
+    let mut pool = Pool::new(&MOVER_POOL);
+    let value = pool.take()?;
+    if lanes == 1 {
+        scalar_with(
+            k,
+            types,
+            &mut ops,
+            param,
+            loops,
+            offset,
+            value,
+            &mut pool,
+            &MOVER_INDEX,
+            plan,
+            &m.cbs,
+        )?;
+        let scale = pool.take()?;
+        ops.push(MirOp::Li {
+            reg: scale,
+            value: bytes,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Mul,
+            d: value,
+            a: value,
+            b: scale,
+        });
+        pool.give(scale);
+        emit_request(&mut ops, &mut pool, inbound, cb, index, bytes, value, None)?;
+    } else {
+        let (page, el) = index_page(k, plan, &m.cbs, offset)?;
+        // The lane loop is one more nesting level, so it takes the next counter
+        // pair: a lane copy deep inside two program loops does not fit.
+        let (counter, _) = *MOVER_PAIRS
+            .get(loops.len())
+            .ok_or(Error::TT_TODO_LOOP_DEPTH)?;
+        ops.push(MirOp::Loop { count: lanes });
+        // This lane's base: the index page's datum, in units of the access.
+        let base = pool.take()?;
+        let scale = pool.take()?;
+        ops.push(MirOp::Li {
+            reg: base,
+            value: page,
+        });
+        ops.push(MirOp::Li {
+            reg: scale,
+            value: el,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Mul,
+            d: scale,
+            a: counter,
+            b: scale,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Add,
+            d: base,
+            a: base,
+            b: scale,
+        });
+        ops.push(MirOp::Lw {
+            reg: value,
+            base,
+            at: 0,
+        });
+        ops.push(MirOp::Li {
+            reg: scale,
+            value: bytes,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Mul,
+            d: value,
+            a: value,
+            b: scale,
+        });
+        pool.give(scale);
+        pool.give(base);
+        emit_request(
+            &mut ops,
+            &mut pool,
+            inbound,
+            cb,
+            index,
+            bytes,
+            value,
+            Some(counter),
+        )?;
+        ops.push(MirOp::EndLoop);
+    }
+    pool.give(value);
     for op in ops {
         m.push(core, op);
     }
     Ok(())
+}
+
+/// One NoC request as the mover's own program: the parameter's range base plus
+/// the byte offset in `value`, the ring's page pointer, the ten initiator
+/// registers, the trigger, and the two spins that wait for the hardware to take
+/// the request and for the transaction to complete.
+///
+/// A lane's request is one span of the page past the one before it, so `lane`
+/// (the counter) adds `bytes` to the page pointer.
+#[allow(clippy::too_many_arguments)]
+fn emit_request(
+    ops: &mut Vec<MirOp>,
+    pool: &mut Pool,
+    inbound: bool,
+    cb: Cb,
+    param: u32,
+    bytes: u32,
+    value: u8,
+    lane: Option<u8>,
+) -> Result<(), Error> {
+    use crate::riscv::cb::{RD_PTR, STRIDE, WR_PTR};
+    use tt_isa::noc::niu::{CMD_RD, CMD_WR, RESP_MARKED, STATIC_VC_1, initiator, reqs_outstanding};
+    if bytes == 0 || bytes > tt_isa::noc::niu::MAX_REQUEST_BYTES {
+        return Err(Error::TT_ERROR_NOC_REQUEST_BYTES);
+    }
+    let (lo_arg, hi_arg) = crate::mover::param_arg(param);
+    let lo = pool.take()?;
+    let hi = pool.take()?;
+    let page = pool.take()?;
+    ops.push(MirOp::LoadArg {
+        reg: lo,
+        arg: lo_arg,
+    });
+    ops.push(MirOp::IArith {
+        op: IOp::Add,
+        d: lo,
+        a: lo,
+        b: value,
+    });
+    ops.push(MirOp::LoadArg {
+        reg: hi,
+        arg: hi_arg,
+    });
+    // A read from DRAM publishes into the ring (its write pointer); a write to
+    // DRAM drains the page the ring's read pointer names.
+    let field = if inbound { WR_PTR } else { RD_PTR };
+    ops.push(MirOp::Lw {
+        reg: page,
+        base: reg::A6,
+        at: (u32::from(cb.0) * STRIDE) as i32 + field,
+    });
+    if let Some(counter) = lane {
+        let span = pool.take()?;
+        let off = pool.take()?;
+        ops.push(MirOp::Li {
+            reg: span,
+            value: bytes,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Mul,
+            d: off,
+            a: counter,
+            b: span,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Add,
+            d: page,
+            a: page,
+            b: off,
+        });
+        pool.give(off);
+        pool.give(span);
+    }
+    // `TARG_ADDR` is the request's source and `RET_ADDR` its destination: a
+    // read has the parameter as source and L1 as destination, a write the other
+    // way round. The high word is this tile's NOC word, staged by the prologue.
+    let stores = if inbound {
+        [
+            (initiator::TARG_ADDR_LO, lo),
+            (initiator::TARG_ADDR_MID, reg::ZERO),
+            (initiator::TARG_ADDR_HI, hi),
+            (initiator::RET_ADDR_LO, page),
+            (initiator::RET_ADDR_MID, reg::ZERO),
+            (initiator::RET_ADDR_HI, reg::T3),
+        ]
+    } else {
+        [
+            (initiator::TARG_ADDR_LO, page),
+            (initiator::TARG_ADDR_MID, reg::ZERO),
+            (initiator::TARG_ADDR_HI, reg::T3),
+            (initiator::RET_ADDR_LO, lo),
+            (initiator::RET_ADDR_MID, reg::ZERO),
+            (initiator::RET_ADDR_HI, hi),
+        ]
+    };
+    for (at, value) in stores {
+        ops.push(MirOp::Sw {
+            value,
+            base: reg::T5,
+            at: at as i32,
+        });
+    }
+    pool.give(lo);
+    pool.give(hi);
+    let ctrl = if inbound { CMD_RD } else { CMD_WR } | RESP_MARKED | STATIC_VC_1;
+    let words = [
+        (
+            (crate::mover::TXN.index() as u32) << 10,
+            initiator::PACKET_TAG,
+        ),
+        (ctrl, initiator::CTRL),
+        (bytes, initiator::AT_LEN_BE),
+    ];
+    for (word, at) in words {
+        ops.push(MirOp::Li {
+            reg: page,
+            value: word,
+        });
+        ops.push(MirOp::Sw {
+            value: page,
+            base: reg::T5,
+            at: at as i32,
+        });
+    }
+    ops.push(MirOp::Sw {
+        value: reg::ZERO,
+        base: reg::T5,
+        at: initiator::AT_DATA as i32,
+    });
+    ops.push(MirOp::Li {
+        reg: page,
+        value: 1,
+    });
+    ops.push(MirOp::Sw {
+        value: page,
+        base: reg::T5,
+        at: initiator::CMD_CTRL as i32,
+    });
+    // The hardware takes the request, then the transaction completes.
+    ops.push(MirOp::NiuPoll {
+        reg: page,
+        field: initiator::CMD_CTRL as i32,
+    });
+    ops.push(MirOp::Lw {
+        reg: page,
+        base: reg::T5,
+        at: initiator::CMD_CTRL as i32,
+    });
+    ops.push(MirOp::NiuPoll {
+        reg: page,
+        field: reqs_outstanding(crate::mover::TXN) as i32,
+    });
+    pool.give(page);
+    Ok(())
+}
+
+/// The L1 address of the page a lane index reads its bases out of, and the width
+/// of one datum there: the page the `load` names, on a one-page ring. A deeper
+/// ring's pointer moves at run time, so its page is refused rather than read
+/// from one that only happens to be there.
+fn index_page(
+    k: &Kernel,
+    plan: &Plan,
+    cbs: &crate::slab::Slab<Cb, crate::mir::CbInfo>,
+    value: OpId,
+) -> Result<(u32, u32), Error> {
+    let (buffer, offset) = match *k.at(value) {
+        Op::Load { buffer, offset, .. } => (buffer, offset),
+        _ => return Err(Error::TT_TODO_MULTI_LANE),
+    };
+    let (dtype, len) = match *k.at(buffer) {
+        Op::Cb { dtype, len, .. } => (dtype, len),
+        _ => return Err(Error::TT_ERROR_NOT_A_BUFFER),
+    };
+    if len != 1 {
+        let _ = (value, len);
+        return Err(Error::TT_TODO_LOOP_ADDRESS);
+    }
+    let cb = *plan
+        .cb
+        .get(&buffer)
+        .ok_or(Error::TT_ERROR_BUFFER_NOT_PLACED)?;
+    let ring = cbs.get(cb).ok_or(Error::TT_ERROR_BUFFER_NOT_PLACED)?;
+    let el = dtype.bytes();
+    let units = k
+        .const_i32(offset)
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or(Error::TT_TODO_LOOP_ADDRESS)?;
+    let bytes = units
+        .checked_mul(el)
+        .ok_or(Error::TT_ERROR_PARAM_OFFSET_OVERFLOW)?;
+    let base = ring
+        .base
+        .checked_add(bytes)
+        .ok_or(Error::TT_ERROR_PARAM_OFFSET_OVERFLOW)?;
+    Ok((base, el))
 }
 
 /// Follow a bitcast to the value that owns the `Dst` slot: a bitcast has no

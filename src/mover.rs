@@ -25,6 +25,14 @@
 use std::collections::BTreeMap;
 
 use crate::ir::{Error, Kernel, Op, OpId, ValueKind};
+use tt_isa::noc::niu::TxnId;
+
+/// Transaction ID every request uses. A mover issues in order and drains after
+/// each copy, so one ID is enough.
+pub const TXN: TxnId = match TxnId::new(1) {
+    Some(txn) => txn,
+    None => panic!("transaction id 1 exists"),
+};
 
 /// The inbound launch argument: the DRAM address a parameter's page is read
 /// from.
@@ -437,9 +445,24 @@ impl Mover<'_> {
                     if_false,
                 }))
             }
-            // A copy whose index is a vector reads its bases out of a page; the
-            // movers do not do a gather yet.
-            Op::Load { .. } => Err(Error::TT_TODO_MULTI_LANE),
+            // A vector index's bases live in the page the program copied, so
+            // the load that names it has to be in the moved program too: the
+            // lowering reads the page's address out of it per lane. The load
+            // itself stays a definition — nothing unpacks it — because a value
+            // only a copy's index reads never enters a `Dst` slot.
+            Op::Load {
+                buffer,
+                offset,
+                shape,
+            } => {
+                let buffer = self.clone_value(into, buffer)?;
+                let offset = self.clone_value(into, offset)?;
+                Ok(into.push(Op::Load {
+                    buffer,
+                    offset,
+                    shape,
+                }))
+            }
             other => {
                 let _ = other;
                 Err(Error::TT_ERROR_VALUE_UNDEFINED)
