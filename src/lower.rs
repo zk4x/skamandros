@@ -34,9 +34,18 @@ pub const TILE_DATUMS: u32 = 1024;
 /// Datums in one 16x16 face: one `Src` unpack's run.
 pub const FACE_DATUMS: u32 = TILE_DATUMS / 4;
 
-/// The RISC-V register a loop counts in, by nesting depth. `encode` uses the
-/// same two for a constant bound, so a dynamic bound leaves its count there.
-const COUNTERS: [u8; 2] = [reg::T4, reg::T5];
+/// The RISC-V registers a loop counts in, by nesting depth: the index counts up
+/// from zero and the body may use it as a value. `encode` opens the loop with
+/// the same pair, so `eval` and the branch agree on the index register.
+///
+/// The compute roles have one level (`t4` index, `t5` limit); the movers have
+/// two (`a1`/`a2`, then `a3`/`a4`) because `t5` is their NIU base.
+const COMPUTE_PAIR: (u8, u8) = (reg::T4, reg::T5);
+const MOVER_PAIRS: [(u8, u8); 2] = [(reg::A1, reg::A2), (reg::A3, reg::A4)];
+
+/// The index registers `eval` reads an induction value from, by depth.
+const COMPUTE_INDEX: [u8; 1] = [COMPUTE_PAIR.0];
+const MOVER_INDEX: [u8; 2] = [MOVER_PAIRS[0].0, MOVER_PAIRS[1].0];
 
 /// Registers a role owns for evaluating a bound expression. They are disjoint
 /// from `a0` (the launch arguments), `a6` (the CB interface), the loop counters
@@ -46,7 +55,6 @@ const SCRATCH: [u8; 6] = [reg::A1, reg::A2, reg::A3, reg::A4, reg::A5, reg::T3];
 /// A mover program's loop counters and temporaries. `t5` is that program's NIU
 /// base and `a0`/`a6` its arguments and CB table, so the compute roles'
 /// registers are not free there.
-const MOVER_COUNTERS: [u8; 4] = [reg::A1, reg::A2, reg::A3, reg::A4];
 const MOVER_TEMPS: [u8; 5] = [reg::T6, reg::T4, reg::T0, reg::T1, reg::T2];
 
 /// What the program means, recomputed from the op that defines each value.
@@ -129,9 +137,13 @@ fn prepare(k: &Kernel) -> Result<(Plan, MachineKernel, Alloc), Error> {
             shape: [32, 32],
         });
         place.insert(id, reg);
-        let a = m.lregs.push(dtype);
-        let b = m.lregs.push(dtype);
-        lreg.insert(id, (a, b));
+        // A body's lanes are the hardware's own: lane 0 is the input and lane 1
+        // the output of every row body, with 2..7 as the scratch the bodies
+        // name (an `exp2` or a reciprocal needs all six).
+        while usize::from(m.lregs.len()) < usize::from(crate::alloc::LREGS) {
+            m.lregs.push(dtype);
+        }
+        lreg.insert(id, (LReg(0), LReg(1)));
     }
     // One datum width for the whole bank: a value that needs more than 16 bits
     // forces 32-bit mode, which tt-metal calls `DST_ACCUM_MODE`.
@@ -352,26 +364,28 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                 if types.of(value).shape == RegShape::Scalar => {}
             Op::Loop { bound } => {
                 let depth = loops.len();
-                let counter = *COUNTERS.get(depth).ok_or(Error::TT_TODO_LOOP_DEPTH)?;
                 if let Some(core) = mover {
-                    // A mover segment's loop is that program's own: one core,
-                    // one counter pair, the same `eval` the roles use.
+                    // A mover segment's loop is that program's own: its own
+                    // index/limit pair, its own temporaries, so `t5` (the NIU
+                    // base) never holds an index.
+                    let (_, limit) = *MOVER_PAIRS.get(depth).ok_or(Error::TT_TODO_LOOP_DEPTH)?;
                     match bound_const(k, bound) {
                         Some(count) => m.push(core, MirOp::Loop { count }),
                         None => {
                             let mut ops = Vec::new();
-                            let mut scratch = SCRATCH.iter().copied();
-                            scalar(
+                            let mut scratch = MOVER_TEMPS.iter().copied();
+                            scalar_with(
                                 k,
                                 types,
                                 &mut ops,
                                 &param,
                                 &loops,
                                 bound,
-                                counter,
+                                limit,
                                 &mut scratch,
+                                &MOVER_INDEX,
                             )?;
-                            ops.push(MirOp::LoopReg { reg: counter });
+                            ops.push(MirOp::LoopReg { reg: limit });
                             for op in ops {
                                 m.push(core, op);
                             }
@@ -379,6 +393,11 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                     }
                     loops.push(value);
                     continue;
+                }
+                // The compute roles have one nesting level: `t4`/`t5` are the
+                // only two registers a body may not touch.
+                if depth != 0 {
+                    return Err(Error::TT_TODO_LOOP_DEPTH);
                 }
                 match bound_const(k, bound) {
                     Some(count) => {
@@ -388,22 +407,25 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                     }
                     None => {
                         // A symbolic bound is RISC-V arithmetic in the role,
-                        // like the C loop of a tt-metal kernel; the count ends
-                        // in the counter register and the branch reads it.
+                        // like the C loop of a tt-metal kernel; the limit ends
+                        // in the pair's limit register and the branch reads it.
                         for role in [Core::Unpack, Core::Math, Core::Pack] {
                             let mut ops = Vec::new();
                             let mut scratch = SCRATCH.iter().copied();
-                            scalar(
+                            scalar_with(
                                 k,
                                 types,
                                 &mut ops,
                                 &param,
                                 &loops,
                                 bound,
-                                counter,
+                                COMPUTE_PAIR.1,
                                 &mut scratch,
+                                &COMPUTE_INDEX,
                             )?;
-                            ops.push(MirOp::LoopReg { reg: counter });
+                            ops.push(MirOp::LoopReg {
+                                reg: COMPUTE_PAIR.1,
+                            });
                             for op in ops {
                                 m.push(role, op);
                             }
@@ -2290,7 +2312,17 @@ fn scalar(
     dest: u8,
     scratch: &mut impl Iterator<Item = u8>,
 ) -> Result<(), Error> {
-    scalar_with(k, types, role, param, loops, dim, dest, scratch, &COUNTERS)
+    scalar_with(
+        k,
+        types,
+        role,
+        param,
+        loops,
+        dim,
+        dest,
+        scratch,
+        &COMPUTE_INDEX,
+    )
 }
 
 /// [`scalar`] with an explicit set of loop counters.
@@ -2942,7 +2974,7 @@ fn copy_to(
         offset,
         reg::A5,
         &mut scratch,
-        &MOVER_COUNTERS,
+        &MOVER_INDEX,
     )?;
     ops.push(MirOp::Li {
         reg: reg::T4,

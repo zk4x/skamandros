@@ -1445,9 +1445,11 @@ fn is_value(info: &ValueInfo) -> bool {
             true
         }
         // A scalar parameter carries its value, so the movers can compute with
-        // it; a tensor parameter, a buffer or an accumulator never flows.
+        // it, and an accumulator is a `Dst` region the datapath reads like any
+        // value (a reduce's result is broadcast back over the tile).
         ValueKind::Param => info.shape == RegShape::Scalar,
-        ValueKind::Buffer | ValueKind::Acc | ValueKind::Shape => false,
+        ValueKind::Acc => true,
+        ValueKind::Buffer | ValueKind::Shape => false,
     }
 }
 

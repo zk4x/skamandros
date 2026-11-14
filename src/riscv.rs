@@ -147,6 +147,11 @@ pub fn beq(rs1: u8, rs2: u8, imm: i32) -> u32 {
     b_type(imm, rs2, rs1, 0, 0x63)
 }
 
+/// Branch if `rs1 < rs2`, unsigned: a loop's `index < limit` test.
+pub fn bltu(rs1: u8, rs2: u8, imm: i32) -> u32 {
+    b_type(imm, rs2, rs1, 6, 0x63)
+}
+
 pub fn bne(rs1: u8, rs2: u8, imm: i32) -> u32 {
     b_type(imm, rs2, rs1, 1, 0x63)
 }

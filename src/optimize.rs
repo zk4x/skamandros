@@ -75,7 +75,9 @@ pub fn reg_sync(m: &mut MachineKernel) {
     // `Src`: an `UNPACR` writes `Dst` only when its unit is on the `Dst` path.
     let mut target: Option<Dst> = None;
     let mut to_src = [false; 2];
-    let mut touches: Vec<Vec<Access>> = vec![Vec::new(); m.dst_slots() as usize];
+    // One bucket per `Dst` the lowering minted: before `alloc` an id is a name,
+    // not a hardware register, so the slab's length is the right size.
+    let mut touches: Vec<Vec<Access>> = vec![Vec::new(); usize::from(m.dsts.len())];
     for (at, (role, op)) in ops.iter().enumerate() {
         let mut touched: Vec<(Dst, bool)> = Vec::new();
         match *op {

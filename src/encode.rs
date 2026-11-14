@@ -30,9 +30,6 @@ use tt_isa::noc::niu::{
 };
 use tt_isa::sync::{self, Semaphore};
 
-/// A mover's loop counters: `a1..a4`, because `t5` is its NIU base.
-const MOVER_COUNTERS: [u8; 4] = [reg::A1, reg::A2, reg::A3, reg::A4];
-
 /// Transaction ID every request uses. The programs issue in order and drain
 /// after each copy, so one ID is enough.
 const TXN: TxnId = match TxnId::new(1) {
@@ -132,13 +129,21 @@ impl Stream {
     }
 }
 
-/// One open [`MirOp::Loop`]: the register holding the remaining trip count, the
-/// word the forward skip is patched into, and the word the body starts at.
+/// One open [`MirOp::Loop`]: the register that counts up from zero, the register
+/// holding the limit, the word the zero-trip skip is patched into, and the word
+/// the body starts at.
 struct OpenLoop {
-    reg: u8,
+    index: u8,
+    limit: u8,
     top: usize,
     skip: usize,
 }
+
+/// A loop's `(index, limit)` pair per nesting level: the compute roles count in
+/// `t4` against `t5`, and the movers in `a1`/`a2` then `a3`/`a4` (their `t5` is
+/// the NIU base).
+const COMPUTE_PAIR: (u8, u8) = (reg::T4, reg::T5);
+const MOVER_PAIRS: [(u8, u8); 2] = [(reg::A1, reg::A2), (reg::A3, reg::A4)];
 
 /// Open a loop: `reg = count; if reg == 0 goto end; top:`.
 ///
@@ -147,7 +152,7 @@ struct OpenLoop {
 /// `T4` then `T5`. A deeper loop is a concrete future item, not a guess at a
 /// register.
 fn open_loop(out: &mut Stream, loops: &mut Vec<OpenLoop>, count: u32) -> Result<(), Error> {
-    open_loop_with(out, loops, count, &[reg::T4, reg::T5])
+    open_loop_with(out, loops, count, &[COMPUTE_PAIR])
 }
 
 /// [`open_loop`] with an explicit counter set: the movers keep `t5` for their
@@ -156,43 +161,61 @@ fn open_loop_with(
     out: &mut Stream,
     loops: &mut Vec<OpenLoop>,
     count: u32,
-    counters: &[u8],
+    pairs: &[(u8, u8)],
 ) -> Result<(), Error> {
-    let reg = *counters.get(loops.len()).ok_or(Error::TT_TODO_LOOP_DEPTH)?;
-    out.li(reg, count);
+    let (index, limit) = *pairs.get(loops.len()).ok_or(Error::TT_TODO_LOOP_DEPTH)?;
+    out.li(index, 0);
+    out.li(limit, count);
     let skip = out.len();
-    out.rv(rv::beq(reg, reg::ZERO, 0));
+    out.rv(rv::beq(limit, reg::ZERO, 0));
     let top = out.len();
-    loops.push(OpenLoop { reg, top, skip });
+    loops.push(OpenLoop {
+        index,
+        limit,
+        top,
+        skip,
+    });
     Ok(())
 }
 
-/// Close a loop: `addi reg, reg, -1; bne reg, zero, top; end:` and the patched
-/// forward skip of [`open_loop`].
+/// Close a loop: `index = index + 1; if index < limit goto top; end:`, and the
+/// zero-trip skip of [`open_loop`] patched to the end.
 fn close_loop(out: &mut Stream, loops: &mut Vec<OpenLoop>) -> Result<(), Error> {
     let loop_ = loops.pop().ok_or(Error::TT_ERROR_ENDLOOP_MACHINE)?;
-    out.rv(rv::addi(loop_.reg, loop_.reg, -1));
+    out.rv(rv::addi(loop_.index, loop_.index, 1));
     let here = out.len();
-    out.rv(rv::bne(loop_.reg, reg::ZERO, 0));
+    out.rv(rv::bltu(loop_.index, loop_.limit, 0));
     let after = out.len();
     // The back branch is emitted at `here` and targets `top`.
     let back = ((loop_.top as i32) - (here as i32)) * 4;
-    out.patch(here, rv::bne(loop_.reg, reg::ZERO, back));
+    out.patch(here, rv::bltu(loop_.index, loop_.limit, back));
     let forward = ((after as i32) - (loop_.skip as i32)) * 4;
-    out.patch(loop_.skip, rv::beq(loop_.reg, reg::ZERO, forward));
+    out.patch(loop_.skip, rv::beq(loop_.limit, reg::ZERO, forward));
     Ok(())
 }
 
-/// Open a loop whose count is already in `reg` (a dynamic bound). The branch
-/// and the counter are the same as [`open_loop`]'s; only the `li` is missing.
-fn open_loop_reg(out: &mut Stream, loops: &mut Vec<OpenLoop>, reg: u8) -> Result<(), Error> {
-    if loops.len() >= 4 {
-        return Err(Error::TT_TODO_LOOP_DEPTH);
+/// Open a loop whose limit is already in `reg` (a dynamic bound). Same shape as
+/// [`open_loop`]; the limit arrives in a register instead of an immediate.
+fn open_loop_reg(
+    out: &mut Stream,
+    loops: &mut Vec<OpenLoop>,
+    reg: u8,
+    pairs: &[(u8, u8)],
+) -> Result<(), Error> {
+    let (index, limit) = *pairs.get(loops.len()).ok_or(Error::TT_TODO_LOOP_DEPTH)?;
+    if reg != limit {
+        out.rv(rv::addi(limit, reg, 0));
     }
+    out.li(index, 0);
     let skip = out.len();
-    out.rv(rv::beq(reg, reg::ZERO, 0));
+    out.rv(rv::beq(limit, reg::ZERO, 0));
     let top = out.len();
-    loops.push(OpenLoop { reg, top, skip });
+    loops.push(OpenLoop {
+        index,
+        limit,
+        top,
+        skip,
+    });
     Ok(())
 }
 
@@ -223,7 +246,7 @@ fn encode_int(op: &MirOp, out: &mut Stream, loops: &mut Vec<OpenLoop>) -> Result
             IOp::Sll => rv::sll(d, a, b),
             IOp::Sra => rv::sra(d, a, b),
         }),
-        MirOp::LoopReg { reg } => open_loop_reg(out, loops, reg)?,
+        MirOp::LoopReg { reg } => open_loop_reg(out, loops, reg, &[COMPUTE_PAIR])?,
         _ => return Ok(false),
     }
     Ok(true)
@@ -309,8 +332,8 @@ fn encode_mover(
             continue;
         }
         match *op {
-            MirOp::Loop { count } => open_loop_with(out, &mut loops, count, &MOVER_COUNTERS)?,
-            MirOp::LoopReg { reg } => open_loop_reg(out, &mut loops, reg)?,
+            MirOp::Loop { count } => open_loop_with(out, &mut loops, count, &MOVER_PAIRS)?,
+            MirOp::LoopReg { reg } => open_loop_reg(out, &mut loops, reg, &MOVER_PAIRS)?,
             MirOp::EndLoop => close_loop(out, &mut loops)?,
             MirOp::Copy {
                 cb,

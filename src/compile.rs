@@ -26,8 +26,10 @@ pub fn compile(k: &Kernel) -> Result<Module, Error> {
     // cross-core order with the per-core streams.
     crate::optimize::reg_sync(&mut machine);
     crate::optimize::fuse(&mut machine);
-    machine.verify()?;
+    // The allocator is what brings the lane registers and `Dst` ids inside the
+    // hardware's limits, so it runs before the check that enforces them.
     machine.alloc()?;
+    machine.verify()?;
     machine.plan_cbs()?;
     machine.render()
 }
