@@ -1,5 +1,5 @@
-// Copyright (C) 2025 zk4x
-// SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
+// Copyright (C) 2026 zk4x
+// SPDX-License-Identifier: Apache-2.0
 
 //! The machine IR: what each of the five cores executes, and the hardware it
 //! names.
@@ -144,7 +144,6 @@ macro_rules! slab_id {
 
         impl SlabId for $ty {
             const ZERO: Self = Self($zero);
-            const NULL: Self = Self(u16::MAX);
 
             fn inc(&mut self) {
                 self.0 += 1;

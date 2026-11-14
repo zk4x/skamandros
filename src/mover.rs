@@ -1,5 +1,5 @@
-// Copyright (C) 2025 zk4x
-// SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
+// Copyright (C) 2026 zk4x
+// SPDX-License-Identifier: Apache-2.0
 
 //! The movers: the virtual-IR pass that draws the segments and the CB sync.
 //!

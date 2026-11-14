@@ -1,5 +1,5 @@
-// Copyright (C) 2025 zk4x
-// SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
+// Copyright (C) 2026 zk4x
+// SPDX-License-Identifier: Apache-2.0
 
 //! The machine-side allocation: what `lower` minted without a limit, brought
 //! inside the limits the hardware has.

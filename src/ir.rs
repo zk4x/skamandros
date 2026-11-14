@@ -1,5 +1,5 @@
-// Copyright (C) 2025 zk4x
-// SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
+// Copyright (C) 2026 zk4x
+// SPDX-License-Identifier: Apache-2.0
 
 //! The semantic kernel IR: one unified SSA program, machine programs out.
 //!
@@ -73,7 +73,6 @@ impl From<OpId> for usize {
 
 impl SlabId for OpId {
     const ZERO: Self = Self(0);
-    const NULL: Self = Self(u32::MAX);
 
     fn inc(&mut self) {
         self.0 += 1;
@@ -115,16 +114,6 @@ impl DType {
             DType::Bf16 => "bf16",
             DType::I32 => "i32",
             DType::Bool => "bool",
-        }
-    }
-
-    fn from_tag(tag: u8) -> Option<DType> {
-        match tag {
-            0 => Some(DType::F32),
-            1 => Some(DType::Bf16),
-            2 => Some(DType::I32),
-            3 => Some(DType::Bool),
-            _ => None,
         }
     }
 }
@@ -200,8 +189,6 @@ pub enum ValueKind {
     Const,
     /// A loop's induction value.
     Induction,
-    /// This core's logical coordinate on one grid axis.
-    GridCoord,
     /// A register value.
     Register,
     /// A named accumulator: mutable, one `Dst` tile region.
@@ -272,49 +259,11 @@ impl BOp {
         })
     }
 
-    fn from_tag(tag: u8) -> Option<BOp> {
-        Some(match tag {
-            0 => BOp::Add,
-            1 => BOp::Sub,
-            2 => BOp::Mul,
-            3 => BOp::Div,
-            4 => BOp::Pow,
-            5 => BOp::Mod,
-            6 => BOp::Cmplt,
-            7 => BOp::Cmpgt,
-            8 => BOp::Cmpge,
-            9 => BOp::Max,
-            10 => BOp::Or,
-            11 => BOp::And,
-            12 => BOp::BitXor,
-            13 => BOp::BitOr,
-            14 => BOp::BitAnd,
-            15 => BOp::BitShiftLeft,
-            16 => BOp::BitShiftRight,
-            17 => BOp::NotEq,
-            18 => BOp::Eq,
-            _ => return None,
-        })
-    }
-
     /// A comparison: the result is a `bool`.
     pub const fn returns_bool(self) -> bool {
         matches!(
             self,
             BOp::Cmplt | BOp::Cmpgt | BOp::Cmpge | BOp::NotEq | BOp::Eq
-        )
-    }
-
-    /// The ops that only make sense on an integer dtype.
-    pub const fn is_integer_only(self) -> bool {
-        matches!(
-            self,
-            BOp::Mod
-                | BOp::BitAnd
-                | BOp::BitOr
-                | BOp::BitXor
-                | BOp::BitShiftLeft
-                | BOp::BitShiftRight
         )
     }
 
@@ -358,25 +307,6 @@ impl UOp {
             "floor" => UOp::Floor,
             "trunc" => UOp::Trunc,
             "abs" => UOp::Abs,
-            _ => return None,
-        })
-    }
-
-    fn from_tag(tag: u8) -> Option<UOp> {
-        Some(match tag {
-            0 => UOp::Neg,
-            1 => UOp::Not,
-            2 => UOp::BitNot,
-            3 => UOp::Exp2,
-            4 => UOp::Log2,
-            5 => UOp::Reciprocal,
-            6 => UOp::Sqrt,
-            7 => UOp::Rsqrt,
-            8 => UOp::Sin,
-            9 => UOp::Cos,
-            10 => UOp::Floor,
-            11 => UOp::Trunc,
-            12 => UOp::Abs,
             _ => return None,
         })
     }
@@ -1441,9 +1371,7 @@ impl Kernel {
 /// shapes are named by their own ops and never flow through the datapath.
 fn is_value(info: &ValueInfo) -> bool {
     match info.kind {
-        ValueKind::Const | ValueKind::Induction | ValueKind::GridCoord | ValueKind::Register => {
-            true
-        }
+        ValueKind::Const | ValueKind::Induction | ValueKind::Register => true,
         // A scalar parameter carries its value, so the movers can compute with
         // it, and an accumulator is a `Dst` region the datapath reads like any
         // value (a reduce's result is broadcast back over the tile).
@@ -1484,8 +1412,6 @@ fn acc_reg_shape_checked(shape: [Dim; 2], at: usize, dtype: DType) -> Result<Reg
 // Forms
 // ---------------------------------------------------------------------------
 
-/// The byte form's magic.
-pub const MAGIC: [u8; 4] = *b"TTIR";
 /// The IR version this build reads.
 pub const VERSION: u32 = 9;
 

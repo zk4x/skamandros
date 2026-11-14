@@ -1,5 +1,5 @@
-// Copyright (C) 2025 zk4x
-// SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
+// Copyright (C) 2026 zk4x
+// SPDX-License-Identifier: Apache-2.0
 
 //! The passes over the machine IR: role synchronization, fusion and
 //! verification.

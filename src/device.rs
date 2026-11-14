@@ -1,5 +1,5 @@
-// Copyright (C) 2025 zk4x
-// SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
+// Copyright (C) 2026 zk4x
+// SPDX-License-Identifier: Apache-2.0
 
 //! The device: `libttsim` through `dlopen`, one TLB window, DRAM and L1 access,
 //! and starting a core on an image.
@@ -154,7 +154,9 @@ impl Lib {
 /// A misdirected DMA is a bug in the code that programmed the device, and
 /// there is no way to report it to the library. Stop.
 unsafe extern "C" fn dma_read_unexpected(paddr: u64, _dst: *mut c_void, size: u32) {
-    eprintln!("libTT: the device attempted a DMA read of {size} bytes at host address {paddr:#x}");
+    eprintln!(
+        "libskamandros: the device attempted a DMA read of {size} bytes at host address {paddr:#x}"
+    );
     std::process::abort()
 }
 
@@ -207,7 +209,9 @@ impl Link {
 }
 
 unsafe extern "C" fn dma_write_unexpected(paddr: u64, _src: *const c_void, size: u32) {
-    eprintln!("libTT: the device attempted a DMA write of {size} bytes at host address {paddr:#x}");
+    eprintln!(
+        "libskamandros: the device attempted a DMA write of {size} bytes at host address {paddr:#x}"
+    );
     std::process::abort()
 }
 
@@ -215,7 +219,7 @@ unsafe extern "C" fn dma_write_unexpected(paddr: u64, _src: *const c_void, size:
 ///
 /// The bytes are the firmware `build.rs` produced from `firmware/` and judged
 /// instruction by instruction, so an image here is known to be executable before
-/// anything runs it. That is what makes `libTT.so` self-contained: the consumer's
+/// anything runs it. That is what makes `libskamandros.so` self-contained: the consumer's
 /// build needs neither the RISC-V target nor `llvm-objcopy`, only this crate's
 /// build did.
 pub type Image = (Core, &'static [u8], u64);

@@ -4,12 +4,13 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
+authors = ["zk4x"]
 repository = "https://github.com/zk4x/skamandros"
 homepage = "https://github.com/zk4x/skamandros"
-description = "Tenstorrent kernel IR, allocator and driver. Builds libTT.so."
+description = "Tenstorrent kernel IR, allocator and driver. Builds libskamandros.so."
 
 [lib]
-name = "TT"
+name = "skamandros"
 crate-type = ["cdylib", "rlib"]
 
 [features]

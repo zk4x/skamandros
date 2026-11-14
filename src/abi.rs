@@ -1,7 +1,7 @@
-// Copyright (C) 2025 zk4x
-// SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
+// Copyright (C) 2026 zk4x
+// SPDX-License-Identifier: Apache-2.0
 
-//! The C ABI: the only stable surface `libTT.so` exports.
+//! The C ABI: the only stable surface `libskamandros.so` exports.
 //!
 //! Everything crosses as pointers, lengths and scalars. A call returns
 //! [`ttStatus`], and on failure writes a NUL-terminated message to the `err` out
@@ -331,7 +331,7 @@ pub unsafe extern "C" fn ttLaunch(
 ///
 /// # Safety
 ///
-/// `ptr` must be null or a pointer [`fail`]'s callers wrote, freed once.
+/// `ptr` must be null or a pointer this library's error path wrote, freed once.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ttFree(ptr: *mut c_void) {
     if ptr.is_null() {

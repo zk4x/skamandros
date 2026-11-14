@@ -1,13 +1,13 @@
-// Copyright (C) 2025 zk4x
-// SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
+// Copyright (C) 2026 zk4x
+// SPDX-License-Identifier: Apache-2.0
 
-//! `libTT.so`: a Tenstorrent kernel compiler and driver for Blackhole.
+//! `libskamandros.so`: a Tenstorrent kernel compiler and driver for Blackhole.
 //!
 //! The only public module is `abi`, the C ABI. Everything else is private: a
 //! consumer links `libTT.so` and calls `ttCompile`, `ttLaunch` and the transfers
 //! beside them, exactly as the header describes. Nothing in this crate is a Rust
 //! library, and nothing outside it should need to be.
-#![allow(non_snake_case)] // the crate is `TT`, and the artifact is `libTT.so`.
+#![allow(non_snake_case)] // the C ABI's names are the caller's, not Rust's.
 
 pub mod abi;
 

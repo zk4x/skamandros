@@ -1,5 +1,5 @@
-// Copyright (C) 2025 zk4x
-// SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
+// Copyright (C) 2026 zk4x
+// SPDX-License-Identifier: Apache-2.0
 
 //! Index map using unsinged integer indices to index
 //! into vector of T. Pushing new values returns their
@@ -32,14 +32,8 @@ pub trait SlabId:
 {
     /// First valid index (0).
     const ZERO: Self;
-    /// Sentinel for "no index".
-    const NULL: Self;
     /// Advance to the next index.
     fn inc(&mut self);
-    /// Whether this is [`SlabId::NULL`].
-    fn is_null(self) -> bool {
-        self == Self::NULL
-    }
 }
 
 /// Index map using unsigned integer indices to index
@@ -138,19 +132,6 @@ impl<Id: SlabId, T> Slab<Id, T> {
         }
     }
 
-    pub(crate) fn remove(&mut self, id: Id) {
-        debug_assert!(!self.empty.contains(&id), "slab double-remove of id {id:?}");
-        self.empty.insert(id);
-        unsafe { self.values[id.into()].assume_init_drop() };
-    }
-
-    pub(crate) unsafe fn remove_and_return(&mut self, id: Id) -> T {
-        debug_assert!(!self.empty.contains(&id));
-        self.empty.insert(id);
-        self.values.push(MaybeUninit::uninit());
-        unsafe { self.values.swap_remove(id.into()).assume_init() }
-    }
-
     #[allow(unused)]
     pub(crate) fn get(&self, id: Id) -> Option<&T> {
         if !self.contains_id(id) {
@@ -164,22 +145,9 @@ impl<Id: SlabId, T> Slab<Id, T> {
         self.values.swap(x as usize, y as usize);
     }*/
 
-    pub(crate) fn ids(&self) -> impl Iterator<Item = Id> + '_ {
-        IdIter::new(&self.empty, Id::from(self.values.len()))
-    }
-
     pub(crate) fn values(&self) -> impl Iterator<Item = &T> {
         IdIter::new(&self.empty, Id::from(self.values.len()))
             .map(|id| unsafe { self.values[id.into()].assume_init_ref() })
-    }
-
-    /// Mutable iterator over live values.
-    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut T> {
-        self.values
-            .iter_mut()
-            .enumerate()
-            .filter(|(id, _)| !self.empty.contains(&(Id::from(*id))))
-            .map(|(_, x)| unsafe { x.assume_init_mut() })
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (Id, &T)> {
@@ -192,14 +160,6 @@ impl<Id: SlabId, T> Slab<Id, T> {
 
     pub(crate) fn contains_id(&self, id: Id) -> bool {
         id < Id::from(self.values.len()) && !self.empty.contains(&id)
-    }
-
-    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (Id, &mut T)> {
-        self.values
-            .iter_mut()
-            .enumerate()
-            .filter(|(id, _)| !self.empty.contains(&(Id::from(*id))))
-            .map(|(id, x)| (Id::from(id), unsafe { x.assume_init_mut() }))
     }
 
     /*pub(crate) fn first_id(&self) -> Id {
@@ -248,20 +208,10 @@ impl<Id: SlabId, T> Slab<Id, T> {
         Id::from(self.values.len() - self.empty.len())
     }
 
+    /// Whether every slot is free.
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.values.len() - self.empty.len() == 0
-    }
-
-    #[allow(unused)]
-    /// Mutable reference to the value at `index`, if live.
-    pub fn get_mut(&mut self, index: Id) -> Option<&mut T> {
-        if self.empty.contains(&index) {
-            return None;
-        }
-        let idx = index.into();
-        self.values
-            .get_mut(idx)
-            .map(|e| unsafe { e.assume_init_mut() })
     }
 }
 

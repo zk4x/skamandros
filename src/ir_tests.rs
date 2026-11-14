@@ -1,12 +1,12 @@
-// Copyright (C) 2025 zk4x
-// SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
+// Copyright (C) 2026 zk4x
+// SPDX-License-Identifier: Apache-2.0
 
 //! The IR as a program format: the text form is the contract, the byte form is
 //! the shipping encoding, and the two are checked against each other.
 
 use crate::compile;
 use crate::compile::ParamKind;
-use crate::ir::{DType, Kernel, Op, OpId, RegShape};
+use crate::ir::{DType, Kernel, Op, RegShape};
 use crate::status::ttStatus;
 
 /// The unified program: no reader/compute/writer segments, no unpack/pack, no
@@ -212,7 +212,7 @@ store 32,32 %out [0] = %y
 grid 1,1
 ";
     let k = Kernel::parse(DIRECT).expect("the direct kernel parses");
-    let types = k.verify().expect("the direct form verifies");
+    k.verify().expect("the direct form verifies");
     let staged = crate::mover::add_movers(&k).expect("the access is staged");
     let buffers = staged
         .ops()
@@ -261,7 +261,7 @@ load 1,1 %x = %ib [%i]
 load 1,32 %y = %ib [0]
 ";
     let k = Kernel::parse(ROW).expect("the row program parses");
-    let types = k.verify().expect("the row program verifies");
+    k.verify().expect("the row program verifies");
     let value = |name: &str| {
         *k.names
             .iter()
@@ -573,7 +573,7 @@ version 9
 grid 1,1
 ";
     let k = Kernel::parse(SELECT).expect("the select program parses");
-    let types = k.verify().expect("it verifies");
+    k.verify().expect("it verifies");
     let of = |name: &str| {
         *k.names
             .iter()

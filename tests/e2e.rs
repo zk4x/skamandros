@@ -1,7 +1,7 @@
-// Copyright (C) 2025 zk4x
-// SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
+// Copyright (C) 2026 zk4x
+// SPDX-License-Identifier: Apache-2.0
 
-//! End to end through the shipped artifact: load `libTT.so` with `dlopen` and
+//! End to end through the shipped artifact: load `libskamandros.so` with `dlopen` and
 //! drive the C ABI.
 //!
 //! Every call goes through the loaded library; the crate itself is linked only
@@ -51,19 +51,19 @@ const TT_ERROR_VALUE_UNDEFINED: c_int = 14;
 const TT_ERROR_NOT_TTIR: c_int = 10;
 const TT_ERROR_BF16_WIDEN: c_int = 153;
 
-/// The `libTT.so` this test binary was built next to.
+/// The `libskamandros.so` this test binary was built next to.
 fn library_path() -> PathBuf {
     let exe = std::env::current_exe().expect("the test binary's path");
     let dir = exe.parent().expect("the test binary's directory");
-    // `target/<profile>/deps/<test>` -> `target/<profile>/libTT.so`
+    // `target/<profile>/deps/<test>` -> `target/<profile>/libskamandros.so`
     dir.parent()
         .expect("the profile directory")
-        .join(format!("{}TT.so", std::env::consts::DLL_PREFIX))
+        .join(format!("{}skamandros.so", std::env::consts::DLL_PREFIX))
 }
 
 /// The artifact, loaded once per test process.
 ///
-/// A `dlclose` of `libTT.so` between two tests unloads the library's own
+/// A `dlclose` of `libskamandros.so` between two tests unloads the library's own
 /// process-wide state, and `libttsim` — which stays resident — refuses a second
 /// `libttsim_init`. Keeping one handle for the whole process is also how a real
 /// consumer uses the `.so`.
@@ -2531,6 +2531,295 @@ fn bf16_matmul_runs_on_the_simulator() {
             truncate_to_bf16(*v),
             "bf16 operands, bf16 accumulator, datum {i}"
         );
+    }
+}
+
+/// Interleaved (GGUF / llama.cpp) RoPE across four 32-wide pages of one head:
+/// `y = x*cos + (x @ T)*sin`, where `T` is the ±1 page that swaps neighbours.
+/// Every table is full-width, so one page is one 32-wide slice of the head and
+/// the rotation never crosses a page.
+const ROPE_INTERLEAVED: &str = "\
+version 9
+grid 1,1
+%px = param f32 4096
+%pc = param f32 4096
+%ps = param f32 4096
+%pt = param f32 1024
+%out = param f32 4096
+%bx = buffer f32 32,32
+%bc = buffer f32 32,32
+%bs = buffer f32 32,32
+%bt = buffer f32 32,32
+%br = buffer f32 32,32
+%bo = buffer f32 32,32
+%acc = acc f32 32,32
+%zero = const f32 0
+%j = loop 4
+copy 32,32 %bx [0] = %px [%j]
+copy 32,32 %bc [0] = %pc [%j]
+copy 32,32 %bs [0] = %ps [%j]
+copy 32,32 %bt [0] = %pt [0]
+load 32,32 %x = %bx [0]
+load 32,32 %c = %bc [0]
+load 32,32 %s = %bs [0]
+load 32,32 %t = %bt [0]
+store 32,32 %acc = %zero
+matmul %acc %x %t
+store 32,32 %br [0] = %acc
+load 32,32 %r = %br [0]
+%y1 = mul %x %c
+%y2 = mul %r %s
+%y = add %y1 %y2
+store 32,32 %bo [0] = %y
+copy 32,32 %out [%j] = %bo [0]
+endloop
+";
+
+/// Split-half (Hugging Face) RoPE at `head_dim = 128`: `d` pairs with
+/// `d + 64`, so the two halves are whole pages and the rotation is two
+/// multiplies and an add per output page — no matmul, no data movement. The
+/// `+64` half reuses the low half's cos/sin page.
+const ROPE_SPLIT_HALF: &str = "\
+version 9
+grid 1,1
+%px = param f32 4096
+%pc = param f32 2048
+%ps = param f32 2048
+%out = param f32 4096
+%ba = buffer f32 32,32
+%bb = buffer f32 32,32
+%bc = buffer f32 32,32
+%bs = buffer f32 32,32
+%bo0 = buffer f32 32,32
+%bo1 = buffer f32 32,32
+%two = const i32 2
+%j = loop 2
+%oj2 = add %j %two
+copy 32,32 %ba [0] = %px [%j]
+copy 32,32 %bb [0] = %px [%oj2]
+copy 32,32 %bc [0] = %pc [%j]
+copy 32,32 %bs [0] = %ps [%j]
+load 32,32 %xa = %ba [0]
+load 32,32 %xb = %bb [0]
+load 32,32 %c = %bc [0]
+load 32,32 %s = %bs [0]
+%p0 = mul %xa %c
+%p1 = mul %xb %s
+%y0 = sub %p0 %p1
+store 32,32 %bo0 [0] = %y0
+copy 32,32 %out [%j] = %bo0 [0]
+%p2 = mul %xb %c
+%p3 = mul %xa %s
+%y1 = add %p2 %p3
+store 32,32 %bo1 [0] = %y1
+copy 32,32 %out [%oj2] = %bo1 [0]
+endloop
+";
+
+/// Split-half RoPE at `head_dim = 32`: both halves are inside one page, so the
+/// swap is the block permutation `[[0, I],[-I, 0]]` the Matrix Unit applies.
+const ROPE_SPLIT_HALF_PAGE: &str = "\
+version 9
+grid 1,1
+%px = param f32 1024
+%pc = param f32 1024
+%ps = param f32 1024
+%pt = param f32 1024
+%out = param f32 1024
+%bx = buffer f32 32,32
+%bc = buffer f32 32,32
+%bs = buffer f32 32,32
+%bt = buffer f32 32,32
+%br = buffer f32 32,32
+%bo = buffer f32 32,32
+%acc = acc f32 32,32
+%zero = const f32 0
+copy 32,32 %bx [0] = %px [0]
+copy 32,32 %bc [0] = %pc [0]
+copy 32,32 %bs [0] = %ps [0]
+copy 32,32 %bt [0] = %pt [0]
+load 32,32 %x = %bx [0]
+load 32,32 %c = %bc [0]
+load 32,32 %s = %bs [0]
+load 32,32 %t = %bt [0]
+store 32,32 %acc = %zero
+matmul %acc %x %t
+store 32,32 %br [0] = %acc
+load 32,32 %r = %br [0]
+%y1 = mul %x %c
+%y2 = mul %r %s
+%y = add %y1 %y2
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
+";
+
+/// The interleaved rotation: `y[2k] = -x[2k+1]`, `y[2k+1] = x[2k]` — one
+/// `matmul` against a ±1 page, then the two multiplies and the add.
+#[test]
+fn rope_interleaved_runs_on_the_simulator() {
+    const TOKENS: usize = 32;
+    const DIM: usize = 128;
+    // Small integers: exact in TF32, so the accumulator store rounds nothing.
+    let x: Vec<f32> = (0..TOKENS * DIM).map(|i| (i % 7) as f32 - 3.0).collect();
+    // bf16 tables, as tt-metal ships them. Truncated here too, so every later
+    // product is exact in f32 and the rotation is asserted datum by datum.
+    let table = |f: fn(f32) -> f32| -> Vec<f32> {
+        (0..TOKENS * DIM)
+            .map(|i| {
+                let (t, d) = (i / DIM, i % DIM);
+                let angle = (t * (d / 2)) as f32 * 0.001;
+                f32::from_bits(u32::from(truncate_to_bf16(f(angle))) << 16)
+            })
+            .collect()
+    };
+    let cos = table(f32::cos);
+    let sin = table(f32::sin);
+    let mut perm = vec![0f32; 1024];
+    for k in 0..16 {
+        perm[2 * k * 32 + 2 * k + 1] = 1.0;
+        perm[(2 * k + 1) * 32 + 2 * k] = -1.0;
+    }
+
+    let bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let out = run_kernel_tensors(
+        ROPE_INTERLEAVED,
+        &[
+            &bytes(&tiled(TOKENS, DIM, &x)),
+            &bytes(&tiled(TOKENS, DIM, &cos)),
+            &bytes(&tiled(TOKENS, DIM, &sin)),
+            &bytes(&tiled(32, 32, &perm)),
+        ],
+        TOKENS * DIM * 4,
+    );
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let mut shown = 0;
+    for t in 0..TOKENS {
+        for d in 0..DIM {
+            let (a, b) = (x[t * DIM + d], x[t * DIM + (d ^ 1)]);
+            let (c, s) = (cos[t * DIM + d], sin[t * DIM + d]);
+            let want = if d % 2 == 0 {
+                a * c - b * s
+            } else {
+                a * c + b * s
+            };
+            let at = (d / 32) * 1024 + tile_index(t, d % 32);
+            if shown < 8 {
+                eprintln!(
+                    "t{t} d{d}: got {} want {} x {} c {} s {}",
+                    got[at], want, a, c, s
+                );
+                shown += 1;
+            }
+            assert_eq!(got[at], want, "token {t}, dim {d}");
+        }
+    }
+}
+
+/// The split-half rotation at `head_dim = 128`: `d` pairs with `d + 64`, both
+/// halves whole pages, so this form needs no matrix product at all.
+#[test]
+fn rope_split_half_runs_on_the_simulator() {
+    const TOKENS: usize = 32;
+    const DIM: usize = 128;
+    const HALF: usize = DIM / 2;
+    let x: Vec<f32> = (0..TOKENS * DIM).map(|i| (i % 7) as f32 - 3.0).collect();
+    let table = |f: fn(f32) -> f32| -> Vec<f32> {
+        (0..TOKENS * HALF)
+            .map(|i| {
+                let (t, d) = (i / HALF, i % HALF);
+                let angle = (t * d) as f32 * 0.001;
+                f32::from_bits(u32::from(truncate_to_bf16(f(angle))) << 16)
+            })
+            .collect()
+    };
+    let cos = table(f32::cos);
+    let sin = table(f32::sin);
+
+    let bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let out = run_kernel_tensors(
+        ROPE_SPLIT_HALF,
+        &[
+            &bytes(&tiled(TOKENS, DIM, &x)),
+            &bytes(&tiled(TOKENS, HALF, &cos)),
+            &bytes(&tiled(TOKENS, HALF, &sin)),
+        ],
+        TOKENS * DIM * 4,
+    );
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for t in 0..TOKENS {
+        for d in 0..DIM {
+            let a = x[t * DIM + d];
+            let (c, s) = (cos[t * HALF + d % HALF], sin[t * HALF + d % HALF]);
+            let want = if d < HALF {
+                a * c - x[t * DIM + d + HALF] * s
+            } else {
+                a * c + x[t * DIM + d - HALF] * s
+            };
+            let at = (d / 32) * 1024 + tile_index(t, d % 32);
+            assert_eq!(got[at], want, "token {t}, dim {d}");
+        }
+    }
+}
+
+/// The split-half rotation inside one 32-wide page: `d` pairs with `d + 16`, so
+/// the swap is the ±1 block page and the arithmetic is `matmul`/`mul`/`add`.
+#[test]
+fn rope_split_half_within_a_page_runs_on_the_simulator() {
+    const TOKENS: usize = 32;
+    const DIM: usize = 32;
+    const HALF: usize = DIM / 2;
+    let x: Vec<f32> = (0..TOKENS * DIM).map(|i| (i % 7) as f32 - 3.0).collect();
+    // Each frequency covers a pair, as the single-tile op's tables do.
+    let table = |f: fn(f32) -> f32| -> Vec<f32> {
+        (0..TOKENS * DIM)
+            .map(|i| {
+                let (t, d) = (i / DIM, i % DIM);
+                let angle = (t * (d / 2)) as f32 * 0.001;
+                f32::from_bits(u32::from(truncate_to_bf16(f(angle))) << 16)
+            })
+            .collect()
+    };
+    let cos = table(f32::cos);
+    let sin = table(f32::sin);
+    let mut perm = vec![0f32; 1024];
+    for d in 0..HALF {
+        perm[(d + HALF) * 32 + d] = -1.0;
+        perm[d * 32 + (d + HALF)] = 1.0;
+    }
+
+    let bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let out = run_kernel_tensors(
+        ROPE_SPLIT_HALF_PAGE,
+        &[
+            &bytes(&tiled(TOKENS, DIM, &x)),
+            &bytes(&tiled(TOKENS, DIM, &cos)),
+            &bytes(&tiled(TOKENS, DIM, &sin)),
+            &bytes(&tiled(32, 32, &perm)),
+        ],
+        TOKENS * DIM * 4,
+    );
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for t in 0..TOKENS {
+        for d in 0..DIM {
+            let a = x[t * DIM + d];
+            let (c, s) = (cos[t * DIM + d], sin[t * DIM + d]);
+            let want = if d < HALF {
+                a * c - x[t * DIM + d + HALF] * s
+            } else {
+                a * c + x[t * DIM + d - HALF] * s
+            };
+            let at = tile_index(t, d);
+            assert_eq!(got[at], want, "token {t}, dim {d}");
+        }
     }
 }
 

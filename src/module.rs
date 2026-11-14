@@ -1,5 +1,5 @@
-// Copyright (C) 2025 zk4x
-// SPDX-License-Identifier: LGPL-3.0-only WITH Classpath-exception-2.0
+// Copyright (C) 2026 zk4x
+// SPDX-License-Identifier: Apache-2.0
 
 //! The compiled program: what a launch runs.
 
@@ -22,6 +22,10 @@ pub enum GridTerm {
     Const(u32),
     /// The value of parameter `i` (program order), which must be a scalar.
     Param(u32),
+    /// Arithmetic over the two above, evaluated at launch. `grid_eval` reads it;
+    /// nothing builds one yet, because `compile::term` refuses anything but a
+    /// constant or a scalar parameter.
+    #[allow(dead_code)]
     Binary(BOp, Box<GridTerm>, Box<GridTerm>),
 }
 
