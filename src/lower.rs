@@ -38,19 +38,19 @@ pub const FACE_DATUMS: u32 = TILE_DATUMS / 4;
 /// from zero and the body may use it as a value. `encode` opens the loop with
 /// the same pair, so `eval` and the branch agree on the index register.
 ///
-/// The compute roles have one level (`t4` index, `t5` limit); the movers have
-/// two (`a1`/`a2`, then `a3`/`a4`) because `t5` is their NIU base.
-const COMPUTE_PAIR: (u8, u8) = (reg::T4, reg::T5);
+/// The compute roles have two levels (`t4`/`t5`, then `a7`/`a1`); the movers
+/// have (`a1`/`a2`, then `a3`/`a4`) because `t5` is their NIU base.
+const COMPUTE_PAIRS: [(u8, u8); 2] = [(reg::T4, reg::T5), (reg::A7, reg::A1)];
 const MOVER_PAIRS: [(u8, u8); 2] = [(reg::A1, reg::A2), (reg::A3, reg::A4)];
 
 /// The index registers `eval` reads an induction value from, by depth.
-const COMPUTE_INDEX: [u8; 1] = [COMPUTE_PAIR.0];
+const COMPUTE_INDEX: [u8; 2] = [COMPUTE_PAIRS[0].0, COMPUTE_PAIRS[1].0];
 const MOVER_INDEX: [u8; 2] = [MOVER_PAIRS[0].0, MOVER_PAIRS[1].0];
 
 /// Registers a role owns for evaluating a bound expression. They are disjoint
 /// from `a0` (the launch arguments), `a6` (the CB interface), the loop counters
-/// and the sync scratch `encode` uses.
-const SCRATCH: [u8; 6] = [reg::A1, reg::A2, reg::A3, reg::A4, reg::A5, reg::T3];
+/// (`a1` is the second level's index) and the sync scratch `encode` uses.
+const SCRATCH: [u8; 5] = [reg::A2, reg::A3, reg::A4, reg::A5, reg::T3];
 
 /// A mover program's temporaries: everything it does not keep across ops. `t5`
 /// is its NIU base, `t3` this tile's NOC word, `a0`/`a6` its arguments and CB
@@ -423,11 +423,9 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                     loops.push(value);
                     continue;
                 }
-                // The compute roles have one nesting level: `t4`/`t5` are the
-                // only two registers a body may not touch.
-                if depth != 0 {
-                    return Err(Error::TT_TODO_LOOP_DEPTH);
-                }
+                // Two levels is what the compute roles have counter pairs for;
+                // a third would need another pair, which is not reserved.
+                let (_, limit) = *COMPUTE_PAIRS.get(depth).ok_or(Error::TT_TODO_LOOP_DEPTH)?;
                 match bound_const(k, bound) {
                     Some(count) => {
                         m.push(Core::Unpack, MirOp::Loop { count });
@@ -448,15 +446,13 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                                 &param,
                                 &loops,
                                 bound,
-                                COMPUTE_PAIR.1,
+                                limit,
                                 &mut scratch,
                                 &COMPUTE_INDEX,
                                 &plan,
                                 &m.cbs,
                             )?;
-                            ops.push(MirOp::LoopReg {
-                                reg: COMPUTE_PAIR.1,
-                            });
+                            ops.push(MirOp::LoopReg { reg: limit });
                             for op in ops {
                                 m.push(role, op);
                             }

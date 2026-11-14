@@ -18,6 +18,7 @@ pub mod reg {
     pub const A4: u8 = 14;
     pub const A5: u8 = 15;
     pub const A6: u8 = 16;
+    pub const A7: u8 = 17;
     pub const T0: u8 = 5;
     pub const T1: u8 = 6;
     pub const T2: u8 = 7;

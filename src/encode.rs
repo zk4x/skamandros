@@ -131,9 +131,9 @@ struct OpenLoop {
 }
 
 /// A loop's `(index, limit)` pair per nesting level: the compute roles count in
-/// `t4` against `t5`, and the movers in `a1`/`a2` then `a3`/`a4` (their `t5` is
-/// the NIU base).
-const COMPUTE_PAIR: (u8, u8) = (reg::T4, reg::T5);
+/// `t4` against `t5`, then `a7` against `a1`; the movers in `a1`/`a2` then
+/// `a3`/`a4` (their `t5` is the NIU base).
+const COMPUTE_PAIRS: [(u8, u8); 2] = [(reg::T4, reg::T5), (reg::A7, reg::A1)];
 const MOVER_PAIRS: [(u8, u8); 2] = [(reg::A1, reg::A2), (reg::A3, reg::A4)];
 
 /// Open a loop: `reg = count; if reg == 0 goto end; top:`.
@@ -143,7 +143,7 @@ const MOVER_PAIRS: [(u8, u8); 2] = [(reg::A1, reg::A2), (reg::A3, reg::A4)];
 /// `T4` then `T5`. A deeper loop is a concrete future item, not a guess at a
 /// register.
 fn open_loop(out: &mut Stream, loops: &mut Vec<OpenLoop>, count: u32) -> Result<(), Error> {
-    open_loop_with(out, loops, count, &[COMPUTE_PAIR])
+    open_loop_with(out, loops, count, &COMPUTE_PAIRS)
 }
 
 /// [`open_loop`] with an explicit counter set: the movers keep `t5` for their
@@ -238,7 +238,7 @@ fn encode_int(op: &MirOp, out: &mut Stream, loops: &mut Vec<OpenLoop>) -> Result
             IOp::Sll => rv::sll(d, a, b),
             IOp::Sra => rv::sra(d, a, b),
         }),
-        MirOp::LoopReg { reg } => open_loop_reg(out, loops, reg, &[COMPUTE_PAIR])?,
+        MirOp::LoopReg { reg } => open_loop_reg(out, loops, reg, &COMPUTE_PAIRS)?,
         _ => return Ok(false),
     }
     Ok(true)
