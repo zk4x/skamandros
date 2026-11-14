@@ -116,7 +116,6 @@ fn prepare(k: &Kernel) -> Result<(Plan, MachineKernel, Alloc), Error> {
             Op::Acc { .. }
                 | Op::Load { .. }
                 | Op::Cast { .. }
-                | Op::Bitcast { .. }
                 | Op::Unary { .. }
                 | Op::Binary { .. }
                 | Op::Select { .. }
