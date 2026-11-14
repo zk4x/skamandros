@@ -1465,6 +1465,7 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), tt
             // together are the one-datum scalar broadcast.
             let row = dst_row(reg, at, row_delta);
             let (brow, col) = match bcast {
+                Bcast::None => (0, 0),
                 Bcast::Row => (1, 0),
                 Bcast::Col => (0, 1),
                 Bcast::Scalar => (1, 1),
@@ -1600,6 +1601,24 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), tt
         MirOp::Trnspsrcb => {
             out.push(encode::trnspsrcb().map_err(bad_isa)?);
         }
+        MirOp::Zerosrc {
+            zero_val,
+            write_mode,
+            bank_mask,
+            clear_src_b,
+            clear_src_a,
+        } => {
+            out.push(
+                encode::Zerosrc::ZERO
+                    .negative_inf_src_a(u32::from(zero_val))
+                    .single_bank_matrix_unit(u32::from(write_mode))
+                    .both_banks(u32::from(bank_mask))
+                    .clear_src_b(u32::from(clear_src_b))
+                    .clear_src_a(u32::from(clear_src_a))
+                    .encode()
+                    .map_err(bad_isa)?,
+            );
+        }
         MirOp::AluAccCtrl {
             fp32,
             zero_flag_src,
@@ -1656,6 +1675,19 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), tt
                 .encode()
                 .map_err(bad_isa)?;
             out.push(i);
+        }
+        MirOp::Incrwc { src_a, src_b, dst } => {
+            out.push(
+                encode::Incrwc::ZERO
+                    .dst_cr(0)
+                    .src_b_cr(0)
+                    .src_a_cr(0)
+                    .dst_inc(dst)
+                    .src_b_inc(src_b)
+                    .src_a_inc(src_a)
+                    .encode()
+                    .map_err(bad_isa)?,
+            );
         }
         MirOp::ThreadWord { addr, value } => {
             // A whole `ThreadConfig` word: `SETC16` carries the composed value
@@ -1765,11 +1797,15 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(
                 cb_base_pack(out, cb)?;
             }
             MirOp::SetPackConfig { dtype, mask } => {
-                // A bf16 page out of a 32-bit `Dst` is the packer's own
-                // conversion, which `ttsim` does not model.
-                if !dst_is_16_bit && dtype == DType::Bf16 {
-                    return Err(ttStatus::TT_TODO_PACK_F32_TO_BF16);
-                }
+                // A bf16 page out of a 32-bit `Dst` is the packer's own early
+                // conversion (`pack_fmt_conv_mode = 0x105`, tt-metal's
+                // `is_packer_to_L1_early_conversion_supported`: `Float32` ->
+                // `Float16_b`). `pack_config` already writes the two formats and
+                // `Read_32b_data`, so the mode is the one the hardware takes;
+                // `ttsim` refuses to model it (`TENSIX_EXECUTE_PACR`'s accepted
+                // list has no `0x105`), so a launch would abort there. The
+                // compiler still emits it: the silicon path exists and only the
+                // simulator cannot run it.
                 if last_config == Some((dtype, mask)) {
                     continue;
                 }

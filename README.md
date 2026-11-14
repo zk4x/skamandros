@@ -103,7 +103,9 @@ is 1. The text form is the only program form `ttCompile` reads.
 
 Working end to end through the C ABI: copies, elementwise arithmetic,
 comparisons, `sel`, casts and bitcasts, bf16 (constants, a bf16 page widening
-into a 32-bit `Dst` through `SrcA` and `MOVA2D`, and bf16 reduces), both
+into a 32-bit `Dst` through `SrcA` and `MOVA2D`, bf16 reduces, and the
+transcendentals — `log2`, `sin`, `cos`, `reciprocal`, `sqrt`, `div` — as lane
+bodies on the 32-bit lane, so a bf16 kernel stays 16-bit), both
 reduces, `matmul`, a symbolic loop bound, a symbolic grid, a gather, and a
 `gate_proj`-shaped GEMM over the whole grid (240 tiles, every datum checked).
 The allocator reuses `Dst` by liveness, so a kernel's *values* may outnumber
@@ -111,16 +113,13 @@ the bank's slots: `softmax` needs eleven live values in eight slots.
 
 Open, in the order they block a release:
 
-- The transcendentals `log2`, `sin`, `cos`, `reciprocal`, `sqrt`, `floor`,
-  `trunc` (and so `div` and `pow`) unfold into f32 bit arithmetic, so a bf16
-  operand has to widen to f32 there; `exp2` and `rsqrt` are native bodies and
-  work on 16-bit `Dst`.
-- A `bf16` page out of a 32-bit `Dst` is refused as `TT_TODO_PACK_F32_TO_BF16`:
-  the packer's conversion is built for silicon, but `ttsim` does not model it.
-- `max row` in a 16-bit `Dst` is wrong (the fold's transpose is written for a
-  32-bit `Dst` only); `sum row`, `sum col` and `max col` are correct.
 - `rms_norm`'s gate never asserts and its numbers are wrong; it is a recorded
   bug, not a passing kernel.
+- `ttsim` does not model the packer's `f32 -> bf16` conversion
+  (`pack_fmt_conv_mode=0x105`), so that path — and every bf16 page written out
+  of a 32-bit `Dst` — compiles but cannot be run here. It needs silicon.
+- `trunc`/`floor` still round through `i32` in the IR, so a bf16 kernel that
+  uses them runs 32-bit and its bf16 output hits that same packer path.
 - The hardware link is not written: this runs on `ttsim` only.
 
 ## License

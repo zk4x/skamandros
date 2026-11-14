@@ -2156,16 +2156,20 @@ fn bf16_casts_run_on_the_simulator() {
     }
 }
 
-/// A bf16 page written out of a 32-bit `Dst` is the packer's own conversion
-/// (`pack_fmt_conv_mode=0x105`): tt-metal's kernels use it
-/// (`is_packer_to_L1_early_conversion_supported`: `Float32 -> Float16_b`) and
-/// the instruction is built for silicon, but `ttsim` exits with
-/// `UnimplementedFunctionality`. Nothing in this tree can run the result, so the
-/// compiler refuses the program rather than leaving it to abort the simulator.
+/// A bf16 page written out of a 32-bit `Dst` is the packer's own early
+/// conversion (`pack_fmt_conv_mode=0x105`): tt-metal's
+/// `is_packer_to_L1_early_conversion_supported` lists `Float32 ->
+/// Float16_b`, and `pack_config` writes the two formats and
+/// `Read_32b_data`, which is the whole mode word. `ttsim` does not model the
+/// conversion (`TENSIX_EXECUTE_PACR`'s accepted list has no `0x105`) and exits
+/// with `UnimplementedFunctionality`, so the gate compiles the three shapes the
+/// cast takes and stops there; a launch belongs to silicon.
 #[test]
-fn an_f32_dst_packed_into_a_bf16_page_is_refused() {
+fn an_f32_dst_packs_into_a_bf16_page() {
     let lib = library();
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
+    let unload: Symbol<ModuleUnload> =
+        unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
 
     for program in [CAST_F32_TO_BF16, CAST_I32_TO_BF16, CAST_BOOL_TO_BF16] {
@@ -2179,12 +2183,10 @@ fn an_f32_dst_packed_into_a_bf16_page_is_refused() {
                 &mut err,
             )
         };
-        assert_eq!(
-            code, TT_TODO_PACK_F32_TO_BF16,
-            "a 32-bit Dst packed into a bf16 page is refused"
-        );
-        assert!(module.is_null() && !err.is_null());
-        assert_eq!(take_error(&free, err), "TT_TODO_PACK_F32_TO_BF16");
+        assert_eq!(code, TT_OK, "compile: {}", take_error(&free, err));
+        assert!(!module.is_null());
+        let mut err: *mut c_char = std::ptr::null_mut();
+        assert_eq!(unsafe { unload(module, &mut err) }, TT_OK);
     }
 }
 
@@ -2357,6 +2359,85 @@ matmul %m %a %b
 store 32,32 %bo [0] = %m
 copy 32,32 %out [0] = %bo [0]
 ";
+
+/// A bf16 kernel with no widening: `log2`, `sin`, `cos`, `reciprocal`, `sqrt`
+/// and `div` are lane bodies in `lower`, and a lane is 32 bits whatever the
+/// `Dst` holds. The datum widens on `SFPLOAD` and narrows on `SFPSTORE`, so the
+/// result is the f32 answer truncated to bf16 — every datum.
+#[test]
+fn bf16_transcendentals_run_in_the_lane() {
+    let count = 1024usize;
+    let unary = |name: &str, host: &[f32], want: &dyn Fn(f32) -> f32, ulps: u16| {
+        let bytes: Vec<u8> = host
+            .iter()
+            .flat_map(|v| truncate_to_bf16(*v).to_le_bytes())
+            .collect();
+        let program = format!(
+            "version 9\ngrid 1,1\n%in = param bf16 1024\n%out = param bf16 1024\n\
+             %b0 = buffer bf16 32,32\n%bo = buffer bf16 32,32\n\
+             copy 32,32 %b0 [0] = %in [0]\nload 32,32 %x = %b0 [0]\n\
+             %r = {name} %x\nstore 32,32 %bo [0] = %r\ncopy 32,32 %out [0] = %bo [0]\n"
+        );
+        let out = run_kernel(&program, &bytes, count * 2);
+        for (i, h) in host.iter().enumerate() {
+            let x = widen_bf16(truncate_to_bf16(*h));
+            let got = u16::from_le_bytes(out[2 * i..2 * i + 2].try_into().unwrap());
+            let want = truncate_to_bf16(want(x));
+            // The approximate bodies carry the one-ulp slack the coverage
+            // matrix gives them; the polynomial ones are exact.
+            let delta = got.wrapping_sub(want).min(want.wrapping_sub(got));
+            assert!(
+                delta <= ulps,
+                "{name}: datum {i} of {x}: {got:#06x} vs {want:#06x}"
+            );
+        }
+    };
+    let positive: Vec<f32> = (0..count).map(|i| 0.01 * (1.0 + i as f32 * 1.1)).collect();
+    unary("log2", &positive, &f32::log2, 0);
+    unary("reciprocal", &positive, &|x| x.recip(), 2);
+    unary("sqrt", &positive, &f32::sqrt, 2);
+    let angles: Vec<f32> = (0..count).map(|i| (i as f32 - 512.0) / 64.0).collect();
+    unary("sin", &angles, &f32::sin, 0);
+    unary("cos", &angles, &f32::cos, 0);
+
+    // `div`: a bf16 numerator over a bf16 divisor, every datum.
+    const DIV: &str = "\
+version 9
+grid 1,1
+%in = param bf16 2048
+%out = param bf16 1024
+%b0 = buffer bf16 32,64
+%bo = buffer bf16 32,32
+copy 32,32 %b0 [0] = %in [0]
+copy 32,32 %b0 [1] = %in [1]
+load 32,32 %x = %b0 [0]
+load 32,32 %y = %b0 [1]
+%r = div %x %y
+store 32,32 %bo [0] = %r
+copy 32,32 %out [0] = %bo [0]
+";
+    let x: Vec<f32> = (0..count).map(|i| (i as f32 - 500.0) / 7.0).collect();
+    let y: Vec<f32> = (0..count).map(|i| 0.25 + (i % 97) as f32 * 0.5).collect();
+    let mut bytes: Vec<u8> = Vec::new();
+    for v in x.iter().chain(y.iter()) {
+        bytes.extend(truncate_to_bf16(*v).to_le_bytes());
+    }
+    let out = run_kernel(DIV, &bytes, count * 2);
+    for (i, (a, b)) in x.iter().zip(&y).enumerate() {
+        let a = widen_bf16(truncate_to_bf16(*a));
+        let b = widen_bf16(truncate_to_bf16(*b));
+        let got = u16::from_le_bytes(out[2 * i..2 * i + 2].try_into().unwrap());
+        let want = truncate_to_bf16(a / b);
+        // The reciprocal is an estimate plus Newton steps: one bf16 ulp of
+        // slack on the quotient.
+        let slack = 2u16;
+        assert!(
+            got.wrapping_sub(want).min(want.wrapping_sub(got)) <= slack
+                || (got & 0x7fff) == (want & 0x7fff),
+            "div: datum {i}: {a} / {b} = {got:#06x}, wanted {want:#06x}"
+        );
+    }
+}
 
 /// The `(row, column)` of a 32x32 matrix that L1 datum `index` holds. A tile in
 /// L1 is four 16x16 faces; each face is 256 contiguous datums, row-major.
@@ -3165,6 +3246,26 @@ store 32,32 %bo [0] = %acc
 copy 32,32 %out [0] = %bo [0]
 ";
 
+/// The `row` fold of a bf16 page: column 0 of every row holds the row's
+/// maximum, and the fold goes through the 16-bit transpose (`MOVD2B`,
+/// `TRNSPSRCB`, the two `ELWADD`s) rather than the 32-bit hi/lo split.
+const REDUCE_MAX_ROW_BF16: &str = "\
+version 9
+grid 1,1
+%px = param bf16 1024
+%out = param bf16 1024
+%bx = buffer bf16 32,32
+%bo = buffer bf16 32,32
+copy 32,32 %bx [0] = %px [0]
+%acc = acc bf16 32,1
+%low = const f32 -1000
+store 32,32 %acc = %low
+load 32,32 %x = %bx [0]
+max %acc %x
+store 32,32 %bo [0] = %acc
+copy 32,32 %out [0] = %bo [0]
+";
+
 /// Every datum of a bf16 page, as the `u16` it is.
 fn bf16_pages(bytes: &[u8]) -> Vec<u16> {
     bytes
@@ -3245,6 +3346,25 @@ fn bf16_reduces_run_on_the_simulator() {
     let want = col_reduce_oracle(&widened, true, None);
     for i in 0..count {
         assert_eq!(got[i], truncate_to_bf16(want[i]), "bf16 max col: datum {i}");
+    }
+
+    // `max row`, seeded below every datum: column 0 of every row holds the
+    // row's fold, and the 16-bit transpose is what lands it there.
+    let got = bf16_pages(&run_kernel(REDUCE_MAX_ROW_BF16, &x_bytes, count * 2));
+    let want = row_reduce_oracle(&widened);
+    for row in 0..32 {
+        assert_eq!(
+            got[tile_index(row, 0)],
+            truncate_to_bf16(want[tile_index(row, 0)]),
+            "bf16 max row: row {row}"
+        );
+        for column in 1..32 {
+            assert_eq!(
+                got[tile_index(row, column)],
+                0,
+                "bf16 max row: ({row}, {column}) is not zero"
+            );
+        }
     }
 }
 

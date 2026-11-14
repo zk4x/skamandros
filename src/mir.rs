@@ -59,6 +59,8 @@ pub enum ElwOp {
 /// Which part of `SrcB` the FPU broadcasts to every row of `SrcA`'s face.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bcast {
+    /// No broadcast: `SrcB` is read row for row, the plain `ELWADD` form.
+    None,
     Row,
     Col,
     Scalar,
@@ -409,6 +411,18 @@ pub enum MirOp {
     },
     /// `TRNSPSRCB`: transpose the 16x16 block in `SrcB` rows 16..31 in place.
     Trnspsrcb,
+    /// `ZEROSRC`: write zeros (or negative infinity) over the source banks.
+    /// `zero_val` is the ISA's `NegativeInfSrcA`, `write_mode` its
+    /// `SingleBankMatrixUnit`, `bank_mask` its `BothBanks`, and the last two
+    /// are `src_mask`'s two bits. tt-metal's `TTI_ZEROSRC(0, 1, 0, 1)` clears
+    /// the current `SrcA` bank.
+    Zerosrc {
+        zero_val: bool,
+        write_mode: bool,
+        bank_mask: bool,
+        clear_src_b: bool,
+        clear_src_a: bool,
+    },
     /// `ALU_ACC_CTRL`: the `Dst` width the Matrix Unit and the moves address.
     AluAccCtrl { fp32: bool, zero_flag_src: bool },
     /// `ALU_FORMAT_SPEC_REG0_SrcA`, through the override bit.
@@ -422,6 +436,11 @@ pub enum MirOp {
         flip_src_b: bool,
         dst_cr: bool,
     },
+    /// `INCRWC`: advance the `SrcA`/`SrcB`/`Dst` row counters. tt-metal reaches
+    /// the same state with `SETRWC(CR_B, +8)`, which this IR cannot spell (the
+    /// counter values are four-bit, and 16 does not fit); the ISA has the
+    /// dedicated increment, and `SrcBVal` is only four bits wide.
+    Incrwc { src_a: u32, src_b: u32, dst: u32 },
     /// One whole `SETC16` `ThreadConfig` word (address and value).
     ThreadWord { addr: u16, value: u16 },
     /// Wait until the Matrix Unit has drained.
@@ -983,6 +1002,21 @@ fn write_op(f: &mut dyn fmt::Write, op: &MirOp) -> fmt::Result {
             if use_dst32b_lo { " lo" } else { "" }
         ),
         MirOp::Trnspsrcb => write!(f, "trnspsrcb"),
+        MirOp::Zerosrc {
+            zero_val,
+            write_mode,
+            bank_mask,
+            clear_src_b,
+            clear_src_a,
+        } => write!(
+            f,
+            "zerosrc{}{}{}{}{}",
+            if zero_val { " -inf" } else { "" },
+            if write_mode { " single_bank" } else { "" },
+            if bank_mask { " both_banks" } else { "" },
+            if clear_src_b { " clr_b" } else { "" },
+            if clear_src_a { " clr_a" } else { "" }
+        ),
         MirOp::AluAccCtrl {
             fp32,
             zero_flag_src,
@@ -1008,6 +1042,9 @@ fn write_op(f: &mut dyn fmt::Write, op: &MirOp) -> fmt::Result {
             if dst_cr { " dst_cr" } else { "" }
         ),
         MirOp::ThreadWord { addr, value } => write!(f, "threadword 0x{addr:04x} = {value}"),
+        MirOp::Incrwc { src_a, src_b, dst } => {
+            write!(f, "incrwc a+{src_a} b+{src_b} d+{dst}")
+        }
         MirOp::WaitMatrix => write!(f, "wait_matrix"),
         MirOp::Setdst { reg } => write!(f, "setdst dst{}", reg.0),
         MirOp::SetPackBase { cb } => write!(f, "setpackbase {}", cb_name(cb)),
@@ -1089,6 +1126,7 @@ fn elw_name(op: ElwOp) -> &'static str {
 
 fn bcast_name(bcast: Bcast) -> &'static str {
     match bcast {
+        Bcast::None => "none",
         Bcast::Row => "row",
         Bcast::Col => "col",
         Bcast::Scalar => "scalar",

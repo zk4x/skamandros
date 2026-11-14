@@ -717,6 +717,8 @@ pub fn verify(m: &MachineKernel) -> Result<(), ttStatus> {
                     }
                 }
                 MirOp::SfpEncc { .. } => {}
+                MirOp::Zerosrc { .. } => {}
+                MirOp::Incrwc { .. } => {}
                 MirOp::Setdst { reg } => {
                     if reg.0 >= m.dst_slots() {
                         let _ = (name, at, reg);

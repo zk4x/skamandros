@@ -39,34 +39,22 @@ pub fn unfold(k: &Kernel) -> Result<Kernel, ttStatus> {
     for (id, op) in k.ops() {
         match *op {
             Op::Unary {
-                op:
-                    uop @ (UOp::Log2
-                    | UOp::Sin
-                    | UOp::Cos
-                    | UOp::Floor
-                    | UOp::Trunc
-                    | UOp::Reciprocal
-                    | UOp::Sqrt),
+                op: uop @ (UOp::Floor | UOp::Trunc | UOp::Sqrt),
                 a,
             } => {
                 let x = b.map_of(a);
-                // A bf16 value carries seven mantissa bits, so tt-metal's
-                // reciprocal needs one Newton step there and two here.
-                let steps = if k.dtype(a) == DType::Bf16 { 1 } else { 2 };
+                let dtype = k.dtype(a);
                 let out = match uop {
-                    UOp::Log2 => b.log2(x),
-                    UOp::Sin => b.sin_cos(x, false),
-                    UOp::Cos => b.sin_cos(x, true),
-                    UOp::Floor => b.floor(x),
-                    UOp::Trunc => b.trunc(x),
-                    UOp::Reciprocal => b.reciprocal(x, steps),
+                    UOp::Floor => b.floor(x, dtype),
+                    UOp::Trunc => b.trunc(x, dtype),
                     // `sqrt x = 1/rsqrt x`: at `x = 0` the reciprocal square
                     // root is `+inf` and the reciprocal of that is `0`, at
                     // `x = +inf` it is `0` and the reciprocal is `+inf`, and a
-                    // negative `x` is a `NaN` through both.
+                    // negative `x` is a `NaN` through both. Both are lane
+                    // bodies in `lower`.
                     _ => {
                         let r = b.un(UOp::Rsqrt, x, "sqrt_rsqrt");
-                        b.reciprocal(r, steps)
+                        b.un(UOp::Reciprocal, r, "sqrt_recip")
                     }
                 };
                 b.name(id, out);
@@ -86,17 +74,15 @@ pub fn unfold(k: &Kernel) -> Result<Kernel, ttStatus> {
                     // the float path only, and an integer `pow` is left for
                     // `lower` to refuse rather than silently mis-lowered here.
                     (BOp::Pow, true) => {
-                        let l = b.log2(x);
+                        let l = b.un(UOp::Log2, x, "pow_log2");
                         let p = b.bin(BOp::Mul, y, l, "pow_mul");
                         b.un(UOp::Exp2, p, "pow_exp2")
                     }
-                    // `x / y = x * (1/y)`, the reciprocal being tt-metal's
-                    // `_sfpu_reciprocal_`: a quadratic estimate and then one
-                    // Newton step per datum width, as `ckernel_sfpu_recip.h`
-                    // documents.
+                    // `x / y = x * (1/y)`, the reciprocal being the lane body
+                    // in `lower` (tt-metal's `_sfpu_reciprocal_`: a quadratic
+                    // estimate and one Newton step per datum width).
                     (BOp::Div, true) => {
-                        let steps = if k.dtype(a) == DType::Bf16 { 1 } else { 2 };
-                        let r = b.reciprocal(y, steps);
+                        let r = b.un(UOp::Reciprocal, y, "div_recip");
                         b.bin(BOp::Mul, x, r, "div_mul")
                     }
                     _ => {
@@ -152,14 +138,6 @@ impl Build<'_> {
         })
     }
 
-    fn ki(&mut self, x: u32, tag: &str) -> OpId {
-        self.value(tag);
-        self.out.push(Op::Const {
-            dtype: DType::I32,
-            bits: x,
-        })
-    }
-
     fn bin(&mut self, op: BOp, a: OpId, b: OpId, tag: &str) -> OpId {
         self.value(tag);
         self.out.push(Op::Binary { op, a, b })
@@ -175,11 +153,6 @@ impl Build<'_> {
         self.out.push(Op::Cast { dtype, src })
     }
 
-    fn bitcast(&mut self, src: OpId, dtype: DType, tag: &str) -> OpId {
-        self.value(tag);
-        self.out.push(Op::Bitcast { dtype, src })
-    }
-
     fn select(&mut self, cond: OpId, t: OpId, f: OpId, tag: &str) -> OpId {
         self.value(tag);
         self.out.push(Op::Select {
@@ -189,29 +162,19 @@ impl Build<'_> {
         })
     }
 
-    /// `1 + s (c1 + s (c2 + ...))` over `coeffs`, the non-constant terms in
-    /// increasing power of `s` (zyx's `tt_horner`).
-    fn horner(&mut self, s: OpId, coeffs: &[f32], tag: &str) -> OpId {
-        let mut p = self.kf(coeffs[coeffs.len() - 1], tag);
-        for c in coeffs[..coeffs.len() - 1].iter().rev() {
-            let cc = self.kf(*c, tag);
-            let q = self.bin(BOp::Mul, p, s, tag);
-            p = self.bin(BOp::Add, q, cc, tag);
-        }
-        let one = self.kf(1.0, tag);
-        let q = self.bin(BOp::Mul, p, s, tag);
-        self.bin(BOp::Add, q, one, tag)
-    }
-
     /// `trunc x`: toward zero. The IR's cast to `i32` truncates (the SFPU's
     /// `SFPCAST`), so `(f32)(i32)x` is the answer wherever the integer cast is
     /// exact. Outside that range the value is already integral, and a `NaN` is
     /// not a value to round: both pass through unchanged.
-    fn trunc(&mut self, x: OpId) -> OpId {
+    /// `dtype` is the value's own: the constants and the `i32` round trip come
+    /// back at it, so a bf16 tile only meets bf16 operands (`select` and the
+    /// comparisons take one dtype), and a constant is the bf16 the lane reads.
+    fn trunc(&mut self, x: OpId, dtype: DType) -> OpId {
         let i = self.cast(x, DType::I32, "trunc_i");
-        let t = self.cast(i, DType::F32, "trunc_f");
+        let t = self.cast(i, dtype, "trunc_f");
         let abs = self.un(UOp::Abs, x, "trunc_abs");
         let big = self.kf(2_147_483_648.0, "trunc_big");
+        let big = self.at(big, dtype, "trunc_big");
         let over = self.bin(BOp::Cmpge, abs, big, "trunc_over");
         let nan = self.bin(BOp::NotEq, x, x, "trunc_nan");
         let pass = self.bin(BOp::Or, over, nan, "trunc_pass");
@@ -221,178 +184,27 @@ impl Build<'_> {
     /// `floor x = trunc x` less one when `x` is negative and not integral.
     /// `trunc` already let the non-finite values through, so `x - trunc x` is
     /// zero there and the adjustment never fires.
-    fn floor(&mut self, x: OpId) -> OpId {
-        let t = self.trunc(x);
+    fn floor(&mut self, x: OpId, dtype: DType) -> OpId {
+        let t = self.trunc(x, dtype);
         let frac = self.bin(BOp::Sub, x, t, "floor_frac");
         let zero = self.kf(0.0, "floor_zero");
+        let zero = self.at(zero, dtype, "floor_zero");
         let down = self.bin(BOp::Cmplt, frac, zero, "floor_down");
         let one = self.kf(1.0, "floor_one");
+        let one = self.at(one, dtype, "floor_one");
         let less = self.bin(BOp::Sub, t, one, "floor_less");
         self.select(down, less, t, "floor")
     }
 
-    /// `log2 x` by tt-metal's `calculate_log_body` (Norbert Juffa's `logf`),
-    /// zyx's body: the exponent falls out of `bits(x) - bits(0.75)` with the
-    /// mantissa masked off, leaving `x = m 2^k` with `m` in `[0.75, 1.5)`;
-    /// `log1p(m - 1)` is the LLK's shared degree-9 polynomial, and
-    /// `log2 x = k + log2(m)` folds the `ln 2`/`log2 e` round trip into one
-    /// multiply. The specials (`-inf`/`NaN` inputs) are dropped, the same ML
-    /// approximation `tt_exp2` takes.
-    fn log2(&mut self, x: OpId) -> OpId {
-        let bits = self.bitcast(x, DType::I32, "log2_bits");
-        let c75 = self.ki(0x3f40_0000, "log2_c75");
-        let e = self.bin(BOp::Sub, bits, c75, "log2_e");
-        let emask = self.ki(0xff80_0000, "log2_emask");
-        let e = self.bin(BOp::BitAnd, e, emask, "log2_e");
-        let m = self.bin(BOp::Sub, bits, e, "log2_m");
-        let m = self.bitcast(m, DType::F32, "log2_m");
-        let one = self.kf(1.0, "log2_one");
-        let m = self.bin(BOp::Sub, m, one, "log2_m");
-        let s = self.bin(BOp::Mul, m, m, "log2_s");
-        let mut r = self.kf(f32::from_bits(0xbd49_6000), "log2_r");
-        for c in [
-            0x3ddc_2000u32,
-            0xbe06_2000,
-            0x3e13_a000,
-            0xbe2a_8000,
-            0x3e4c_c000,
-            0xbe80_000d,
-            0x3eaa_aab9,
-            0xbf00_0000,
-        ] {
-            let cc = self.kf(f32::from_bits(c), "log2_c");
-            let p = self.bin(BOp::Mul, r, m, "log2_p");
-            r = self.bin(BOp::Add, p, cc, "log2_r");
-        }
-        let r = self.bin(BOp::Mul, r, s, "log2_r");
-        let r = self.bin(BOp::Add, r, m, "log2_r");
-        // `e` is `k << 23`, so `e * 2^-23` is exactly `k`.
-        let ef = self.cast(e, DType::F32, "log2_k");
-        let two_m23 = self.kf(f32::from_bits(0x3400_0000), "log2_two_m23");
-        let kf = self.bin(BOp::Mul, ef, two_m23, "log2_k");
-        let log2e = self.kf(std::f32::consts::LOG2_E, "log2_log2e");
-        let rl = self.bin(BOp::Mul, r, log2e, "log2_rl");
-        self.bin(BOp::Add, kf, rl, "log2_out")
-    }
-
-    /// `sin x` / `cos x`: the classical float reduction (`n = round(x 2/pi)`
-    /// by the magic constant, a two-limb `pi/2` so `|r| <= pi/4`) and a
-    /// five-term Taylor core, with the quadrant from `q = n & 3` — its low bit
-    /// picks `sin` or `cos`, `q >> 1` (for cosine `((q + 1) >> 1) & 1`) flips
-    /// the sign. zyx's `tt_sin_cos`.
-    fn sin_cos(&mut self, x: OpId, cos: bool) -> OpId {
-        let pio2_hi = f32::from_bits((std::f64::consts::FRAC_PI_2 as f32).to_bits() & !0xfff);
-        let pio2_lo = (std::f64::consts::FRAC_PI_2 - f64::from(pio2_hi)) as f32;
-        let magic = self.kf(12_582_912.0, "trig_magic");
-        let inv_pio2 = self.kf(std::f32::consts::FRAC_2_PI, "trig_inv_pio2");
-        let hi = self.kf(pio2_hi, "trig_pio2_hi");
-        let lo = self.kf(pio2_lo, "trig_pio2_lo");
-        let t = self.bin(BOp::Mul, x, inv_pio2, "trig_t");
-        let t = self.bin(BOp::Add, t, magic, "trig_t");
-        let nf = self.bin(BOp::Sub, t, magic, "trig_nf");
-        let n = self.cast(nf, DType::I32, "trig_n");
-        let a = self.bin(BOp::Mul, nf, hi, "trig_a");
-        let r = self.bin(BOp::Sub, x, a, "trig_r");
-        let b = self.bin(BOp::Mul, nf, lo, "trig_b");
-        let r = self.bin(BOp::Sub, r, b, "trig_r");
-        let s = self.bin(BOp::Mul, r, r, "trig_s");
-        let sin_core = self.horner(
-            s,
-            &[
-                -1.0 / 6.0,
-                1.0 / 120.0,
-                -1.0 / 5040.0,
-                1.0 / 362_880.0,
-                -1.0 / 39_916_800.0,
-            ],
-            "trig_sin",
-        );
-        let cos_core = self.horner(
-            s,
-            &[
-                -0.5,
-                1.0 / 24.0,
-                -1.0 / 720.0,
-                1.0 / 40_320.0,
-                -1.0 / 3_628_800.0,
-            ],
-            "trig_cos",
-        );
-        let sin_r = self.bin(BOp::Mul, r, sin_core, "trig_sin_r");
-        // `q`'s low bit picks the core, `q >> 1` the sign.
-        let three = self.ki(3, "trig_three");
-        let one_i = self.ki(1, "trig_one_i");
-        let zero_i = self.ki(0, "trig_zero_i");
-        let q = self.bin(BOp::BitAnd, n, three, "trig_q");
-        let low = self.bin(BOp::BitAnd, q, one_i, "trig_low");
-        let odd = self.bin(BOp::NotEq, low, zero_i, "trig_odd");
-        let neg = if cos {
-            let q1 = self.bin(BOp::Add, q, one_i, "trig_q1");
-            let half = self.bin(BOp::BitShiftRight, q1, one_i, "trig_half");
-            let bit = self.bin(BOp::BitAnd, half, one_i, "trig_bit");
-            self.bin(BOp::NotEq, bit, zero_i, "trig_neg")
+    /// A constant at `dtype`: a `cast` of a constant is the conversion it
+    /// names, and the lane reads the result's image (a bf16 constant is the
+    /// truncation of the literal, zyx's `bf16::from_f32`).
+    fn at(&mut self, constant: OpId, dtype: DType, tag: &str) -> OpId {
+        if dtype == DType::F32 {
+            constant
         } else {
-            let half = self.bin(BOp::BitShiftRight, q, one_i, "trig_half");
-            let bit = self.bin(BOp::BitAnd, half, one_i, "trig_bit");
-            self.bin(BOp::NotEq, bit, zero_i, "trig_neg")
-        };
-        let (odd_core, even_core) = if cos {
-            (sin_r, cos_core)
-        } else {
-            (cos_core, sin_r)
-        };
-        let base = self.select(odd, odd_core, even_core, "trig_base");
-        let minus_one = self.kf(-1.0, "trig_minus_one");
-        let flipped = self.bin(BOp::Mul, base, minus_one, "trig_flipped");
-        self.select(neg, flipped, base, "trig_out")
-    }
-
-    /// `1/y` by tt-metal's `_sfpu_reciprocal_` (`ckernel_sfpu_recip.h`): a
-    /// quadratic estimate over the mantissa scaled to `[1, 2)`, `steps` Newton
-    /// iterations (`t = 1 - x y; y = y + y t`), then the exponent restored with
-    /// `~bits(y)`'s field and the sign copied from the input.
-    fn reciprocal(&mut self, y: OpId, steps: usize) -> OpId {
-        let bits = self.bitcast(y, DType::I32, "recip_bits");
-        // `setman(-1.0, y)`: the sign and exponent of `-1.0`, the mantissa of
-        // the input, which makes the value negative and scales it to `[1, 2)`.
-        let mant = self.ki(0x007f_ffff, "recip_mant");
-        let m = self.bin(BOp::BitAnd, bits, mant, "recip_mant");
-        let neg_one = self.ki(0xbf80_0000, "recip_neg_one");
-        let neg_bits = self.bin(BOp::BitOr, m, neg_one, "recip_neg_bits");
-        let neg = self.bitcast(neg_bits, DType::F32, "recip_neg");
-        // The quadratic estimate `k2 - k1 x + k0 x^2`.
-        let k0 = self.kf(0.323_232_501_745_224, "recip_k0");
-        let k1 = self.kf(1.454_545_974_731_445_3, "recip_k1");
-        let k2 = self.kf(2.121_212_482_452_392_6, "recip_k2");
-        let p = self.bin(BOp::Mul, k0, neg, "recip_p");
-        let mut est = self.bin(BOp::Add, k1, p, "recip_est");
-        let p = self.bin(BOp::Mul, est, neg, "recip_p");
-        est = self.bin(BOp::Add, k2, p, "recip_est");
-        // `scale = ~bits(y)` with the mantissa cleared, halved.
-        let not = self.un(UOp::BitNot, bits, "recip_not");
-        let emask = self.ki(0xff80_0000, "recip_emask");
-        let sbits = self.bin(BOp::BitAnd, not, emask, "recip_scale");
-        let scale = self.bitcast(sbits, DType::F32, "recip_scale");
-        let half = self.kf(0.5, "recip_half");
-        let scale = self.bin(BOp::Mul, scale, half, "recip_scale");
-        let one = self.kf(1.0, "recip_one");
-        // `t = 1 + neg y` is `1 - x y` with the sign folded into `neg`.
-        for _ in 0..steps.max(1) {
-            let ny = self.bin(BOp::Mul, neg, est, "recip_ny");
-            let t = self.bin(BOp::Add, one, ny, "recip_t");
-            let yt = self.bin(BOp::Mul, est, t, "recip_yt");
-            est = self.bin(BOp::Add, est, yt, "recip_est");
+            self.cast(constant, dtype, tag)
         }
-        let est = self.bin(BOp::Mul, est, scale, "recip_scaled");
-        // `copysgn(est, y)`: the sign comes from the input, the rest from the
-        // estimate.
-        let ebits = self.bitcast(est, DType::I32, "recip_est_bits");
-        let abs_mask = self.ki(0x7fff_ffff, "recip_abs_mask");
-        let mag = self.bin(BOp::BitAnd, ebits, abs_mask, "recip_mag");
-        let sign_mask = self.ki(0x8000_0000, "recip_sign_mask");
-        let sign = self.bin(BOp::BitAnd, bits, sign_mask, "recip_sign");
-        let signed = self.bin(BOp::BitOr, mag, sign, "recip_signed");
-        self.bitcast(signed, DType::F32, "recip_out")
     }
 
     /// Copy an op unchanged, with its operands remapped. A value *is* its
@@ -428,19 +240,25 @@ copy 32,32 %out [0] = %bo [0]
 ";
 
     #[test]
-    fn log2_leaves_no_transcendental_behind() {
+    fn the_transcendentals_stay_ops_for_the_lane_bodies() {
+        // `log2`, `sin`, `cos` and `reciprocal` are lane bodies in `lower`
+        // now; `pow`/`div`/`sqrt` are the compositions the pass still writes.
         let k = Kernel::parse(LOG2).expect("the program parses");
         let out = unfold(&k).expect("the unfold runs");
         out.verify().expect("the unfolded program verifies");
         assert!(
-            !out.ops().any(|(_, op)| matches!(
-                op,
-                Op::Unary {
-                    op: UOp::Log2 | UOp::Sin | UOp::Cos,
-                    ..
-                }
-            )),
-            "the unfolded program still has a transcendental"
+            out.ops()
+                .any(|(_, op)| matches!(op, Op::Unary { op: UOp::Log2, .. })),
+            "log2 must survive the unfold as the lane body's op"
+        );
+        let sqrt = LOG2.replace("%r = log2 %x", "%r = sqrt %x");
+        let k = Kernel::parse(&sqrt).expect("the sqrt program parses");
+        let out = unfold(&k).expect("the unfold runs");
+        out.verify().expect("the unfolded sqrt verifies");
+        assert!(
+            !out.ops()
+                .any(|(_, op)| matches!(op, Op::Unary { op: UOp::Sqrt, .. })),
+            "sqrt is `rsqrt` then `reciprocal`"
         );
     }
 }

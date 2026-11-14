@@ -440,11 +440,14 @@ pub enum ttStatus {
     /// pool is a free list with no spill slot — a role's program has no frame —
     /// so a deeper expression is refused rather than reusing a live register.
     TT_ERROR_REGISTERS_EXHAUSTED = 179,
-    /// A 32-bit `Dst` is about to be packed into a `bf16` page. The packer does
-    /// that conversion in hardware (`pack_fmt_conv_mode=0x105`) and tt-metal's
-    /// kernels use it, but `ttsim` exits with `UnimplementedFunctionality`, so
-    /// nothing in this tree can run the result: refused until the driver link
-    /// can exercise it.
+    /// A 32-bit `Dst` is packed into a `bf16` page.
+    ///
+    /// **Retired, no longer produced (2026-11-14):** the packer's early
+    /// conversion is written now (`pack_fmt_conv_mode=0x105`, tt-metal's
+    /// `is_packer_to_L1_early_conversion_supported`: `Float32 -> Float16_b`), so
+    /// the program compiles and the silicon path exists. `ttsim` still refuses
+    /// to model the conversion, so a launch aborts there; the code stays because
+    /// ABI v1's error table publishes it.
     TT_TODO_PACK_F32_TO_BF16 = 180,
 
     // -- Remaining unimplemented forms -----------------------------------------

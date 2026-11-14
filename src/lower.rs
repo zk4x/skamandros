@@ -884,6 +884,33 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     }
                     continue;
                 }
+                if op == UOp::Log2 {
+                    let mut body = Vec::new();
+                    log2_body(&mut body, src, out, &rows, la, dtype);
+                    for op in body {
+                        m.push(Core::Math, op);
+                    }
+                    continue;
+                }
+                if op == UOp::Sin || op == UOp::Cos {
+                    let mut body = Vec::new();
+                    sin_cos_body(&mut body, src, out, &rows, la, op == UOp::Cos, dtype)?;
+                    for op in body {
+                        m.push(Core::Math, op);
+                    }
+                    continue;
+                }
+                if op == UOp::Reciprocal {
+                    // One Newton step per datum width: a bf16 value carries
+                    // seven mantissa bits, so the quadratic estimate needs one.
+                    let steps = usize::from(types.of(a).dtype != crate::ir::DType::Bf16) + 1;
+                    let mut body = Vec::new();
+                    reciprocal_body(&mut body, src, out, &rows, la, steps, dtype);
+                    for op in body {
+                        m.push(Core::Math, op);
+                    }
+                    continue;
+                }
                 let sfp = unary(op, at)?;
                 for row in rows {
                     m.push(
@@ -1758,110 +1785,187 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                         // The low halves are saved in `SrcA` first: writing the
                         // high halves zeroes them in `Dst`, exactly as
                         // tt-metal's `transpose_dest_32b` orders it.
-                        m.push(
-                            Core::Math,
-                            thread_word(&[(thread::DISABLE_IMPLIED_SRCA_FMT_Base, 1)])?,
-                        );
-                        m.push(
-                            Core::Math,
-                            MirOp::SrcAFormat {
-                                dtype: crate::ir::DType::F32,
-                            },
-                        );
-                        m.push(
-                            Core::Math,
-                            MirOp::AluAccCtrl {
-                                fp32: true,
-                                zero_flag_src: true,
-                            },
-                        );
-                        // The transposed low halves, parked in `SrcA` rows
-                        // 0..15.
-                        m.push(
-                            Core::Math,
-                            MirOp::Movd2b {
-                                use_dst32b_lo: true,
-                                src_row: 16,
-                                addr_mod: 0,
-                                move4_rows: false,
-                                reg: base,
-                                at: dst_off,
-                            },
-                        );
-                        m.push(Core::Math, MirOp::Trnspsrcb);
-                        for chunk in 0..4u32 {
+                        if wide {
                             m.push(
                                 Core::Math,
-                                MirOp::Movb2a {
-                                    src_a_row: 4 * chunk,
-                                    addr_mod: 0,
-                                    move4_rows: true,
-                                    src_b_row: 16 + 4 * chunk,
+                                thread_word(&[(thread::DISABLE_IMPLIED_SRCA_FMT_Base, 1)])?,
+                            );
+                            m.push(
+                                Core::Math,
+                                MirOp::SrcAFormat {
+                                    dtype: crate::ir::DType::F32,
                                 },
                             );
-                        }
-                        // The high halves, back into the `Dst` column.
-                        m.push(
-                            Core::Math,
-                            MirOp::Movd2b {
-                                use_dst32b_lo: false,
-                                src_row: 16,
-                                addr_mod: 0,
-                                move4_rows: false,
-                                reg: base,
-                                at: dst_off,
-                            },
-                        );
-                        m.push(Core::Math, MirOp::Trnspsrcb);
-                        m.push(
-                            Core::Math,
-                            MirOp::Movd2b {
-                                use_dst32b_lo: false,
-                                src_row: 16,
-                                addr_mod: 0,
-                                move4_rows: false,
-                                reg: base,
-                                at: dst_off,
-                            },
-                        );
-                        for chunk in 0..4u32 {
                             m.push(
                                 Core::Math,
-                                MirOp::Movb2d {
-                                    use_dst32b_lo: false,
-                                    src_row: 16 + 4 * chunk,
-                                    addr_mod: 0,
-                                    move4_rows: true,
-                                    reg: base,
-                                    at: dst_off + 4 * chunk,
+                                MirOp::AluAccCtrl {
+                                    fp32: true,
+                                    zero_flag_src: true,
                                 },
                             );
-                        }
-                        // The low halves, restored from the parked column.
-                        for half in 0..2u32 {
+                            // The transposed low halves, parked in `SrcA` rows
+                            // 0..15.
                             m.push(
                                 Core::Math,
-                                MirOp::Mova2d {
+                                MirOp::Movd2b {
                                     use_dst32b_lo: true,
-                                    src_row: 8 * half,
+                                    src_row: 16,
                                     addr_mod: 0,
-                                    move8_rows: true,
+                                    move4_rows: false,
                                     reg: base,
-                                    at: dst_off + 8 * half,
+                                    at: dst_off,
                                 },
                             );
+                            m.push(Core::Math, MirOp::Trnspsrcb);
+                            for chunk in 0..4u32 {
+                                m.push(
+                                    Core::Math,
+                                    MirOp::Movb2a {
+                                        src_a_row: 4 * chunk,
+                                        addr_mod: 0,
+                                        move4_rows: true,
+                                        src_b_row: 16 + 4 * chunk,
+                                    },
+                                );
+                            }
+                            // The high halves, back into the `Dst` column.
+                            m.push(
+                                Core::Math,
+                                MirOp::Movd2b {
+                                    use_dst32b_lo: false,
+                                    src_row: 16,
+                                    addr_mod: 0,
+                                    move4_rows: false,
+                                    reg: base,
+                                    at: dst_off,
+                                },
+                            );
+                            m.push(Core::Math, MirOp::Trnspsrcb);
+                            m.push(
+                                Core::Math,
+                                MirOp::Movd2b {
+                                    use_dst32b_lo: false,
+                                    src_row: 16,
+                                    addr_mod: 0,
+                                    move4_rows: false,
+                                    reg: base,
+                                    at: dst_off,
+                                },
+                            );
+                            for chunk in 0..4u32 {
+                                m.push(
+                                    Core::Math,
+                                    MirOp::Movb2d {
+                                        use_dst32b_lo: false,
+                                        src_row: 16 + 4 * chunk,
+                                        addr_mod: 0,
+                                        move4_rows: true,
+                                        reg: base,
+                                        at: dst_off + 4 * chunk,
+                                    },
+                                );
+                            }
+                            // The low halves, restored from the parked column.
+                            for half in 0..2u32 {
+                                m.push(
+                                    Core::Math,
+                                    MirOp::Mova2d {
+                                        use_dst32b_lo: true,
+                                        src_row: 8 * half,
+                                        addr_mod: 0,
+                                        move8_rows: true,
+                                        reg: base,
+                                        at: dst_off + 8 * half,
+                                    },
+                                );
+                            }
+                            m.push(
+                                Core::Math,
+                                MirOp::AluAccCtrl {
+                                    fp32: true,
+                                    zero_flag_src: false,
+                                },
+                            );
+                            m.push(
+                                Core::Math,
+                                thread_word(&[(thread::DISABLE_IMPLIED_SRCA_FMT_Base, 0)])?,
+                            );
+                        } else {
+                            // `reduce_row_perform_transpose<false>`, the arm
+                            // tt-lang takes on Blackhole (full-fp32 row reduce
+                            // is unavailable there, tt-metal #47311): a 16-bit
+                            // `Dst` datum is one `SrcB` datum, so the fold's
+                            // row is moved whole, transposed, and added back
+                            // over a zeroed `SrcA` — no half split and no
+                            // format switch.
+                            m.push(
+                                Core::Math,
+                                MirOp::Movd2b {
+                                    use_dst32b_lo: false,
+                                    src_row: 16,
+                                    addr_mod: 0,
+                                    move4_rows: false,
+                                    reg: base,
+                                    at: dst_off,
+                                },
+                            );
+                            m.push(Core::Math, MirOp::Trnspsrcb);
+                            // tt-metal moves the row again after the transpose
+                            // (its multi-tile accumulation). Row 16's column 0
+                            // is the same datum before and after the move, and
+                            // the pack keeps column 0, so the fold's values
+                            // survive.
+                            m.push(
+                                Core::Math,
+                                MirOp::Movd2b {
+                                    use_dst32b_lo: false,
+                                    src_row: 16,
+                                    addr_mod: 0,
+                                    move4_rows: false,
+                                    reg: base,
+                                    at: dst_off,
+                                },
+                            );
+                            // The two `SETRWC(CR_B, +8)`s: the transposed block
+                            // is `SrcB` rows 16..31, which is where the adds
+                            // read from. A counter value is four bits, so the
+                            // increment instruction is what reaches 16.
+                            for _ in 0..2 {
+                                m.push(
+                                    Core::Math,
+                                    MirOp::Incrwc {
+                                        src_a: 0,
+                                        src_b: 8,
+                                        dst: 0,
+                                    },
+                                );
+                            }
+                            m.push(
+                                Core::Math,
+                                MirOp::Zerosrc {
+                                    zero_val: false,
+                                    write_mode: true,
+                                    bank_mask: false,
+                                    clear_src_b: false,
+                                    clear_src_a: true,
+                                },
+                            );
+                            // Two eight-row adds over the zeroed `SrcA` copy the
+                            // transposed face; `ADDR_MOD_2` steps `SrcB` and
+                            // `Dst` by eight rows.
+                            for _ in 0..2 {
+                                m.push(
+                                    Core::Math,
+                                    MirOp::Elw {
+                                        op: ElwOp::Add,
+                                        bcast: Bcast::None,
+                                        addr_mod: 2,
+                                        reg: base,
+                                        at: dst_off,
+                                    },
+                                );
+                            }
                         }
-                        m.push(
-                            Core::Math,
-                            MirOp::AluAccCtrl {
-                                fp32: true,
-                                zero_flag_src: false,
-                            },
-                        );
-                        m.push(
-                            Core::Math,
-                            thread_word(&[(thread::DISABLE_IMPLIED_SRCA_FMT_Base, 0)])?,
-                        );
                         // `SETRWC(CLR_AB, 0, 0, 0, 0, SET_BD)`: hand both banks
                         // back before the next pair unpacks.
                         m.push(
@@ -2262,6 +2366,11 @@ fn fpu_broadcast(
                 match bcast {
                     Bcast::Col => 8u16,
                     Bcast::Row | Bcast::Scalar => 0,
+                    Bcast::None => {
+                        return Err(crate::status::internal_bug(
+                            "lower: the FPU broadcast has no broadcast mode",
+                        ));
+                    }
                 },
             ),
             (thread::ADDR_MOD_AB_SEC0_SrcBClear, 0),
@@ -2356,6 +2465,11 @@ fn fpu_broadcast(
             Bcast::Row => face & 1,
             Bcast::Col => face & !1,
             Bcast::Scalar => 0,
+            Bcast::None => {
+                return Err(crate::status::internal_bug(
+                    "lower: the FPU broadcast has no broadcast mode",
+                ));
+            }
         };
         m.push(
             Core::Unpack,
@@ -3308,6 +3422,610 @@ fn rsqrt_body(
         sfp_select(role, LReg(7), LReg(6), LReg(1), LReg(3));
         role.push(MirOp::Sfpstore {
             lreg: LReg(3),
+            reg: out,
+            at: row,
+            dtype,
+        });
+    }
+    Ok(())
+}
+
+/// `1/y` in the lane: `src/unfold.rs`'s `reciprocal` step for step. Its
+/// `bitcast` to `i32` is the lane word itself here, so the body is one
+/// sequence for every dtype — a bf16 datum is widened by `SFPLOAD` and the
+/// result narrowed by `SFPSTORE`'s format.
+///
+/// `la` is the input and lane 1 the result; the other six lanes are scratch.
+fn reciprocal_body(
+    role: &mut Vec<MirOp>,
+    src: Dst,
+    out: Dst,
+    rows: &[u32],
+    la: LReg,
+    steps: usize,
+    dtype: crate::ir::DType,
+) {
+    const MANT: u32 = 0x007f_ffff;
+    const NEG_ONE: u32 = 0xbf80_0000;
+    const EMASK: u32 = 0xff80_0000;
+    const K0: f32 = 0.323_232_501_745_224;
+    const K1: f32 = 1.454_545_974_731_445_3;
+    const K2: f32 = 2.121_212_482_452_392_6;
+    const ABS: u32 = 0x7fff_ffff;
+    const SIGN: u32 = 0x8000_0000;
+    let (neg, tmp, est, scale, t) = (LReg(2), LReg(3), LReg(4), LReg(5), LReg(6));
+    debug_assert!(la.0 < 2, "the body's scratch lanes start at 2");
+    for &row in rows {
+        role.push(MirOp::Sfpload {
+            lreg: la,
+            reg: src,
+            at: row,
+            dtype,
+        });
+        // `setman(-1.0, y)`: the sign and exponent of `-1.0` with the input's
+        // mantissa, which is negative and scaled to `[1, 2)`.
+        role.push(MirOp::LaneConst {
+            lreg: tmp,
+            bits: MANT,
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::BitAnd,
+            a: la,
+            b: tmp,
+            d: neg,
+        });
+        role.push(MirOp::LaneConst {
+            lreg: tmp,
+            bits: NEG_ONE,
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::BitOr,
+            a: neg,
+            b: tmp,
+            d: neg,
+        });
+        // `scale = ~bits(y)` with the mantissa cleared, halved.
+        role.push(MirOp::UnarySfp {
+            op: UnarySfpOp::BitNot,
+            a: la,
+            d: scale,
+        });
+        role.push(MirOp::LaneConst {
+            lreg: tmp,
+            bits: EMASK,
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::BitAnd,
+            a: scale,
+            b: tmp,
+            d: scale,
+        });
+        role.push(MirOp::LaneConst {
+            lreg: tmp,
+            bits: 0.5f32.to_bits(),
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: scale,
+            b: tmp,
+            d: scale,
+        });
+        // The quadratic estimate, `k2 + (k1 + k0 neg) neg`.
+        role.push(MirOp::LaneConst {
+            lreg: tmp,
+            bits: K0.to_bits(),
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: tmp,
+            b: neg,
+            d: t,
+        });
+        role.push(MirOp::LaneConst {
+            lreg: tmp,
+            bits: K1.to_bits(),
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Add,
+            a: tmp,
+            b: t,
+            d: est,
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: est,
+            b: neg,
+            d: t,
+        });
+        role.push(MirOp::LaneConst {
+            lreg: tmp,
+            bits: K2.to_bits(),
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Add,
+            a: tmp,
+            b: t,
+            d: est,
+        });
+        // `t = 1 + neg est; est += est t`, one step per datum width.
+        for _ in 0..steps.max(1) {
+            role.push(MirOp::BinarySfp {
+                op: BinarySfpOp::Mul,
+                a: neg,
+                b: est,
+                d: t,
+            });
+            role.push(MirOp::LaneConst {
+                lreg: tmp,
+                bits: 1.0f32.to_bits(),
+            });
+            role.push(MirOp::BinarySfp {
+                op: BinarySfpOp::Add,
+                a: tmp,
+                b: t,
+                d: t,
+            });
+            role.push(MirOp::BinarySfp {
+                op: BinarySfpOp::Mul,
+                a: est,
+                b: t,
+                d: t,
+            });
+            role.push(MirOp::BinarySfp {
+                op: BinarySfpOp::Add,
+                a: est,
+                b: t,
+                d: est,
+            });
+        }
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: est,
+            b: scale,
+            d: est,
+        });
+        // `copysgn(est, y)`.
+        role.push(MirOp::LaneConst {
+            lreg: tmp,
+            bits: ABS,
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::BitAnd,
+            a: est,
+            b: tmp,
+            d: est,
+        });
+        role.push(MirOp::LaneConst {
+            lreg: tmp,
+            bits: SIGN,
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::BitAnd,
+            a: la,
+            b: tmp,
+            d: t,
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::BitOr,
+            a: est,
+            b: t,
+            d: est,
+        });
+        role.push(MirOp::Sfpstore {
+            lreg: est,
+            reg: out,
+            at: row,
+            dtype,
+        });
+    }
+}
+
+/// `log2 x` in the lane: `src/unfold.rs`'s body (Juffa's reduction, the LLK's
+/// degree-9 `log1p` chain, one `log2 e` multiply). The exponent/mantissa split
+/// is the lane word's own fields, so no `bitcast` to `i32` has to name a width.
+fn log2_body(
+    role: &mut Vec<MirOp>,
+    src: Dst,
+    out: Dst,
+    rows: &[u32],
+    la: LReg,
+    dtype: crate::ir::DType,
+) {
+    const C75: u32 = 0x3f40_0000;
+    const EMASK: u32 = 0xff80_0000;
+    const TWO_M23: u32 = 0x3400_0000;
+    const COEFFS: [u32; 8] = [
+        0x3ddc_2000,
+        0xbe06_2000,
+        0x3e13_a000,
+        0xbe2a_8000,
+        0x3e4c_c000,
+        0xbe80_000d,
+        0x3eaa_aab9,
+        0xbf00_0000,
+    ];
+    let (e, m, s, r, p, cc) = (LReg(2), LReg(3), LReg(4), LReg(5), LReg(6), LReg(7));
+    debug_assert!(la.0 < 2, "the body's scratch lanes start at 2");
+    for &row in rows {
+        role.push(MirOp::Sfpload {
+            lreg: la,
+            reg: src,
+            at: row,
+            dtype,
+        });
+        // `e = (bits(x) - bits(0.75)) & 0xff80_0000` is `k << 23`, and
+        // `m = bits(x) - e` is the mantissa as a float in `[0.75, 1.5)`.
+        role.push(MirOp::LaneConst {
+            lreg: cc,
+            bits: C75,
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::ISub,
+            a: la,
+            b: cc,
+            d: e,
+        });
+        role.push(MirOp::LaneConst {
+            lreg: cc,
+            bits: EMASK,
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::BitAnd,
+            a: e,
+            b: cc,
+            d: e,
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::ISub,
+            a: la,
+            b: e,
+            d: m,
+        });
+        role.push(MirOp::LaneConst {
+            lreg: cc,
+            bits: 1.0f32.to_bits(),
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Sub,
+            a: m,
+            b: cc,
+            d: m,
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: m,
+            b: m,
+            d: s,
+        });
+        role.push(MirOp::LaneConst {
+            lreg: r,
+            bits: 0xbd49_6000,
+        });
+        for c in COEFFS {
+            role.push(MirOp::BinarySfp {
+                op: BinarySfpOp::Mul,
+                a: r,
+                b: m,
+                d: p,
+            });
+            role.push(MirOp::LaneConst { lreg: cc, bits: c });
+            role.push(MirOp::BinarySfp {
+                op: BinarySfpOp::Add,
+                a: p,
+                b: cc,
+                d: r,
+            });
+        }
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: r,
+            b: s,
+            d: r,
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Add,
+            a: r,
+            b: m,
+            d: r,
+        });
+        // `e * 2^-23` is exactly `k`.
+        for op in
+            cast_lanes(crate::ir::DType::I32, crate::ir::DType::F32, e, cc, p).unwrap_or_default()
+        {
+            role.push(op);
+        }
+        role.push(MirOp::LaneConst {
+            lreg: p,
+            bits: TWO_M23,
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: cc,
+            b: p,
+            d: cc,
+        });
+        role.push(MirOp::LaneConst {
+            lreg: p,
+            bits: std::f32::consts::LOG2_E.to_bits(),
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: r,
+            b: p,
+            d: r,
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Add,
+            a: cc,
+            b: r,
+            d: cc,
+        });
+        role.push(MirOp::Sfpstore {
+            lreg: cc,
+            reg: out,
+            at: row,
+            dtype,
+        });
+    }
+}
+
+/// `sin x`/`cos x` in the lane: `src/unfold.rs`'s reduction and Taylor cores,
+/// with the quadrant taken from the integer `n`. The `i32` casts it spells are
+/// `SFPCAST`s on the lane word, so the body is one sequence for every dtype.
+///
+/// `la` is the input and lane 1 the result; the other six lanes are scratch.
+fn sin_cos_body(
+    role: &mut Vec<MirOp>,
+    src: Dst,
+    out: Dst,
+    rows: &[u32],
+    la: LReg,
+    cos: bool,
+    dtype: crate::ir::DType,
+) -> Result<(), ttStatus> {
+    const MAGIC: f32 = 12_582_912.0;
+    const SIN: [f32; 5] = [
+        -1.0 / 6.0,
+        1.0 / 120.0,
+        -1.0 / 5040.0,
+        1.0 / 362_880.0,
+        -1.0 / 39_916_800.0,
+    ];
+    const COS: [f32; 5] = [
+        -0.5,
+        1.0 / 24.0,
+        -1.0 / 720.0,
+        1.0 / 40_320.0,
+        -1.0 / 3_628_800.0,
+    ];
+    let pio2_hi = f32::from_bits((std::f64::consts::FRAC_PI_2 as f32).to_bits() & !0xfff);
+    let pio2_lo = (std::f64::consts::FRAC_PI_2 - f64::from(pio2_hi)) as f32;
+    let zero = LReg(tt_isa::sfpu::LREG_ZERO as u16);
+    let (n, nf, s, r, rest, tmp) = (LReg(2), LReg(3), LReg(4), LReg(5), LReg(6), LReg(7));
+    debug_assert!(la.0 < 2, "the body's scratch lanes start at 2");
+    for &row in rows {
+        role.push(MirOp::Sfpload {
+            lreg: la,
+            reg: src,
+            at: row,
+            dtype,
+        });
+        // `t = x 2/pi + magic`, `nf = t - magic`: `nf` is the rounded count.
+        role.push(MirOp::LaneConst {
+            lreg: tmp,
+            bits: std::f32::consts::FRAC_2_PI.to_bits(),
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: la,
+            b: tmp,
+            d: nf,
+        });
+        role.push(MirOp::LaneConst {
+            lreg: tmp,
+            bits: MAGIC.to_bits(),
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Add,
+            a: nf,
+            b: tmp,
+            d: nf,
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Sub,
+            a: nf,
+            b: tmp,
+            d: nf,
+        });
+        // `n = (i32)nf`, kept for the quadrant.
+        for op in cast_lanes(crate::ir::DType::F32, crate::ir::DType::I32, nf, n, rest)? {
+            role.push(op);
+        }
+        // `r = x - nf hi - nf lo`, the two-limb `pi/2` so `|r| <= pi/4`.
+        role.push(MirOp::LaneConst {
+            lreg: tmp,
+            bits: pio2_hi.to_bits(),
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: nf,
+            b: tmp,
+            d: rest,
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Sub,
+            a: la,
+            b: rest,
+            d: r,
+        });
+        role.push(MirOp::LaneConst {
+            lreg: tmp,
+            bits: pio2_lo.to_bits(),
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: nf,
+            b: tmp,
+            d: rest,
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Sub,
+            a: r,
+            b: rest,
+            d: r,
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: r,
+            b: r,
+            d: s,
+        });
+        // `sin_core` (`rest`), then `sin_r = r sin_core` back into `rest`.
+        role.push(MirOp::LaneConst {
+            lreg: rest,
+            bits: SIN[4].to_bits(),
+        });
+        for coeff in SIN[..4].iter().rev() {
+            role.push(MirOp::BinarySfp {
+                op: BinarySfpOp::Mul,
+                a: rest,
+                b: s,
+                d: tmp,
+            });
+            role.push(MirOp::LaneConst {
+                lreg: nf,
+                bits: coeff.to_bits(),
+            });
+            role.push(MirOp::BinarySfp {
+                op: BinarySfpOp::Add,
+                a: tmp,
+                b: nf,
+                d: rest,
+            });
+        }
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: rest,
+            b: s,
+            d: tmp,
+        });
+        role.push(MirOp::LaneConst {
+            lreg: nf,
+            bits: 1.0f32.to_bits(),
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Add,
+            a: tmp,
+            b: nf,
+            d: rest,
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: r,
+            b: rest,
+            d: rest,
+        });
+        // `cos_core` (`tmp`, with `la` as its scratch): `n` is still live here.
+        role.push(MirOp::LaneConst {
+            lreg: tmp,
+            bits: COS[4].to_bits(),
+        });
+        for coeff in COS[..4].iter().rev() {
+            role.push(MirOp::BinarySfp {
+                op: BinarySfpOp::Mul,
+                a: tmp,
+                b: s,
+                d: la,
+            });
+            role.push(MirOp::LaneConst {
+                lreg: nf,
+                bits: coeff.to_bits(),
+            });
+            role.push(MirOp::BinarySfp {
+                op: BinarySfpOp::Add,
+                a: la,
+                b: nf,
+                d: tmp,
+            });
+        }
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: tmp,
+            b: s,
+            d: la,
+        });
+        role.push(MirOp::LaneConst {
+            lreg: nf,
+            bits: 1.0f32.to_bits(),
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Add,
+            a: la,
+            b: nf,
+            d: tmp,
+        });
+        // The quadrant: `q = n & 3` in `r`, `low = q & 1` in `n`, `odd` in `nf`.
+        role.push(MirOp::LaneConst { lreg: nf, bits: 3 });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::BitAnd,
+            a: n,
+            b: nf,
+            d: r,
+        });
+        role.push(MirOp::LaneConst { lreg: nf, bits: 1 });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::BitAnd,
+            a: r,
+            b: nf,
+            d: n,
+        });
+        sfp_gt(role, n, zero, nf);
+        // `neg = ((q + cos) >> 1) & 1 != 0`, each `1` fresh: `SFPSHFT` consumes
+        // its amount lane, and `SFPIADD` moves one operand into its
+        // destination, so `q` is copied into `n` first rather than added in
+        // place.
+        if cos {
+            role.push(MirOp::LaneConst { lreg: la, bits: 1 });
+            role.push(MirOp::BinarySfp {
+                op: BinarySfpOp::IAdd,
+                a: r,
+                b: la,
+                d: n,
+            });
+        } else {
+            role.push(MirOp::SfpMov { a: r, d: n });
+        }
+        role.push(MirOp::LaneConst { lreg: la, bits: 1 });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Shr,
+            a: n,
+            b: la,
+            d: n,
+        });
+        role.push(MirOp::LaneConst { lreg: la, bits: 1 });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::BitAnd,
+            a: n,
+            b: la,
+            d: n,
+        });
+        sfp_gt(role, n, zero, n);
+        // `base = odd ? odd_core : even_core`, then `out = neg ? -base : base`.
+        let (odd_core, even_core) = if cos { (rest, tmp) } else { (tmp, rest) };
+        sfp_select(role, nf, odd_core, even_core, r);
+        role.push(MirOp::LaneConst {
+            lreg: la,
+            bits: (-1.0f32).to_bits(),
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a: r,
+            b: la,
+            d: s,
+        });
+        sfp_select(role, n, s, r, r);
+        role.push(MirOp::Sfpstore {
+            lreg: r,
             reg: out,
             at: row,
             dtype,
