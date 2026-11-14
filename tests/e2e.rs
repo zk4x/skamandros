@@ -31,8 +31,6 @@ fn device() -> MutexGuard<'static, ()> {
 type AbiVersion = unsafe extern "C" fn() -> u32;
 type Compile =
     unsafe extern "C" fn(*const c_char, usize, *mut *mut c_void, *mut *mut c_char) -> c_int;
-type ModuleLoad =
-    unsafe extern "C" fn(*const u8, usize, *mut *mut c_void, *mut *mut c_char) -> c_int;
 type ModuleUnload = unsafe extern "C" fn(*mut c_void, *mut *mut c_char) -> c_int;
 type Free = unsafe extern "C" fn(*mut c_void);
 type Init = unsafe extern "C" fn(*mut *mut c_char) -> c_int;
@@ -47,7 +45,6 @@ const TT_OK: c_int = 0;
 const TT_ERROR_ARGUMENT: c_int = 1;
 const TT_ERROR_MODULE: c_int = 3;
 const TT_ERROR_VALUE_UNDEFINED: c_int = 14;
-const TT_ERROR_NOT_TTIR: c_int = 10;
 const TT_ERROR_BF16_WIDEN: c_int = 153;
 const TT_TODO_PACK_F32_TO_BF16: c_int = 180;
 
@@ -125,20 +122,6 @@ copy 32,32 %b0 [0] = %in [0]
 copy 32,32 %out [0] = %b0 [0]
 ";
 
-/// The byte form of [`COPY`]: the shipping encoding, frozen.
-///
-/// A literal, not something this test builds: the crate is not linked here at
-/// all, so a real consumer of the `.so` can only hand it bytes it already has.
-/// A change to the encoding's version makes `ttModuleLoad` refuse this, which is
-/// the correct failure — regenerate the fixture.
-const COPY_TTIR: [u8; 128] = [
-    84, 84, 73, 82, 9, 0, 0, 0, 6, 0, 0, 0, 3, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 2, 0, 0, 0, 105,
-    110, 0, 1, 0, 0, 0, 0, 0, 4, 0, 0, 1, 3, 0, 0, 0, 111, 117, 116, 0, 1, 0, 0, 0, 0, 0, 4, 0, 0,
-    2, 2, 0, 0, 0, 98, 48, 0, 32, 0, 0, 0, 32, 0, 0, 0, 6, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 32, 0, 0, 0, 32, 0, 0, 0, 6, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 32, 0, 0, 0, 32, 0, 0, 0,
-];
-
 /// Read and clear the message a failed call left behind.
 fn take_error(free: &Symbol<Free>, err: *mut c_char) -> String {
     if err.is_null() {
@@ -159,7 +142,7 @@ fn the_so_compiles_a_program_through_the_c_abi() {
     let unload: Symbol<ModuleUnload> =
         unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
-    assert_eq!(unsafe { version() }, 2, "the ABI version");
+    assert_eq!(unsafe { version() }, 1, "the ABI version");
 
     let mut module: *mut c_void = std::ptr::null_mut();
     let mut err: *mut c_char = std::ptr::null_mut();
@@ -173,37 +156,6 @@ fn the_so_compiles_a_program_through_the_c_abi() {
         "unload: {}",
         take_error(&free, err)
     );
-}
-
-#[test]
-fn the_byte_form_compiles_through_the_c_abi() {
-    let lib = library();
-    let load: Symbol<ModuleLoad> = unsafe { lib.get(b"ttModuleLoad\0") }.expect("ttModuleLoad");
-    let unload: Symbol<ModuleUnload> =
-        unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
-    let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
-
-    // The fixture is the byte form of `COPY`; the compile is the `.so`'s.
-    let bytes = COPY_TTIR;
-    let mut module: *mut c_void = std::ptr::null_mut();
-    let mut err: *mut c_char = std::ptr::null_mut();
-    let code = unsafe { load(bytes.as_ptr(), bytes.len(), &mut module, &mut err) };
-    assert_eq!(code, TT_OK, "ttModuleLoad: {}", take_error(&free, err));
-    assert!(!module.is_null());
-    assert_eq!(
-        unsafe { unload(module, &mut err) },
-        TT_OK,
-        "unload: {}",
-        take_error(&free, err)
-    );
-
-    // Text is the other entry point's input, and is refused here.
-    let mut module: *mut c_void = std::ptr::null_mut();
-    let code = unsafe { load(COPY.as_ptr(), COPY.len(), &mut module, &mut err) };
-    assert_eq!(code, TT_ERROR_NOT_TTIR, "text is not the byte form");
-    assert!(module.is_null());
-    assert!(!err.is_null(), "there is a message");
-    let _ = take_error(&free, err);
 }
 
 #[test]

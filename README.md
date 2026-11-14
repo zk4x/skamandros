@@ -73,7 +73,7 @@ The build generates `skamandros.h` next to `libskamandros.so`, from the code
 that declares it: `ttCompile`, `ttMemAlloc`, `ttMemcpyH2D`, `ttMemcpyD2H`,
 `ttLaunch`, `ttModuleUnload`, `ttInit`, `ttRelease` and `ttFree`, each returning
 a `ttStatus` and writing a message the caller frees with `ttFree`. `ttAbiVersion`
-is 2.
+is 1. The text form is the only program form `ttCompile` reads.
 
 ## Status
 
@@ -84,11 +84,7 @@ over the whole grid (240 tiles, every datum checked).
 
 Open, in the order they block a release:
 
-- A hand-off race: two staged pages in one loop body and a one-page ring let a
-  page be refilled while the unpacker still reads it (rope's two looped tests).
-- `softmax` needs nine live `Dst`; the bank has eight.
-- `Kernel::from_bytes` is a `todo!()`, so `ttModuleLoad` panics across the ABI;
-  `param bool` and `buffer bool` do the same in the verifier.
+- `softmax` needs eleven live `Dst`; the bank has eight.
 - A `bf16` page out of a 32-bit `Dst` is refused as `TT_TODO_PACK_F32_TO_BF16`:
   the packer's conversion is built for silicon, but `ttsim` does not model it.
 - The hardware link is not written: this runs on `ttsim` only.

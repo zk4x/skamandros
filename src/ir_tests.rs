@@ -1,8 +1,8 @@
 // Copyright (C) 2026 zk4x
 // SPDX-License-Identifier: Apache-2.0
 
-//! The IR as a program format: the text form is the contract, the byte form is
-//! the shipping encoding, and the two are checked against each other.
+//! The IR as a program format: the text form is the contract, and it is the
+//! only form.
 
 use crate::compile;
 use crate::compile::ParamKind;
@@ -476,21 +476,22 @@ grid 1,1
     assert!(!m.reader.is_empty() && !m.writer.is_empty());
     assert!(m.cores.iter().all(|c| !c.is_empty()));
     // Both movers branch backwards: one body, run twice.
-    assert!(has_backward_branch(&m.reader), "the reader loops");
-    assert!(has_backward_branch(&m.writer), "the writer loops");
+    assert!(has_backward_jump(&m.reader), "the reader loops");
+    assert!(has_backward_jump(&m.writer), "the writer loops");
     for (role, words) in ["t0", "t1", "t2"].into_iter().zip(&m.cores) {
-        assert!(has_backward_branch(words), "{role} loops");
+        assert!(has_backward_jump(words), "{role} loops");
     }
 }
 
-/// A RISC-V `BRANCH` (opcode `0x63`) whose B-type immediate is negative, i.e.
-/// a branch back to an earlier word.
-fn has_backward_branch(words: &[u32]) -> bool {
+/// A RISC-V `JAL` (opcode `0x6f`) whose J-type immediate is negative: the
+/// back edge of a loop body. The edge is a `bgeu` over a long `jal` because a
+/// body can be larger than the +-4 KiB a B-type branch reaches.
+fn has_backward_jump(words: &[u32]) -> bool {
     words.iter().any(|word| {
-        word & 0x7f == 0x63 && {
-            // imm[12] is the sign bit.
-            let imm12 = (word >> 31) & 1;
-            imm12 == 1
+        word & 0x7f == 0x6f && {
+            // imm[20] is the sign bit, in the word's bit 31.
+            let imm20 = (word >> 31) & 1;
+            imm20 == 1
         }
     })
 }
@@ -517,10 +518,10 @@ grid 1,1
 ";
     let k = Kernel::parse(DYNAMIC).expect("the dynamic loop parses");
     let m = compile::compile(&k).expect("a dynamic loop is lowered");
-    assert!(has_backward_branch(&m.reader), "the reader loops");
-    assert!(has_backward_branch(&m.writer), "the writer loops");
+    assert!(has_backward_jump(&m.reader), "the reader loops");
+    assert!(has_backward_jump(&m.writer), "the writer loops");
     for (role, words) in ["t0", "t1", "t2"].into_iter().zip(&m.cores) {
-        assert!(has_backward_branch(words), "{role} loops");
+        assert!(has_backward_jump(words), "{role} loops");
     }
 }
 

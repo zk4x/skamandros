@@ -6,8 +6,8 @@
 //! Everything crosses as pointers, lengths and scalars. A call returns
 //! [`ttStatus`], and on failure writes a NUL-terminated message to the `err` out
 //! pointer, which the caller frees with [`ttFree`]. A compiled module is an
-//! opaque handle ([`ttModule`]): the caller never sees its bytes, only the
-//! pointer [`ttCompile`]/[`ttModuleLoad`] hands back and [`ttLaunch`] consumes.
+//! opaque handle ([`ttModule`]): the caller never sees its contents, only the
+//! pointer [`ttCompile`] hands back and [`ttLaunch`] consumes.
 //!
 //! # Errors
 //!
@@ -16,8 +16,8 @@
 //! * [`ttStatus::TT_ERROR_ARGUMENT`] -- a required pointer is null, a length is
 //!   zero, the parameter count is not the module's, or a null buffer was given a
 //!   nonzero length. Nothing was read or written.
-//! * [`ttStatus::TT_ERROR_PROGRAM`] -- the text or bytes are not a program this
-//!   compiler accepts. Nothing was done.
+//! * [`ttStatus::TT_ERROR_PROGRAM`] -- the text is not a program this compiler
+//!   accepts. Nothing was done.
 //! * [`ttStatus::TT_ERROR_MODULE`] -- the handle is not one this library handed
 //!   out, or it was already unloaded. Nothing was done.
 //! * [`ttStatus::TT_ERROR_UNSUPPORTED`] -- the program is valid and compiled, but
@@ -37,7 +37,7 @@ use crate::runtime;
 pub use crate::status::ttStatus;
 
 /// The ABI version this library implements.
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 1;
 
 /// A compiled module. Opaque: the pointer is the handle, and its contents are
 /// the library's.
@@ -78,6 +78,8 @@ pub extern "C" fn ttAbiVersion() -> u32 {
 
 /// Compile a program from its text form.
 ///
+/// The text is the only program form this library reads.
+///
 /// On success `*out` is a module handle and `*err` is null. On failure `*out` is
 /// null and the code says why.
 ///
@@ -115,47 +117,12 @@ pub unsafe extern "C" fn ttCompile(
     ttStatus::TT_OK
 }
 
-/// Compile a program from its byte form (`TTIR`).
-///
-/// Same contract as [`ttCompile`]; the input must be the byte form, not text.
-///
-/// # Safety
-///
-/// `bytes` must be readable for `len` bytes; `out` and `err` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ttModuleLoad(
-    bytes: *const u8,
-    len: usize,
-    out: *mut *mut ttModule,
-    err: *mut *mut c_char,
-) -> ttStatus {
-    clear(err);
-    if out.is_null() {
-        return fail(ttStatus::TT_ERROR_ARGUMENT, err);
-    }
-    unsafe { *out = std::ptr::null_mut() };
-    if bytes.is_null() || len == 0 {
-        return fail(ttStatus::TT_ERROR_ARGUMENT, err);
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(bytes, len) };
-    let kernel = match Kernel::from_bytes(bytes) {
-        Ok(k) => k,
-        Err(e) => return fail(e, err),
-    };
-    let module = match compile::compile(&kernel) {
-        Ok(m) => m,
-        Err(e) => return fail(e, err),
-    };
-    unsafe { *out = add_module(module) };
-    ttStatus::TT_OK
-}
-
 /// Drop a module this library handed out. A second unload of the same handle is
 /// [`ttStatus::TT_ERROR_MODULE`], never a double free.
 ///
 /// # Safety
 ///
-/// `module` must be a handle [`ttCompile`]/[`ttModuleLoad`] returned, or null.
+/// `module` must be a handle [`ttCompile`] returned, or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ttModuleUnload(module: *mut ttModule, err: *mut *mut c_char) -> ttStatus {
     clear(err);
@@ -355,7 +322,9 @@ fn clear(err: *mut *mut c_char) {
 fn fail(status: ttStatus, err: *mut *mut c_char) -> ttStatus {
     if !err.is_null() {
         let name = status.name().replace('\0', " ");
-        let msg = CString::new(name).expect("a variant name has no NUL");
+        let Ok(msg) = CString::new(name) else {
+            return crate::status::internal_bug("a status name still carried a NUL");
+        };
         unsafe { *err = msg.into_raw() };
     }
     status

@@ -23,7 +23,7 @@ use std::sync::Mutex;
 
 use crate::compile::Module;
 use crate::device::Device;
-use crate::ir::Error;
+use crate::status::ttStatus;
 use tt_isa::mailbox;
 use tt_isa::noc::NocCoord;
 use tt_isa::noc::niu::Niu;
@@ -51,7 +51,7 @@ const fn slot(index: u32) -> u32 {
 }
 
 /// Open the device. Idempotent; the simulator is initialized once per process.
-pub fn init() -> Result<(), Error> {
+pub fn init() -> Result<(), ttStatus> {
     let mut device = lock()?;
     if device.is_none() {
         *device = Some(Device::open()?);
@@ -61,23 +61,23 @@ pub fn init() -> Result<(), Error> {
 
 /// Close the device. DRAM allocations from this device are gone; a later
 /// [`init`] opens a fresh one over the same simulator.
-pub fn release() -> Result<(), Error> {
+pub fn release() -> Result<(), ttStatus> {
     *lock()? = None;
     Ok(())
 }
 
 /// Reserve `bytes` of DRAM and return its address.
-pub fn alloc(bytes: usize) -> Result<u64, Error> {
+pub fn alloc(bytes: usize) -> Result<u64, ttStatus> {
     with_device(|d| d.alloc_dram(bytes))
 }
 
 /// Copy host bytes into DRAM at `address`.
-pub fn h2d(address: u64, bytes: &[u8]) -> Result<(), Error> {
+pub fn h2d(address: u64, bytes: &[u8]) -> Result<(), ttStatus> {
     with_device(|d| d.dram_write(address, bytes))
 }
 
 /// Copy DRAM at `address` into host bytes.
-pub fn d2h(address: u64, out: &mut [u8]) -> Result<(), Error> {
+pub fn d2h(address: u64, out: &mut [u8]) -> Result<(), ttStatus> {
     with_device(|d| d.dram_read(address, out))
 }
 
@@ -91,21 +91,26 @@ pub fn d2h(address: u64, out: &mut [u8]) -> Result<(), Error> {
 /// parameter's word(s). A count that disagrees with the module is refused.
 /// Every failure is a [`ttStatus`] variant; there is no second error channel
 /// and no string error.
-pub fn launch(module: &Module, params: &[u64]) -> Result<(), Error> {
+pub fn launch(module: &Module, params: &[u64]) -> Result<(), ttStatus> {
     if module.params.len() != params.len() {
-        return Err(Error::TT_ERROR_ARGUMENT);
+        return Err(ttStatus::TT_ERROR_ARGUMENT);
     }
     let grid = resolve_grid(module, params)?;
     if module.reader.is_empty()
         && module.writer.is_empty()
         && module.cores.iter().all(Vec::is_empty)
     {
-        return Err(Error::TT_ERROR_UNSUPPORTED);
+        return Err(ttStatus::TT_ERROR_UNSUPPORTED);
     }
     with_device(|device| run(device, module, params, grid))
 }
 
-fn run(device: &mut Device, module: &Module, params: &[u64], grid: [u32; 2]) -> Result<(), Error> {
+fn run(
+    device: &mut Device,
+    module: &Module,
+    params: &[u64],
+    grid: [u32; 2],
+) -> Result<(), ttStatus> {
     let result = launch_steps(device, module, params, grid);
     if result.is_err() {
         // A failed launch is a status, not a wedged tile: stop the cores this
@@ -119,14 +124,14 @@ fn run(device: &mut Device, module: &Module, params: &[u64], grid: [u32; 2]) -> 
 
 /// The grid extent of one axis, from the launch's scalar arguments. Zero, a
 /// value beyond the part and a malformed expression are refused.
-fn resolve_grid(module: &Module, params: &[u64]) -> Result<[u32; 2], Error> {
+fn resolve_grid(module: &Module, params: &[u64]) -> Result<[u32; 2], ttStatus> {
     let mut grid = [0u32; 2];
     for (axis, term) in module.grid.iter().enumerate() {
         let value = grid_eval(term, module, params)?;
         grid[axis] = u32::try_from(value)
             .ok()
             .filter(|n| *n > 0)
-            .ok_or(Error::TT_ERROR_GRID)?;
+            .ok_or(ttStatus::TT_ERROR_GRID)?;
     }
     Ok(grid)
 }
@@ -135,7 +140,7 @@ fn grid_eval(
     term: &crate::compile::GridTerm,
     module: &Module,
     params: &[u64],
-) -> Result<i64, Error> {
+) -> Result<i64, ttStatus> {
     use crate::compile::GridTerm;
     use crate::ir::BOp;
     let value = match term {
@@ -143,9 +148,9 @@ fn grid_eval(
         GridTerm::Param(index) => {
             let index = *index as usize;
             if module.params.get(index) != Some(&crate::compile::ParamKind::Scalar) {
-                return Err(Error::TT_ERROR_GRID);
+                return Err(ttStatus::TT_ERROR_GRID);
             }
-            let word = *params.get(index).ok_or(Error::TT_ERROR_ARGUMENT)?;
+            let word = *params.get(index).ok_or(ttStatus::TT_ERROR_ARGUMENT)?;
             // A scalar is an `i32`: its low word, read as one.
             i64::from(word as u32 as i32)
         }
@@ -153,26 +158,26 @@ fn grid_eval(
             let a = grid_eval(a, module, params)?;
             let b = grid_eval(b, module, params)?;
             match op {
-                BOp::Add => a.checked_add(b).ok_or(Error::TT_ERROR_GRID)?,
-                BOp::Sub => a.checked_sub(b).ok_or(Error::TT_ERROR_GRID)?,
-                BOp::Mul => a.checked_mul(b).ok_or(Error::TT_ERROR_GRID)?,
-                BOp::Div => a.checked_div(b).ok_or(Error::TT_ERROR_GRID)?,
-                BOp::Mod => a.checked_rem(b).ok_or(Error::TT_ERROR_GRID)?,
+                BOp::Add => a.checked_add(b).ok_or(ttStatus::TT_ERROR_GRID)?,
+                BOp::Sub => a.checked_sub(b).ok_or(ttStatus::TT_ERROR_GRID)?,
+                BOp::Mul => a.checked_mul(b).ok_or(ttStatus::TT_ERROR_GRID)?,
+                BOp::Div => a.checked_div(b).ok_or(ttStatus::TT_ERROR_GRID)?,
+                BOp::Mod => a.checked_rem(b).ok_or(ttStatus::TT_ERROR_GRID)?,
                 BOp::Pow => a
-                    .checked_pow(u32::try_from(b).map_err(|_| Error::TT_ERROR_GRID)?)
-                    .ok_or(Error::TT_ERROR_GRID)?,
+                    .checked_pow(u32::try_from(b).map_err(|_| ttStatus::TT_ERROR_GRID)?)
+                    .ok_or(ttStatus::TT_ERROR_GRID)?,
                 BOp::Max => a.max(b),
                 BOp::BitAnd => a & b,
                 BOp::BitOr => a | b,
                 BOp::BitXor => a ^ b,
                 BOp::BitShiftLeft => a
-                    .checked_shl(u32::try_from(b).map_err(|_| Error::TT_ERROR_GRID)?)
-                    .ok_or(Error::TT_ERROR_GRID)?,
+                    .checked_shl(u32::try_from(b).map_err(|_| ttStatus::TT_ERROR_GRID)?)
+                    .ok_or(ttStatus::TT_ERROR_GRID)?,
                 BOp::BitShiftRight => a
-                    .checked_shr(u32::try_from(b).map_err(|_| Error::TT_ERROR_GRID)?)
-                    .ok_or(Error::TT_ERROR_GRID)?,
+                    .checked_shr(u32::try_from(b).map_err(|_| ttStatus::TT_ERROR_GRID)?)
+                    .ok_or(ttStatus::TT_ERROR_GRID)?,
                 _ => {
-                    return Err(Error::TT_ERROR_GRID);
+                    return Err(ttStatus::TT_ERROR_GRID);
                 }
             }
         }
@@ -199,7 +204,7 @@ fn args_for(
     params: &[u64],
     grid: [u32; 2],
     tile: NocCoord,
-) -> Result<[(Niu, Vec<u32>); 2], Error> {
+) -> Result<[(Niu, Vec<u32>); 2], ttStatus> {
     let mut arrays = [(Niu::Noc0, Vec::new()), (Niu::Noc1, Vec::new())];
     for (niu, args) in arrays.iter_mut() {
         *args = vec![grid[0], grid[1], module.iface, me_hi(tile)];
@@ -209,7 +214,7 @@ fn args_for(
             let (low, high) = match kind {
                 crate::compile::ParamKind::Scalar => (word as u32, 0),
                 crate::compile::ParamKind::Tensor => (
-                    u32::try_from(word).map_err(|_| Error::TT_ERROR_PARAMETER_ADDRESS)?,
+                    u32::try_from(word).map_err(|_| ttStatus::TT_ERROR_PARAMETER_ADDRESS)?,
                     hi,
                 ),
             };
@@ -218,7 +223,7 @@ fn args_for(
         }
         if (args_at(*niu) as u64) + 4 * args.len() as u64 > tt_isa::l1::PROGRAM_CACHE.end {
             let _ = args.len();
-            return Err(Error::TT_ERROR_PROGRAM_AREA_SIZE);
+            return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
         }
     }
     Ok(arrays)
@@ -229,7 +234,7 @@ fn launch_steps(
     module: &Module,
     params: &[u64],
     grid: [u32; 2],
-) -> Result<(), Error> {
+) -> Result<(), ttStatus> {
     // The logical grid the module asks for, as physical tiles, row-major. Each
     // tile's logical coordinate is what `grid.x`/`grid.y` read.
     let mut tiles = Vec::with_capacity(grid[0] as usize * grid[1] as usize);
@@ -244,7 +249,7 @@ fn launch_steps(
         }
         if 4 * words.len() as u32 > SLOT_BYTES {
             let _ = (name, words.len());
-            return Err(Error::TT_ERROR_PROGRAM_AREA_SIZE);
+            return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
         }
     }
     let compute = module.cores.iter().any(|words| !words.is_empty());
@@ -267,7 +272,7 @@ fn launch_steps(
                     ring.page_bytes.checked_mul(ring.len).unwrap_or(0),
                     ring.page_bytes,
                     ring.len,
-                ));
+                )?);
             }
             let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
             device.l1_write(u64::from(module.iface), &bytes)?;
@@ -362,14 +367,14 @@ fn stage_role(
     thread: usize,
     words: &[u32],
     args_at: u32,
-) -> Result<(), Error> {
+) -> Result<(), ttStatus> {
     if words.is_empty() || words.len() as u32 > mailbox::MAX_WORDS {
         let _ = (thread, words.len());
-        return Err(Error::TT_ERROR_ROLE_PROGRAM_SIZE);
+        return Err(ttStatus::TT_ERROR_ROLE_PROGRAM_SIZE);
     }
     if 4 * words.len() as u32 > SLOT_BYTES {
         let _ = (thread, words.len());
-        return Err(Error::TT_ERROR_PROGRAM_AREA_SIZE);
+        return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
     }
     let mb = mailbox::launch::Mailbox::of(thread as u32);
     let text = slot(ROLE_SLOT[thread]);
@@ -391,13 +396,13 @@ fn me_hi(tile: NocCoord) -> u32 {
     (tile.x() as u32 & 0x3F) | ((tile.y() as u32 & 0x3F) << 6)
 }
 
-fn lock() -> Result<std::sync::MutexGuard<'static, Option<Device>>, Error> {
-    DEVICE.lock().map_err(|_| Error::TT_ERROR_DEVICE_LOCK)
+fn lock() -> Result<std::sync::MutexGuard<'static, Option<Device>>, ttStatus> {
+    DEVICE.lock().map_err(|_| ttStatus::TT_ERROR_DEVICE_LOCK)
 }
 
-fn with_device<T>(f: impl FnOnce(&mut Device) -> Result<T, Error>) -> Result<T, Error> {
+fn with_device<T>(f: impl FnOnce(&mut Device) -> Result<T, ttStatus>) -> Result<T, ttStatus> {
     let mut device = lock()?;
-    let device = device.as_mut().ok_or(Error::TT_ERROR_NO_DEVICE)?;
+    let device = device.as_mut().ok_or(ttStatus::TT_ERROR_NO_DEVICE)?;
     f(device)
 }
 
@@ -433,7 +438,7 @@ mod tests {
     fn a_timed_out_launch_returns_timeout_and_the_next_launch_runs() {
         init().expect("init");
         match launch(&module(vec![HANG]), &[]) {
-            Err(Error::TT_ERROR_FIRMWARE_TIMEOUT) => {}
+            Err(ttStatus::TT_ERROR_FIRMWARE_TIMEOUT) => {}
             other => panic!("expected a timeout, got {other:?}"),
         }
         // The failed launch held B and cleared its mailboxes, so this one

@@ -21,7 +21,7 @@ use std::sync::OnceLock;
 
 use libloading::{Library, Symbol};
 
-use crate::ir::Error;
+use crate::status::ttStatus;
 use tt_isa::dram::{CHANNEL_BYTES, Dram, DramChannel};
 use tt_isa::l1;
 use tt_isa::mailbox::{self, status};
@@ -82,27 +82,27 @@ unsafe impl Sync for Lib {}
 impl Lib {
     /// `dlopen` the simulator and resolve the entry points. The library is
     /// initialized on the first successful load, once per process.
-    fn open(path: &OsStr) -> Result<&'static Lib, Error> {
-        static LIB: OnceLock<Result<&'static Lib, Error>> = OnceLock::new();
+    fn open(path: &OsStr) -> Result<&'static Lib, ttStatus> {
+        static LIB: OnceLock<Result<&'static Lib, ttStatus>> = OnceLock::new();
         LIB.get_or_init(|| Self::load(path))
             .as_ref()
             .map(|lib| *lib)
             .map_err(|e| *e)
     }
 
-    fn load(path: &OsStr) -> Result<&'static Lib, Error> {
+    fn load(path: &OsStr) -> Result<&'static Lib, ttStatus> {
         // SAFETY: the caller named a libttsim shared object; loading a shared
         // object runs its initializers, which is what the caller asked for.
         let library = unsafe { Library::new(path) }.map_err(|e| {
             let _ = (e, PathBuf::from(path));
-            Error::TT_ERROR_DLOPEN
+            ttStatus::TT_ERROR_DLOPEN
         })?;
         macro_rules! sym {
             ($name:literal) => {{
                 let s: Symbol<'_, _> = unsafe { library.get(concat!($name, "\0").as_bytes()) }
                     .map_err(|e| {
                         let _ = (e, $name);
-                        Error::TT_ERROR_DLSYM
+                        ttStatus::TT_ERROR_DLSYM
                     })?;
                 *s
             }};
@@ -357,7 +357,7 @@ pub struct Device {
 
 impl Device {
     /// Load the simulator if needed and take the device.
-    pub fn open() -> Result<Device, Error> {
+    pub fn open() -> Result<Device, ttStatus> {
         let path = std::env::var_os(LIB_PATH_ENV)
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("libttsim_bh.so"));
@@ -369,13 +369,13 @@ impl Device {
         // every address constant above is Blackhole's.
         let id = link.config_rd32(0, 0);
         if id == u32::MAX {
-            return Err(Error::TT_ERROR_NO_DEVICE);
+            return Err(ttStatus::TT_ERROR_NO_DEVICE);
         }
         let vendor = (id & 0xFFFF) as u16;
         let device = (id >> 16) as u16;
         if vendor != VENDOR_ID_TENSTORRENT || device != DEVICE_ID_BLACKHOLE {
             let _ = (vendor, device);
-            return Err(Error::TT_ERROR_NOT_BLACKHOLE);
+            return Err(ttStatus::TT_ERROR_NOT_BLACKHOLE);
         }
 
         // The live Tensix grid comes from the ARC's telemetry, never from the
@@ -397,7 +397,10 @@ impl Device {
         let tensix = device.probe_tensix()?;
         device.tiles = tensix.tiles().collect();
         device.columns = tensix.enabled_column_count();
-        device.tile = *device.tiles.first().ok_or(Error::TT_ERROR_NO_TENSIX_TILE)?;
+        device.tile = *device
+            .tiles
+            .first()
+            .ok_or(ttStatus::TT_ERROR_NO_TENSIX_TILE)?;
         // A previous process (`ttRelease` only drops this struct) leaves its
         // cores running and its mailboxes written. Reopening is the 0 -> 1
         // transition, so it cannot disturb a live caller: hold the five cores
@@ -415,8 +418,8 @@ impl Device {
     /// DRAM base — so this refuses rather than quietly opening the simulator under
     /// a second name.
     #[allow(dead_code)]
-    pub fn open_hardware() -> Result<Device, Error> {
-        Err(Error::TT_ERROR_UNSUPPORTED)
+    pub fn open_hardware() -> Result<Device, ttStatus> {
+        Err(ttStatus::TT_ERROR_UNSUPPORTED)
     }
 
     /// This chip's live Tensix columns, from the ARC's telemetry table.
@@ -431,7 +434,7 @@ impl Device {
     /// the survivors are a prefix). A chip that will not name its columns, or
     /// names a shape the specification forbids, is refused: assuming a full part
     /// writes to a fused-off tile, which ttsim v1.16 treats as undefined.
-    fn probe_tensix(&mut self) -> Result<tt_isa::noc::grid::Tensix, Error> {
+    fn probe_tensix(&mut self) -> Result<tt_isa::noc::grid::Tensix, ttStatus> {
         use tt_isa::arc;
         let arc_tile = arc::arc_tile();
         let table = u64::from(self.arc_word(arc_tile, arc::TELEMETRY_PTR)?);
@@ -440,7 +443,7 @@ impl Device {
         // address outside the CSM is an unmapped ARC read, which hangs.
         if !arc::is_within_csm(table, 8) || !arc::is_within_csm(values, 4) {
             let _ = (table, values);
-            return Err(Error::TT_ERROR_TELEMETRY);
+            return Err(ttStatus::TT_ERROR_TELEMETRY);
         }
         let version = self.arc_word(arc_tile, table)?;
         let entries = self.arc_word(arc_tile, table + 4)?;
@@ -451,7 +454,7 @@ impl Device {
             || !arc::is_within_csm(table, tag_table)
         {
             let _ = (version, entries);
-            return Err(Error::TT_ERROR_TELEMETRY);
+            return Err(ttStatus::TT_ERROR_TELEMETRY);
         }
         let mut enabled = None;
         for i in 0..u64::from(entries) {
@@ -462,17 +465,18 @@ impl Device {
             let at = values + 4 * u64::from(entry >> 16);
             if !arc::is_within_csm(at, 4) {
                 let _ = at;
-                return Err(Error::TT_ERROR_TELEMETRY);
+                return Err(ttStatus::TT_ERROR_TELEMETRY);
             }
             enabled = Some(self.arc_word(arc_tile, at)?);
         }
-        let mask = enabled.ok_or(Error::TT_ERROR_TELEMETRY)?;
-        tt_isa::noc::grid::Tensix::from_enabled_column_mask(mask).ok_or(Error::TT_ERROR_TELEMETRY)
+        let mask = enabled.ok_or(ttStatus::TT_ERROR_TELEMETRY)?;
+        tt_isa::noc::grid::Tensix::from_enabled_column_mask(mask)
+            .ok_or(ttStatus::TT_ERROR_TELEMETRY)
     }
 
     /// One word of the ARC's address space, through the window: its reset-unit
     /// scratch and its CSM are ordinary tile addresses.
-    fn arc_word(&mut self, arc_tile: NocCoord, address: u64) -> Result<u32, Error> {
+    fn arc_word(&mut self, arc_tile: NocCoord, address: u64) -> Result<u32, ttStatus> {
         let mut bytes = [0u8; 4];
         self.window_read(arc_tile, address, &mut bytes)?;
         Ok(u32::from_le_bytes(bytes))
@@ -493,10 +497,10 @@ impl Device {
     /// The physical tile at logical `(x, y)`. `tt_metal`'s logical grid is the
     /// worker grid: `absolute_logical_x/y` are these coordinates, and the
     /// physical tile follows the column list.
-    pub fn tile_at(&self, x: u32, y: u32) -> Result<NocCoord, Error> {
+    pub fn tile_at(&self, x: u32, y: u32) -> Result<NocCoord, ttStatus> {
         if x as usize >= self.columns || y as usize >= self.rows() {
             let _ = (x, y, self.columns, self.rows());
-            return Err(Error::TT_ERROR_GRID);
+            return Err(ttStatus::TT_ERROR_GRID);
         }
         Ok(self.tiles[y as usize * self.columns + x as usize])
     }
@@ -510,17 +514,17 @@ impl Device {
 
     /// Reserve `bytes` of DRAM, 64-byte aligned, and return its channel-0
     /// offset. This is what a caller passes back to `ttMemcpy` and `ttLaunch`.
-    pub fn alloc_dram(&mut self, bytes: usize) -> Result<u64, Error> {
+    pub fn alloc_dram(&mut self, bytes: usize) -> Result<u64, ttStatus> {
         if bytes == 0 {
-            return Err(Error::TT_ERROR_ALLOC_ZERO);
+            return Err(ttStatus::TT_ERROR_ALLOC_ZERO);
         }
         let at = self.dram_used.next_multiple_of(64);
         let end = at
             .checked_add(bytes as u64)
-            .ok_or(Error::TT_ERROR_DRAM_ADDRESS_OVERFLOW)?;
+            .ok_or(ttStatus::TT_ERROR_DRAM_ADDRESS_OVERFLOW)?;
         if end > CHANNEL_BYTES {
             let _ = (bytes, at);
-            return Err(Error::TT_ERROR_DRAM_FULL);
+            return Err(ttStatus::TT_ERROR_DRAM_FULL);
         }
         self.dram_used = end;
         Ok(at)
@@ -539,11 +543,11 @@ impl Device {
     }
 
     /// Write `bytes` to DRAM at a channel-0 offset.
-    pub fn dram_write(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {
+    pub fn dram_write(&mut self, offset: u64, bytes: &[u8]) -> Result<(), ttStatus> {
         let channel = self.dram_channel();
         let range = channel.range(offset, bytes.len() as u64).ok_or_else(|| {
             let _ = (bytes.len(), offset);
-            Error::TT_ERROR_DRAM_RANGE
+            ttStatus::TT_ERROR_DRAM_RANGE
         })?;
         let ep = self.channel_endpoint(channel, tt_isa::noc::niu::Niu::Noc0);
         self.window_write(ep, range.offset(), bytes)?;
@@ -562,25 +566,25 @@ impl Device {
     }
 
     /// Read DRAM at a channel-0 offset.
-    pub fn dram_read(&mut self, offset: u64, out: &mut [u8]) -> Result<(), Error> {
+    pub fn dram_read(&mut self, offset: u64, out: &mut [u8]) -> Result<(), ttStatus> {
         let channel = self.dram_channel();
         channel.range(offset, out.len() as u64).ok_or_else(|| {
             let _ = out.len();
-            Error::TT_ERROR_DRAM_RANGE
+            ttStatus::TT_ERROR_DRAM_RANGE
         })?;
         let ep = self.channel_endpoint(channel, tt_isa::noc::niu::Niu::Noc0);
         self.window_read(ep, offset, out)
     }
 
     /// Write into this tile's L1.
-    pub fn l1_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), Error> {
+    pub fn l1_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), ttStatus> {
         self.check_l1(address, bytes.len())?;
         let tile = self.tile;
         self.window_write(tile, address, bytes)
     }
 
     /// Read one dword from the tile (an L1 word or a core register).
-    pub fn read32(&mut self, address: u64) -> Result<u32, Error> {
+    pub fn read32(&mut self, address: u64) -> Result<u32, ttStatus> {
         let mut b = [0u8; 4];
         let tile = self.tile;
         self.window_read(tile, address, &mut b)?;
@@ -588,7 +592,7 @@ impl Device {
     }
 
     /// Write one dword to the tile (an L1 word or a core register).
-    pub fn write32(&mut self, address: u64, value: u32) -> Result<(), Error> {
+    pub fn write32(&mut self, address: u64, value: u32) -> Result<(), ttStatus> {
         let tile = self.tile;
         self.window_write(tile, address, &value.to_le_bytes())
     }
@@ -599,7 +603,7 @@ impl Device {
     }
 
     /// Load `image` into L1 and start `core` on it.
-    pub fn load_and_start(&mut self, core: Core, image: &[u8], at: u64) -> Result<(), Error> {
+    pub fn load_and_start(&mut self, core: Core, image: &[u8], at: u64) -> Result<(), ttStatus> {
         self.load_held(core, image, at)?;
         self.set_core_reset(core, false)
     }
@@ -609,7 +613,7 @@ impl Device {
     /// Everything [`Device::load_and_start`] does except the release: the image,
     /// the reset PC and a cleared status word are in place, so one later write to
     /// `SOFT_RESET_0` starts this core and every other held one at once.
-    fn load_held(&mut self, core: Core, image: &[u8], at: u64) -> Result<(), Error> {
+    fn load_held(&mut self, core: Core, image: &[u8], at: u64) -> Result<(), ttStatus> {
         self.set_core_reset(core, true)?;
         self.l1_write(at, image)?;
         // A stale status word would satisfy the wait before the image runs.
@@ -626,7 +630,7 @@ impl Device {
             None if at == u64::from(core.default_reset_pc()) => {}
             None => {
                 let _ = (core, at);
-                return Err(Error::TT_ERROR_RESET_PC);
+                return Err(ttStatus::TT_ERROR_RESET_PC);
             }
         }
         Ok(())
@@ -634,7 +638,7 @@ impl Device {
 
     /// Release the Tensix backend — unpackers, packers, Matrix Unit, Vector Unit
     /// and the rest — from soft reset, leaving the five RISC-V cores alone.
-    pub fn release_tensix_backend(&mut self) -> Result<(), Error> {
+    pub fn release_tensix_backend(&mut self) -> Result<(), ttStatus> {
         let current = self.read32(tensix::SOFT_RESET_0)?;
         self.write32(tensix::SOFT_RESET_0, current & !tensix::BACKEND_RESET_MASK)
     }
@@ -644,7 +648,7 @@ impl Device {
         &mut self,
         address: u64,
         mut predicate: impl FnMut(u32) -> bool,
-    ) -> Result<u32, Error> {
+    ) -> Result<u32, ttStatus> {
         let mut waited = 0u64;
         loop {
             let value = self.read32(address)?;
@@ -654,11 +658,11 @@ impl Device {
             if value == status::PANICKED {
                 let code = self.read32(mailbox::PANIC_CODE)?;
                 let _ = code;
-                return Err(Error::TT_ERROR_FIRMWARE_PANIC);
+                return Err(ttStatus::TT_ERROR_FIRMWARE_PANIC);
             }
             if waited >= BUDGET {
                 let _ = value;
-                return Err(Error::TT_ERROR_FIRMWARE_TIMEOUT);
+                return Err(ttStatus::TT_ERROR_FIRMWARE_TIMEOUT);
             }
             self.clock(CYCLES_PER_POLL);
             waited += u64::from(CYCLES_PER_POLL);
@@ -672,8 +676,8 @@ impl Device {
     /// The failure path has no `ttReset` (user decision): this is the driver's
     /// own cleanup. Every step is attempted even if one fails, and the first
     /// failure is returned, so a wedged tile is reported rather than hidden.
-    pub fn quiesce(&mut self) -> Result<(), Error> {
-        let mut first: Result<(), Error> = Ok(());
+    pub fn quiesce(&mut self) -> Result<(), ttStatus> {
+        let mut first: Result<(), ttStatus> = Ok(());
         for i in 0..self.tiles.len() {
             let tile = self.tiles[i];
             self.select(tile);
@@ -727,7 +731,7 @@ impl Device {
     /// `RUNNING`, so the images are fetched through clean caches when the host
     /// then releases the other four (tt-metal: BRISC's mask store, then
     /// `deassert_all_reset`).
-    pub fn start_executors(&mut self) -> Result<(), Error> {
+    pub fn start_executors(&mut self) -> Result<(), ttStatus> {
         if self
             .exec_started
             .iter()
@@ -762,7 +766,7 @@ impl Device {
 
     /// Load NC's image at `at` and leave NC held, with the jump that starts it
     /// at its reset PC.
-    fn load_held_nc(&mut self, image: &[u8], at: u64) -> Result<(), Error> {
+    fn load_held_nc(&mut self, image: &[u8], at: u64) -> Result<(), ttStatus> {
         self.set_core_reset(Core::NC, true)?;
         self.l1_write(at, image)?;
         let stub = tt_isa::dm::nc::stub(at);
@@ -773,7 +777,7 @@ impl Device {
 
     /// Clear one launch message: the generation first, then the program and
     /// control words.
-    fn clear_launch(&mut self, mb: mailbox::launch::Mailbox) -> Result<(), Error> {
+    fn clear_launch(&mut self, mb: mailbox::launch::Mailbox) -> Result<(), ttStatus> {
         self.write32(mb.generation(), 0)?;
         for at in [
             mb.program_addr(),
@@ -793,13 +797,13 @@ impl Device {
     /// Place `words` at `at` in the program cache, unless this device put the
     /// same words there already. The launch message names the address; it does
     /// not carry the program (tt-metal's `kernel_text_offset`).
-    pub fn place(&mut self, at: u32, words: &[u32]) -> Result<(), Error> {
+    pub fn place(&mut self, at: u32, words: &[u32]) -> Result<(), ttStatus> {
         if words.is_empty() {
-            return Err(Error::TT_ERROR_EMPTY_PROGRAM);
+            return Err(ttStatus::TT_ERROR_EMPTY_PROGRAM);
         }
         if words.len() as u64 > u64::from(mailbox::MAX_WORDS) {
             let _ = words.len();
-            return Err(Error::TT_ERROR_PROGRAM_TOO_LONG);
+            return Err(ttStatus::TT_ERROR_PROGRAM_TOO_LONG);
         }
         // FNV-1a: enough to skip rewriting an unchanged program, not a
         // correctness check on the words.
@@ -830,7 +834,7 @@ impl Device {
         text: u32,
         words: u32,
         args: u32,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ttStatus> {
         self.write32(mb.program_addr(), text)?;
         self.write32(mb.program_len(), words)?;
         self.write32(mb.args(), args)?;
@@ -842,7 +846,7 @@ impl Device {
     /// Start whatever launch message `mb` holds with a fresh generation, and
     /// return it. Device-wide and monotonic, so a core never sees a value equal
     /// to the one it last ran.
-    pub fn start(&mut self, mb: mailbox::launch::Mailbox) -> Result<u32, Error> {
+    pub fn start(&mut self, mb: mailbox::launch::Mailbox) -> Result<u32, ttStatus> {
         self.launch_seq = self.launch_seq.wrapping_add(1).max(1);
         let generation = self.launch_seq;
         self.write32(mb.ack(), 0)?;
@@ -860,7 +864,7 @@ impl Device {
         words: u32,
         args: u32,
         enables: u32,
-    ) -> Result<u32, Error> {
+    ) -> Result<u32, ttStatus> {
         self.prepare(mb, text, words, args)?;
         self.write32(mb.enables(), enables)?;
         self.start(mb)
@@ -871,17 +875,17 @@ impl Device {
         &mut self,
         mb: mailbox::launch::Mailbox,
         generation: u32,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ttStatus> {
         let mut waited = 0u64;
         loop {
             if self.read32(mb.ack())? == generation {
                 return Ok(());
             }
             if self.read32(mb.status())? == status::PANICKED {
-                return Err(Error::TT_ERROR_PROGRAM_REFUSED);
+                return Err(ttStatus::TT_ERROR_PROGRAM_REFUSED);
             }
             if waited >= BUDGET {
-                return Err(Error::TT_ERROR_FIRMWARE_TIMEOUT);
+                return Err(ttStatus::TT_ERROR_FIRMWARE_TIMEOUT);
             }
             self.clock(CYCLES_PER_POLL);
             waited += u64::from(CYCLES_PER_POLL);
@@ -897,13 +901,13 @@ impl Device {
         args_at: u32,
         words: &[u32],
         args: &[u32],
-    ) -> Result<u32, Error> {
+    ) -> Result<u32, ttStatus> {
         if words.is_empty() {
-            return Err(Error::TT_ERROR_EMPTY_PROGRAM);
+            return Err(ttStatus::TT_ERROR_EMPTY_PROGRAM);
         }
         if (program_at as u64) + 4 * words.len() as u64 > args_at as u64 {
             let _ = (program_at, args_at);
-            return Err(Error::TT_ERROR_PROGRAM_OVERLAPS_ARGS);
+            return Err(ttStatus::TT_ERROR_PROGRAM_OVERLAPS_ARGS);
         }
         self.place(program_at, words)?;
         let args_bytes: Vec<u8> = args.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -921,7 +925,7 @@ impl Device {
     }
 
     /// Point the window at `address` in `tile`, unless it already is.
-    fn retarget(&mut self, tile: NocCoord, address: u64) -> Result<(), Error> {
+    fn retarget(&mut self, tile: NocCoord, address: u64) -> Result<(), ttStatus> {
         let words = tlb_words(address, tile)?;
         if self.shadow == Some(words) {
             return Ok(());
@@ -933,7 +937,7 @@ impl Device {
         Ok(())
     }
 
-    fn window_write(&mut self, tile: NocCoord, address: u64, bytes: &[u8]) -> Result<(), Error> {
+    fn window_write(&mut self, tile: NocCoord, address: u64, bytes: &[u8]) -> Result<(), ttStatus> {
         let mut done = 0usize;
         while done < bytes.len() {
             let at = address + done as u64;
@@ -950,7 +954,12 @@ impl Device {
         Ok(())
     }
 
-    fn window_read(&mut self, tile: NocCoord, address: u64, out: &mut [u8]) -> Result<(), Error> {
+    fn window_read(
+        &mut self,
+        tile: NocCoord,
+        address: u64,
+        out: &mut [u8],
+    ) -> Result<(), ttStatus> {
         let mut done = 0usize;
         while done < out.len() {
             let at = address + done as u64;
@@ -967,7 +976,7 @@ impl Device {
         Ok(())
     }
 
-    fn bar_write32(&self, offset: u64, value: u32) -> Result<(), Error> {
+    fn bar_write32(&self, offset: u64, value: u32) -> Result<(), ttStatus> {
         check_bar0(offset, 4)?;
         self.link
             .mem_write(BAR0_BASE + offset, &value.to_le_bytes());
@@ -980,18 +989,18 @@ impl Device {
             .expect("the NIU's first endpoint")
     }
 
-    fn check_l1(&self, address: u64, len: usize) -> Result<(), Error> {
+    fn check_l1(&self, address: u64, len: usize) -> Result<(), ttStatus> {
         let end = address
             .checked_add(len as u64)
-            .ok_or(Error::TT_ERROR_L1_ADDRESS_OVERFLOW)?;
+            .ok_or(ttStatus::TT_ERROR_L1_ADDRESS_OVERFLOW)?;
         if end > tensix::L1_SIZE {
             let _ = (address, end);
-            return Err(Error::TT_ERROR_L1_ACCESS);
+            return Err(ttStatus::TT_ERROR_L1_ACCESS);
         }
         Ok(())
     }
 
-    fn set_core_reset(&mut self, core: Core, held: bool) -> Result<(), Error> {
+    fn set_core_reset(&mut self, core: Core, held: bool) -> Result<(), ttStatus> {
         let current = self.read32(tensix::SOFT_RESET_0)?;
         let updated = if held {
             current | core.soft_reset_mask()
@@ -1012,27 +1021,27 @@ const fn window_bar_offset() -> u64 {
 
 /// Refuse an access BAR0 would not decode: past the window aperture, or into
 /// the configuration array.
-fn check_bar0(offset: u64, len: usize) -> Result<(), Error> {
+fn check_bar0(offset: u64, len: usize) -> Result<(), ttStatus> {
     if len == 0 {
-        return Err(Error::TT_ERROR_BAR0_ZERO_LENGTH);
+        return Err(ttStatus::TT_ERROR_BAR0_ZERO_LENGTH);
     }
     let end = offset
         .checked_add(len as u64)
-        .ok_or(Error::TT_ERROR_BAR0_OVERFLOW)?;
+        .ok_or(ttStatus::TT_ERROR_BAR0_OVERFLOW)?;
     let in_aperture = end <= 202 * WINDOW_SIZE;
     let in_config = offset >= TLB_CONFIG_BASE && end <= TLB_CONFIG_BASE + 210 * 12;
     if !in_aperture && !in_config {
         let _ = (offset, end);
-        return Err(Error::TT_ERROR_BAR0_NOT_DECODED);
+        return Err(ttStatus::TT_ERROR_BAR0_NOT_DECODED);
     }
     Ok(())
 }
 
 /// Encode the three dwords of a 2 MiB unicast window on NoC #0, strict ordering.
-fn tlb_words(base_address: u64, tile: NocCoord) -> Result<[u32; 3], Error> {
+fn tlb_words(base_address: u64, tile: NocCoord) -> Result<[u32; 3], ttStatus> {
     if base_address % WINDOW_SIZE != 0 {
         let _ = base_address;
-        return Err(Error::TT_ERROR_WINDOW_ALIGNMENT);
+        return Err(ttStatus::TT_ERROR_WINDOW_ALIGNMENT);
     }
     // Field positions, `HostToDeviceTLBs.md`: local offset 43 bits, then the
     // unicast end coordinate, NoC index and ordering.

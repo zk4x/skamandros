@@ -19,14 +19,14 @@
 //! dtypes and shapes are not a side table: a leaf op carries its own, and every
 //! other op's is [`Kernel::dtype`]/[`Kernel::shape`], recomputed on demand.
 //!
-//! Both forms are canonical: the text form and the byte form ([`MAGIC`],
-//! [`VERSION`]). Each refuses the other's version.
+//! The text form is the only program form, and [`VERSION`] its version line.
 
 use core::fmt;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use crate::slab::{Slab, SlabId};
+use crate::status::ttStatus;
 
 /// One operation of the kernel's list.
 ///
@@ -210,6 +210,12 @@ pub struct ValueInfo {
 /// Comparisons produce a `bool`; `Or`/`And` are logical (bool operands and
 /// result); `BitOr`/`BitAnd`/`BitXor`/`BitShiftLeft`/`BitShiftRight`/`Mod` are
 /// integer (`i32`); the rest operate on two values of the same dtype.
+///
+/// A shift moves the two's-complement bit pattern, filling with zeros:
+/// `BitShiftRight` is a *logical* shift even on a negative value, unlike
+/// Rust's `i32 >>`, which sign-extends. The tile path (`SFPSHFT`), the scalar
+/// path (`srl`/`sll`) and the constant fold all agree on that, and the amount
+/// is the hardware's low five bits rather than Rust's panic on `>= 32`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BOp {
     Add,
@@ -437,14 +443,14 @@ pub enum Op {
     /// and scales the packed result afterwards with an SFPU multiply. The
     /// compiler supplies the 1.0 tile this op's `SrcB` still needs.
     Max { acc: OpId, x: OpId },
-    /// `wait %cb`: the unpacker takes a page from the ring.
-    Wait { cb: OpId },
+    /// `wait %cb`: the unpacker waits for a published page of the ring.
+    Wait { cb: OpId, n: Dim },
     /// `reserve %cb`: the packer takes a free page of the ring.
-    Reserve { cb: OpId },
+    Reserve { cb: OpId, n: Dim },
     /// `push %cb`: the page just filled is published.
-    Push { cb: OpId },
+    Push { cb: OpId, n: Dim },
     /// `pop %cb`: the page just consumed is released.
-    Pop { cb: OpId },
+    Pop { cb: OpId, n: Dim },
 }
 
 impl Op {
@@ -489,9 +495,10 @@ impl Op {
             Op::Matmul { acc, a, b } => [acc, a, b].get(idx).copied(),
             Op::Sum { acc, x, s } => [acc, x, s].get(idx).copied(),
             Op::Max { acc, x } => [acc, x].get(idx).copied(),
-            Op::Wait { cb } | Op::Reserve { cb } | Op::Push { cb } | Op::Pop { cb } => {
-                [cb].get(idx).copied()
-            }
+            Op::Wait { cb, .. }
+            | Op::Reserve { cb, .. }
+            | Op::Push { cb, .. }
+            | Op::Pop { cb, .. } => [cb].get(idx).copied(),
         }
     }
 
@@ -542,9 +549,10 @@ impl Op {
             Op::Matmul { acc, a, b } => ParamsMut::Three(Some(acc), Some(a), Some(b)),
             Op::Sum { acc, x, s } => ParamsMut::Three(Some(acc), Some(x), Some(s)),
             Op::Max { acc, x } => ParamsMut::Two(Some(acc), Some(x)),
-            Op::Wait { cb } | Op::Reserve { cb } | Op::Push { cb } | Op::Pop { cb } => {
-                ParamsMut::One(Some(cb))
-            }
+            Op::Wait { cb, .. }
+            | Op::Reserve { cb, .. }
+            | Op::Push { cb, .. }
+            | Op::Pop { cb, .. } => ParamsMut::One(Some(cb)),
         }
     }
 }
@@ -737,19 +745,14 @@ pub(crate) fn broadcast_pair(k: &Kernel, op: &Op) -> Option<(OpId, OpId)> {
     }
 }
 
-/// The crate's error: the one C ABI enum, [`crate::status::ttStatus`]. The
-/// `Error` name is an alias for it, not a second error type and not a second
-/// enum.
-pub use crate::status::ttStatus as Error;
-
 /// Rewrite every operand of `op` through `map`, the id translation a pass
 /// builds as it copies a program (zyx's `renumber`).
-pub fn renumber(op: &mut Op, map: &BTreeMap<OpId, OpId>) -> Result<(), Error> {
+pub fn renumber(op: &mut Op, map: &BTreeMap<OpId, OpId>) -> Result<(), ttStatus> {
     for param in op.parameters_mut() {
         let to = map
             .get(param)
             .copied()
-            .ok_or(Error::TT_ERROR_VALUE_UNDEFINED)?;
+            .ok_or(ttStatus::TT_ERROR_VALUE_UNDEFINED)?;
         *param = to;
     }
     Ok(())
@@ -765,10 +768,10 @@ pub fn renumber(op: &mut Op, map: &BTreeMap<OpId, OpId>) -> Result<(), Error> {
 /// A `1,N` buffer is a row vector and a `N,1` buffer a column; otherwise both
 /// dimensions are multiples of 32 and each 32x32 block is a tile. The extra
 /// units are the pages of a deeper buffer (double or triple buffering).
-pub fn unit_of(shape: [Dim; 2], dtype: DType) -> Result<(RegShape, u32, u32), Error> {
+pub fn unit_of(shape: [Dim; 2], dtype: DType) -> Result<(RegShape, u32, u32), ttStatus> {
     let [a, b] = shape;
     if a == 0 || b == 0 {
-        return Err(Error::TT_ERROR_ZERO_DIMENSION);
+        return Err(ttStatus::TT_ERROR_ZERO_DIMENSION);
     }
     let reg = if a == 1 && b == 1 {
         RegShape::Scalar
@@ -779,7 +782,7 @@ pub fn unit_of(shape: [Dim; 2], dtype: DType) -> Result<(RegShape, u32, u32), Er
     } else if a % 32 == 0 && b % 32 == 0 {
         RegShape::Tile
     } else {
-        return Err(Error::TT_ERROR_BUFFER_SHAPE);
+        return Err(ttStatus::TT_ERROR_BUFFER_SHAPE);
     };
     let datums = if reg == RegShape::Scalar {
         1
@@ -795,7 +798,7 @@ pub fn unit_of(shape: [Dim; 2], dtype: DType) -> Result<(RegShape, u32, u32), Er
 
 /// A ring's page shape and page count from the buffer's declared shape
 /// (`%bi = buffer f32 32,64`: a `32,32` page, two of them).
-fn cb_ring(shape: [Dim; 2], dtype: DType) -> Result<([Dim; 2], Dim), Error> {
+fn cb_ring(shape: [Dim; 2], dtype: DType) -> Result<([Dim; 2], Dim), ttStatus> {
     let (unit, units, _) = unit_of(shape, dtype)?;
     let page = match unit {
         RegShape::Scalar => [1, 1],
@@ -804,21 +807,21 @@ fn cb_ring(shape: [Dim; 2], dtype: DType) -> Result<([Dim; 2], Dim), Error> {
         RegShape::Tile => [32, 32],
     };
     if units == 0 {
-        return Err(Error::TT_ERROR_ZERO_DIMENSION);
+        return Err(ttStatus::TT_ERROR_ZERO_DIMENSION);
     }
     Ok((page, units))
 }
 
 /// The register shape a copy's or an access's `[Dim; 2]` unit names.
-pub(crate) fn access_shape(shape: [Dim; 2]) -> Result<RegShape, Error> {
+pub(crate) fn access_shape(shape: [Dim; 2]) -> Result<RegShape, ttStatus> {
     let [a, b] = shape;
     Ok(match (a, b) {
-        (0, _) | (_, 0) => return Err(Error::TT_ERROR_ZERO_DIMENSION),
+        (0, _) | (_, 0) => return Err(ttStatus::TT_ERROR_ZERO_DIMENSION),
         (1, 1) => RegShape::Scalar,
         (1, _) if b == 32 => RegShape::Row,
         (_, 1) if a == 32 => RegShape::Column,
         _ if a == 32 && b == 32 => RegShape::Tile,
-        _ => return Err(Error::TT_ERROR_ACCESS_SHAPE),
+        _ => return Err(ttStatus::TT_ERROR_ACCESS_SHAPE),
     })
 }
 
@@ -849,7 +852,11 @@ impl Kernel {
                     BOp::BitOr => Some(a | b),
                     BOp::BitXor => Some(a ^ b),
                     BOp::BitShiftLeft => a.checked_shl(u32::try_from(b).ok()?),
-                    BOp::BitShiftRight => a.checked_shr(u32::try_from(b).ok()?),
+                    // A shift is over the two's-complement bit pattern: the
+                    // right shift fills with zeros, a *logical* shift.
+                    BOp::BitShiftRight => (a as u32)
+                        .checked_shr(u32::try_from(b).ok()?)
+                        .map(|v| v as i32),
                     BOp::Cmplt
                     | BOp::Cmpgt
                     | BOp::Cmpge
@@ -943,25 +950,35 @@ impl Kernel {
     ///
     /// A `Shape` op's own value is its members, so [`Kernel::shape`] of one is
     /// that list, resolved to numbers: a symbolic term folds through
-    /// [`Kernel::const_i32`] and a term that does not fold is a panic, because
-    /// a shape that is still symbolic at the point a consumer needs numbers is
-    /// a compiler bug, not a user program.
-    pub fn shape(&self, value: OpId) -> Cow<'_, [Dim]> {
-        match *self.at(value) {
-            Op::Shape(ref ops) => Cow::Owned(
-                ops.iter()
-                    .map(|op| {
-                        u32::try_from(self.const_i32(*op).expect("a shape term is a constant"))
-                            .expect("a shape term fits a Dim")
-                    })
-                    .collect::<Vec<Dim>>(),
-            ),
-            Op::Param { shape, .. } => self.shape(shape),
+    /// [`Kernel::const_i32`]. A term that does not fold is this compiler's own
+    /// bug, not a user program: [`Kernel::verify`] admits only constant terms
+    /// where a consumer needs numbers, so the failure is reported and returned.
+    #[allow(dead_code)]
+    pub fn shape(&self, value: OpId) -> Result<Cow<'_, [Dim]>, ttStatus> {
+        Ok(match *self.at(value) {
+            Op::Shape(ref ops) => {
+                let mut dims: Vec<Dim> = Vec::with_capacity(ops.len());
+                for op in ops {
+                    let Some(term) = self.const_i32(*op) else {
+                        return Err(crate::status::internal_bug(
+                            "a shape term is not a constant",
+                        ));
+                    };
+                    let Ok(dim) = u32::try_from(term) else {
+                        return Err(crate::status::internal_bug(
+                            "a shape term does not fit a Dim",
+                        ));
+                    };
+                    dims.push(dim);
+                }
+                Cow::Owned(dims)
+            }
+            Op::Param { shape, .. } => self.shape(shape)?,
             Op::Cb { page, .. } => Cow::Owned(page.to_vec()),
             Op::Acc { shape, .. } => Cow::Owned(shape.to_vec()),
             Op::Load { shape, .. } => Cow::Owned(shape.to_vec()),
             _ => Cow::Borrowed(&[]),
-        }
+        })
     }
 
     /// The value a cast's operand names, following a chain of casts.
@@ -972,8 +989,11 @@ impl Kernel {
         }
     }
 
-    /// Check every reference, dtype, shape and scope of the program.
-    pub fn verify(&self) -> Result<(), Error> {
+    /// Everything a text program can get wrong: its references, scopes,
+    /// dtypes, shapes and its grid. [`Kernel::parse`] is the caller that
+    /// reports these as the caller's errors; [`Kernel::verify`] runs the same
+    /// checks after the passes, where a failure is this compiler's own bug.
+    pub(crate) fn check(&self) -> Result<(), ttStatus> {
         let slots = usize::from(self.ops.max_id());
         let mut values: Vec<Option<ValueInfo>> = vec![None; slots];
         let mut visible: Vec<bool> = vec![false; slots];
@@ -986,25 +1006,25 @@ impl Kernel {
                 let slot = usize::from(v);
                 if values.get(slot).and_then(|v| *v).is_none() {
                     let _ = (at, v);
-                    return Err(Error::TT_ERROR_VALUE_UNDEFINED);
+                    return Err(ttStatus::TT_ERROR_VALUE_UNDEFINED);
                 }
                 if !visible.get(slot).copied().unwrap_or(false) {
                     let _ = (at, v);
-                    return Err(Error::TT_ERROR_VALUE_OUT_OF_SCOPE);
+                    return Err(ttStatus::TT_ERROR_VALUE_OUT_OF_SCOPE);
                 }
             }
             match *op {
                 Op::Const { dtype, .. } => {
                     if dtype == DType::Bf16 {
-                        return Err(Error::TT_ERROR_CONST_BF16);
+                        return Err(ttStatus::TT_ERROR_CONST_BF16);
                     }
                     if dtype == DType::Bool {
-                        return Err(Error::TT_ERROR_CONST_BOOL);
+                        return Err(ttStatus::TT_ERROR_CONST_BOOL);
                     }
                 }
                 Op::Shape(ref ops) => {
                     if ops.is_empty() {
-                        return Err(Error::TT_ERROR_ZERO_DIMENSION);
+                        return Err(ttStatus::TT_ERROR_ZERO_DIMENSION);
                     }
                     for term in ops.iter() {
                         self.expect_index_scalar(*term, at)?;
@@ -1012,22 +1032,22 @@ impl Kernel {
                 }
                 Op::Param { dtype, shape } => {
                     if dtype == DType::Bool {
-                        todo!("op {at}: a bool parameter is not implemented");
+                        return Err(ttStatus::TT_TODO_BOOL_PARAMETER);
                     }
                     self.expect_index_scalar(shape, at)?;
                     self.expect_terms(shape, at)?;
                 }
                 Op::Variable { dtype } => {
                     if dtype == DType::Bool {
-                        todo!("op {at}: a bool parameter is not implemented");
+                        return Err(ttStatus::TT_TODO_BOOL_PARAMETER);
                     }
                 }
                 Op::Cb { dtype, page, len } => {
                     if dtype == DType::Bool {
-                        todo!("op {at}: a bool buffer is not implemented");
+                        return Err(ttStatus::TT_TODO_BOOL_BUFFER);
                     }
                     if len == 0 {
-                        return Err(Error::TT_ERROR_ZERO_DIMENSION);
+                        return Err(ttStatus::TT_ERROR_ZERO_DIMENSION);
                     }
                     unit_of(page, dtype)?;
                 }
@@ -1036,7 +1056,7 @@ impl Kernel {
                 }
                 Op::Grid { x, y } => {
                     if grid.is_some() {
-                        return Err(Error::TT_ERROR_GRID);
+                        return Err(ttStatus::TT_ERROR_GRID);
                     }
                     self.expect_index_scalar(x, at)?;
                     self.expect_index_scalar(y, at)?;
@@ -1044,7 +1064,7 @@ impl Kernel {
                 }
                 Op::GridCoord { axis } => {
                     if axis > 1 {
-                        return Err(Error::TT_ERROR_GRID_AXIS);
+                        return Err(ttStatus::TT_ERROR_GRID_AXIS);
                     }
                 }
                 Op::Loop { bound } => {
@@ -1054,7 +1074,7 @@ impl Kernel {
                 }
                 Op::EndLoop => {
                     let Some(start) = loops.pop() else {
-                        return Err(Error::TT_ERROR_ENDLOOP_WITHOUT_LOOP);
+                        return Err(ttStatus::TT_ERROR_ENDLOOP_WITHOUT_LOOP);
                     };
                     for slot in start..values.len().min(visible.len()) {
                         visible[slot] = false;
@@ -1072,30 +1092,30 @@ impl Kernel {
                     let (buffer, param, buffer_offset, param_offset) = match (d.kind, s.kind) {
                         (ValueKind::Buffer, ValueKind::Param) => (dst, src, dst_offset, src_offset),
                         (ValueKind::Param, ValueKind::Buffer) => (src, dst, src_offset, dst_offset),
-                        _ => return Err(Error::TT_ERROR_COPY_ENDS),
+                        _ => return Err(ttStatus::TT_ERROR_COPY_ENDS),
                     };
                     if self.info(param).shape == RegShape::Scalar {
-                        return Err(Error::TT_ERROR_COPY_SCALAR_PARAM);
+                        return Err(ttStatus::TT_ERROR_COPY_SCALAR_PARAM);
                     }
                     if self.dtype(buffer) != self.dtype(param) {
-                        return Err(Error::TT_ERROR_COPY_CAST);
+                        return Err(ttStatus::TT_ERROR_COPY_CAST);
                     }
                     let unit = access_shape(shape)?;
                     if !matches!(unit, RegShape::Row | RegShape::Tile) {
-                        return Err(Error::TT_ERROR_COPY_UNIT);
+                        return Err(ttStatus::TT_ERROR_COPY_UNIT);
                     }
                     let lanes = self.expect_offset(param_offset, at)?;
                     let page = self.expect_offset(buffer_offset, at)?;
                     if page != 1 {
-                        return Err(Error::TT_TODO_MULTI_LANE);
+                        return Err(ttStatus::TT_TODO_MULTI_LANE);
                     }
                     let (page, len) = match *self.at(buffer) {
                         Op::Cb { page, len, .. } => (page, len),
-                        _ => return Err(Error::TT_ERROR_NOT_A_BUFFER),
+                        _ => return Err(ttStatus::TT_ERROR_NOT_A_BUFFER),
                     };
                     let (unit_shape, _, _) = unit_of(page, self.dtype(buffer))?;
                     if lanes.checked_mul(shape[0] * shape[1]) != Some(unit_shape.datums()) {
-                        return Err(Error::TT_ERROR_COPY_LANES);
+                        return Err(ttStatus::TT_ERROR_COPY_LANES);
                     }
                     let _ = len;
                     let _ = unit;
@@ -1108,24 +1128,24 @@ impl Kernel {
                     let b = self.info(buffer);
                     let unit = access_shape(shape)?;
                     if self.expect_offset(offset, at)? != 1 {
-                        return Err(Error::TT_TODO_MULTI_LANE);
+                        return Err(ttStatus::TT_TODO_MULTI_LANE);
                     }
                     let datums = shape[0] * shape[1];
                     if b.kind == ValueKind::Param {
                         if unit != RegShape::Tile || b.shape != RegShape::Tile {
-                            return Err(Error::TT_ERROR_LOAD_PARAM_NOT_TILE);
+                            return Err(ttStatus::TT_ERROR_LOAD_PARAM_NOT_TILE);
                         }
                     } else {
                         if b.kind != ValueKind::Buffer {
-                            return Err(Error::TT_ERROR_NOT_A_BUFFER);
+                            return Err(ttStatus::TT_ERROR_NOT_A_BUFFER);
                         }
                         let (page, _) = match *self.at(buffer) {
                             Op::Cb { page, len, .. } => (page, len),
-                            _ => return Err(Error::TT_ERROR_NOT_A_BUFFER),
+                            _ => return Err(ttStatus::TT_ERROR_NOT_A_BUFFER),
                         };
                         let (unit_shape, _, _) = unit_of(page, b.dtype)?;
                         if unit_shape.datums() < datums {
-                            return Err(Error::TT_ERROR_ACCESS_SHAPE);
+                            return Err(ttStatus::TT_ERROR_ACCESS_SHAPE);
                         }
                     }
                 }
@@ -1139,85 +1159,85 @@ impl Kernel {
                     let b = self.info(buffer);
                     let unit = access_shape(shape)?;
                     if self.expect_offset(offset, at)? != 1 {
-                        return Err(Error::TT_TODO_MULTI_LANE);
+                        return Err(ttStatus::TT_TODO_MULTI_LANE);
                     }
                     let datums = shape[0] * shape[1];
                     if b.kind == ValueKind::Acc {
                         if unit != RegShape::Tile {
-                            return Err(Error::TT_ERROR_ACC_SHAPE);
+                            return Err(ttStatus::TT_ERROR_ACC_SHAPE);
                         }
                         if self.const_i32(offset) != Some(0) {
-                            return Err(Error::TT_ERROR_ACC_OFFSET);
+                            return Err(ttStatus::TT_ERROR_ACC_OFFSET);
                         }
                         if v.kind != ValueKind::Const || v.dtype != DType::F32 {
-                            return Err(Error::TT_TODO_ACC_STORE);
+                            return Err(ttStatus::TT_TODO_ACC_STORE);
                         }
                         continue;
                     }
                     if v.kind != ValueKind::Register && v.kind != ValueKind::Acc {
-                        return Err(Error::TT_ERROR_STORE_VALUE_NOT_REGISTER);
+                        return Err(ttStatus::TT_ERROR_STORE_VALUE_NOT_REGISTER);
                     }
                     if b.kind == ValueKind::Param {
                         if unit != RegShape::Tile || b.shape != RegShape::Tile {
-                            return Err(Error::TT_ERROR_STORE_PARAM_NOT_TILE);
+                            return Err(ttStatus::TT_ERROR_STORE_PARAM_NOT_TILE);
                         }
                         if v.dtype != b.dtype {
-                            return Err(Error::TT_ERROR_STORE_PARAM_CAST);
+                            return Err(ttStatus::TT_ERROR_STORE_PARAM_CAST);
                         }
                         if v.shape != RegShape::Tile && v.kind != ValueKind::Acc {
-                            return Err(Error::TT_ERROR_STORE_PARAM_VALUE_NOT_TILE);
+                            return Err(ttStatus::TT_ERROR_STORE_PARAM_VALUE_NOT_TILE);
                         }
                         continue;
                     }
                     if b.kind != ValueKind::Buffer {
-                        return Err(Error::TT_ERROR_NOT_A_BUFFER);
+                        return Err(ttStatus::TT_ERROR_NOT_A_BUFFER);
                     }
                     if v.dtype != b.dtype {
-                        return Err(Error::TT_ERROR_STORE_BUFFER_CAST);
+                        return Err(ttStatus::TT_ERROR_STORE_BUFFER_CAST);
                     }
                     let (page, _) = match *self.at(buffer) {
                         Op::Cb { page, len, .. } => (page, len),
-                        _ => return Err(Error::TT_ERROR_NOT_A_BUFFER),
+                        _ => return Err(ttStatus::TT_ERROR_NOT_A_BUFFER),
                     };
                     let (unit_shape, _, _) = unit_of(page, b.dtype)?;
                     if unit_shape.datums() < datums {
-                        return Err(Error::TT_ERROR_ACCESS_SHAPE);
+                        return Err(ttStatus::TT_ERROR_ACCESS_SHAPE);
                     }
                     if v.shape != unit && v.kind != ValueKind::Acc {
-                        return Err(Error::TT_ERROR_STORE_BUFFER_SHAPE);
+                        return Err(ttStatus::TT_ERROR_STORE_BUFFER_SHAPE);
                     }
                 }
                 Op::Cast { src, dtype } => {
                     let s = self.info(src);
                     if s.kind != ValueKind::Register && s.kind != ValueKind::Const {
-                        return Err(Error::TT_ERROR_CAST_SOURCE);
+                        return Err(ttStatus::TT_ERROR_CAST_SOURCE);
                     }
                     if s.dtype.bytes() == 0 || dtype.bytes() == 0 {
                         let _ = dtype;
-                        return Err(Error::TT_ERROR_CAST_SOURCE);
+                        return Err(ttStatus::TT_ERROR_CAST_SOURCE);
                     }
                 }
                 Op::Bitcast { src, dtype } => {
                     if self.dtype(src).bytes() != dtype.bytes() {
                         let _ = (src, dtype);
-                        return Err(Error::TT_ERROR_BITCAST_WIDTH);
+                        return Err(ttStatus::TT_ERROR_BITCAST_WIDTH);
                     }
                 }
                 Op::Unary { a, .. } => {
                     if !is_value(&self.info(a)) {
-                        return Err(Error::TT_ERROR_UNARY_OPERAND);
+                        return Err(ttStatus::TT_ERROR_UNARY_OPERAND);
                     }
                 }
                 Op::Binary { op, a, b } => {
                     let (ia, ib) = (self.info(a), self.info(b));
                     if !is_value(&ia) || !is_value(&ib) {
-                        return Err(Error::TT_ERROR_BINARY_OPERANDS);
+                        return Err(ttStatus::TT_ERROR_BINARY_OPERANDS);
                     }
                     if op.is_logical() && (ia.dtype != DType::Bool || ib.dtype != DType::Bool) {
-                        return Err(Error::TT_ERROR_BINARY_LOGICAL_NOT_BOOL);
+                        return Err(ttStatus::TT_ERROR_BINARY_LOGICAL_NOT_BOOL);
                     }
                     if ia.dtype != ib.dtype {
-                        return Err(Error::TT_ERROR_NO_IMPLICIT_CAST);
+                        return Err(ttStatus::TT_ERROR_NO_IMPLICIT_CAST);
                     }
                 }
                 Op::Select {
@@ -1226,24 +1246,24 @@ impl Kernel {
                     if_false,
                 } => {
                     if self.dtype(cond) != DType::Bool {
-                        return Err(Error::TT_ERROR_CONDITION_NOT_BOOL);
+                        return Err(ttStatus::TT_ERROR_CONDITION_NOT_BOOL);
                     }
                     if self.dtype(if_true) != self.dtype(if_false) {
-                        return Err(Error::TT_ERROR_SELECT_CAST);
+                        return Err(ttStatus::TT_ERROR_SELECT_CAST);
                     }
                     if self.info(if_true).shape != self.info(if_false).shape {
-                        return Err(Error::TT_ERROR_SELECT_BROADCAST);
+                        return Err(ttStatus::TT_ERROR_SELECT_BROADCAST);
                     }
                 }
                 Op::Matmul { acc, a, b } => {
                     if self.info(acc).kind != ValueKind::Acc
                         || self.info(acc).shape != RegShape::Tile
                     {
-                        return Err(Error::TT_ERROR_MATMUL_ACC);
+                        return Err(ttStatus::TT_ERROR_MATMUL_ACC);
                     }
                     if self.info(a).shape != RegShape::Tile || self.info(b).shape != RegShape::Tile
                     {
-                        return Err(Error::TT_ERROR_MATMUL_OPERAND);
+                        return Err(ttStatus::TT_ERROR_MATMUL_OPERAND);
                     }
                     // The operands share a dtype; the accumulator may be wider
                     // (bf16 operands accumulate in f32), never narrower.
@@ -1251,7 +1271,7 @@ impl Kernel {
                         || self.info(a).dtype != self.info(b).dtype
                         || (self.info(a).dtype == DType::F32 && self.info(acc).dtype == DType::Bf16)
                     {
-                        return Err(Error::TT_ERROR_MATMUL_DTYPE);
+                        return Err(ttStatus::TT_ERROR_MATMUL_DTYPE);
                     }
                 }
                 Op::Sum { acc, x, s } => {
@@ -1261,9 +1281,12 @@ impl Kernel {
                 Op::Max { acc, x } => {
                     self.expect_reduce(acc, x, at)?;
                 }
-                Op::Wait { cb } | Op::Reserve { cb } | Op::Push { cb } | Op::Pop { cb } => {
+                Op::Wait { cb, .. }
+                | Op::Reserve { cb, .. }
+                | Op::Push { cb, .. }
+                | Op::Pop { cb, .. } => {
                     if !matches!(*self.at(cb), Op::Cb { .. }) {
-                        return Err(Error::TT_ERROR_NOT_A_BUFFER);
+                        return Err(ttStatus::TT_ERROR_NOT_A_BUFFER);
                     }
                 }
                 Op::EndReader | Op::EndCompute => {}
@@ -1292,21 +1315,21 @@ impl Kernel {
         }
 
         if grid.is_none() {
-            return Err(Error::TT_ERROR_GRID);
+            return Err(ttStatus::TT_ERROR_GRID);
         }
         if !loops.is_empty() {
-            return Err(Error::TT_ERROR_ENDLOOP_WITHOUT_LOOP);
+            return Err(ttStatus::TT_ERROR_ENDLOOP_WITHOUT_LOOP);
         }
         Ok(())
     }
 
     /// An index: a value of the index dtype, whose shape is how many lanes it
     /// names (a row or a column is 32 bases, a tile 1024).
-    fn expect_offset(&self, value: OpId, at: usize) -> Result<u32, Error> {
+    fn expect_offset(&self, value: OpId, at: usize) -> Result<u32, ttStatus> {
         let info = self.info(value);
         if info.dtype != INDEX {
             let _ = at;
-            return Err(Error::TT_ERROR_OFFSET_NOT_INDEX);
+            return Err(ttStatus::TT_ERROR_OFFSET_NOT_INDEX);
         }
         Ok(match info.shape {
             RegShape::Scalar => 1,
@@ -1316,11 +1339,11 @@ impl Kernel {
     }
 
     /// A shape term must be a scalar of the index dtype.
-    fn expect_index_scalar(&self, value: OpId, at: usize) -> Result<(), Error> {
+    fn expect_index_scalar(&self, value: OpId, at: usize) -> Result<(), ttStatus> {
         let _ = at;
         let info = self.info(value);
         if info.dtype != INDEX || info.shape != RegShape::Scalar {
-            return Err(Error::TT_ERROR_DIMENSION_NOT_INDEX);
+            return Err(ttStatus::TT_ERROR_DIMENSION_NOT_INDEX);
         }
         Ok(())
     }
@@ -1328,38 +1351,38 @@ impl Kernel {
     /// A reduce's accumulator and operand: the accumulator folds one tile
     /// region, its shape picking the axis (see [`ReduceDim::of`]), and the
     /// operand is a tile of the accumulator's dtype.
-    fn expect_reduce(&self, acc: OpId, x: OpId, at: usize) -> Result<(), Error> {
+    fn expect_reduce(&self, acc: OpId, x: OpId, at: usize) -> Result<(), ttStatus> {
         let a = self.info(acc);
         if a.kind != ValueKind::Acc {
             let _ = at;
-            return Err(Error::TT_ERROR_REDUCE_ACC);
+            return Err(ttStatus::TT_ERROR_REDUCE_ACC);
         }
         if ReduceDim::of(a.shape).is_none() {
             let _ = at;
-            return Err(Error::TT_ERROR_REDUCE_ACC_SHAPE);
+            return Err(ttStatus::TT_ERROR_REDUCE_ACC_SHAPE);
         }
         let x = self.info(x);
         if x.shape != RegShape::Tile {
             let _ = at;
-            return Err(Error::TT_ERROR_REDUCE_OPERAND);
+            return Err(ttStatus::TT_ERROR_REDUCE_OPERAND);
         }
         if x.dtype != a.dtype {
             let _ = (x.dtype, a.dtype);
-            return Err(Error::TT_ERROR_REDUCE_DTYPE);
+            return Err(ttStatus::TT_ERROR_REDUCE_DTYPE);
         }
         Ok(())
     }
 
     /// Every member of the shape op `value` must be a non-zero index scalar.
-    fn expect_terms(&self, value: OpId, at: usize) -> Result<(), Error> {
+    fn expect_terms(&self, value: OpId, at: usize) -> Result<(), ttStatus> {
         let Op::Shape(ref ops) = *self.at(value) else {
             let _ = at;
-            return Err(Error::TT_ERROR_DIMENSION_NOT_INDEX);
+            return Err(ttStatus::TT_ERROR_DIMENSION_NOT_INDEX);
         };
         for term in ops.iter() {
             self.expect_index_scalar(*term, at)?;
             if self.const_i32(*term) == Some(0) {
-                return Err(Error::TT_ERROR_ZERO_DIMENSION);
+                return Err(ttStatus::TT_ERROR_ZERO_DIMENSION);
             }
         }
         Ok(())
@@ -1381,6 +1404,23 @@ fn is_value(info: &ValueInfo) -> bool {
     }
 }
 
+/// An accumulator's shape and dtype, checked: the four shapes the hardware
+/// has, and a float datum.
+fn acc_reg_shape_checked(shape: [Dim; 2], at: usize, dtype: DType) -> Result<RegShape, ttStatus> {
+    let reg = match shape {
+        [1, 32] | [32, 1] | [1, 1] | [32, 32] => acc_reg_shape(shape),
+        _ => {
+            let _ = at;
+            return Err(ttStatus::TT_ERROR_ACC_SHAPE);
+        }
+    };
+    if !matches!(dtype, DType::F32 | DType::Bf16) {
+        let _ = (at, dtype);
+        return Err(ttStatus::TT_ERROR_ACC_DTYPE);
+    }
+    Ok(reg)
+}
+
 /// The register shape an accumulator's fixed shape names.
 fn acc_reg_shape(shape: [Dim; 2]) -> RegShape {
     match shape {
@@ -1391,23 +1431,6 @@ fn acc_reg_shape(shape: [Dim; 2]) -> RegShape {
     }
 }
 
-/// An accumulator's shape and dtype, checked: the four shapes the hardware
-/// has, and a float datum.
-fn acc_reg_shape_checked(shape: [Dim; 2], at: usize, dtype: DType) -> Result<RegShape, Error> {
-    let reg = match shape {
-        [1, 32] | [32, 1] | [1, 1] | [32, 32] => acc_reg_shape(shape),
-        _ => {
-            let _ = at;
-            return Err(Error::TT_ERROR_ACC_SHAPE);
-        }
-    };
-    if !matches!(dtype, DType::F32 | DType::Bf16) {
-        let _ = (at, dtype);
-        return Err(Error::TT_ERROR_ACC_DTYPE);
-    }
-    Ok(reg)
-}
-
 // ---------------------------------------------------------------------------
 // Forms
 // ---------------------------------------------------------------------------
@@ -1416,18 +1439,6 @@ fn acc_reg_shape_checked(shape: [Dim; 2], at: usize, dtype: DType) -> Result<Reg
 pub const VERSION: u32 = 9;
 
 impl Kernel {
-    /// Read the byte form.
-    ///
-    /// TODO(the IR re-model): the op tags changed shape with the IR
-    /// (`Op::Const` lost its `value`, `Param` carries a shape op, `Tile` is
-    /// `Acc`, `Sum` carries `s`), so the record has to be redesigned before it
-    /// can be written again. The text form is the one form that round-trips
-    /// while the re-model lands.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Kernel, Error> {
-        let _ = bytes;
-        todo!("the byte form is being redesigned with the IR")
-    }
-
     /// Parse the text form.
     ///
     /// The grammar is the one the tests write:
@@ -1454,19 +1465,19 @@ impl Kernel {
     /// interned as an `Op::Const` of the index dtype, and a multi-term
     /// parameter shape becomes an `Op::Shape` of those terms, so the program's
     /// own ops are the only place an extent lives.
-    pub fn parse(text: &str) -> Result<Kernel, Error> {
+    pub fn parse(text: &str) -> Result<Kernel, ttStatus> {
         let mut p = Parser::default();
         p.run(text)
     }
 }
 
 impl Parser {
-    fn value(&self, t: &mut Tokens<'_>) -> Result<OpId, Error> {
+    fn value(&self, t: &mut Tokens<'_>) -> Result<OpId, ttStatus> {
         t.value(&self.symbols)
     }
 
     /// Parse every line, in order.
-    fn run(&mut self, text: &str) -> Result<Kernel, Error> {
+    fn run(&mut self, text: &str) -> Result<Kernel, ttStatus> {
         let mut version = false;
         for line in text.lines() {
             let line = line.trim();
@@ -1476,10 +1487,10 @@ impl Parser {
             let mut t = Tokens::new(line);
             if !version {
                 if t.word() != Some("version") {
-                    return Err(Error::TT_ERROR_VERSION);
+                    return Err(ttStatus::TT_ERROR_VERSION);
                 }
                 if t.number()? != VERSION {
-                    return Err(Error::TT_ERROR_VERSION);
+                    return Err(ttStatus::TT_ERROR_VERSION);
                 }
                 version = true;
                 continue;
@@ -1581,14 +1592,22 @@ impl Parser {
                         continue;
                     }
                     "wait" | "reserve" | "push" | "pop" => {
-                        let word = t.word().expect("the word was peeked");
+                        let Some(word) = t.word() else {
+                            return Err(crate::status::internal_bug(
+                                "a peeked hand-off word was not there",
+                            ));
+                        };
                         let cb = self.value(&mut t)?;
+                        let n = match t.peek_char() {
+                            Some(c) if c.is_ascii_digit() => t.number()?,
+                            _ => 1,
+                        };
                         t.end()?;
                         self.push(match word {
-                            "wait" => Op::Wait { cb },
-                            "reserve" => Op::Reserve { cb },
-                            "push" => Op::Push { cb },
-                            _ => Op::Pop { cb },
+                            "wait" => Op::Wait { cb, n },
+                            "reserve" => Op::Reserve { cb, n },
+                            "push" => Op::Push { cb, n },
+                            _ => Op::Pop { cb, n },
                         });
                         continue;
                     }
@@ -1617,10 +1636,10 @@ impl Parser {
             self.definition(&mut t)?;
         }
         if !version {
-            return Err(Error::TT_ERROR_VERSION);
+            return Err(ttStatus::TT_ERROR_VERSION);
         }
         let k = self.take()?;
-        k.verify()?;
+        k.check()?;
         Ok(k)
     }
 }
@@ -1655,9 +1674,9 @@ impl Parser {
         id
     }
 
-    fn define(&mut self, name: String, id: usize) -> Result<(), Error> {
+    fn define(&mut self, name: String, id: usize) -> Result<(), ttStatus> {
         if self.symbols.contains_key(&name) {
-            return Err(Error::TT_ERROR_NAME_DUPLICATE);
+            return Err(ttStatus::TT_ERROR_NAME_DUPLICATE);
         }
         let id = OpId(id as u32);
         self.names.insert(id, name.clone());
@@ -1673,7 +1692,7 @@ impl Parser {
         })
     }
 
-    fn term(&mut self, t: &mut Tokens<'_>) -> Result<OpId, Error> {
+    fn term(&mut self, t: &mut Tokens<'_>) -> Result<OpId, ttStatus> {
         if t.peek_char() == Some('%') {
             return t.value(&self.symbols);
         }
@@ -1681,10 +1700,10 @@ impl Parser {
         Ok(self.intern_i32(n as i32))
     }
 
-    fn definition(&mut self, t: &mut Tokens<'_>) -> Result<(), Error> {
+    fn definition(&mut self, t: &mut Tokens<'_>) -> Result<(), ttStatus> {
         let name = t.name()?;
         t.eq()?;
-        let keyword = t.word().ok_or(Error::TT_ERROR_PARSE)?.to_owned();
+        let keyword = t.word().ok_or(ttStatus::TT_ERROR_PARSE)?.to_owned();
         let key = keyword.as_str();
         match key {
             "const" => {
@@ -1754,7 +1773,7 @@ impl Parser {
                 let axis = match t.word() {
                     Some("x") => 0,
                     Some("y") => 1,
-                    _ => return Err(Error::TT_ERROR_GRID_AXIS),
+                    _ => return Err(ttStatus::TT_ERROR_GRID_AXIS),
                 };
                 t.end()?;
                 let id = self.ops.len();
@@ -1764,7 +1783,7 @@ impl Parser {
             "cast" | "bitcast" => {
                 let src = self.value(t)?;
                 if t.word() != Some("to") {
-                    return Err(Error::TT_ERROR_PARSE);
+                    return Err(ttStatus::TT_ERROR_PARSE);
                 }
                 let dtype = t.dtype()?;
                 t.end()?;
@@ -1803,14 +1822,14 @@ impl Parser {
                     self.define(name, id)?;
                     self.push(Op::Binary { op, a, b });
                 } else {
-                    return Err(Error::TT_ERROR_PARSE);
+                    return Err(ttStatus::TT_ERROR_PARSE);
                 }
             }
         }
         Ok(())
     }
 
-    fn take(&mut self) -> Result<Kernel, Error> {
+    fn take(&mut self) -> Result<Kernel, ttStatus> {
         let mut k = Kernel::default();
         for op in std::mem::take(&mut self.ops) {
             k.push(op);
@@ -1849,20 +1868,19 @@ impl Printer<'_, '_> {
                 "%{} = const {} {}",
                 k.names.get(&id).map(String::as_str).unwrap_or("?"),
                 dtype.name(),
-                literal(dtype, bits)
+                match literal(dtype, bits) {
+                    Ok(text) => text,
+                    Err(_) => return Err(fmt::Error),
+                }
             ),
             Op::Param { dtype, shape } => {
-                write!(self.f, "{} = param {} ", self.name(id), dtype.name()).and_then(|_| {
-                    let dims: Vec<String> =
-                        (0..k.shape(shape).len()).map(|_| String::new()).collect();
-                    let _ = dims;
-                    let terms: Vec<OpId> = match *k.at(shape) {
-                        Op::Shape(ref ops) => ops.to_vec(),
-                        _ => Vec::new(),
-                    };
-                    let text: Vec<String> = terms.iter().map(|t| self.name(*t)).collect();
-                    writeln!(self.f, "{}", text.join(","))
-                })
+                write!(self.f, "{} = param {} ", self.name(id), dtype.name())?;
+                let terms: Vec<OpId> = match *k.at(shape) {
+                    Op::Shape(ref ops) => ops.to_vec(),
+                    _ => Vec::new(),
+                };
+                let text: Vec<String> = terms.iter().map(|t| self.name(*t)).collect();
+                writeln!(self.f, "{}", text.join(","))
             }
             Op::Variable { dtype } => {
                 writeln!(self.f, "{} = param {} 0", self.name(id), dtype.name())
@@ -1999,29 +2017,43 @@ impl Printer<'_, '_> {
                 self.name(s)
             ),
             Op::Max { acc, x } => writeln!(self.f, "max {} {}", self.name(acc), self.name(x)),
-            Op::Wait { cb } => writeln!(self.f, "wait {}", self.name(cb)),
-            Op::Reserve { cb } => writeln!(self.f, "reserve {}", self.name(cb)),
-            Op::Push { cb } => writeln!(self.f, "push {}", self.name(cb)),
-            Op::Pop { cb } => writeln!(self.f, "pop {}", self.name(cb)),
+            Op::Wait { cb, n } => writeln!(self.f, "wait {}{}", self.name(cb), pages(n)),
+            Op::Reserve { cb, n } => writeln!(self.f, "reserve {}{}", self.name(cb), pages(n)),
+            Op::Push { cb, n } => writeln!(self.f, "push {}{}", self.name(cb), pages(n)),
+            Op::Pop { cb, n } => writeln!(self.f, "pop {}{}", self.name(cb), pages(n)),
         }?;
         let _ = named;
         Ok(())
     }
 }
 
-fn literal(dtype: DType, bits: u32) -> String {
+/// A hand-off's page count as text: omitted when it is one page, the common
+/// case.
+fn pages(n: Dim) -> String {
+    if n == 1 {
+        String::new()
+    } else {
+        format!(" {n}")
+    }
+}
+
+fn literal(dtype: DType, bits: u32) -> Result<String, ttStatus> {
     match dtype {
-        DType::I32 => (bits as i32).to_string(),
+        DType::I32 => Ok((bits as i32).to_string()),
         DType::F32 => {
             let v = f32::from_bits(bits);
             if v.fract() == 0.0 {
-                format!("{v:.1}")
+                Ok(format!("{v:.1}"))
             } else {
-                format!("{v}")
+                Ok(format!("{v}"))
             }
         }
-        DType::Bf16 => unreachable!("bf16 constants are refused"),
-        DType::Bool => unreachable!("bool constants are refused"),
+        DType::Bf16 => Err(crate::status::internal_bug(
+            "a bf16 constant reached the printer",
+        )),
+        DType::Bool => Err(crate::status::internal_bug(
+            "a bool constant reached the printer",
+        )),
     }
 }
 
@@ -2129,120 +2161,120 @@ impl<'a> Tokens<'a> {
         Some(word)
     }
 
-    fn name(&mut self) -> Result<String, Error> {
+    fn name(&mut self) -> Result<String, ttStatus> {
         self.skip_space();
         if self.peek_char() != Some('%') {
-            return Err(Error::TT_ERROR_PARSE);
+            return Err(ttStatus::TT_ERROR_PARSE);
         }
         self.at += 1;
-        let word = self.word().ok_or(Error::TT_ERROR_PARSE)?;
+        let word = self.word().ok_or(ttStatus::TT_ERROR_PARSE)?;
         Ok(word.to_owned())
     }
 
-    fn value(&mut self, symbols: &BTreeMap<String, OpId>) -> Result<OpId, Error> {
+    fn value(&mut self, symbols: &BTreeMap<String, OpId>) -> Result<OpId, ttStatus> {
         let name = self.name()?;
         symbols
             .get(&name)
             .copied()
-            .ok_or(Error::TT_ERROR_VALUE_UNDEFINED)
+            .ok_or(ttStatus::TT_ERROR_VALUE_UNDEFINED)
     }
 
-    fn number(&mut self) -> Result<u32, Error> {
+    fn number(&mut self) -> Result<u32, ttStatus> {
         self.skip_space();
         let rest = self.rest();
         let end = rest
             .find(|c: char| !c.is_ascii_digit())
             .unwrap_or(rest.len());
         if end == 0 {
-            return Err(Error::TT_ERROR_PARSE);
+            return Err(ttStatus::TT_ERROR_PARSE);
         }
-        let n: u32 = rest[..end].parse().map_err(|_| Error::TT_ERROR_PARSE)?;
+        let n: u32 = rest[..end].parse().map_err(|_| ttStatus::TT_ERROR_PARSE)?;
         self.at += end;
         Ok(n)
     }
 
-    fn comma(&mut self) -> Result<(), Error> {
+    fn comma(&mut self) -> Result<(), ttStatus> {
         self.skip_space();
         if self.peek_char() != Some(',') {
-            return Err(Error::TT_ERROR_PARSE);
+            return Err(ttStatus::TT_ERROR_PARSE);
         }
         self.at += 1;
         Ok(())
     }
 
-    fn dot(&mut self) -> Result<(), Error> {
+    fn dot(&mut self) -> Result<(), ttStatus> {
         self.skip_space();
         if self.peek_char() != Some('.') {
-            return Err(Error::TT_ERROR_PARSE);
+            return Err(ttStatus::TT_ERROR_PARSE);
         }
         self.at += 1;
         Ok(())
     }
 
-    fn eq(&mut self) -> Result<(), Error> {
+    fn eq(&mut self) -> Result<(), ttStatus> {
         self.skip_space();
         if self.peek_char() != Some('=') {
-            return Err(Error::TT_ERROR_PARSE);
+            return Err(ttStatus::TT_ERROR_PARSE);
         }
         self.at += 1;
         Ok(())
     }
 
-    fn bracket(&mut self, p: &mut Parser) -> Result<OpId, Error> {
+    fn bracket(&mut self, p: &mut Parser) -> Result<OpId, ttStatus> {
         self.skip_space();
         if self.peek_char() != Some('[') {
-            return Err(Error::TT_ERROR_PARSE);
+            return Err(ttStatus::TT_ERROR_PARSE);
         }
         self.at += 1;
         let value = p.term(self)?;
         self.skip_space();
         if self.peek_char() != Some(']') {
-            return Err(Error::TT_ERROR_PARSE);
+            return Err(ttStatus::TT_ERROR_PARSE);
         }
         self.at += 1;
         Ok(value)
     }
 
-    fn shape2(&mut self) -> Result<[Dim; 2], Error> {
+    fn shape2(&mut self) -> Result<[Dim; 2], ttStatus> {
         let a = self.number()?;
         self.comma()?;
         let b = self.number()?;
         Ok([a, b])
     }
 
-    fn dtype(&mut self) -> Result<DType, Error> {
+    fn dtype(&mut self) -> Result<DType, ttStatus> {
         match self.word() {
             Some("f32") => Ok(DType::F32),
             Some("bf16") => Ok(DType::Bf16),
             Some("i32") => Ok(DType::I32),
             Some("bool") => Ok(DType::Bool),
             // A real format with no path yet: named, never guessed.
-            Some("tf32") => Err(Error::TT_TODO_TF32),
-            _ => Err(Error::TT_ERROR_PARSE),
+            Some("tf32") => Err(ttStatus::TT_TODO_TF32),
+            _ => Err(ttStatus::TT_ERROR_PARSE),
         }
     }
 
-    fn literal(&mut self, dtype: DType) -> Result<u32, Error> {
-        let word = self.token().ok_or(Error::TT_ERROR_PARSE)?;
+    fn literal(&mut self, dtype: DType) -> Result<u32, ttStatus> {
+        let word = self.token().ok_or(ttStatus::TT_ERROR_PARSE)?;
         match dtype {
             DType::I32 => word
                 .parse::<i32>()
                 .map(|v| v as u32)
-                .map_err(|_| Error::TT_ERROR_PARSE),
+                .map_err(|_| ttStatus::TT_ERROR_PARSE),
             DType::F32 => word
                 .parse::<f32>()
                 .map(|v| v.to_bits())
-                .map_err(|_| Error::TT_ERROR_PARSE),
-            _ => Err(Error::TT_ERROR_CONST_BF16),
+                .map_err(|_| ttStatus::TT_ERROR_PARSE),
+            _ => Err(ttStatus::TT_ERROR_CONST_BF16),
         }
     }
 
-    fn end(&mut self) -> Result<(), Error> {
+    fn end(&mut self) -> Result<(), ttStatus> {
         self.skip_space();
         if self.rest().is_empty() {
             Ok(())
         } else {
-            Err(Error::TT_ERROR_TRAILING_INPUT)
+            Err(ttStatus::TT_ERROR_TRAILING_INPUT)
         }
     }
 }

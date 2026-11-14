@@ -18,13 +18,14 @@
 use std::collections::BTreeMap;
 
 use crate::ir::{
-    BOp, DType, Dim, Error, Kernel, Op, OpId, RegShape, UOp, ValueInfo, access_shape, unit_of,
+    BOp, DType, Dim, Kernel, Op, OpId, RegShape, UOp, ValueInfo, access_shape, unit_of,
 };
 use crate::mir::{
     Bcast, BinarySfpOp, Cb, CmpOp, Core, Dst, ElwOp, IOp, LReg, MachineKernel, MirOp, PackMask,
     UnarySfpOp,
 };
 use crate::riscv::reg;
+use crate::status::ttStatus;
 use tt_isa::cfg::generated::thread;
 
 /// `Dst` rows one 32x32 F32 tile occupies (`tt_isa`'s SFPU row is 16 datums).
@@ -76,8 +77,10 @@ impl Pool {
         }
     }
 
-    fn take(&mut self) -> Result<u8, Error> {
-        self.free.pop().ok_or(Error::TT_ERROR_REGISTERS_EXHAUSTED)
+    fn take(&mut self) -> Result<u8, ttStatus> {
+        self.free
+            .pop()
+            .ok_or(ttStatus::TT_ERROR_REGISTERS_EXHAUSTED)
     }
 
     fn give(&mut self, reg: u8) {
@@ -133,7 +136,7 @@ struct OnesPage {
 ///
 /// Nothing here is limited by the hardware: the point of lowering with no reuse
 /// is that a missing register is a `plan`-time error, not a silent overlay.
-fn prepare(k: &Kernel) -> Result<(Plan, MachineKernel, Alloc), Error> {
+fn prepare(k: &Kernel) -> Result<(Plan, MachineKernel, Alloc), ttStatus> {
     use crate::mir::{CbInfo, DstInfo};
     let mut m = MachineKernel::default();
     let mut place: BTreeMap<OpId, Dst> = BTreeMap::new();
@@ -250,14 +253,14 @@ fn owner(k: &Kernel, value: OpId) -> OpId {
 impl Kernel {
     /// Lower the verified SSA program to the machine IR, with one register per
     /// value and no hardware limit applied.
-    pub fn lower(&self) -> Result<MachineKernel, Error> {
+    pub fn lower(&self) -> Result<MachineKernel, ttStatus> {
         let k = self;
         lower_with(k)
     }
 }
 
 /// Lower `k` to the five programs.
-fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
+fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
     let types = Types { k };
     let types = &types;
     let (plan, mut m, alloc) = prepare(k)?;
@@ -366,7 +369,12 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
         // needs that same `32,32`.
         let reduce_dim = match *op {
             Op::Sum { acc, .. } | Op::Max { acc, .. } => {
-                Some(crate::ir::ReduceDim::of(types.of(acc).shape).expect("a reduce acc folds"))
+                let Some(dim) = crate::ir::ReduceDim::of(types.of(acc).shape) else {
+                    return Err(crate::status::internal_bug(
+                        "lower: a reduce accumulator has no fold",
+                    ));
+                };
+                Some(dim)
             }
             _ => None,
         };
@@ -395,7 +403,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                     // A mover segment's loop is that program's own: its own
                     // index/limit pair, its own temporaries, so `t5` (the NIU
                     // base) never holds an index.
-                    let (_, limit) = *MOVER_PAIRS.get(depth).ok_or(Error::TT_TODO_LOOP_DEPTH)?;
+                    let (_, limit) = *MOVER_PAIRS.get(depth).ok_or(ttStatus::TT_TODO_LOOP_DEPTH)?;
                     match bound_const(k, bound) {
                         Some(count) => m.push(core, MirOp::Loop { count }),
                         None => {
@@ -425,7 +433,9 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                 }
                 // Two levels is what the compute roles have counter pairs for;
                 // a third would need another pair, which is not reserved.
-                let (_, limit) = *COMPUTE_PAIRS.get(depth).ok_or(Error::TT_TODO_LOOP_DEPTH)?;
+                let (_, limit) = *COMPUTE_PAIRS
+                    .get(depth)
+                    .ok_or(ttStatus::TT_TODO_LOOP_DEPTH)?;
                 match bound_const(k, bound) {
                     Some(count) => {
                         m.push(Core::Unpack, MirOp::Loop { count });
@@ -486,12 +496,17 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
             // page and releases it, a producer reserves one and publishes it.
             // The core is the one that does it — the unpacker and the packer in
             // the compute ring, the movers in their own segments.
-            Op::Wait { cb } | Op::Pop { cb } => {
-                let ring = cb_id(*plan.cb.get(&cb).ok_or(Error::TT_ERROR_BUFFER_NOT_PLACED)?);
+            Op::Wait { cb, n } | Op::Pop { cb, n } => {
+                let ring = cb_id(
+                    *plan
+                        .cb
+                        .get(&cb)
+                        .ok_or(ttStatus::TT_ERROR_BUFFER_NOT_PLACED)?,
+                );
                 let op = if matches!(*op, Op::Wait { .. }) {
-                    MirOp::CbWait { cb: ring }
+                    MirOp::CbWait { cb: ring, n }
                 } else {
-                    MirOp::CbPop { cb: ring }
+                    MirOp::CbPop { cb: ring, n }
                 };
                 let core = match mover {
                     Some(Core::Writer) => Core::Writer,
@@ -500,12 +515,17 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                 m.push(core, op);
                 continue;
             }
-            Op::Reserve { cb } | Op::Push { cb } => {
-                let ring = cb_id(*plan.cb.get(&cb).ok_or(Error::TT_ERROR_BUFFER_NOT_PLACED)?);
+            Op::Reserve { cb, n } | Op::Push { cb, n } => {
+                let ring = cb_id(
+                    *plan
+                        .cb
+                        .get(&cb)
+                        .ok_or(ttStatus::TT_ERROR_BUFFER_NOT_PLACED)?,
+                );
                 let op = if matches!(*op, Op::Reserve { .. }) {
-                    MirOp::CbReserve { cb: ring }
+                    MirOp::CbReserve { cb: ring, n }
                 } else {
-                    MirOp::CbPush { cb: ring }
+                    MirOp::CbPush { cb: ring, n }
                 };
                 let core = match mover {
                     Some(Core::Reader) => Core::Reader,
@@ -552,11 +572,11 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                     Op::Cb { dtype, .. } => *dtype,
                     _ => {
                         let _ = buffer;
-                        return Err(Error::TT_ERROR_NOT_A_BUFFER);
+                        return Err(ttStatus::TT_ERROR_NOT_A_BUFFER);
                     }
                 };
                 let unit_shape = access_shape(access)?;
-                let reg = dst_reg(alloc, owner(k, value));
+                let reg = dst_reg(alloc, owner(k, value))?;
                 // A value only an `Src` reader consumes never enters `Dst`: the
                 // unpack goes straight into `SrcA`/`SrcB` at the op that reads
                 // it, and this load only reserves the page.
@@ -568,12 +588,12 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                 // page's own layout.
                 if unit_shape != RegShape::Tile && lands_in_dst {
                     let _ = (at, access);
-                    return Err(Error::TT_TODO_ACCESS_SHAPE);
+                    return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
                 }
                 let rows = rows_of(unit_shape, at)?;
                 let cb = cb_id(plan.cb.get(&buffer).copied().ok_or_else(|| {
                     let _ = buffer;
-                    Error::TT_ERROR_BUFFER_NOT_PLACED
+                    ttStatus::TT_ERROR_BUFFER_NOT_PLACED
                 })?);
                 if lands_in_dst {
                     // A bf16 page can only be unpacked into a bf16 `Dst`
@@ -583,7 +603,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                     // widening `BF16 -> TF32` path.
                     if wide && dtype == crate::ir::DType::Bf16 {
                         let _ = (at, buffer);
-                        return Err(Error::TT_ERROR_BF16_WIDEN);
+                        return Err(ttStatus::TT_ERROR_BF16_WIDEN);
                     }
                     // The page's wait and release are the `wait`/`pop` ops
                     // `add_movers` placed around this load.
@@ -636,13 +656,13 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                         Op::Const { bits, .. } => *bits,
                         _ => {
                             let _ = src;
-                            return Err(Error::TT_TODO_ACC_STORE);
+                            return Err(ttStatus::TT_TODO_ACC_STORE);
                         }
                     };
                     let acc_dtype = types.of(buffer).dtype;
                     let (unit_shape, _, _) = unit_of([32, 32], acc_dtype)?;
                     let rows = rows_of(unit_shape, at)?;
-                    let reg = dst_reg(alloc, buffer);
+                    let reg = dst_reg(alloc, buffer)?;
                     // The fill writes `Dst` rows; `reg_sync` places the wait
                     // for a packer that still reads them.
                     m.push(
@@ -675,7 +695,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                     Op::Cb { dtype, .. } => *dtype,
                     _ => {
                         let _ = buffer;
-                        return Err(Error::TT_ERROR_NOT_A_BUFFER);
+                        return Err(ttStatus::TT_ERROR_NOT_A_BUFFER);
                     }
                 };
                 let unit_shape = access_shape(access)?;
@@ -683,12 +703,12 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                 // packer's `SETADCX` narrowing.
                 if unit_shape != RegShape::Tile {
                     let _ = (at, access);
-                    return Err(Error::TT_TODO_ACCESS_SHAPE);
+                    return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
                 }
                 let rows = rows_of(unit_shape, at)?;
                 let cb = cb_id(plan.cb.get(&buffer).copied().ok_or_else(|| {
                     let _ = buffer;
-                    Error::TT_ERROR_BUFFER_NOT_PLACED
+                    ttStatus::TT_ERROR_BUFFER_NOT_PLACED
                 })?);
                 // The ring's `reserve`/`push` are the ops `add_movers` placed
                 // around this store. The `Dst` hand-off is `reg_sync`'s: the
@@ -707,7 +727,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                 m.push(
                     Core::Pack,
                     MirOp::SetPackOffset {
-                        reg: dst_reg(alloc, owner(k, src)),
+                        reg: dst_reg(alloc, owner(k, src))?,
                         at: 0,
                     },
                 );
@@ -718,8 +738,8 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                 let from = types.of(src).dtype;
                 let shape = types.of(src).shape;
                 let rows = sfp_rows(shape, at)?;
-                let s = dst_reg(alloc, owner(k, src));
-                let out = dst_reg(alloc, owner(k, value));
+                let s = dst_reg(alloc, owner(k, src))?;
+                let out = dst_reg(alloc, owner(k, value))?;
                 let (la, ld) = alloc.lreg[&owner(k, value)];
                 // The conversion happens in the lane. 16-bit mode stores every
                 // value as a bf16 datum, so a `bool` lane *is* `-1.0`/`0.0` there
@@ -768,8 +788,8 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
             Op::Unary { op, a } => {
                 let shape = types.of(a).shape;
                 let rows = sfp_rows(shape, at)?;
-                let src = dst_reg(alloc, owner(k, a));
-                let out = dst_reg(alloc, owner(k, value));
+                let src = dst_reg(alloc, owner(k, a))?;
+                let out = dst_reg(alloc, owner(k, value))?;
                 let (la, ld) = alloc.lreg[&owner(k, value)];
                 let dtype = storage(types.of(a).dtype);
                 // `exp2` is the one transcendental no IR op spells: its
@@ -843,7 +863,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                         || !matches!(right.dtype, DType::F32 | DType::Bf16)
                     {
                         let _ = (left.dtype, right.dtype);
-                        return Err(Error::TT_TODO_BROADCAST_SFPU);
+                        return Err(ttStatus::TT_TODO_BROADCAST_SFPU);
                     }
                     // The FPU's `ELWADD`/`ELWSUB`/`ELWMUL` broadcast `SrcB`:
                     // one operand is the tile, the other its row, column or
@@ -851,14 +871,14 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                     // or the compiler's staged one.
                     if !matches!(op, BOp::Add | BOp::Sub | BOp::Mul) {
                         let _ = (op, left.shape, right.shape);
-                        return Err(Error::TT_TODO_BROADCAST);
+                        return Err(ttStatus::TT_TODO_BROADCAST);
                     }
                     let (tile, narrow) = match (left.shape, right.shape) {
                         (RegShape::Tile, _) => (a, b),
                         (_, RegShape::Tile) => (b, a),
                         _ => {
                             let _ = (left.shape, right.shape);
-                            return Err(Error::TT_TODO_BROADCAST);
+                            return Err(ttStatus::TT_TODO_BROADCAST);
                         }
                     };
                     // The instruction is `SrcA op SrcB` and the tile is the
@@ -866,13 +886,17 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                     // value on the left has no lowering.
                     if op == BOp::Sub && tile != a {
                         let _ = (a, b);
-                        return Err(Error::TT_TODO_BROADCAST);
+                        return Err(ttStatus::TT_TODO_BROADCAST);
                     }
                     let bcast = match types.of(narrow).shape {
                         RegShape::Row => Bcast::Row,
                         RegShape::Column => Bcast::Col,
                         RegShape::Scalar => Bcast::Scalar,
-                        RegShape::Tile => unreachable!("the tile is the other operand"),
+                        RegShape::Tile => {
+                            return Err(crate::status::internal_bug(
+                                "lower: a broadcast with two tile operands",
+                            ));
+                        }
                     };
                     fpu_broadcast(
                         &mut m, k, types, &plan, alloc, &acc_mask, value, op, tile, narrow, bcast,
@@ -925,11 +949,11 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                     }
                     other => {
                         let _ = (op, other);
-                        return Err(Error::TT_TODO_BINARY_DTYPE);
+                        return Err(ttStatus::TT_TODO_BINARY_DTYPE);
                     }
                 };
                 let rows = sfp_rows(shape, at)?;
-                let out = dst_reg(alloc, owner(k, value));
+                let out = dst_reg(alloc, owner(k, value))?;
                 let (la, ld) = alloc.lreg[&owner(k, value)];
                 let lb = LReg(2);
                 // A comparison writes `-1`/`0` lanes, so its result is stored in
@@ -962,7 +986,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                             Core::Math,
                             MirOp::Sfpload {
                                 lreg: la,
-                                reg: dst_reg(alloc, owner(k, a)),
+                                reg: dst_reg(alloc, owner(k, a))?,
                                 at: row,
                                 dtype,
                             },
@@ -973,7 +997,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                             Core::Math,
                             MirOp::Sfpload {
                                 lreg: lb,
-                                reg: dst_reg(alloc, owner(k, b)),
+                                reg: dst_reg(alloc, owner(k, b))?,
                                 at: row,
                                 dtype,
                             },
@@ -983,7 +1007,14 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                             Core::Math,
                             MirOp::LaneConst {
                                 lreg: lb,
-                                bits: cb.expect("a re-loaded amount is a constant"),
+                                bits: match cb {
+                                    Some(bits) => bits,
+                                    None => {
+                                        return Err(crate::status::internal_bug(
+                                            "lower: a re-loaded shift amount is not a constant",
+                                        ));
+                                    }
+                                },
                             },
                         );
                     }
@@ -1095,17 +1126,17 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
             } => {
                 let shape = types.of(if_true).shape;
                 let rows = sfp_rows(shape, at)?;
-                let sc = dst_reg(alloc, owner(k, cond));
-                let st = dst_reg(alloc, owner(k, if_true));
-                let sf = dst_reg(alloc, owner(k, if_false));
-                let out = dst_reg(alloc, owner(k, value));
+                let sc = dst_reg(alloc, owner(k, cond))?;
+                let st = dst_reg(alloc, owner(k, if_true))?;
+                let sf = dst_reg(alloc, owner(k, if_false))?;
+                let out = dst_reg(alloc, owner(k, value))?;
                 let ld = alloc.lreg[&owner(k, value)].1;
                 let lc = LReg(3);
                 let lt = LReg(0);
                 let lf = LReg(2);
                 if types.of(cond).dtype != crate::ir::DType::Bool {
                     let _ = at;
-                    return Err(Error::TT_ERROR_CONDITION_NOT_BOOL);
+                    return Err(ttStatus::TT_ERROR_CONDITION_NOT_BOOL);
                 }
                 for row in rows {
                     m.push(
@@ -1166,11 +1197,15 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                 let (acc, a, b) = match *op {
                     Op::Matmul { acc, a, b } => (acc, a, b),
                     Op::Sum { acc, x, s } => (acc, x, s),
-                    _ => unreachable!("the arm pattern is matmul and sum row"),
+                    _ => {
+                        return Err(crate::status::internal_bug(
+                            "lower: the matmul/sum-row arm matched another op",
+                        ));
+                    }
                 };
                 if types.of(acc).kind != crate::ir::ValueKind::Acc {
                     let _ = at;
-                    return Err(Error::TT_ERROR_MATMUL_ACC);
+                    return Err(ttStatus::TT_ERROR_MATMUL_ACC);
                 }
                 let dt_a = types.of(a).dtype;
                 let dt_b = types.of(b).dtype;
@@ -1182,25 +1217,25 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                     || (dt_a == crate::ir::DType::F32 && dtype == crate::ir::DType::Bf16)
                 {
                     let _ = (at, dt_a, dt_b, dtype);
-                    return Err(Error::TT_ERROR_MATMUL_DTYPE);
+                    return Err(ttStatus::TT_ERROR_MATMUL_DTYPE);
                 }
                 // The accumulator is the `Dst` width; a `bf16` accumulator in a
                 // module whose bank is 32-bit would accumulate in FP32 instead.
                 if dtype == crate::ir::DType::Bf16 && wide {
                     let _ = at;
-                    return Err(Error::TT_ERROR_MATMUL_ACCUM_WIDE);
+                    return Err(ttStatus::TT_ERROR_MATMUL_ACCUM_WIDE);
                 }
-                let (cb_a, stage_a) = fpu_page(k, &plan, a, at, Error::TT_ERROR_MATMUL_OPERAND)?;
-                let (cb_b, stage_b) = fpu_page(k, &plan, b, at, Error::TT_ERROR_MATMUL_OPERAND)?;
+                let (cb_a, stage_a) = fpu_page(k, &plan, a, at, ttStatus::TT_ERROR_MATMUL_OPERAND)?;
+                let (cb_b, stage_b) = fpu_page(k, &plan, b, at, ttStatus::TT_ERROR_MATMUL_OPERAND)?;
                 // A computed operand has no page: the compiler packs it into its
                 // own and the Matrix Unit reads that.
                 if stage_a {
-                    stage(&mut m, k, &types, alloc, &acc_mask, a, cb_a);
+                    stage(&mut m, k, &types, alloc, &acc_mask, a, cb_a)?;
                 }
                 if stage_b {
-                    stage(&mut m, k, &types, alloc, &acc_mask, b, cb_b);
+                    stage(&mut m, k, &types, alloc, &acc_mask, b, cb_b)?;
                 }
-                let base = dst_reg(alloc, acc);
+                let base = dst_reg(alloc, acc)?;
                 // Scratch for `mvmul_group`, which emits a run of math ops: the
                 // run is appended to the one IR as it is produced.
                 let mut math_scratch: Vec<MirOp> = Vec::new();
@@ -1250,7 +1285,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                     ],
                     vec![(thread::FIDELITY_BASE_Phase, 0)],
                 ] {
-                    m.push(Core::Math, thread_word(&entry));
+                    m.push(Core::Math, thread_word(&entry)?);
                 }
                 // Src rows and the `Dst` counter start at 0.
                 m.push(
@@ -1275,7 +1310,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                 // the unpacker reads it, and released after the last face.
                 for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
                     if staged {
-                        m.push(Core::Unpack, MirOp::CbWait { cb });
+                        m.push(Core::Unpack, MirOp::CbWait { cb, n: 1 });
                     }
                 }
                 for fi in 0..2u32 {
@@ -1389,7 +1424,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                 m.push(Core::Math, MirOp::WaitMatrix);
                 for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
                     if staged {
-                        m.push(Core::Unpack, MirOp::CbPop { cb });
+                        m.push(Core::Unpack, MirOp::CbPop { cb, n: 1 });
                     }
                 }
                 m.push(
@@ -1412,12 +1447,18 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                 let (acc, x, scaler, max) = match *op {
                     Op::Sum { acc, x, s } => (acc, x, Some(s), false),
                     Op::Max { acc, x } => (acc, x, None, true),
-                    _ => unreachable!("the arm pattern is the two reduce ops"),
+                    _ => {
+                        return Err(crate::status::internal_bug(
+                            "lower: the reduce arm matched another op",
+                        ));
+                    }
                 };
-                let dim = reduce_dim.expect("a reduce's acc has a fold");
+                let Some(dim) = reduce_dim else {
+                    return Err(crate::status::internal_bug("lower: a reduce has no fold"));
+                };
                 if dim == crate::ir::ReduceDim::Scalar {
                     let _ = dim;
-                    return Err(Error::TT_TODO_REDUCE);
+                    return Err(ttStatus::TT_TODO_REDUCE);
                 }
                 // `max` needs a `SrcB` row of exactly 1.0 (`GMPOOL` scales by
                 // the exponent). It names no scaler, so the compiler's own
@@ -1426,28 +1467,28 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                 let dtype = types.of(acc).dtype;
                 if dtype == crate::ir::DType::Bf16 && wide {
                     let _ = at;
-                    return Err(Error::TT_ERROR_MATMUL_ACCUM_WIDE);
+                    return Err(ttStatus::TT_ERROR_MATMUL_ACCUM_WIDE);
                 }
-                let (cb_x, stage_x) = fpu_page(k, &plan, x, at, Error::TT_ERROR_REDUCE_OPERAND)?;
+                let (cb_x, stage_x) = fpu_page(k, &plan, x, at, ttStatus::TT_ERROR_REDUCE_OPERAND)?;
                 let (cb_b, stage_b, dt_b) = match scaler {
                     Some(scaler) => {
                         let dt_s = types.of(scaler).dtype;
                         if dt_s != dt_x {
                             let _ = (dt_s, dt_x);
-                            return Err(Error::TT_ERROR_REDUCE_DTYPE);
+                            return Err(ttStatus::TT_ERROR_REDUCE_DTYPE);
                         }
                         let (cb, staged) =
-                            fpu_page(k, &plan, scaler, at, Error::TT_ERROR_REDUCE_OPERAND)?;
+                            fpu_page(k, &plan, scaler, at, ttStatus::TT_ERROR_REDUCE_OPERAND)?;
                         (cb, staged, dt_s)
                     }
                     None => {
                         let ones = plan.ones.ok_or_else(|| {
                             let _ = at;
-                            Error::TT_TODO_REDUCE
+                            ttStatus::TT_TODO_REDUCE
                         })?;
                         if ones.dtype != dt_x {
                             let _ = (ones.dtype, dt_x);
-                            return Err(Error::TT_ERROR_REDUCE_DTYPE);
+                            return Err(ttStatus::TT_ERROR_REDUCE_DTYPE);
                         }
                         (cb_id(ones.cb), false, ones.dtype)
                     }
@@ -1456,25 +1497,25 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                 // for it before the first face and never pops it, so every
                 // `max` in the program re-reads the same page.
                 if scaler.is_none() {
-                    m.push(Core::Unpack, MirOp::CbWait { cb: cb_b });
+                    m.push(Core::Unpack, MirOp::CbWait { cb: cb_b, n: 1 });
                 }
                 // A computed operand has no page: the compiler stages it, and
                 // the unpacker waits for that page before the first face.
                 if stage_x {
-                    stage(&mut m, k, &types, alloc, &acc_mask, x, cb_x);
-                    m.push(Core::Unpack, MirOp::CbWait { cb: cb_x });
+                    stage(&mut m, k, &types, alloc, &acc_mask, x, cb_x)?;
+                    m.push(Core::Unpack, MirOp::CbWait { cb: cb_x, n: 1 });
                 }
                 if stage_b {
                     if let Some(scaler) = scaler {
-                        stage(&mut m, k, &types, alloc, &acc_mask, scaler, cb_b);
+                        stage(&mut m, k, &types, alloc, &acc_mask, scaler, cb_b)?;
                     }
-                    m.push(Core::Unpack, MirOp::CbWait { cb: cb_b });
+                    m.push(Core::Unpack, MirOp::CbWait { cb: cb_b, n: 1 });
                 }
                 if types.of(acc).kind != crate::ir::ValueKind::Acc {
                     let _ = at;
-                    return Err(Error::TT_ERROR_REDUCE_ACC);
+                    return Err(ttStatus::TT_ERROR_REDUCE_ACC);
                 }
-                let base = dst_reg(alloc, acc);
+                let base = dst_reg(alloc, acc)?;
                 // The accumulator's rows are written; `reg_sync` places the
                 // wait for the packer to give the section back.
                 // `reduce_configure_addrmod`: entry 0 clears the phase, 1 and 2
@@ -1505,7 +1546,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                     ],
                     vec![(thread::FIDELITY_BASE_Phase, 0)],
                 ] {
-                    m.push(Core::Math, thread_word(&entry));
+                    m.push(Core::Math, thread_word(&entry)?);
                 }
                 m.push(
                     Core::Math,
@@ -1602,7 +1643,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                         // tt-metal's `transpose_dest_32b` orders it.
                         m.push(
                             Core::Math,
-                            thread_word(&[(thread::DISABLE_IMPLIED_SRCA_FMT_Base, 1)]),
+                            thread_word(&[(thread::DISABLE_IMPLIED_SRCA_FMT_Base, 1)])?,
                         );
                         m.push(
                             Core::Math,
@@ -1702,7 +1743,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                         );
                         m.push(
                             Core::Math,
-                            thread_word(&[(thread::DISABLE_IMPLIED_SRCA_FMT_Base, 0)]),
+                            thread_word(&[(thread::DISABLE_IMPLIED_SRCA_FMT_Base, 0)])?,
                         );
                         // `SETRWC(CLR_AB, 0, 0, 0, 0, SET_BD)`: hand both banks
                         // back before the next pair unpacks.
@@ -1885,14 +1926,18 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                 // the fold has drained it.
                 for (cb, staged) in [(cb_x, stage_x), (cb_b, stage_b)] {
                     if staged {
-                        m.push(Core::Unpack, MirOp::CbPop { cb });
+                        m.push(Core::Unpack, MirOp::CbPop { cb, n: 1 });
                     }
                 }
             }
             // The arms above cover every `Op`; the matmul/sum-row one is
             // guarded, so the compiler cannot see it does, and a new variant
             // lands here loudly rather than in a silent default.
-            _ => unreachable!("every op is handled above"),
+            _ => {
+                return Err(crate::status::internal_bug(
+                    "lower: an op reached the catch-all arm",
+                ));
+            }
         }
     }
     // The compiler's 1.0 page: written once, at the start of the kernel, into
@@ -1925,7 +1970,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
             ));
         }
         for op in [
-            MirOp::CbReserve { cb: ones_cb },
+            MirOp::CbReserve { cb: ones_cb, n: 1 },
             MirOp::SetPackBase { cb: ones_cb },
             MirOp::SetPackConfig {
                 dtype: ones.dtype,
@@ -1936,7 +1981,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                 rows: DST_ROWS,
                 last: true,
             },
-            MirOp::CbPush { cb: ones_cb },
+            MirOp::CbPush { cb: ones_cb, n: 1 },
         ] {
             prologue.push((Core::Pack, op));
         }
@@ -1978,17 +2023,27 @@ fn mvmul_group(role: &mut Vec<MirOp>, reg: Dst, at: u32) {
 }
 
 /// One whole `SETC16` `ThreadConfig` word composed from `fields`.
-fn thread_word(fields: &[(tt_isa::cfg::ThreadConfigField, u16)]) -> MirOp {
-    let mut entry = tt_isa::backend::ThreadConfigEntry::zeroed(fields[0].0.addr32());
+fn thread_word(fields: &[(tt_isa::cfg::ThreadConfigField, u16)]) -> Result<MirOp, ttStatus> {
+    let Some(first) = fields.first() else {
+        return Err(crate::status::internal_bug(
+            "lower: a thread config has no fields",
+        ));
+    };
+    let mut entry = tt_isa::backend::ThreadConfigEntry::zeroed(first.0.addr32());
     for &(field, value) in fields {
-        entry = entry
-            .set(field, value)
-            .expect("the matmul's thread entry is encodable");
+        entry = match entry.set(field, value) {
+            Ok(entry) => entry,
+            Err(_) => {
+                return Err(crate::status::internal_bug(format_args!(
+                    "lower: thread config value {value} does not fit {field:?}"
+                )));
+            }
+        };
     }
-    MirOp::ThreadWord {
+    Ok(MirOp::ThreadWord {
         addr: entry.addr32(),
         value: entry.value(),
-    }
+    })
 }
 
 /// The CB an `Src`-read operand takes, and whether it had to be staged: a
@@ -2000,8 +2055,8 @@ fn fpu_page(
     plan: &Plan,
     value: crate::ir::OpId,
     at: OpId,
-    err: Error,
-) -> Result<(Cb, bool), Error> {
+    err: ttStatus,
+) -> Result<(Cb, bool), ttStatus> {
     let id = owner(k, value);
     if k.op(id).is_none() {
         let _ = (at, value);
@@ -2011,7 +2066,7 @@ fn fpu_page(
         return Ok((
             cb_id(plan.cb.get(buffer).copied().ok_or_else(|| {
                 let _ = buffer;
-                Error::TT_ERROR_BUFFER_NOT_PLACED
+                ttStatus::TT_ERROR_BUFFER_NOT_PLACED
             })?),
             false,
         ));
@@ -2050,22 +2105,22 @@ fn fpu_broadcast(
     narrow: crate::ir::OpId,
     bcast: Bcast,
     at: OpId,
-) -> Result<(), Error> {
-    let (cb_a, stage_a) = fpu_page(k, &plan, tile, at, Error::TT_TODO_BROADCAST)?;
-    let (cb_b, stage_b) = fpu_page(k, &plan, narrow, at, Error::TT_TODO_BROADCAST)?;
+) -> Result<(), ttStatus> {
+    let (cb_a, stage_a) = fpu_page(k, &plan, tile, at, ttStatus::TT_TODO_BROADCAST)?;
+    let (cb_b, stage_b) = fpu_page(k, &plan, narrow, at, ttStatus::TT_TODO_BROADCAST)?;
     if stage_a {
-        stage(m, k, types, alloc, acc_mask, tile, cb_a);
+        stage(m, k, types, alloc, acc_mask, tile, cb_a)?;
     }
     if stage_b {
-        stage(m, k, types, alloc, acc_mask, narrow, cb_b);
+        stage(m, k, types, alloc, acc_mask, narrow, cb_b)?;
     }
     let dt_a = types.of(tile).dtype;
     let dt_b = types.of(narrow).dtype;
-    let out = dst_reg(alloc, owner(k, value));
+    let out = dst_reg(alloc, owner(k, value))?;
     // The `Src` banks are filled from the pages the unpacker owns.
     for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
         if staged {
-            m.push(Core::Unpack, MirOp::CbWait { cb });
+            m.push(Core::Unpack, MirOp::CbWait { cb, n: 1 });
         }
     }
     // The counters start at 0 and `ADDR_MOD_0` steps `SrcA` and `Dst` eight
@@ -2094,7 +2149,7 @@ fn fpu_broadcast(
             ),
             (thread::ADDR_MOD_AB_SEC0_SrcBClear, 0),
             (thread::ADDR_MOD_AB_SEC0_SrcAClear, 0),
-        ]),
+        ])?,
     );
     m.push(
         Core::Math,
@@ -2103,7 +2158,7 @@ fn fpu_broadcast(
             (thread::ADDR_MOD_DST_SEC0_DestCR, 0),
             // The last phase of a multiply hands the phase counter back to 0.
             (thread::ADDR_MOD_DST_SEC0_FidelityClear, 1),
-        ]),
+        ])?,
     );
     // `ADDR_MOD_1`: the next fidelity phase of the same eight rows — no
     // counter moves, only the phase, so the instruction re-multiplies the same
@@ -2115,7 +2170,7 @@ fn fpu_broadcast(
             (thread::ADDR_MOD_AB_SEC1_SrcBIncr, 0),
             (thread::ADDR_MOD_AB_SEC1_SrcBClear, 0),
             (thread::ADDR_MOD_AB_SEC1_SrcAClear, 0),
-        ]),
+        ])?,
     );
     m.push(
         Core::Math,
@@ -2123,7 +2178,7 @@ fn fpu_broadcast(
             (thread::ADDR_MOD_DST_SEC1_DestIncr, 0),
             (thread::ADDR_MOD_DST_SEC1_DestCR, 0),
             (thread::ADDR_MOD_DST_SEC1_FidelityIncr, 1),
-        ]),
+        ])?,
     );
     // The section is written, never accumulated into; `reg_sync` places the wait
     // for a packer that still reads it.
@@ -2229,7 +2284,9 @@ fn fpu_broadcast(
                             BOp::Sub => ElwOp::Sub,
                             BOp::Mul => ElwOp::Mul,
                             other => {
-                                unreachable!("the caller admits add, sub and mul, not {other:?}")
+                                return Err(crate::status::internal_bug(format_args!(
+                                    "lower: an SFPU broadcast of {other:?}"
+                                )));
                             }
                         },
                         bcast,
@@ -2272,7 +2329,7 @@ fn fpu_broadcast(
     );
     for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
         if staged {
-            m.push(Core::Unpack, MirOp::CbPop { cb });
+            m.push(Core::Unpack, MirOp::CbPop { cb, n: 1 });
         }
     }
     Ok(())
@@ -2290,10 +2347,10 @@ fn stage(
     acc_mask: &BTreeMap<OpId, PackMask>,
     value: crate::ir::OpId,
     cb: Cb,
-) {
+) -> Result<(), ttStatus> {
     let id = owner(k, value);
     let dtype = types.of(id).dtype;
-    m.push(Core::Pack, MirOp::CbReserve { cb });
+    m.push(Core::Pack, MirOp::CbReserve { cb, n: 1 });
     m.push(Core::Pack, MirOp::SetPackBase { cb });
     m.push(
         Core::Pack,
@@ -2305,7 +2362,7 @@ fn stage(
     m.push(
         Core::Pack,
         MirOp::SetPackOffset {
-            reg: dst_reg(alloc, id),
+            reg: dst_reg(alloc, id)?,
             at: 0,
         },
     );
@@ -2316,7 +2373,8 @@ fn stage(
             last: true,
         },
     );
-    m.push(Core::Pack, MirOp::CbPush { cb });
+    m.push(Core::Pack, MirOp::CbPush { cb, n: 1 });
+    Ok(())
 }
 
 /// The literal trip count of a bound, if it has one.
@@ -2343,7 +2401,7 @@ fn scalar_with(
     counters: &[u8],
     plan: &Plan,
     cbs: &crate::slab::Slab<Cb, crate::mir::CbInfo>,
-) -> Result<(), Error> {
+) -> Result<(), ttStatus> {
     eval(
         k, types, role, param, loops, dim, dest, scratch, counters, plan, cbs,
     )
@@ -2364,10 +2422,10 @@ fn eval(
     counters: &[u8],
     plan: &Plan,
     cbs: &crate::slab::Slab<Cb, crate::mir::CbInfo>,
-) -> Result<(), Error> {
+) -> Result<(), ttStatus> {
     // An enclosing loop's induction value is in that loop's counter register.
     if let Some(depth) = loops.iter().rposition(|v| *v == value) {
-        let a = *counters.get(depth).ok_or(Error::TT_TODO_LOOP_DEPTH)?;
+        let a = *counters.get(depth).ok_or(ttStatus::TT_TODO_LOOP_DEPTH)?;
         role.push(MirOp::IArith {
             op: IOp::Add,
             d: dest,
@@ -2376,7 +2434,7 @@ fn eval(
         });
         return Ok(());
     }
-    let op = k.op(value).ok_or(Error::TT_TODO_LOOP_ADDRESS)?;
+    let op = k.op(value).ok_or(ttStatus::TT_TODO_LOOP_ADDRESS)?;
     match *op {
         Op::Const {
             dtype: crate::ir::DType::I32,
@@ -2390,7 +2448,7 @@ fn eval(
             Ok(())
         }
         Op::Variable { .. } => {
-            let index = *param.get(&value).ok_or(Error::TT_TODO_LOOP_ADDRESS)?;
+            let index = *param.get(&value).ok_or(ttStatus::TT_TODO_LOOP_ADDRESS)?;
             role.push(MirOp::LoadArg {
                 reg: dest,
                 arg: crate::mover::param_arg(index).0,
@@ -2402,7 +2460,7 @@ fn eval(
             Ok(())
         }
         Op::Binary { op, a, b, .. } => {
-            let op = int_op(op).ok_or(Error::TT_TODO_LOOP_ADDRESS)?;
+            let op = int_op(op).ok_or(ttStatus::TT_TODO_LOOP_ADDRESS)?;
             eval(
                 k, types, role, param, loops, a, dest, scratch, counters, plan, cbs,
             )?;
@@ -2428,31 +2486,31 @@ fn eval(
                 Op::Cb { dtype, len, .. } => (dtype, len),
                 _ => {
                     let _ = buffer;
-                    return Err(Error::TT_ERROR_NOT_A_BUFFER);
+                    return Err(ttStatus::TT_ERROR_NOT_A_BUFFER);
                 }
             };
             if len != 1 {
                 let _ = (at_len(len), buffer);
-                return Err(Error::TT_TODO_LOOP_ADDRESS);
+                return Err(ttStatus::TT_TODO_LOOP_ADDRESS);
             }
             let cb = *plan
                 .cb
                 .get(&buffer)
-                .ok_or(Error::TT_ERROR_BUFFER_NOT_PLACED)?;
-            let ring = cbs.get(cb).ok_or(Error::TT_ERROR_BUFFER_NOT_PLACED)?;
+                .ok_or(ttStatus::TT_ERROR_BUFFER_NOT_PLACED)?;
+            let ring = cbs.get(cb).ok_or(ttStatus::TT_ERROR_BUFFER_NOT_PLACED)?;
             let el = dtype.bytes();
             match k.const_i32(offset) {
                 Some(n) if n >= 0 => {
                     let bytes = u32::try_from(n)
                         .ok()
                         .and_then(|n| n.checked_mul(el))
-                        .ok_or(Error::TT_ERROR_PARAM_OFFSET_OVERFLOW)?;
+                        .ok_or(ttStatus::TT_ERROR_PARAM_OFFSET_OVERFLOW)?;
                     role.push(MirOp::Li {
                         reg: dest,
                         value: ring
                             .base
                             .checked_add(bytes)
-                            .ok_or(Error::TT_ERROR_PARAM_OFFSET_OVERFLOW)?,
+                            .ok_or(ttStatus::TT_ERROR_PARAM_OFFSET_OVERFLOW)?,
                     });
                 }
                 _ => {
@@ -2494,7 +2552,7 @@ fn eval(
             });
             Ok(())
         }
-        _ => Err(Error::TT_TODO_LOOP_ADDRESS),
+        _ => Err(ttStatus::TT_TODO_LOOP_ADDRESS),
     }
 }
 
@@ -2516,7 +2574,7 @@ fn int_op(op: BOp) -> Option<IOp> {
         BOp::BitOr => IOp::Or,
         BOp::BitXor => IOp::Xor,
         BOp::BitShiftLeft => IOp::Sll,
-        BOp::BitShiftRight => IOp::Sra,
+        BOp::BitShiftRight => IOp::Srl,
         _ => return None,
     })
 }
@@ -2962,25 +3020,25 @@ fn rsqrt_body(
 /// its lane layout in the lane — sixteen meaningful lanes of each — is not
 /// lowered: a value that reaches the datapath with that shape is refused rather
 /// than walked with a tile's addressing.
-fn sfp_rows(shape: RegShape, at: OpId) -> Result<Vec<u32>, Error> {
+fn sfp_rows(shape: RegShape, at: OpId) -> Result<Vec<u32>, ttStatus> {
     Ok(match shape {
         RegShape::Tile => (0..DST_ROWS).step_by(2).collect(),
         RegShape::Row | RegShape::Column => {
             let _ = (at, shape);
-            return Err(Error::TT_TODO_ACCESS_SHAPE);
+            return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
         }
         RegShape::Scalar => {
             let _ = at;
-            return Err(Error::TT_ERROR_SCALAR_NO_ROWS);
+            return Err(ttStatus::TT_ERROR_SCALAR_NO_ROWS);
         }
     })
 }
 
-fn rows_of(shape: RegShape, at: OpId) -> Result<u32, Error> {
+fn rows_of(shape: RegShape, at: OpId) -> Result<u32, ttStatus> {
     match shape {
         RegShape::Scalar => {
             let _ = at;
-            Err(Error::TT_ERROR_SCALAR_NO_ROWS)
+            Err(ttStatus::TT_ERROR_SCALAR_NO_ROWS)
         }
         RegShape::Row | RegShape::Column => Ok(2),
         RegShape::Tile => Ok(DST_ROWS),
@@ -2989,14 +3047,12 @@ fn rows_of(shape: RegShape, at: OpId) -> Result<u32, Error> {
 
 /// The `Dst` register a value lives in. A bitcast has no home of its own, so
 /// the caller passes the owning definition ([`owner`]).
-#[track_caller]
-fn dst_reg(alloc: &Alloc, value: OpId) -> Dst {
+fn dst_reg(alloc: &Alloc, value: OpId) -> Result<Dst, ttStatus> {
     match alloc.place_of(value) {
-        Some(reg) => reg,
-        None => panic!(
-            "no Dst for value {value} from {}",
-            std::panic::Location::caller()
-        ),
+        Some(reg) => Ok(reg),
+        None => Err(crate::status::internal_bug(format_args!(
+            "lower: value {value} has no `Dst`"
+        ))),
     }
 }
 
@@ -3023,7 +3079,7 @@ fn copy_to(
     dst_offset: OpId,
     src_offset: OpId,
     access: [Dim; 2],
-) -> Result<(), Error> {
+) -> Result<(), ttStatus> {
     let inbound = core == Core::Reader;
     let (buffer, argument, offset) = if inbound {
         (dst, src, src_offset)
@@ -3032,17 +3088,17 @@ fn copy_to(
     };
     let dtype = match *k.at(buffer) {
         Op::Cb { dtype, .. } => dtype,
-        _ => return Err(Error::TT_ERROR_NOT_A_BUFFER),
+        _ => return Err(ttStatus::TT_ERROR_NOT_A_BUFFER),
     };
     let cb = *plan
         .cb
         .get(&buffer)
-        .ok_or(Error::TT_ERROR_BUFFER_NOT_PLACED)?;
-    let index = *param.get(&argument).ok_or(Error::TT_ERROR_COPY_ENDS)?;
+        .ok_or(ttStatus::TT_ERROR_BUFFER_NOT_PLACED)?;
+    let index = *param.get(&argument).ok_or(ttStatus::TT_ERROR_COPY_ENDS)?;
     // The index is in access units, so one step is the unit's bytes.
     let bytes = (access[0] * access[1])
         .checked_mul(dtype.bytes())
-        .ok_or(Error::TT_ERROR_PARAM_OFFSET_OVERFLOW)?;
+        .ok_or(ttStatus::TT_ERROR_PARAM_OFFSET_OVERFLOW)?;
     // A vector index is one base per datum: one request per lane, each base read
     // out of the page the index load copied.
     let lanes = match types.of(offset).shape {
@@ -3088,7 +3144,7 @@ fn copy_to(
         // pair: a lane copy deep inside two program loops does not fit.
         let (counter, _) = *MOVER_PAIRS
             .get(loops.len())
-            .ok_or(Error::TT_TODO_LOOP_DEPTH)?;
+            .ok_or(ttStatus::TT_TODO_LOOP_DEPTH)?;
         ops.push(MirOp::Loop { count: lanes });
         // This lane's base: the index page's datum, in units of the access.
         let base = pool.take()?;
@@ -3166,11 +3222,11 @@ fn emit_request(
     bytes: u32,
     value: u8,
     lane: Option<u8>,
-) -> Result<(), Error> {
+) -> Result<(), ttStatus> {
     use crate::riscv::cb::{RD_PTR, STRIDE, WR_PTR};
     use tt_isa::noc::niu::{CMD_RD, CMD_WR, RESP_MARKED, STATIC_VC_1, initiator, reqs_outstanding};
     if bytes == 0 || bytes > tt_isa::noc::niu::MAX_REQUEST_BYTES {
-        return Err(Error::TT_ERROR_NOC_REQUEST_BYTES);
+        return Err(ttStatus::TT_ERROR_NOC_REQUEST_BYTES);
     }
     let (lo_arg, hi_arg) = crate::mover::param_arg(param);
     let lo = pool.take()?;
@@ -3312,55 +3368,55 @@ fn index_page(
     plan: &Plan,
     cbs: &crate::slab::Slab<Cb, crate::mir::CbInfo>,
     value: OpId,
-) -> Result<(u32, u32), Error> {
+) -> Result<(u32, u32), ttStatus> {
     let (buffer, offset) = match *k.at(value) {
         Op::Load { buffer, offset, .. } => (buffer, offset),
-        _ => return Err(Error::TT_TODO_MULTI_LANE),
+        _ => return Err(ttStatus::TT_TODO_MULTI_LANE),
     };
     let (dtype, len) = match *k.at(buffer) {
         Op::Cb { dtype, len, .. } => (dtype, len),
-        _ => return Err(Error::TT_ERROR_NOT_A_BUFFER),
+        _ => return Err(ttStatus::TT_ERROR_NOT_A_BUFFER),
     };
     if len != 1 {
         let _ = (value, len);
-        return Err(Error::TT_TODO_LOOP_ADDRESS);
+        return Err(ttStatus::TT_TODO_LOOP_ADDRESS);
     }
     let cb = *plan
         .cb
         .get(&buffer)
-        .ok_or(Error::TT_ERROR_BUFFER_NOT_PLACED)?;
-    let ring = cbs.get(cb).ok_or(Error::TT_ERROR_BUFFER_NOT_PLACED)?;
+        .ok_or(ttStatus::TT_ERROR_BUFFER_NOT_PLACED)?;
+    let ring = cbs.get(cb).ok_or(ttStatus::TT_ERROR_BUFFER_NOT_PLACED)?;
     let el = dtype.bytes();
     let units = k
         .const_i32(offset)
         .and_then(|n| u32::try_from(n).ok())
-        .ok_or(Error::TT_TODO_LOOP_ADDRESS)?;
+        .ok_or(ttStatus::TT_TODO_LOOP_ADDRESS)?;
     let bytes = units
         .checked_mul(el)
-        .ok_or(Error::TT_ERROR_PARAM_OFFSET_OVERFLOW)?;
+        .ok_or(ttStatus::TT_ERROR_PARAM_OFFSET_OVERFLOW)?;
     let base = ring
         .base
         .checked_add(bytes)
-        .ok_or(Error::TT_ERROR_PARAM_OFFSET_OVERFLOW)?;
+        .ok_or(ttStatus::TT_ERROR_PARAM_OFFSET_OVERFLOW)?;
     Ok((base, el))
 }
 
 /// Follow a bitcast to the value that owns the `Dst` slot: a bitcast has no
 /// home of its own. The definition is the value itself, so this is a walk of
 /// the chain, not a table.
-fn unary(op: UOp, at: OpId) -> Result<UnarySfpOp, Error> {
+fn unary(op: UOp, at: OpId) -> Result<UnarySfpOp, ttStatus> {
     match op {
         UOp::Neg => Ok(UnarySfpOp::Neg),
         UOp::Abs => Ok(UnarySfpOp::Abs),
         UOp::BitNot => Ok(UnarySfpOp::BitNot),
         other => {
             let _ = (at, other);
-            Err(Error::TT_TODO_UNARY_SFPU)
+            Err(ttStatus::TT_TODO_UNARY_SFPU)
         }
     }
 }
 
-fn binary(op: BOp, at: OpId) -> Result<BinarySfpOp, Error> {
+fn binary(op: BOp, at: OpId) -> Result<BinarySfpOp, ttStatus> {
     match op {
         BOp::Add => Ok(BinarySfpOp::Add),
         BOp::Sub => Ok(BinarySfpOp::Sub),
@@ -3372,7 +3428,7 @@ fn binary(op: BOp, at: OpId) -> Result<BinarySfpOp, Error> {
         BOp::BitShiftRight => Ok(BinarySfpOp::Shr),
         other => {
             let _ = (at, other);
-            Err(Error::TT_TODO_BINARY_SFPU)
+            Err(ttStatus::TT_TODO_BINARY_SFPU)
         }
     }
 }
@@ -3480,7 +3536,7 @@ copy 32,32 %po [0] = %bo [0]
         let k = crate::mover::add_movers(&k).expect("the movers are added");
         assert_eq!(
             k.lower().expect_err("an integer broadcast has no path"),
-            Error::TT_TODO_BROADCAST_SFPU
+            ttStatus::TT_TODO_BROADCAST_SFPU
         );
     }
 }

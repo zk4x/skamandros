@@ -14,8 +14,9 @@
 
 use core::fmt;
 
-use crate::ir::{DType, Dim, Error};
+use crate::ir::{DType, Dim};
 use crate::slab::{Slab, SlabId};
+use crate::status::ttStatus;
 
 /// One unary SFPU instruction: a lane register into another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,7 +88,7 @@ pub enum IOp {
     Or,
     Xor,
     Sll,
-    Sra,
+    Srl,
 }
 
 /// This core's `core_info`: the logical grid coordinate the host wrote before
@@ -395,14 +396,14 @@ pub enum MirOp {
     PackRows { rows: u32, last: bool },
     /// The unpacker's L1 source: the page [`MirOp::CbWait`] waited for.
     SetUnpackBase { cb: Cb, unit: u8 },
-    /// `cb_wait_front`: wait for a page to be published on this ring.
-    CbWait { cb: Cb },
-    /// `cb_pop_front`: release the page [`MirOp::CbWait`] waited for.
-    CbPop { cb: Cb },
-    /// `cb_reserve_back`: wait for a free page on this ring.
-    CbReserve { cb: Cb },
-    /// `cb_push_back`: publish the page [`MirOp::CbReserve`] reserved.
-    CbPush { cb: Cb },
+    /// `cb_wait_front`: wait for `n` pages to be published on this ring.
+    CbWait { cb: Cb, n: u32 },
+    /// `cb_pop_front`: release the `n` pages [`MirOp::CbWait`] waited for.
+    CbPop { cb: Cb, n: u32 },
+    /// `cb_reserve_back`: wait for `n` free pages on this ring.
+    CbReserve { cb: Cb, n: u32 },
+    /// `cb_push_back`: publish the `n` pages [`MirOp::CbReserve`] reserved.
+    CbPush { cb: Cb, n: u32 },
     /// `SEMINIT`: the semaphore's initial `Value` and its `Max`.
     Semset { sem: u8, value: u8 },
     /// `SEMPOST` on this core.
@@ -488,23 +489,23 @@ impl MachineKernel {
     }
 
     /// Bring every allocation inside the hardware's limits, in place.
-    pub fn alloc(&mut self) -> Result<(), Error> {
+    pub fn alloc(&mut self) -> Result<(), ttStatus> {
         crate::alloc::alloc(self)
     }
 
     /// Place the rings in L1 and build their interface entries.
-    pub fn plan_cbs(&mut self) -> Result<(), Error> {
+    pub fn plan_cbs(&mut self) -> Result<(), ttStatus> {
         crate::alloc::plan_cbs(self)
     }
 
     /// Render the module a launch runs.
-    pub fn render(&self) -> Result<crate::module::Module, Error> {
+    pub fn render(&self) -> Result<crate::module::Module, ttStatus> {
         crate::compile::render(self)
     }
 
     /// Check that every op names a live slab entry, and that an op's rows fit
     /// the register it names.
-    pub fn verify(&self) -> Result<(), Error> {
+    pub fn verify(&self) -> Result<(), ttStatus> {
         crate::optimize::verify(self)
     }
 }
@@ -821,10 +822,10 @@ fn write_op(f: &mut dyn fmt::Write, op: &MirOp) -> fmt::Result {
         MirOp::SetUnpackBase { cb, unit } => {
             write!(f, "setunpackbase {} u{unit}", cb_name(cb))
         }
-        MirOp::CbWait { cb } => write!(f, "cbwait {}", cb_name(cb)),
-        MirOp::CbPop { cb } => write!(f, "cbpop {}", cb_name(cb)),
-        MirOp::CbReserve { cb } => write!(f, "cbreserve {}", cb_name(cb)),
-        MirOp::CbPush { cb } => write!(f, "cbpush {}", cb_name(cb)),
+        MirOp::CbWait { cb, n } => write!(f, "cbwait {} {}", cb_name(cb), n),
+        MirOp::CbPop { cb, n } => write!(f, "cbpop {} {}", cb_name(cb), n),
+        MirOp::CbReserve { cb, n } => write!(f, "cbreserve {} {}", cb_name(cb), n),
+        MirOp::CbPush { cb, n } => write!(f, "cbpush {} {}", cb_name(cb), n),
         MirOp::Semset { sem, value } => write!(f, "semset {sem} = {value}"),
         MirOp::SemPost { sem } => write!(f, "sempost {sem}"),
         MirOp::SemWait { sem, before } => write!(f, "semwait {sem} before {before}"),
@@ -920,6 +921,6 @@ fn iop_name(op: IOp) -> &'static str {
         IOp::Or => "or",
         IOp::Xor => "xor",
         IOp::Sll => "sll",
-        IOp::Sra => "sra",
+        IOp::Srl => "srl",
     }
 }

@@ -124,8 +124,9 @@ pub fn sll(rd: u8, rs1: u8, rs2: u8) -> u32 {
     r_type(0, rs2, rs1, 1, rd, 0x33)
 }
 
-pub fn sra(rd: u8, rs1: u8, rs2: u8) -> u32 {
-    r_type(0x20, rs2, rs1, 5, rd, 0x33)
+/// `srl`: a logical right shift, filling with zeros from the sign bit.
+pub fn srl(rd: u8, rs1: u8, rs2: u8) -> u32 {
+    r_type(0, rs2, rs1, 5, rd, 0x33)
 }
 
 pub fn lw(rd: u8, rs1: u8, imm: i32) -> u32 {
@@ -144,13 +145,24 @@ pub fn sh(rs2: u8, rs1: u8, imm: i32) -> u32 {
     s_type(imm, rs2, rs1, 1, 0x23)
 }
 
-pub fn beq(rs1: u8, rs2: u8, imm: i32) -> u32 {
-    b_type(imm, rs2, rs1, 0, 0x63)
+/// Branch if `rs1 >= rs2`, unsigned: the exit test of a loop whose back edge
+/// is the long `bgeu`/`jal` pair.
+pub fn bgeu(rs1: u8, rs2: u8, imm: i32) -> u32 {
+    b_type(imm, rs2, rs1, 7, 0x63)
 }
 
-/// Branch if `rs1 < rs2`, unsigned: a loop's `index < limit` test.
-pub fn bltu(rs1: u8, rs2: u8, imm: i32) -> u32 {
-    b_type(imm, rs2, rs1, 6, 0x63)
+/// `jal rd, off`: the J-type jump, a +-1 MiB displacement. A loop edge whose
+/// body is larger than a B-type branch's +-4 KiB uses it (`x86`-style long
+/// branch): `bgeu` skips over a `jal` back to the top, and the zero-trip test
+/// skips over a `jal` to the end.
+pub fn jal(rd: u8, imm: i32) -> u32 {
+    let imm = imm as u32;
+    (((imm >> 20) & 1) << 31)
+        | (((imm >> 1) & 0x3ff) << 21)
+        | (((imm >> 11) & 1) << 20)
+        | (((imm >> 12) & 0xff) << 12)
+        | (u32::from(rd) << 7)
+        | 0x6f
 }
 
 pub fn bne(rs1: u8, rs2: u8, imm: i32) -> u32 {
@@ -197,6 +209,7 @@ pub fn coprocessor_done(a: &mut Asm) {
 /// encoding buys nothing. The unpack/pack base conversion shifts at its use site.
 pub mod cb {
     use super::*;
+    use crate::status::ttStatus;
 
     /// Byte offsets of the `LocalCBInterface` fields.
     pub const SIZE: i32 = 0;
@@ -212,15 +225,26 @@ pub mod cb {
     /// Entries in the table: tt-metal's `NUM_CIRCULAR_BUFFERS`.
     pub const COUNT: u32 = 32;
 
-    fn base_of(a: &mut Asm, base: u8, cb: u32, out: u8) {
-        assert!(cb < COUNT, "cb id {cb} out of range");
+    fn base_of(a: &mut Asm, base: u8, cb: u32, out: u8) -> Result<(), ttStatus> {
+        if cb >= COUNT {
+            return Err(crate::status::internal_bug(
+                "a circular buffer id past the interface table",
+            ));
+        }
         a.word(addi(out, base, (cb * STRIDE) as i32));
+        Ok(())
     }
 
     /// `cb_reserve_back(cb, n)`: poll until `num_pages - (received - acked) >= n`.
-    pub fn reserve_back(a: &mut Asm, base: u8, cb: u32, n: u32, s: [u8; 3]) {
+    pub fn reserve_back(
+        a: &mut Asm,
+        base: u8,
+        cb: u32,
+        n: u32,
+        s: [u8; 3],
+    ) -> Result<(), ttStatus> {
         let [p, t, u] = s;
-        base_of(a, base, cb, p);
+        base_of(a, base, cb, p)?;
         let top = a.fresh_label();
         a.label(top.clone());
         a.word(lhu(u, p, COUNTERS + 2));
@@ -230,12 +254,13 @@ pub mod cb {
         a.word(sub(t, t, u));
         a.li(u, n);
         a.bltu_label(t, u, top);
+        Ok(())
     }
 
     /// `cb_wait_front(cb, n)`: poll until `received - acked >= n`.
-    pub fn wait_front(a: &mut Asm, base: u8, cb: u32, n: u32, s: [u8; 3]) {
+    pub fn wait_front(a: &mut Asm, base: u8, cb: u32, n: u32, s: [u8; 3]) -> Result<(), ttStatus> {
         let [p, t, u] = s;
-        base_of(a, base, cb, p);
+        base_of(a, base, cb, p)?;
         let top = a.fresh_label();
         a.label(top.clone());
         a.word(lhu(u, p, COUNTERS + 2));
@@ -243,28 +268,31 @@ pub mod cb {
         a.word(sub(u, u, t));
         a.li(t, n);
         a.bltu_label(u, t, top);
+        Ok(())
     }
 
     /// `cb_push_back(cb, n)`: `received += n`, advance the write pointer.
-    pub fn push_back(a: &mut Asm, base: u8, cb: u32, n: u32, s: [u8; 4]) {
+    pub fn push_back(a: &mut Asm, base: u8, cb: u32, n: u32, s: [u8; 4]) -> Result<(), ttStatus> {
         let [p, t, u, v] = s;
-        base_of(a, base, cb, p);
+        base_of(a, base, cb, p)?;
         a.li(t, n);
         a.word(lhu(u, p, COUNTERS + 2));
         a.word(add(u, u, t));
         a.word(sh(u, p, COUNTERS + 2));
         advance(a, p, WR_PTR, t, v);
+        Ok(())
     }
 
     /// `cb_pop_front(cb, n)`: `acked += n`, advance the read pointer.
-    pub fn pop_front(a: &mut Asm, base: u8, cb: u32, n: u32, s: [u8; 4]) {
+    pub fn pop_front(a: &mut Asm, base: u8, cb: u32, n: u32, s: [u8; 4]) -> Result<(), ttStatus> {
         let [p, t, u, v] = s;
-        base_of(a, base, cb, p);
+        base_of(a, base, cb, p)?;
         a.li(t, n);
         a.word(lhu(u, p, COUNTERS));
         a.word(add(u, u, t));
         a.word(sh(u, p, COUNTERS));
         advance(a, p, RD_PTR, t, v);
+        Ok(())
     }
 
     /// `*ptr += n * page_size`, wrapping at `fifo_limit` (tt-metal: the pointer
@@ -285,12 +313,18 @@ pub mod cb {
     }
 
     /// The interface words, ready to be written into L1.
-    pub fn interface(fifo_addr: u32, size: u32, page_size: u32, num_pages: u32) -> [u32; 8] {
-        assert!(
-            size > 0 && page_size > 0 && size % page_size == 0,
-            "cb interface: size {size} / page {page_size}"
-        );
-        [
+    pub fn interface(
+        fifo_addr: u32,
+        size: u32,
+        page_size: u32,
+        num_pages: u32,
+    ) -> Result<[u32; 8], ttStatus> {
+        if !(size > 0 && page_size > 0 && size % page_size == 0) {
+            return Err(crate::status::internal_bug(
+                "a circular buffer's interface is not a whole number of pages",
+            ));
+        }
+        Ok([
             size,
             fifo_addr + size,
             page_size,
@@ -299,7 +333,7 @@ pub mod cb {
             fifo_addr,
             0,
             0,
-        ]
+        ])
     }
 }
 
@@ -441,7 +475,7 @@ mod tests {
     /// 32 apart, with the ring's two pointers starting at the FIFO base.
     #[test]
     fn the_interface_is_tt_metals_local_cb_interface() {
-        let words = cb::interface(0x1000, 0x1000, 0x400, 4);
+        let words = cb::interface(0x1000, 0x1000, 0x400, 4).expect("the interface encodes");
         assert_eq!(words, [0x1000, 0x2000, 0x400, 4, 0x1000, 0x1000, 0, 0]);
         assert_eq!(cb::STRIDE, 32);
         assert_eq!(cb::RD_PTR, 16);

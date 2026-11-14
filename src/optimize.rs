@@ -12,8 +12,8 @@
 //! row-address modifier execute. The hand-offs between the three roles are
 //! derived here too ([`reg_sync`]), from the accesses themselves.
 
-use crate::ir::Error;
 use crate::mir::{Core, Dst, MachineKernel, MirOp};
+use crate::status::ttStatus;
 
 /// The three compute cores, as 0/1/2: the movers have no `Dst` accesses.
 fn compute_slot(core: Core) -> Option<usize> {
@@ -58,16 +58,19 @@ type Edge = (Core, Core);
 ///   wait for.
 ///
 /// All three are counting hand-offs, so one semaphore serves one ordered edge —
-/// every slot and epoch on that edge shares it. The consumer's takes are counted
-/// against the producer's posts up to the one it needs, so a consumer that reads
-/// the second slot the producer wrote first takes two tokens at once rather than
-/// waiting for a post that already happened. Reads by the role that wrote the
-/// slot need no seam: they are the same stream. Initial values are zero unless
-/// the edge paces a loop; a producer always posts before any take of its edge.
+/// every slot and epoch on that edge shares it. A counting semaphore's tokens
+/// carry no identity, so the k-th take consumes the k-th post and a take that
+/// arrives before its own post would spend somebody else's token. Both take
+/// kinds therefore wait for the post of the slot they need: a reading consumer
+/// takes as many tokens as there are posts up to the slot it reads, and a
+/// writing consumer (a loop or reuse seam) takes as many as the rank of its own
+/// slot's post. Reads by the role that wrote the slot need no seam: they are
+/// the same stream. Initial values are zero unless the edge paces a loop; a
+/// producer always posts before any take of its edge.
 ///
 /// This must run before [`fuse`]: it reads the cross-role program order, which
 /// fusion replaces with the three per-role streams.
-pub fn reg_sync(m: &mut MachineKernel) {
+pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
     // The pass inserts hand-offs between ops, so it works on the order as a
     // vector and rebuilds the slab at the end.
     let mut ops: Vec<(Core, MirOp)> = m.ops.clone();
@@ -87,7 +90,11 @@ pub fn reg_sync(m: &mut MachineKernel) {
             } => to_src[unit as usize] = src,
             MirOp::Unpacr { unit, .. } => {
                 if !to_src[unit as usize] {
-                    let reg = target.expect("the Dst path names its register with Setdst");
+                    let Some(reg) = target else {
+                        return Err(crate::status::internal_bug(
+                            "reg_sync: an unpack has no destination register",
+                        ));
+                    };
                     touched.push((reg, true));
                 }
             }
@@ -109,7 +116,11 @@ pub fn reg_sync(m: &mut MachineKernel) {
             // setting).
             MirOp::SetPackOffset { reg, .. } => target = Some(reg),
             MirOp::PackRows { .. } => {
-                let reg = target.expect("a pack names its register with SetPackOffset");
+                let Some(reg) = target else {
+                    return Err(crate::status::internal_bug(
+                        "reg_sync: a pack has no source register",
+                    ));
+                };
                 touched.push((reg, false));
             }
             _ => {}
@@ -147,7 +158,11 @@ pub fn reg_sync(m: &mut MachineKernel) {
                 }
             }
             MirOp::EndLoop => {
-                let ordinal = stacks[r].pop().expect("EndLoop matches a Loop");
+                let Some(ordinal) = stacks[r].pop() else {
+                    return Err(crate::status::internal_bug(
+                        "reg_sync: an end-of-loop has no open loop",
+                    ));
+                };
                 levels[ordinal].1 = levels[ordinal].1.max(at);
             }
             _ => {}
@@ -199,10 +214,12 @@ pub fn reg_sync(m: &mut MachineKernel) {
     // A seam names the ordered edge it carries; the semaphore index is assigned
     // once all edges are known. A data seam counts its posts, because the
     // consumer's take count must match them (see below); a reuse or pacing seam
-    // is one post and one take, in role order.
+    // is one post and one take, in role order, and its take waits for the post
+    // of its own slot (see below).
     let mut data: Vec<(Edge, usize, usize, usize)> = Vec::new();
-    let mut posts: Vec<(usize, Edge)> = Vec::new();
-    let mut takes: Vec<(usize, Edge)> = Vec::new();
+    // `(edge, post position, take position)`: a post after the slot's last
+    // reader and the take before the same slot's next writer.
+    let mut seams: Vec<(Edge, usize, usize)> = Vec::new();
     // Loop-pacing edges, counted per body: the semaphore starts with one token
     // per hand-off the body performs.
     let mut reuse: Vec<(Edge, usize, u8)> = Vec::new();
@@ -238,8 +255,7 @@ pub fn reg_sync(m: &mut MachineKernel) {
             if let Some(((next_writer, next_write), _)) = epochs.get(n + 1) {
                 for &(reader, _, last) in readers {
                     if reader != *next_writer && scope(last) == scope(*next_write) {
-                        posts.push((last + 1, (reader, *next_writer)));
-                        takes.push((*next_write, (reader, *next_writer)));
+                        seams.push(((reader, *next_writer), last + 1, *next_write));
                     }
                 }
             }
@@ -258,8 +274,7 @@ pub fn reg_sync(m: &mut MachineKernel) {
             if w.role == r.role {
                 continue;
             }
-            posts.push((r.at + 1, (r.role, w.role)));
-            takes.push((w.at, (r.role, w.role)));
+            seams.push(((r.role, w.role), r.at + 1, w.at));
             match reuse
                 .iter_mut()
                 .find(|(edge, body, _)| *edge == (r.role, w.role) && *body == *start)
@@ -269,8 +284,8 @@ pub fn reg_sync(m: &mut MachineKernel) {
             }
         }
     }
-    if data.is_empty() && posts.is_empty() && takes.is_empty() {
-        return;
+    if data.is_empty() && seams.is_empty() {
+        return Ok(());
     }
     let mut edges: Vec<Edge> = Vec::new();
     for &(edge, _, _, _) in &data {
@@ -278,23 +293,26 @@ pub fn reg_sync(m: &mut MachineKernel) {
             edges.push(edge);
         }
     }
-    for &(_, edge) in posts.iter().chain(takes.iter()) {
+    for &(edge, _, _) in &seams {
         if !edges.contains(&edge) {
             edges.push(edge);
         }
     }
     edges.sort_unstable();
-    assert!(
-        edges.len() <= tt_isa::sync::Semaphore::COUNT as usize,
-        "reg_sync: {} role hand-off edges need more than the {} semaphores of the Sync Unit",
-        edges.len(),
-        tt_isa::sync::Semaphore::COUNT
-    );
-    let sem = |edge: Edge| -> u8 {
-        edges
-            .iter()
-            .position(|e| *e == edge)
-            .expect("every seam's edge is in `edges`") as u8
+    if edges.len() > tt_isa::sync::Semaphore::COUNT as usize {
+        return Err(crate::status::internal_bug(format_args!(
+            "reg_sync: {} role hand-off edges need more than the {} semaphores of the Sync Unit",
+            edges.len(),
+            tt_isa::sync::Semaphore::COUNT
+        )));
+    }
+    let sem = |edge: Edge| -> Result<u8, ttStatus> {
+        match edges.iter().position(|e| *e == edge) {
+            Some(index) => Ok(index as u8),
+            None => Err(crate::status::internal_bug(
+                "reg_sync: a seam's edge is not in the edge set",
+            )),
+        }
     };
     // A counting hand-off pairs posts with takes in the producer's order, but a
     // consumer can read a slot the producer wrote *second* before one it wrote
@@ -354,7 +372,7 @@ pub fn reg_sync(m: &mut MachineKernel) {
                 (
                     edge.1,
                     MirOp::SemWait {
-                        sem: sem(*edge),
+                        sem: sem(*edge)?,
                         before: 0,
                     },
                 ),
@@ -362,29 +380,82 @@ pub fn reg_sync(m: &mut MachineKernel) {
         }
         *seen = (*seen).max(need);
     }
-    for (at, edge) in takes {
-        inserts.push((
-            at,
-            (
-                edge.1,
-                MirOp::SemWait {
-                    sem: sem(edge),
-                    before: 0,
-                },
-            ),
-        ));
+    // A seam's post and take sit on one counting semaphore shared by the whole
+    // edge, and a counting semaphore's tokens carry no identity: the k-th take
+    // consumes the k-th post. That is wrong when the body releases the slots in
+    // a different order than it writes them -- `div` releases the divisor (the
+    // second page) before the dividend, while the unpacker refills the dividend
+    // first -- because the first take would then spend the second slot's token
+    // and the unpacker would refill a page the math is still reading. So each
+    // take waits for the post of *its own* slot: as many tokens as that post's
+    // rank among the body's posts on the edge. The takes are handled in program
+    // order, so an early take that waits for a later post covers the takes
+    // before it, and the initial value `reuse` recorded (one token per hand-off
+    // the body performs) still lets the first iteration through.
+    let mut post_rank = vec![0usize; seams.len()];
+    let mut post_order: Vec<usize> = (0..seams.len()).collect();
+    post_order.sort_by_key(|i| seams[*i].1);
+    let mut paced_counts: Vec<(Edge, Option<(usize, usize)>, usize)> = Vec::new();
+    for &i in &post_order {
+        let (edge, post, _) = seams[i];
+        let at = scope(post);
+        post_rank[i] = match paced_counts
+            .iter()
+            .position(|(e, s, _)| *e == edge && *s == at)
+        {
+            Some(k) => {
+                paced_counts[k].2 += 1;
+                paced_counts[k].2
+            }
+            None => {
+                paced_counts.push((edge, at, 1));
+                1
+            }
+        };
     }
-    for (at, edge) in posts {
+    let mut take_order: Vec<usize> = (0..seams.len()).collect();
+    take_order.sort_by_key(|i| seams[*i].2);
+    let mut paced_seen: Vec<(Edge, Option<(usize, usize)>, usize)> = Vec::new();
+    for &i in &take_order {
+        let (edge, _, take) = seams[i];
+        let at = scope(take);
+        let need = post_rank[i];
+        let seen = match paced_seen
+            .iter()
+            .position(|(e, s, _)| *e == edge && *s == at)
+        {
+            Some(k) => &mut paced_seen[k].2,
+            None => {
+                paced_seen.push((edge, at, 0));
+                let k = paced_seen.len() - 1;
+                &mut paced_seen[k].2
+            }
+        };
+        for _ in *seen..need {
+            inserts.push((
+                take,
+                (
+                    edge.1,
+                    MirOp::SemWait {
+                        sem: sem(edge)?,
+                        before: 0,
+                    },
+                ),
+            ));
+        }
+        *seen = (*seen).max(need);
+    }
+    for &(edge, at, _) in &seams {
         // Inserted in this order because `insert(at, ..)` puts the new op in
         // front of what is already there: the post goes in first, so the guard
         // ends up before it.
-        inserts.push((at, (edge.0, MirOp::SemPost { sem: sem(edge) })));
-        inserts.push((at, (edge.0, MirOp::SemWaitFree { sem: sem(edge) })));
+        inserts.push((at, (edge.0, MirOp::SemPost { sem: sem(edge)? })));
+        inserts.push((at, (edge.0, MirOp::SemWaitFree { sem: sem(edge)? })));
     }
     // Each data post is one token, guarded like every other post.
     for (edge, post, _, _) in &data {
-        inserts.push((*post, (edge.0, MirOp::SemPost { sem: sem(*edge) })));
-        inserts.push((*post, (edge.0, MirOp::SemWaitFree { sem: sem(*edge) })));
+        inserts.push((*post, (edge.0, MirOp::SemPost { sem: sem(*edge)? })));
+        inserts.push((*post, (edge.0, MirOp::SemWaitFree { sem: sem(*edge)? })));
     }
     // Apply from the back, so the earlier positions stay valid.
     inserts.sort_by(|a, b| b.0.cmp(&a.0));
@@ -401,11 +472,12 @@ pub fn reg_sync(m: &mut MachineKernel) {
             .map(|(_, _, count)| *count)
             .max()
             .unwrap_or(0);
-        assert!(
-            value <= tt_isa::sync::MAX_VALUE,
-            "reg_sync: edge {edge:?} performs {value} loop hand-offs per iteration, more than the {} a semaphore can start with",
-            tt_isa::sync::MAX_VALUE
-        );
+        if value > tt_isa::sync::MAX_VALUE {
+            return Err(crate::status::internal_bug(format_args!(
+                "reg_sync: edge {edge:?} performs {value} loop hand-offs per iteration, more than the {} a semaphore can start with",
+                tt_isa::sync::MAX_VALUE
+            )));
+        }
         inits.push((
             Core::Unpack,
             MirOp::Semset {
@@ -422,6 +494,7 @@ pub fn reg_sync(m: &mut MachineKernel) {
         })
         .collect();
     m.ops = inits.into_iter().chain(ops).collect();
+    Ok(())
 }
 
 /// Collapse every run of identical consecutive row triples into one body plus a
@@ -549,18 +622,18 @@ fn same_shifted(body: &[MirOp; 3], following: &[MirOp; 3]) -> bool {
 
 /// Check every machine-IR invariant. A kernel that fails this must not be
 /// encoded.
-pub fn verify(m: &MachineKernel) -> Result<(), Error> {
+pub fn verify(m: &MachineKernel) -> Result<(), ttStatus> {
     // The semaphore table: every index a stream names must be initialised, and
     // every init names a semaphore the Sync Unit has.
     let sems = m.sems.clone();
     for (i, (sem, value)) in sems.iter().enumerate() {
         if tt_isa::sync::Semaphore::new(*sem).is_none() || *value > tt_isa::sync::MAX_VALUE {
             let _ = (sem, value);
-            return Err(Error::TT_ERROR_SEMAPHORE);
+            return Err(ttStatus::TT_ERROR_SEMAPHORE);
         }
         if sems[..i].iter().any(|(s, _)| s == sem) {
             let _ = sem;
-            return Err(Error::TT_ERROR_SEMAPHORE);
+            return Err(ttStatus::TT_ERROR_SEMAPHORE);
         }
     }
     for (name, ops) in [
@@ -578,11 +651,11 @@ pub fn verify(m: &MachineKernel) -> Result<(), Error> {
                 MirOp::Sfpload { lreg, reg, .. } => {
                     if usize::from(lreg.0) >= usize::from(crate::alloc::LREGS) {
                         let _ = (name, at, lreg);
-                        return Err(Error::TT_ERROR_LANE_REGISTER);
+                        return Err(ttStatus::TT_ERROR_LANE_REGISTER);
                     }
                     if reg.0 >= m.dst_slots() {
                         let _ = (name, at, reg);
-                        return Err(Error::TT_ERROR_DST_ROW);
+                        return Err(ttStatus::TT_ERROR_DST_ROW);
                     }
                 }
                 MirOp::Sfpstore {
@@ -590,31 +663,31 @@ pub fn verify(m: &MachineKernel) -> Result<(), Error> {
                 } => {
                     if usize::from(lreg.0) >= usize::from(crate::alloc::LREGS) {
                         let _ = (name, at, lreg);
-                        return Err(Error::TT_ERROR_LANE_REGISTER);
+                        return Err(ttStatus::TT_ERROR_LANE_REGISTER);
                     }
                     if reg.0 >= m.dst_slots() || row >= Dst::ROWS {
                         let _ = (name, at, reg, row);
-                        return Err(Error::TT_ERROR_DST_ROW);
+                        return Err(ttStatus::TT_ERROR_DST_ROW);
                     }
                     // `SFPSTORE`'s `dest_reg_addr` names a row *pair*: the
                     // hardware refuses an odd row (`tensix.cpp`:
                     // `TTSIM_VERIFY(!(dest_reg_addr & 1))`) and writes two.
                     if row & 1 != 0 {
                         let _ = (name, at, row);
-                        return Err(Error::TT_ERROR_DST_ROW_ODD);
+                        return Err(ttStatus::TT_ERROR_DST_ROW_ODD);
                     }
                 }
                 MirOp::LaneConst { lreg, .. } => {
                     if usize::from(lreg.0) >= usize::from(crate::alloc::LREGS) {
                         let _ = (name, at, lreg);
-                        return Err(Error::TT_ERROR_LANE_REGISTER);
+                        return Err(ttStatus::TT_ERROR_LANE_REGISTER);
                     }
                 }
                 MirOp::UnarySfp { a, d, .. } => {
                     for lreg in [a, d] {
                         if usize::from(lreg.0) >= usize::from(crate::alloc::LREGS) {
                             let _ = (name, at, lreg);
-                            return Err(Error::TT_ERROR_LANE_REGISTER);
+                            return Err(ttStatus::TT_ERROR_LANE_REGISTER);
                         }
                     }
                 }
@@ -622,7 +695,7 @@ pub fn verify(m: &MachineKernel) -> Result<(), Error> {
                     for lreg in [a, b, d] {
                         if usize::from(lreg.0) >= usize::from(crate::alloc::LREGS) {
                             let _ = (name, at, lreg);
-                            return Err(Error::TT_ERROR_LANE_REGISTER);
+                            return Err(ttStatus::TT_ERROR_LANE_REGISTER);
                         }
                     }
                 }
@@ -630,14 +703,14 @@ pub fn verify(m: &MachineKernel) -> Result<(), Error> {
                     for lreg in [a, d] {
                         if usize::from(lreg.0) >= usize::from(crate::alloc::LREGS) {
                             let _ = (name, at, lreg);
-                            return Err(Error::TT_ERROR_LANE_REGISTER);
+                            return Err(ttStatus::TT_ERROR_LANE_REGISTER);
                         }
                     }
                 }
                 MirOp::Setdst { reg } => {
                     if reg.0 >= m.dst_slots() {
                         let _ = (name, at, reg);
-                        return Err(Error::TT_ERROR_DST_ROW);
+                        return Err(ttStatus::TT_ERROR_DST_ROW);
                     }
                 }
                 MirOp::SemPost { sem }
@@ -647,27 +720,29 @@ pub fn verify(m: &MachineKernel) -> Result<(), Error> {
                         || !sems.iter().any(|(s, _)| *s == sem)
                     {
                         let _ = (name, at, sem);
-                        return Err(Error::TT_ERROR_SEMAPHORE);
+                        return Err(ttStatus::TT_ERROR_SEMAPHORE);
                     }
                 }
                 MirOp::Semset { .. } => {
-                    unreachable!("a semaphore init is not an instruction and has no role stream")
+                    return Err(crate::status::internal_bug(
+                        "verify: a semaphore init is not an instruction and has no role stream",
+                    ));
                 }
                 MirOp::Repeat { len, count } => {
                     if len == 0 || count == 0 {
                         let _ = (name, at);
-                        return Err(Error::TT_ERROR_REPEAT_EMPTY);
+                        return Err(ttStatus::TT_ERROR_REPEAT_EMPTY);
                     }
                     if at + 1 + len as usize > ops.len() {
                         let _ = (name, at);
-                        return Err(Error::TT_ERROR_REPEAT_BODY);
+                        return Err(ttStatus::TT_ERROR_REPEAT_BODY);
                     }
                 }
                 MirOp::Compare { a, b, d, .. } => {
                     for lreg in [a, b, d] {
                         if usize::from(lreg.0) >= usize::from(crate::alloc::LREGS) {
                             let _ = (name, at, lreg);
-                            return Err(Error::TT_ERROR_LANE_REGISTER);
+                            return Err(ttStatus::TT_ERROR_LANE_REGISTER);
                         }
                     }
                 }
@@ -675,7 +750,7 @@ pub fn verify(m: &MachineKernel) -> Result<(), Error> {
                     for lreg in [cond, t, f, d] {
                         if usize::from(lreg.0) >= usize::from(crate::alloc::LREGS) {
                             let _ = (name, at, lreg);
-                            return Err(Error::TT_ERROR_LANE_REGISTER);
+                            return Err(ttStatus::TT_ERROR_LANE_REGISTER);
                         }
                     }
                 }
@@ -683,52 +758,54 @@ pub fn verify(m: &MachineKernel) -> Result<(), Error> {
                     for lreg in [a, b, d] {
                         if usize::from(lreg.0) >= usize::from(crate::alloc::LREGS) {
                             let _ = (name, at, lreg);
-                            return Err(Error::TT_ERROR_LANE_REGISTER);
+                            return Err(ttStatus::TT_ERROR_LANE_REGISTER);
                         }
                     }
                 }
                 MirOp::SetUnpackBase { cb, .. }
                 | MirOp::SetPackBase { cb }
-                | MirOp::CbWait { cb }
-                | MirOp::CbPop { cb }
-                | MirOp::CbReserve { cb }
-                | MirOp::CbPush { cb } => {
+                | MirOp::CbWait { cb, .. }
+                | MirOp::CbPop { cb, .. }
+                | MirOp::CbReserve { cb, .. }
+                | MirOp::CbPush { cb, .. } => {
                     let _ = cb;
                 }
                 MirOp::Unpacr { unit, count, .. } => {
                     if count == 0 {
                         let _ = (name, at, unit);
-                        return Err(Error::TT_ERROR_UNPACK_ZERO_DATUMS);
+                        return Err(ttStatus::TT_ERROR_UNPACK_ZERO_DATUMS);
                     }
                 }
                 MirOp::SetPackConfig { .. } => {}
                 MirOp::SetPackOffset { reg, at: row } => {
                     if reg.0 >= m.dst_slots() || row >= Dst::ROWS {
                         let _ = (name, at, reg, row);
-                        return Err(Error::TT_ERROR_DST_ROW);
+                        return Err(ttStatus::TT_ERROR_DST_ROW);
                     }
                     pack_at = Some(row);
                 }
                 MirOp::PackRows { rows, .. } => {
                     if rows == 0 {
                         let _ = (name, at, rows);
-                        return Err(Error::TT_ERROR_PACK_ZERO_ROWS);
+                        return Err(ttStatus::TT_ERROR_PACK_ZERO_ROWS);
                     }
-                    let row = pack_at.expect("a pack names its row with SetPackOffset");
+                    let Some(row) = pack_at else {
+                        return Err(crate::status::internal_bug("verify: a pack has no row"));
+                    };
                     if row + rows > Dst::ROWS {
                         let _ = (name, at, row, rows);
-                        return Err(Error::TT_ERROR_DST_ROW);
+                        return Err(ttStatus::TT_ERROR_DST_ROW);
                     }
                 }
                 MirOp::Setadczw { .. } | MirOp::Setadcx { .. } => {}
                 MirOp::Mvmul { reg, addr_mod, .. } => {
                     if reg.0 >= m.dst_slots() {
                         let _ = (name, at, reg);
-                        return Err(Error::TT_ERROR_DST_ROW);
+                        return Err(ttStatus::TT_ERROR_DST_ROW);
                     }
                     if addr_mod > 7 {
                         let _ = (name, at, addr_mod);
-                        return Err(Error::TT_ERROR_ADDR_MOD);
+                        return Err(ttStatus::TT_ERROR_ADDR_MOD);
                     }
                 }
                 MirOp::Gapool { reg, addr_mod, .. }
@@ -736,11 +813,11 @@ pub fn verify(m: &MachineKernel) -> Result<(), Error> {
                 | MirOp::Elw { reg, addr_mod, .. } => {
                     if reg.0 >= m.dst_slots() {
                         let _ = (name, at, reg);
-                        return Err(Error::TT_ERROR_DST_ROW);
+                        return Err(ttStatus::TT_ERROR_DST_ROW);
                     }
                     if addr_mod > 7 {
                         let _ = (name, at, addr_mod);
-                        return Err(Error::TT_ERROR_ADDR_MOD);
+                        return Err(ttStatus::TT_ERROR_ADDR_MOD);
                     }
                 }
                 MirOp::Movd2b {
@@ -758,15 +835,15 @@ pub fn verify(m: &MachineKernel) -> Result<(), Error> {
                     // `SrcB` is 64 rows of 16 datums.
                     if src_row >= 64 {
                         let _ = (name, at, src_row);
-                        return Err(Error::TT_ERROR_SRC_ROW);
+                        return Err(ttStatus::TT_ERROR_SRC_ROW);
                     }
                     if reg.0 >= m.dst_slots() {
                         let _ = (name, at, reg);
-                        return Err(Error::TT_ERROR_DST_ROW);
+                        return Err(ttStatus::TT_ERROR_DST_ROW);
                     }
                     if addr_mod > 7 {
                         let _ = (name, at, addr_mod);
-                        return Err(Error::TT_ERROR_ADDR_MOD);
+                        return Err(ttStatus::TT_ERROR_ADDR_MOD);
                     }
                 }
                 MirOp::Movb2a {
@@ -778,11 +855,11 @@ pub fn verify(m: &MachineKernel) -> Result<(), Error> {
                     // `SrcA` and `SrcB` are 64 rows of 16 datums.
                     if src_a_row >= 64 || src_b_row >= 64 {
                         let _ = (name, at, src_a_row, src_b_row);
-                        return Err(Error::TT_ERROR_SRC_ROW);
+                        return Err(ttStatus::TT_ERROR_SRC_ROW);
                     }
                     if addr_mod > 7 {
                         let _ = (name, at, addr_mod);
-                        return Err(Error::TT_ERROR_ADDR_MOD);
+                        return Err(ttStatus::TT_ERROR_ADDR_MOD);
                     }
                 }
                 MirOp::Mova2d {
@@ -793,15 +870,15 @@ pub fn verify(m: &MachineKernel) -> Result<(), Error> {
                 } => {
                     if src_row >= 64 {
                         let _ = (name, at, src_row);
-                        return Err(Error::TT_ERROR_SRC_ROW);
+                        return Err(ttStatus::TT_ERROR_SRC_ROW);
                     }
                     if reg.0 >= m.dst_slots() {
                         let _ = (name, at, reg);
-                        return Err(Error::TT_ERROR_DST_ROW);
+                        return Err(ttStatus::TT_ERROR_DST_ROW);
                     }
                     if addr_mod > 7 {
                         let _ = (name, at, addr_mod);
-                        return Err(Error::TT_ERROR_ADDR_MOD);
+                        return Err(ttStatus::TT_ERROR_ADDR_MOD);
                     }
                 }
                 MirOp::Setrwc {
@@ -810,7 +887,7 @@ pub fn verify(m: &MachineKernel) -> Result<(), Error> {
                     // Each counter's field is four bits: sixteen rows.
                     if src_a >= 16 || src_b >= 16 || dst >= 16 {
                         let _ = (name, at, src_a, src_b, dst);
-                        return Err(Error::TT_ERROR_SETRWC);
+                        return Err(ttStatus::TT_ERROR_SETRWC);
                     }
                 }
                 MirOp::ThreadWord { .. } | MirOp::WaitMatrix => {}
@@ -823,7 +900,7 @@ pub fn verify(m: &MachineKernel) -> Result<(), Error> {
                     depth += 1;
                     if depth > 2 {
                         let _ = (name, at, depth);
-                        return Err(Error::TT_TODO_LOOP_DEPTH);
+                        return Err(ttStatus::TT_TODO_LOOP_DEPTH);
                     }
                 }
                 MirOp::LoopReg { reg } => {
@@ -831,7 +908,7 @@ pub fn verify(m: &MachineKernel) -> Result<(), Error> {
                     depth += 1;
                     if depth > 2 {
                         let _ = (name, at, depth);
-                        return Err(Error::TT_TODO_LOOP_DEPTH);
+                        return Err(ttStatus::TT_TODO_LOOP_DEPTH);
                     }
                 }
                 MirOp::Li { .. }
@@ -844,7 +921,7 @@ pub fn verify(m: &MachineKernel) -> Result<(), Error> {
                 MirOp::EndLoop => {
                     depth = depth.checked_sub(1).ok_or_else(|| {
                         let _ = (name, at);
-                        Error::TT_ERROR_ENDLOOP_MACHINE
+                        ttStatus::TT_ERROR_ENDLOOP_MACHINE
                     })?;
                 }
             }
@@ -852,7 +929,7 @@ pub fn verify(m: &MachineKernel) -> Result<(), Error> {
         }
         if depth != 0 {
             let _ = (name, depth);
-            return Err(Error::TT_ERROR_ENDLOOP_MACHINE);
+            return Err(ttStatus::TT_ERROR_ENDLOOP_MACHINE);
         }
     }
     Ok(())
@@ -1019,7 +1096,7 @@ copy 32,32 %out [0] = %b0 [0]
         );
         assert_eq!(
             verify(&m).expect_err("an odd row"),
-            Error::TT_ERROR_DST_ROW_ODD
+            ttStatus::TT_ERROR_DST_ROW_ODD
         );
     }
 

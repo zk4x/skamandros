@@ -25,7 +25,9 @@ mod riscv;
 mod runtime;
 mod slab;
 mod status;
+mod sync_cbs;
 mod unfold;
+mod verify;
 
 /// The hash set zyx's `Slab` keeps its free list in. zyx uses the crate's own
 /// `FHasher`; with no equivalent here the standard hasher stands in, which

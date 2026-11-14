@@ -19,7 +19,7 @@ pub enum ttStatus {
     /// A caller mistake: a null required pointer, a zero length, a wrong
     /// parameter count. Nothing was read or written.
     TT_ERROR_ARGUMENT = 1,
-    /// The text or bytes were not a program this compiler accepts.
+    /// The text was not a program this compiler accepts.
     TT_ERROR_PROGRAM = 2,
     /// The handle is not one this library handed out, or was already unloaded.
     TT_ERROR_MODULE = 3,
@@ -38,11 +38,8 @@ pub enum ttStatus {
     /// The text is not a program this parser accepts (a token, a keyword, a
     /// bracket, a value name).
     TT_ERROR_PARSE = 8,
-    /// The version line, or a byte program's version, is not the one this build
-    /// reads.
+    /// The version line is not the one this build reads.
     TT_ERROR_VERSION = 9,
-    /// The bytes are not a `TTIR` program.
-    TT_ERROR_NOT_TTIR = 10,
     /// The input continues after a complete program.
     TT_ERROR_TRAILING_INPUT = 11,
     /// A buffer's dimension is neither `1` nor a multiple of 32.
@@ -150,22 +147,6 @@ pub enum ttStatus {
     TT_ERROR_LOOP_UNTERMINATED = 61,
     /// The number of defined values is not the number of names.
     TT_ERROR_VALUE_COUNT = 62,
-
-    // -- Byte form -------------------------------------------------------------
-    /// The byte program ends in the middle of a record.
-    TT_ERROR_TRUNCATED = 63,
-    /// A dtype tag is not one this build knows.
-    TT_ERROR_DTYPE_TAG = 64,
-    /// A name's bytes are not UTF-8.
-    TT_ERROR_NAME_UTF8 = 65,
-    /// A shape-term tag is neither a constant nor a value.
-    TT_ERROR_SHAPE_TERM_TAG = 66,
-    /// A unary op tag is not one this build knows.
-    TT_ERROR_UNARY_TAG = 67,
-    /// A binary op tag is not one this build knows.
-    TT_ERROR_BINARY_TAG = 68,
-    /// An instruction tag is not one this build knows.
-    TT_ERROR_INSTRUCTION_TAG = 69,
 
     // -- Lowering --------------------------------------------------------------
     /// A cast reaches lowering.
@@ -453,6 +434,33 @@ pub enum ttStatus {
     /// nothing in this tree can run the result: refused until the driver link
     /// can exercise it.
     TT_TODO_PACK_F32_TO_BF16 = 180,
+
+    // -- Remaining unimplemented forms -----------------------------------------
+    /// A `bool` parameter (or a `bool` variable) reaches the verifier: a `bool`
+    /// is a `Dst`-register datum, and a parameter has no page to load it from.
+    TT_TODO_BOOL_PARAMETER = 181,
+    /// A `bool` buffer reaches the verifier: a `buffer` is an L1 ring of pages,
+    /// and a `bool` page has no layout this build can place.
+    TT_TODO_BOOL_BUFFER = 182,
+    /// A ring is read while a page an earlier `load` of that ring still feeds to
+    /// a `Src` reader is unreleased: that placement has no hand-off yet.
+    TT_TODO_RING_READ_BEFORE_RELEASE = 183,
+    /// A ring is read both inside and outside a loop. The hoisted-page hand-off
+    /// covers one scope, not the two this needs.
+    TT_TODO_RING_IN_AND_OUT_OF_LOOP = 184,
+    /// A ring written more than once is read outside its writing loop: a hoisted
+    /// page would have to name which write it takes.
+    TT_TODO_RING_MULTI_WRITE_OUTSIDE_LOOP = 185,
+    /// A ring is read in two loops outside its producer, so no single scope
+    /// holds its hoisted page yet.
+    TT_TODO_RING_TWO_LOOPS = 186,
+    /// A ring is read outside the loop that writes it: the page that read would
+    /// take is not defined yet.
+    TT_TODO_RING_READ_OUTSIDE_LOOP = 187,
+    /// A compiler invariant was broken: a pass found a program state its own
+    /// preconditions exclude, which the caller cannot cause. A message is on
+    /// stderr, and nothing was compiled.
+    TT_INTERNAL_BUG = 188,
 }
 
 impl ttStatus {
@@ -470,7 +478,6 @@ impl ttStatus {
             ttStatus::TT_TODO_CIRCULAR_BUFFER_ROLE => "TT_TODO_CIRCULAR_BUFFER_ROLE",
             ttStatus::TT_ERROR_PARSE => "TT_ERROR_PARSE",
             ttStatus::TT_ERROR_VERSION => "TT_ERROR_VERSION",
-            ttStatus::TT_ERROR_NOT_TTIR => "TT_ERROR_NOT_TTIR",
             ttStatus::TT_ERROR_TRAILING_INPUT => "TT_ERROR_TRAILING_INPUT",
             ttStatus::TT_ERROR_BUFFER_SHAPE => "TT_ERROR_BUFFER_SHAPE",
             ttStatus::TT_ERROR_ZERO_DIMENSION => "TT_ERROR_ZERO_DIMENSION",
@@ -523,13 +530,6 @@ impl ttStatus {
             ttStatus::TT_ERROR_MATMUL_CAST => "TT_ERROR_MATMUL_CAST",
             ttStatus::TT_ERROR_LOOP_UNTERMINATED => "TT_ERROR_LOOP_UNTERMINATED",
             ttStatus::TT_ERROR_VALUE_COUNT => "TT_ERROR_VALUE_COUNT",
-            ttStatus::TT_ERROR_TRUNCATED => "TT_ERROR_TRUNCATED",
-            ttStatus::TT_ERROR_DTYPE_TAG => "TT_ERROR_DTYPE_TAG",
-            ttStatus::TT_ERROR_NAME_UTF8 => "TT_ERROR_NAME_UTF8",
-            ttStatus::TT_ERROR_SHAPE_TERM_TAG => "TT_ERROR_SHAPE_TERM_TAG",
-            ttStatus::TT_ERROR_UNARY_TAG => "TT_ERROR_UNARY_TAG",
-            ttStatus::TT_ERROR_BINARY_TAG => "TT_ERROR_BINARY_TAG",
-            ttStatus::TT_ERROR_INSTRUCTION_TAG => "TT_ERROR_INSTRUCTION_TAG",
             ttStatus::TT_TODO_CAST => "TT_TODO_CAST",
             ttStatus::TT_TODO_BROADCAST => "TT_TODO_BROADCAST",
             ttStatus::TT_TODO_BINARY_DTYPE => "TT_TODO_BINARY_DTYPE",
@@ -639,6 +639,16 @@ impl ttStatus {
             ttStatus::TT_TODO_TF32 => "TT_TODO_TF32",
             ttStatus::TT_ERROR_REGISTERS_EXHAUSTED => "TT_ERROR_REGISTERS_EXHAUSTED",
             ttStatus::TT_TODO_PACK_F32_TO_BF16 => "TT_TODO_PACK_F32_TO_BF16",
+            ttStatus::TT_TODO_BOOL_PARAMETER => "TT_TODO_BOOL_PARAMETER",
+            ttStatus::TT_TODO_BOOL_BUFFER => "TT_TODO_BOOL_BUFFER",
+            ttStatus::TT_TODO_RING_READ_BEFORE_RELEASE => "TT_TODO_RING_READ_BEFORE_RELEASE",
+            ttStatus::TT_TODO_RING_IN_AND_OUT_OF_LOOP => "TT_TODO_RING_IN_AND_OUT_OF_LOOP",
+            ttStatus::TT_TODO_RING_MULTI_WRITE_OUTSIDE_LOOP => {
+                "TT_TODO_RING_MULTI_WRITE_OUTSIDE_LOOP"
+            }
+            ttStatus::TT_TODO_RING_TWO_LOOPS => "TT_TODO_RING_TWO_LOOPS",
+            ttStatus::TT_TODO_RING_READ_OUTSIDE_LOOP => "TT_TODO_RING_READ_OUTSIDE_LOOP",
+            ttStatus::TT_INTERNAL_BUG => "TT_INTERNAL_BUG",
             ttStatus::TT_ERROR_DST_ROW_ODD => "TT_ERROR_DST_ROW_ODD",
         }
     }
@@ -648,4 +658,17 @@ impl core::fmt::Display for ttStatus {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(self.name())
     }
+}
+
+/// A compiler invariant the caller cannot cause: say so on stderr and answer
+/// with [`ttStatus::TT_INTERNAL_BUG`].
+///
+/// Parsing is where a user's program is judged, so everything after it is this
+/// library's own logic: a value that fits its field by construction, a map key
+/// the pass itself just inserted, a token the parser just peeked. None of those
+/// may panic across the C ABI, where a panic is an abort; they report and
+/// return.
+pub(crate) fn internal_bug(what: impl core::fmt::Display) -> ttStatus {
+    eprintln!("libskamandros: {what}");
+    ttStatus::TT_INTERNAL_BUG
 }

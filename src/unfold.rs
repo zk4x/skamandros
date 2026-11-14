@@ -6,12 +6,14 @@
 //! zyx does this in `tt_unfold`, on the way into its backend, so that the
 //! native lowering only ever sees `add`/`sub`/`mul`, the bit ops, `Bitcast`,
 //! `Cast`, comparisons and `Select`. skamandros does it itself: a caller writes
-//! `log2`, `sin`, `cos`, `pow` or `div` and this pass turns each into that
-//! primitive form, in the same arithmetic zyx's bodies use.
+//! `log2`, `sin`, `cos`, `pow`, `div`, `reciprocal`, `sqrt`, `floor` or `trunc`
+//! and this pass turns each into that primitive form, in the same arithmetic
+//! zyx's bodies use.
 //!
 //! `exp2` is the one transcendental that stays an IR op. Its exponent assembly
 //! is `SFPEXEXP`/`SFPSETEXP`, which no IR op spells, so `lower` emits it as a
-//! machine body instead of it being unfolded here.
+//! machine body instead of it being unfolded here. `rsqrt` is the other: its
+//! body is `lower`'s, and `sqrt` is the reciprocal of it.
 //!
 //! The pass runs on the unified IR, before `lower`: every value it creates is
 //! an ordinary value, and the allocator is what turns a chain into one row
@@ -23,10 +25,11 @@
 
 use std::collections::BTreeMap;
 
-use crate::ir::{BOp, DType, Error, Kernel, Op, OpId, UOp};
+use crate::ir::{BOp, DType, Kernel, Op, OpId, UOp};
+use crate::status::ttStatus;
 
 /// Rewrite every transcendental `k` has into its primitive form.
-pub fn unfold(k: &Kernel) -> Result<Kernel, Error> {
+pub fn unfold(k: &Kernel) -> Result<Kernel, ttStatus> {
     let mut b = Build {
         out: Kernel::default(),
         old: k,
@@ -36,14 +39,35 @@ pub fn unfold(k: &Kernel) -> Result<Kernel, Error> {
     for (id, op) in k.ops() {
         match *op {
             Op::Unary {
-                op: uop @ (UOp::Log2 | UOp::Sin | UOp::Cos),
+                op:
+                    uop @ (UOp::Log2
+                    | UOp::Sin
+                    | UOp::Cos
+                    | UOp::Floor
+                    | UOp::Trunc
+                    | UOp::Reciprocal
+                    | UOp::Sqrt),
                 a,
             } => {
                 let x = b.map_of(a);
+                // A bf16 value carries seven mantissa bits, so tt-metal's
+                // reciprocal needs one Newton step there and two here.
+                let steps = if k.dtype(a) == DType::Bf16 { 1 } else { 2 };
                 let out = match uop {
                     UOp::Log2 => b.log2(x),
                     UOp::Sin => b.sin_cos(x, false),
-                    _ => b.sin_cos(x, true),
+                    UOp::Cos => b.sin_cos(x, true),
+                    UOp::Floor => b.floor(x),
+                    UOp::Trunc => b.trunc(x),
+                    UOp::Reciprocal => b.reciprocal(x, steps),
+                    // `sqrt x = 1/rsqrt x`: at `x = 0` the reciprocal square
+                    // root is `+inf` and the reciprocal of that is `0`, at
+                    // `x = +inf` it is `0` and the reciprocal is `+inf`, and a
+                    // negative `x` is a `NaN` through both.
+                    _ => {
+                        let r = b.un(UOp::Rsqrt, x, "sqrt_rsqrt");
+                        b.reciprocal(r, steps)
+                    }
                 };
                 b.name(id, out);
                 b.map.insert(id, out);
@@ -76,14 +100,14 @@ pub fn unfold(k: &Kernel) -> Result<Kernel, Error> {
                         b.bin(BOp::Mul, x, r, "div_mul")
                     }
                     _ => {
-                        b.copy(id, op.clone());
+                        b.copy(id, op.clone())?;
                         continue;
                     }
                 };
                 b.name(id, out);
                 b.map.insert(id, out);
             }
-            _ => b.copy(id, op.clone()),
+            _ => b.copy(id, op.clone())?,
         }
     }
     Ok(b.out)
@@ -177,6 +201,34 @@ impl Build<'_> {
         let one = self.kf(1.0, tag);
         let q = self.bin(BOp::Mul, p, s, tag);
         self.bin(BOp::Add, q, one, tag)
+    }
+
+    /// `trunc x`: toward zero. The IR's cast to `i32` truncates (the SFPU's
+    /// `SFPCAST`), so `(f32)(i32)x` is the answer wherever the integer cast is
+    /// exact. Outside that range the value is already integral, and a `NaN` is
+    /// not a value to round: both pass through unchanged.
+    fn trunc(&mut self, x: OpId) -> OpId {
+        let i = self.cast(x, DType::I32, "trunc_i");
+        let t = self.cast(i, DType::F32, "trunc_f");
+        let abs = self.un(UOp::Abs, x, "trunc_abs");
+        let big = self.kf(2_147_483_648.0, "trunc_big");
+        let over = self.bin(BOp::Cmpge, abs, big, "trunc_over");
+        let nan = self.bin(BOp::NotEq, x, x, "trunc_nan");
+        let pass = self.bin(BOp::Or, over, nan, "trunc_pass");
+        self.select(pass, x, t, "trunc")
+    }
+
+    /// `floor x = trunc x` less one when `x` is negative and not integral.
+    /// `trunc` already let the non-finite values through, so `x - trunc x` is
+    /// zero there and the adjustment never fires.
+    fn floor(&mut self, x: OpId) -> OpId {
+        let t = self.trunc(x);
+        let frac = self.bin(BOp::Sub, x, t, "floor_frac");
+        let zero = self.kf(0.0, "floor_zero");
+        let down = self.bin(BOp::Cmplt, frac, zero, "floor_down");
+        let one = self.kf(1.0, "floor_one");
+        let less = self.bin(BOp::Sub, t, one, "floor_less");
+        self.select(down, less, t, "floor")
     }
 
     /// `log2 x` by tt-metal's `calculate_log_body` (Norbert Juffa's `logf`),
@@ -345,14 +397,15 @@ impl Build<'_> {
 
     /// Copy an op unchanged, with its operands remapped. A value *is* its
     /// defining op, so a copied value takes the id of the copy.
-    fn copy(&mut self, old: OpId, op: Op) {
+    fn copy(&mut self, old: OpId, op: Op) -> Result<(), ttStatus> {
         let mut op = op;
-        crate::ir::renumber(&mut op, &self.map).expect("a use follows its definition");
+        crate::ir::renumber(&mut op, &self.map)?;
         let id = self.out.push(op);
         self.map.insert(old, id);
         if let Some(name) = self.old.names.get(&old) {
             self.out.names.insert(id, name.clone());
         }
+        Ok(())
     }
 }
 

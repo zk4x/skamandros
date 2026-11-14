@@ -15,8 +15,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::ir::{DType, Error};
-use crate::mir::{Cb, CbInfo, Dst, DstInfo, LReg, MachineKernel, MirOp};
+use crate::ir::DType;
+use crate::mir::{Cb, CbInfo, Core, Dst, DstInfo, LReg, MachineKernel, MirOp};
+use crate::status::ttStatus;
 
 /// Writable lane registers (`SFPLOAD`/`SFPSTORE` address `L0..L7`).
 pub const LREGS: u8 = 8;
@@ -26,7 +27,7 @@ const ALIGN: u32 = 64;
 
 /// Bring the machine kernel's `Dst` registers and lane registers inside the
 /// hardware's limits, in place.
-pub fn alloc(m: &mut MachineKernel) -> Result<(), Error> {
+pub fn alloc(m: &mut MachineKernel) -> Result<(), ttStatus> {
     alloc_dsts(m)?;
     alloc_lregs(m)?;
     Ok(())
@@ -83,14 +84,80 @@ fn lreg_touches(op: &MirOp) -> Vec<(LReg, bool)> {
     }
 }
 
+/// The loop bodies of the machine order, one span per IR loop: the n-th loop a
+/// role opens is the n-th loop every other role opens, the same pairing
+/// `optimize::reg_sync` uses for its seams.
+fn loop_spans(m: &MachineKernel) -> Result<Vec<(usize, usize)>, ttStatus> {
+    let slot = |role: Core| match role {
+        Core::Unpack => Some(0),
+        Core::Math => Some(1),
+        Core::Pack => Some(2),
+        Core::Reader | Core::Writer => None,
+    };
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut stacks: [Vec<usize>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut opened = [0usize; 3];
+    for (at, (role, op)) in m.ops.iter().enumerate() {
+        let Some(r) = slot(*role) else {
+            continue;
+        };
+        match op {
+            MirOp::Loop { .. } | MirOp::LoopReg { .. } => {
+                let ordinal = opened[r];
+                opened[r] += 1;
+                stacks[r].push(ordinal);
+                if ordinal == spans.len() {
+                    spans.push((at, 0));
+                } else {
+                    spans[ordinal].0 = spans[ordinal].0.min(at);
+                }
+            }
+            MirOp::EndLoop => {
+                let Some(ordinal) = stacks[r].pop() else {
+                    return Err(crate::status::internal_bug(
+                        "alloc: an end-of-loop has no open loop",
+                    ));
+                };
+                spans[ordinal].1 = spans[ordinal].1.max(at);
+            }
+            _ => {}
+        }
+    }
+    Ok(spans)
+}
+
 /// Assign the physical `Dst` registers, rewriting every op that names one.
 ///
 /// A linear scan over the order: a register is free from the op after its last
 /// touch, and the scan hands it to the next live range. The slab is rebuilt so
 /// that its ids *are* the physical registers; `alloc` is the only step that
 /// makes a `Dst` id mean a hardware register.
-fn alloc_dsts(m: &mut MachineKernel) -> Result<(), Error> {
-    let live = ranges(m, dst_touches);
+fn alloc_dsts(m: &mut MachineKernel) -> Result<(), ttStatus> {
+    let mut live = ranges(m, dst_touches);
+    // An unpacker's target is refilled by the next iteration as soon as the
+    // math has *read* it (`reg_sync`'s pacing seam), so the slot must not be
+    // shared with a later value of the same body: the math may still write it
+    // as scratch after its last read, and that write would land on the next
+    // iteration's tile.
+    let spans = loop_spans(m)?;
+    for (at, (role, op)) in m.ops.iter().enumerate() {
+        let MirOp::Setdst { reg } = *op else {
+            continue;
+        };
+        if *role != Core::Unpack {
+            continue;
+        }
+        let Some((_, end)) = spans
+            .iter()
+            .filter(|(start, end)| *start < at && at < *end)
+            .max_by_key(|(start, _)| *start)
+        else {
+            continue;
+        };
+        if let Some((_, last)) = live.get_mut(&reg) {
+            *last = (*last).max(*end);
+        }
+    }
     let slots = m.dst_slots() as usize;
     // The order of first use, so the scan is deterministic.
     let mut order: Vec<(Dst, (usize, usize))> = live.into_iter().collect();
@@ -105,7 +172,7 @@ fn alloc_dsts(m: &mut MachineKernel) -> Result<(), Error> {
             .position(|end| end.map(|end| end < first).unwrap_or(true));
         let Some(slot) = free else {
             let _ = (id, first);
-            return Err(Error::TT_ERROR_DST_SLOTS_EXHAUSTED);
+            return Err(ttStatus::TT_ERROR_DST_SLOTS_EXHAUSTED);
         };
         ends[slot] = Some(last);
         rename.insert(id, Dst(slot as u16));
@@ -135,7 +202,7 @@ fn alloc_dsts(m: &mut MachineKernel) -> Result<(), Error> {
 }
 
 /// Assign the physical lane registers, rewriting every op that names one.
-fn alloc_lregs(m: &mut MachineKernel) -> Result<(), Error> {
+fn alloc_lregs(m: &mut MachineKernel) -> Result<(), ttStatus> {
     let live = ranges(m, lreg_touches);
     let slots = 8usize;
     let mut order: Vec<(LReg, (usize, usize))> = live.into_iter().collect();
@@ -149,7 +216,7 @@ fn alloc_lregs(m: &mut MachineKernel) -> Result<(), Error> {
             .position(|end| end.map(|end| end < first).unwrap_or(true));
         let Some(slot) = free else {
             let _ = (id, first);
-            return Err(Error::TT_ERROR_LANE_REGISTER);
+            return Err(ttStatus::TT_ERROR_LANE_REGISTER);
         };
         ends[slot] = Some(last);
         rename.insert(id, LReg(slot as u16));
@@ -234,7 +301,7 @@ fn rewrite_lregs(op: &mut MirOp, rename: &BTreeMap<LReg, LReg>) {
 /// Place every ring in L1, in id order, and the `LocalCBInterface` table after
 /// them. Every ring is `ALIGN`-aligned, so the two sides of a copy are
 /// congruent by construction.
-pub fn plan_cbs(m: &mut MachineKernel) -> Result<(), Error> {
+pub fn plan_cbs(m: &mut MachineKernel) -> Result<(), ttStatus> {
     let mut at = tt_isa::l1::DATA.base as u32;
     let mut infos: Vec<(Cb, CbInfo)> = m.cbs.iter().map(|(id, info)| (id, *info)).collect();
     infos.sort_by_key(|(id, _)| *id);
@@ -243,12 +310,14 @@ pub fn plan_cbs(m: &mut MachineKernel) -> Result<(), Error> {
         let bytes = info
             .page_bytes
             .checked_mul(info.len)
-            .ok_or(Error::TT_ERROR_L1_OVERFLOW)?;
+            .ok_or(ttStatus::TT_ERROR_L1_OVERFLOW)?;
         let base = at.div_ceil(ALIGN) * ALIGN;
-        let end = base.checked_add(bytes).ok_or(Error::TT_ERROR_L1_OVERFLOW)?;
+        let end = base
+            .checked_add(bytes)
+            .ok_or(ttStatus::TT_ERROR_L1_OVERFLOW)?;
         if u64::from(end) > tt_isa::l1::DATA.end {
             let _ = (base, end);
-            return Err(Error::TT_ERROR_L1_ARENA);
+            return Err(ttStatus::TT_ERROR_L1_ARENA);
         }
         info.base = base;
         at = end;
@@ -256,22 +325,22 @@ pub fn plan_cbs(m: &mut MachineKernel) -> Result<(), Error> {
     let iface = at.div_ceil(ALIGN) * ALIGN;
     let table = crate::riscv::cb::COUNT
         .checked_mul(crate::riscv::cb::STRIDE)
-        .ok_or(Error::TT_ERROR_L1_OVERFLOW)?;
+        .ok_or(ttStatus::TT_ERROR_L1_OVERFLOW)?;
     let end = iface
         .checked_add(table)
-        .ok_or(Error::TT_ERROR_L1_OVERFLOW)?;
+        .ok_or(ttStatus::TT_ERROR_L1_OVERFLOW)?;
     if u64::from(end) > tt_isa::l1::DATA.end {
         let _ = (iface, end);
-        return Err(Error::TT_ERROR_L1_ARENA);
+        return Err(ttStatus::TT_ERROR_L1_ARENA);
     }
     for (k, (_, info)) in infos.iter_mut().enumerate() {
         let stride = u32::try_from(k)
             .ok()
             .and_then(|k| crate::riscv::cb::STRIDE.checked_mul(k))
-            .ok_or(Error::TT_ERROR_TOO_MANY_PARAMETERS)?;
+            .ok_or(ttStatus::TT_ERROR_TOO_MANY_PARAMETERS)?;
         info.iface_entry = iface
             .checked_add(stride)
-            .ok_or(Error::TT_ERROR_L1_OVERFLOW)?;
+            .ok_or(ttStatus::TT_ERROR_L1_OVERFLOW)?;
     }
     let _ = count;
     for (id, info) in infos {

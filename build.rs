@@ -27,11 +27,6 @@ const DECLARATIONS: &[(&str, &str, &str)] = &[
         "ttStatus",
         "const char *text, size_t len, ttModule **out, char **err",
     ),
-    (
-        "ttModuleLoad",
-        "ttStatus",
-        "const uint8_t *bytes, size_t len, ttModule **out, char **err",
-    ),
     ("ttModuleUnload", "ttStatus", "ttModule *module, char **err"),
     ("ttInit", "ttStatus", "char **err"),
     ("ttRelease", "ttStatus", "char **err"),
