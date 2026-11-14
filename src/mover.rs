@@ -451,53 +451,84 @@ impl Mover<'_> {
     /// and every write with a `Reserve`/`Push` pair. The rings are named by the
     /// *old* ids here; [`Mover::assemble`] renumbers the whole stream.
     fn handoffs(&mut self, compute: Vec<(OpId, Op)>) -> Result<Vec<(OpId, Op)>, Error> {
-        let mut last_read: BTreeMap<OpId, usize> = BTreeMap::new();
-        for (at, (_, op)) in compute.iter().enumerate() {
-            if let Some(ring) = read_ring(self.old, op) {
-                last_read.insert(ring, at);
-            }
+        // When a page is released. A `load` that lands in `Dst` has consumed its
+        // page by the time the op ends; a `load` whose value the Matrix Unit
+        // reads straight from `Src` has not, so its page is released after the
+        // `matmul`/reduce that reads it.
+        let mut release: BTreeMap<usize, Vec<OpId>> = BTreeMap::new();
+        for (at, (id, op)) in compute.iter().enumerate() {
+            let Some(ring) = self.read_ring(op) else {
+                continue;
+            };
+            let consumed_at = if matches!(*op, Op::Load { .. }) {
+                compute
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, (_, later))| reads_source(later, *id))
+                    .map(|(at, _)| at)
+                    .unwrap_or(at)
+            } else {
+                at
+            };
+            release.entry(consumed_at).or_default().push(ring);
         }
         let mut out = Vec::with_capacity(compute.len());
         for (at, (id, op)) in compute.into_iter().enumerate() {
-            if let Some(old) = read_ring(self.old, &op) {
-                out.push((OpId::NULL, Op::Wait { cb: old }));
-                out.push((id, op));
-                if last_read[&old] == at {
-                    out.push((OpId::NULL, Op::Pop { cb: old }));
-                }
-                continue;
+            let read = self.read_ring(&op);
+            let write = self.write_ring(&op);
+            if let Some(ring) = read {
+                out.push((OpId::NULL, Op::Wait { cb: ring }));
             }
-            if let Some(old) = write_ring(self.old, &op) {
-                out.push((OpId::NULL, Op::Reserve { cb: old }));
-                out.push((id, op));
-                out.push((OpId::NULL, Op::Push { cb: old }));
-                continue;
+            if let Some(ring) = write {
+                out.push((OpId::NULL, Op::Reserve { cb: ring }));
             }
             out.push((id, op));
+            if let Some(ring) = write {
+                out.push((OpId::NULL, Op::Push { cb: ring }));
+            }
+            for ring in release.remove(&at).unwrap_or_default() {
+                out.push((OpId::NULL, Op::Pop { cb: ring }));
+            }
         }
         Ok(out)
     }
 }
 
-/// The ring an op reads, if it reads one.
-fn read_ring(k: &Kernel, op: &Op) -> Option<OpId> {
+/// Whether `op` reads `value`'s page straight from `Src`: the Matrix Unit's
+/// operands are unpacked by the `matmul`/reduce itself, not by the `load`.
+fn reads_source(op: &Op, value: OpId) -> bool {
     match *op {
-        Op::Load { buffer, .. } if is_ring(k, buffer) => Some(buffer),
-        Op::CopyTo { src, .. } if is_ring(k, src) => Some(src),
-        _ => None,
+        Op::Matmul { a, b, .. } => a == value || b == value,
+        Op::Sum { x, s, .. } => x == value || s == value,
+        Op::Max { x, .. } => x == value,
+        _ => false,
     }
 }
 
-/// The ring an op writes, if it writes one.
-fn write_ring(k: &Kernel, op: &Op) -> Option<OpId> {
-    match *op {
-        Op::StoreTo { buffer, .. } if is_ring(k, buffer) => Some(buffer),
-        Op::CopyTo { dst, .. } if is_ring(k, dst) => Some(dst),
-        _ => None,
+impl Mover<'_> {
+    /// Whether `value` names a ring of the program being assembled: one the old
+    /// program declared, or one this pass staged.
+    fn is_ring(&self, value: OpId) -> bool {
+        matches!(self.old.op(value), Some(Op::Cb { .. }))
+            || self.staged_of.values().any(|ring| *ring == value)
     }
-}
 
-/// Whether `value` is a circular buffer.
-fn is_ring(k: &Kernel, value: OpId) -> bool {
-    matches!(k.op(value), Some(Op::Cb { .. }))
+    /// The ring an op reads, if it reads one.
+    fn read_ring(&self, op: &Op) -> Option<OpId> {
+        match *op {
+            Op::Load { buffer, .. } if self.is_ring(buffer) => Some(buffer),
+            Op::CopyTo { src, .. } if self.is_ring(src) => Some(src),
+            _ => None,
+        }
+    }
+
+    /// The ring an op writes, if it writes one.
+    fn write_ring(&self, op: &Op) -> Option<OpId> {
+        match *op {
+            Op::StoreTo { buffer, .. } if self.is_ring(buffer) => Some(buffer),
+            Op::CopyTo { dst, .. } if self.is_ring(dst) => Some(dst),
+            _ => None,
+        }
+    }
 }

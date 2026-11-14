@@ -1108,3 +1108,28 @@ endloop
     m.plan_cbs().expect("plan_cbs");
     println!("== allocated ==\n{m}");
 }
+
+/// An inspection: a direct parameter access (staged by `add_movers`), printed
+/// after the lowering. Added for the reader; whether it stays is the user's call.
+#[test]
+fn show_the_direct_parameter_kernel() {
+    const DIRECT: &str = "\
+version 9
+grid 1,1
+%in = param f32 4096
+%out = param f32 4096
+load 32,32 %x = %in [0]
+%y = neg %x
+store 32,32 %out [0] = %y
+";
+    let k = Kernel::parse(DIRECT).expect("it parses");
+    let k = crate::unfold::unfold(&k).expect("unfold");
+    let k = crate::mover::add_movers(&k).expect("movers");
+    println!("== movers ==\n{k}");
+    let mut m = k.lower().expect("lower");
+    crate::optimize::reg_sync(&mut m);
+    crate::optimize::fuse(&mut m);
+    m.alloc().expect("alloc");
+    m.plan_cbs().expect("plan_cbs");
+    println!("== allocated ==\n{m}");
+}

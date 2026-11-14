@@ -449,7 +449,7 @@ pub fn fuse(m: &mut MachineKernel) {
     for role in [Core::Unpack, Core::Math, Core::Pack] {
         let ops: Vec<MirOp> = entries
             .iter()
-            .filter(|(core, _)| *core == role)
+            .filter(|(core, op)| *core == role && !matches!(op, MirOp::Semset { .. }))
             .map(|(_, op)| *op)
             .collect();
         let mut out: Vec<MirOp> = Vec::with_capacity(ops.len());

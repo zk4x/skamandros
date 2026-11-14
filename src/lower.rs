@@ -325,7 +325,6 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
     // The page of a load that a `matmul` also reads is released at the last
     // reader, not at the load: the ring's read pointer must not move while the
     // Matrix Unit's unpack still points at it.
-    let mut pop_here: BTreeMap<crate::ir::OpId, Vec<Cb>> = BTreeMap::new();
     // Which segment the walk is in: the reader's copies come first, then the
     // compute ring, then the writer's.
     let mut mover: Option<Core> = Some(Core::Reader);
@@ -454,10 +453,38 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                 continue;
             }
             Op::Shape(_) => continue,
-            // The ring hand-offs are the lowering's own pacing today (the
-            // `pop_here`/`matmul_use` machinery below); a mover segment's
-            // reserve/push is part of its copy's encoding.
-            Op::Wait { .. } | Op::Reserve { .. } | Op::Push { .. } | Op::Pop { .. } => continue,
+            // The ring hand-offs `add_movers` placed: a consumer waits for a
+            // page and releases it, a producer reserves one and publishes it.
+            // The core is the one that does it — the unpacker and the packer in
+            // the compute ring, the movers in their own segments.
+            Op::Wait { cb } | Op::Pop { cb } => {
+                let ring = cb_id(*plan.cb.get(&cb).ok_or(Error::TT_ERROR_BUFFER_NOT_PLACED)?);
+                let op = if matches!(*op, Op::Wait { .. }) {
+                    MirOp::CbWait { cb: ring }
+                } else {
+                    MirOp::CbPop { cb: ring }
+                };
+                let core = match mover {
+                    Some(Core::Writer) => Core::Writer,
+                    _ => Core::Unpack,
+                };
+                m.push(core, op);
+                continue;
+            }
+            Op::Reserve { cb } | Op::Push { cb } => {
+                let ring = cb_id(*plan.cb.get(&cb).ok_or(Error::TT_ERROR_BUFFER_NOT_PLACED)?);
+                let op = if matches!(*op, Op::Reserve { .. }) {
+                    MirOp::CbReserve { cb: ring }
+                } else {
+                    MirOp::CbPush { cb: ring }
+                };
+                let core = match mover {
+                    Some(Core::Reader) => Core::Reader,
+                    _ => Core::Pack,
+                };
+                m.push(core, op);
+                continue;
+            }
             Op::CopyTo {
                 dst,
                 src,
@@ -527,10 +554,8 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                         let _ = (at, buffer);
                         return Err(Error::TT_ERROR_BF16_WIDEN);
                     }
-                    // The page comes from the ring: wait for the producer's
-                    // push, unpack, then release the page. Who may write this
-                    // `Dst` slot, and when, is `reg_sync`'s to decide.
-                    m.push(Core::Unpack, MirOp::CbWait { cb });
+                    // The page's wait and release are the `wait`/`pop` ops
+                    // `add_movers` placed around this load.
                     m.push(Core::Unpack, MirOp::Setdst { reg });
                     m.push(Core::Unpack, MirOp::Setadczw { unit: 0, face: 0 });
                     m.push(
@@ -559,22 +584,9 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                             flip: false,
                         },
                     );
-                } else {
-                    // The Matrix Unit's operand: the page is reserved here and
-                    // unpacked at the matmul; the bank handover gates the rest.
-                    m.push(Core::Unpack, MirOp::CbWait { cb });
                 }
-                // A page the Matrix Unit still reads is released after that
-                // read, not here.
-                if matmul_use.contains(&value) {
-                    let last = last_use
-                        .get(&value)
-                        .copied()
-                        .expect("a read value has a last use");
-                    pop_here.entry(last).or_default().push(cb);
-                } else {
-                    m.push(Core::Unpack, MirOp::CbPop { cb });
-                }
+                // A `matmul` operand's page is waited for and released by its
+                // own `wait`/`pop` ops.
                 let _ = info;
                 let _ = rows;
                 let _ = offset;
@@ -626,9 +638,6 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                     // An accumulator store never reads a CB page, but a page
                     // this instruction was the last reader of is released here
                     // exactly like the packed path's.
-                    for cb in pop_here.remove(&at).unwrap_or_default() {
-                        m.push(Core::Unpack, MirOp::CbPop { cb });
-                    }
                     continue;
                 }
                 let dtype = match k.at(buffer) {
@@ -650,11 +659,10 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                     let _ = buffer;
                     Error::TT_ERROR_BUFFER_NOT_PLACED
                 })?);
-                // The page comes from the ring: reserve a free one, pack into
-                // it, then publish it to the writer. The `Dst` hand-off is
-                // `reg_sync`'s: the math thread has published the section and
-                // the packer reads it here.
-                m.push(Core::Pack, MirOp::CbReserve { cb });
+                // The ring's `reserve`/`push` are the ops `add_movers` placed
+                // around this store. The `Dst` hand-off is `reg_sync`'s: the
+                // math thread has published the section and the packer reads it
+                // here.
                 m.push(Core::Pack, MirOp::SetPackBase { cb });
                 m.push(
                     Core::Pack,
@@ -673,7 +681,6 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                     },
                 );
                 m.push(Core::Pack, MirOp::PackRows { rows, last: true });
-                m.push(Core::Pack, MirOp::CbPush { cb });
                 let _ = offset;
             }
             Op::Cast { src, dtype } => {
@@ -842,9 +849,6 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                     )?;
                     // A page whose last reader this broadcast was is released
                     // here; `continue` skips the common block below.
-                    for cb in pop_here.remove(&at).unwrap_or_default() {
-                        m.push(Core::Unpack, MirOp::CbPop { cb });
-                    }
                     continue;
                 }
                 let shape = if left.shape == RegShape::Scalar {
@@ -1858,11 +1862,6 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
             // guarded, so the compiler cannot see it does, and a new variant
             // lands here loudly rather than in a silent default.
             _ => unreachable!("every op is handled above"),
-        }
-        // A page a `matmul` read is released once the last reader of the loaded
-        // value has consumed it, which is after the matmul's own unpacks.
-        for cb in pop_here.remove(&at).unwrap_or_default() {
-            m.push(Core::Unpack, MirOp::CbPop { cb });
         }
     }
     // The compiler's 1.0 page: written once, at the start of the kernel, into

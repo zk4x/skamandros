@@ -342,15 +342,6 @@ fn encode_mover(
                 offset,
                 inbound,
             } => {
-                let sync3 = [reg::T0, reg::T1, reg::T2];
-                let sync4 = [reg::T0, reg::T1, reg::T2, reg::T6];
-                out.asm(|a| {
-                    if inbound {
-                        rv::cb::reserve_back(a, reg::A6, u32::from(cb.0), 1, sync3);
-                    } else {
-                        rv::cb::wait_front(a, reg::A6, u32::from(cb.0), 1, sync3);
-                    }
-                })?;
                 let mut out_asm = Asm::default();
                 mover_copy(&mut out_asm, param, u32::from(cb.0), bytes, offset, inbound)?;
                 for word in out_asm
@@ -359,14 +350,33 @@ fn encode_mover(
                 {
                     out.rv(word);
                 }
-                out.asm(|a| {
-                    if inbound {
-                        rv::cb::push_back(a, reg::A6, u32::from(cb.0), 1, sync4);
-                    } else {
-                        rv::cb::pop_front(a, reg::A6, u32::from(cb.0), 1, sync4);
-                    }
-                })?;
             }
+            // The ring hand-offs are ordinary ops of the machine kernel: the
+            // lowering puts each one on the core that performs it.
+            MirOp::CbReserve { cb } => out.asm(|a| {
+                rv::cb::reserve_back(a, reg::A6, u32::from(cb.0), 1, [reg::T0, reg::T1, reg::T2]);
+            })?,
+            MirOp::CbPush { cb } => out.asm(|a| {
+                rv::cb::push_back(
+                    a,
+                    reg::A6,
+                    u32::from(cb.0),
+                    1,
+                    [reg::T0, reg::T1, reg::T2, reg::T6],
+                );
+            })?,
+            MirOp::CbWait { cb } => out.asm(|a| {
+                rv::cb::wait_front(a, reg::A6, u32::from(cb.0), 1, [reg::T0, reg::T1, reg::T2]);
+            })?,
+            MirOp::CbPop { cb } => out.asm(|a| {
+                rv::cb::pop_front(
+                    a,
+                    reg::A6,
+                    u32::from(cb.0),
+                    1,
+                    [reg::T0, reg::T1, reg::T2, reg::T6],
+                );
+            })?,
             other => {
                 let _ = other;
                 return Err(Error::TT_ERROR_MOVER_PROGRAM);
