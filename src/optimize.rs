@@ -74,6 +74,31 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
     // The pass inserts hand-offs between ops, so it works on the order as a
     // vector and rebuilds the slab at the end.
     let mut ops: Vec<(Core, MirOp)> = m.ops.clone();
+    // A fused body is one unit: a seam whose end is an op inside a `Repeat`
+    // must sit outside the whole body, never between the marker and its ops
+    // (that would put the hand-off in the repeated region and run it 32 times).
+    let mut repeats: Vec<(usize, usize)> = Vec::new();
+    for (at, (_, op)) in ops.iter().enumerate() {
+        if let MirOp::Repeat { len, .. } = *op {
+            repeats.push((at, at + 1 + usize::from(len)));
+        }
+    }
+    let take_at = |p: usize| -> usize {
+        repeats
+            .iter()
+            .filter(|(start, end)| *start < p && p < *end)
+            .map(|(start, _)| *start)
+            .min()
+            .unwrap_or(p)
+    };
+    let post_at = |p: usize| -> usize {
+        repeats
+            .iter()
+            .filter(|(start, end)| *start < p && p <= *end)
+            .map(|(_, end)| *end)
+            .max()
+            .unwrap_or(p)
+    };
     // The unpacker's `Dst` target and, per unit, whether it is configured for
     // `Src`: an `UNPACR` writes `Dst` only when its unit is on the `Dst` path.
     let mut target: Option<Dst> = None;
@@ -368,7 +393,7 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
         };
         for _ in *seen..need {
             inserts.push((
-                *take,
+                take_at(*take),
                 (
                     edge.1,
                     MirOp::SemWait {
@@ -433,7 +458,7 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
         };
         for _ in *seen..need {
             inserts.push((
-                take,
+                take_at(take),
                 (
                     edge.1,
                     MirOp::SemWait {
@@ -449,13 +474,15 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
         // Inserted in this order because `insert(at, ..)` puts the new op in
         // front of what is already there: the post goes in first, so the guard
         // ends up before it.
+        let at = post_at(at);
         inserts.push((at, (edge.0, MirOp::SemPost { sem: sem(edge)? })));
         inserts.push((at, (edge.0, MirOp::SemWaitFree { sem: sem(edge)? })));
     }
     // Each data post is one token, guarded like every other post.
     for (edge, post, _, _) in &data {
-        inserts.push((*post, (edge.0, MirOp::SemPost { sem: sem(*edge)? })));
-        inserts.push((*post, (edge.0, MirOp::SemWaitFree { sem: sem(*edge)? })));
+        let post = post_at(*post);
+        inserts.push((post, (edge.0, MirOp::SemPost { sem: sem(*edge)? })));
+        inserts.push((post, (edge.0, MirOp::SemWaitFree { sem: sem(*edge)? })));
     }
     // Apply from the back, so the earlier positions stay valid.
     inserts.sort_by(|a, b| b.0.cmp(&a.0));
@@ -528,6 +555,14 @@ pub fn fuse(m: &mut MachineKernel) {
         let mut out: Vec<MirOp> = Vec::with_capacity(ops.len());
         let mut i = 0usize;
         while i < ops.len() {
+            // A body the allocator already fused is one unit: its ops must not
+            // be wrapped in a second `Repeat` (the row deltas would compound).
+            if let MirOp::Repeat { len, .. } = ops[i] {
+                let end = (i + 1 + len as usize).min(ops.len());
+                out.extend_from_slice(&ops[i..end]);
+                i = end;
+                continue;
+            }
             let Some(body) = triple(&ops, i) else {
                 out.push(ops[i]);
                 i += 1;

@@ -4105,6 +4105,138 @@ copy 32,32 %out [0] = %bo [0]
     }
 }
 
+/// The `load`, one chain, one `store` shape every activation test shares.
+fn activation_program(chain: &str) -> String {
+    format!(
+        "\
+version 9
+grid 1,1
+%in = param f32 1024
+%out = param f32 1024
+%b0 = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %b0 [0] = %in [0]
+load 32,32 %x = %b0 [0]
+{chain}
+store 32,32 %bo [0] = %r
+copy 32,32 %out [0] = %bo [0]
+"
+    )
+}
+
+fn activation_input() -> Vec<f32> {
+    (0..1024).map(|i| (i as f32 - 512.0) / 64.0).collect()
+}
+
+/// `sigmoid = 1/(1+exp(-x))` as `src/unfold.rs` writes it, one row body.
+const SIGMOID_CHAIN: &str = "\
+%nx = neg %x
+%k = const f32 1.442695
+%p = mul %nx %k
+%e = exp2 %p
+%one = const f32 1
+%d = add %e %one
+%r = reciprocal %d";
+
+#[test]
+fn sigmoid_runs_on_the_simulator() {
+    check_unary(
+        &activation_program(SIGMOID_CHAIN),
+        &activation_input(),
+        |x| 1.0 / (1.0 + (-x).exp()),
+        2e-3,
+        "sigmoid",
+    );
+}
+
+/// `silu = x·sigmoid(x)`: `x` is read by the chain and by the final multiply,
+/// so it must cross the whole body in one lane register.
+const SILU_CHAIN: &str = "\
+%nx = neg %x
+%k = const f32 1.442695
+%p = mul %nx %k
+%e = exp2 %p
+%one = const f32 1
+%d = add %e %one
+%s = reciprocal %d
+%r = mul %x %s";
+
+#[test]
+fn silu_runs_on_the_simulator() {
+    check_unary(
+        &activation_program(SILU_CHAIN),
+        &activation_input(),
+        |x| x / (1.0 + (-x).exp()),
+        2e-3,
+        "silu",
+    );
+}
+
+/// `tanh = 2·sigmoid(2x) - 1`, the composition zyx's gate uses.
+const TANH_CHAIN: &str = "\
+%doubled = add %x %x
+%nx = neg %doubled
+%k = const f32 1.442695
+%p = mul %nx %k
+%e = exp2 %p
+%one = const f32 1
+%d = add %e %one
+%s = reciprocal %d
+%two = const f32 2
+%m = mul %s %two
+%r = sub %m %one";
+
+#[test]
+fn tanh_runs_on_the_simulator() {
+    check_unary(
+        &activation_program(TANH_CHAIN),
+        &activation_input(),
+        f32::tanh,
+        2e-3,
+        "tanh",
+    );
+}
+
+/// `gelu = 0.5·x·(1 + tanh(√(2/π)(x + 0.044715 x³)))`. It is the longest
+/// chain: `x` is needed three times and `x/2` survives to the end.
+const GELU_CHAIN: &str = "\
+%half = const f32 0.5
+%xh = mul %x %half
+%x2 = mul %x %x
+%x3 = mul %x2 %x
+%c = const f32 0.044715
+%cx3 = mul %x3 %c
+%inner = add %x %cx3
+%kk = const f32 0.7978846
+%arg = mul %inner %kk
+%doubled = add %arg %arg
+%narg = neg %doubled
+%k = const f32 1.442695
+%p = mul %narg %k
+%e = exp2 %p
+%one = const f32 1
+%d = add %e %one
+%s = reciprocal %d
+%two = const f32 2
+%m = mul %s %two
+%t = sub %m %one
+%t1 = add %t %one
+%r = mul %xh %t1";
+
+#[test]
+fn gelu_runs_on_the_simulator() {
+    check_unary(
+        &activation_program(GELU_CHAIN),
+        &activation_input(),
+        |x| {
+            let inner = (2.0f32 / std::f32::consts::PI).sqrt() * (x + 0.044715 * x * x * x);
+            0.5 * x * (1.0 + inner.tanh())
+        },
+        2e-3,
+        "gelu",
+    );
+}
+
 /// The embedding gather as pure data movement: the row of ids is copied in as a
 /// whole row, and the copy that follows names that row as its index — one base
 /// per lane — so each lane pulls one weight row into the tile the last copy

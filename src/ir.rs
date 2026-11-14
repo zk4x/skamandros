@@ -871,73 +871,85 @@ impl Kernel {
     }
 
     /// What `value` is, recomputed from its defining op.
+    ///
+    /// The walk is bottom-up over the ops in program order, so a chain of `n`
+    /// operations costs `n`, not the number of paths through its DAG: a value
+    /// that is read many times (`silu`'s `x`, `gelu`'s `x`) would otherwise be
+    /// re-derived once per use and the cost would be exponential in the chain's
+    /// depth.
     pub fn info(&self, value: OpId) -> ValueInfo {
-        let op = self.at(value);
-        let (kind, dtype, shape) = match *op {
-            Op::Const { dtype, .. } => (ValueKind::Const, dtype, RegShape::Scalar),
-            Op::Shape(_) => (ValueKind::Shape, INDEX, RegShape::Scalar),
-            Op::Param { dtype, .. } => (ValueKind::Param, dtype, RegShape::Tile),
-            Op::Variable { dtype } => (ValueKind::Param, dtype, RegShape::Scalar),
-            Op::Cb { dtype, .. } => (ValueKind::Buffer, dtype, RegShape::Tile),
-            Op::Acc { dtype, shape } => (ValueKind::Acc, dtype, acc_reg_shape(shape)),
-            Op::GridCoord { .. } | Op::Loop { .. } => {
-                (ValueKind::Induction, INDEX, RegShape::Scalar)
+        use Op::*;
+        let mut memo: Vec<Option<ValueInfo>> = vec![None; usize::from(self.ops.max_id()) + 1];
+        for (id, op) in self.ops() {
+            let of = |v: OpId| -> ValueInfo {
+                memo[usize::from(v)].expect("a value's operand is defined before it")
+            };
+            let (kind, dtype, shape) = match *op {
+                Const { dtype, .. } => (ValueKind::Const, dtype, RegShape::Scalar),
+                Shape(_) => (ValueKind::Shape, INDEX, RegShape::Scalar),
+                Param { dtype, .. } => (ValueKind::Param, dtype, RegShape::Tile),
+                Variable { dtype } => (ValueKind::Param, dtype, RegShape::Scalar),
+                Cb { dtype, .. } => (ValueKind::Buffer, dtype, RegShape::Tile),
+                Acc { dtype, shape } => (ValueKind::Acc, dtype, acc_reg_shape(shape)),
+                GridCoord { .. } | Loop { .. } => (ValueKind::Induction, INDEX, RegShape::Scalar),
+                Load { buffer, shape, .. } => (
+                    ValueKind::Register,
+                    of(buffer).dtype,
+                    access_shape(shape).unwrap_or(RegShape::Tile),
+                ),
+                Cast { dtype, .. } | Bitcast { dtype, .. } => {
+                    (ValueKind::Register, dtype, of(self.cast_source(id)).shape)
+                }
+                Unary { a, .. } => (ValueKind::Register, of(a).dtype, of(a).shape),
+                Binary { op, a, b } => {
+                    let dtype = if op.returns_bool() {
+                        DType::Bool
+                    } else {
+                        of(a).dtype
+                    };
+                    let sa = of(a).shape;
+                    let sb = of(b).shape;
+                    let shape = if sa == sb {
+                        sa
+                    } else if sb == RegShape::Scalar {
+                        sa
+                    } else if sa == RegShape::Scalar {
+                        sb
+                    } else {
+                        RegShape::Tile
+                    };
+                    (ValueKind::Register, dtype, shape)
+                }
+                Select {
+                    if_true, if_false, ..
+                } => {
+                    let shape = of(if_true).shape;
+                    let _ = if_false;
+                    (ValueKind::Register, of(if_true).dtype, shape)
+                }
+                Matmul { acc, .. } | Sum { acc, .. } | Max { acc, .. } => {
+                    (ValueKind::Acc, of(acc).dtype, of(acc).shape)
+                }
+                StoreTo { buffer, .. } => (ValueKind::Buffer, of(buffer).dtype, RegShape::Tile),
+                Grid { .. } => (ValueKind::Shape, INDEX, RegShape::Scalar),
+                CopyTo { .. }
+                | EndLoop
+                | EndReader
+                | EndCompute
+                | Wait { .. }
+                | Reserve { .. }
+                | Push { .. }
+                | Pop { .. } => {
+                    let _ = id;
+                    (ValueKind::Register, INDEX, RegShape::Scalar)
+                }
+            };
+            memo[usize::from(id)] = Some(ValueInfo { kind, dtype, shape });
+            if id == value {
+                break;
             }
-            Op::Load { buffer, shape, .. } => (
-                ValueKind::Register,
-                self.dtype(buffer),
-                access_shape(shape).unwrap_or(RegShape::Tile),
-            ),
-            Op::Cast { dtype, .. } | Op::Bitcast { dtype, .. } => (
-                ValueKind::Register,
-                dtype,
-                self.info(self.cast_source(value)).shape,
-            ),
-            Op::Unary { a, .. } => (ValueKind::Register, self.dtype(a), self.info(a).shape),
-            Op::Binary { op, a, b } => {
-                let dtype = if op.returns_bool() {
-                    DType::Bool
-                } else {
-                    self.dtype(a)
-                };
-                let sa = self.info(a).shape;
-                let sb = self.info(b).shape;
-                let shape = if sa == sb {
-                    sa
-                } else if sb == RegShape::Scalar {
-                    sa
-                } else if sa == RegShape::Scalar {
-                    sb
-                } else {
-                    RegShape::Tile
-                };
-                (ValueKind::Register, dtype, shape)
-            }
-            Op::Select {
-                if_true, if_false, ..
-            } => {
-                let shape = self.info(if_true).shape;
-                let _ = if_false;
-                (ValueKind::Register, self.dtype(if_true), shape)
-            }
-            Op::Matmul { acc, .. } | Op::Sum { acc, .. } | Op::Max { acc, .. } => {
-                (ValueKind::Acc, self.dtype(acc), self.info(acc).shape)
-            }
-            Op::StoreTo { buffer, .. } => (ValueKind::Buffer, self.dtype(buffer), RegShape::Tile),
-            Op::Grid { .. } => (ValueKind::Shape, INDEX, RegShape::Scalar),
-            Op::CopyTo { .. }
-            | Op::EndLoop
-            | Op::EndReader
-            | Op::EndCompute
-            | Op::Wait { .. }
-            | Op::Reserve { .. }
-            | Op::Push { .. }
-            | Op::Pop { .. } => {
-                let _ = value;
-                (ValueKind::Register, INDEX, RegShape::Scalar)
-            }
-        };
-        ValueInfo { kind, dtype, shape }
+        }
+        memo[usize::from(value)].expect("the value being asked about is defined")
     }
 
     /// The dtype of `value`.

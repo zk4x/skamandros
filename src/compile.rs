@@ -26,6 +26,9 @@ pub fn compile(k: &Kernel) -> Result<Module, ttStatus> {
     // the lowering.
     k.verify()?;
     let mut machine = k.lower()?;
+    // The row bodies are fused before the hand-offs are derived: a value that
+    // stays in a lane register has no `Dst` for a seam to carry.
+    crate::alloc::fuse_bodies(&mut machine)?;
     // The hand-offs are derived from the accesses, before fusion replaces the
     // cross-core order with the per-core streams.
     crate::optimize::reg_sync(&mut machine)?;
