@@ -217,7 +217,17 @@ fn open_loop_reg(
 /// bound that is not a literal: a launch argument (a scalar parameter's value),
 /// this core's coordinate, or arithmetic over them. They are ordinary RISC-V,
 /// the way a C kernel computes its loop bound.
-fn encode_int(op: &MirOp, out: &mut Stream, loops: &mut Vec<OpenLoop>) -> Result<bool, Error> {
+///
+/// `pairs` is the calling role's counter pairs: the counters a `LoopReg` opens
+/// with are the role's own, so a mover's loop never lands in `t5` (its NIU
+/// base) and a compute role's never lands in `a1`/`a2` unless it is the second
+/// level.
+fn encode_int(
+    op: &MirOp,
+    out: &mut Stream,
+    loops: &mut Vec<OpenLoop>,
+    pairs: &[(u8, u8)],
+) -> Result<bool, Error> {
     match *op {
         MirOp::Li { reg, value } => out.li(reg, value),
         MirOp::LoadArg { reg, arg } => out.rv(rv::lw(reg, reg::A0, arg)),
@@ -238,7 +248,7 @@ fn encode_int(op: &MirOp, out: &mut Stream, loops: &mut Vec<OpenLoop>) -> Result
             IOp::Sll => rv::sll(d, a, b),
             IOp::Sra => rv::sra(d, a, b),
         }),
-        MirOp::LoopReg { reg } => open_loop_reg(out, loops, reg, &COMPUTE_PAIRS)?,
+        MirOp::LoopReg { reg } => open_loop_reg(out, loops, reg, pairs)?,
         _ => return Ok(false),
     }
     Ok(true)
@@ -320,12 +330,11 @@ fn encode_mover(
     })?;
     let mut loops = Vec::new();
     for op in &ops {
-        if encode_int(op, out, &mut loops)? {
+        if encode_int(op, out, &mut loops, &MOVER_PAIRS)? {
             continue;
         }
         match *op {
             MirOp::Loop { count } => open_loop_with(out, &mut loops, count, &MOVER_PAIRS)?,
-            MirOp::LoopReg { reg } => open_loop_reg(out, &mut loops, reg, &MOVER_PAIRS)?,
             MirOp::EndLoop => close_loop(out, &mut loops)?,
             // A word store, and the NoC's spin: one instruction and one fixed
             // pair, so neither is a macro op.
@@ -495,7 +504,7 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result
     let mut state = UnpackState::default();
     let mut loops = Vec::new();
     for op in ops {
-        if encode_int(op, out, &mut loops)? {
+        if encode_int(op, out, &mut loops, &COMPUTE_PAIRS)? {
             continue;
         }
         match *op {
@@ -1073,7 +1082,7 @@ fn encode_math(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(
     let mut at = 0usize;
     let mut loops = Vec::new();
     while at < ops.len() {
-        if encode_int(&ops[at], out, &mut loops)? {
+        if encode_int(&ops[at], out, &mut loops, &COMPUTE_PAIRS)? {
             at += 1;
             continue;
         }
@@ -1742,7 +1751,7 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(
     let mut last_offset: Option<(Dst, u32)> = None;
     let mut loops = Vec::new();
     for op in ops {
-        if encode_int(op, out, &mut loops)? {
+        if encode_int(op, out, &mut loops, &COMPUTE_PAIRS)? {
             continue;
         }
         match *op {
