@@ -99,6 +99,11 @@ pub fn fuse_bodies(m: &mut MachineKernel) -> Result<(), ttStatus> {
             continue;
         }
         let section: Vec<MirOp> = entries[start..at].iter().map(|(_, op)| *op).collect();
+        eprintln!(
+            "fuse: section {start}..{at} ({} ops) next {:?}",
+            section.len(),
+            entries.get(at).map(|(c, o)| format!("{c:?} {o:?}"))
+        );
         match parse_sweeps(&section) {
             Some(sweeps) => {
                 for op in fuse_section(m, &sweeps, &stores, &loads, &other)? {

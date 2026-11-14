@@ -106,15 +106,14 @@ comparisons, `sel`, casts and bitcasts, bf16 (constants, a bf16 page widening
 into a 32-bit `Dst` through `SrcA` and `MOVA2D`, bf16 reduces, and the
 transcendentals — `log2`, `sin`, `cos`, `reciprocal`, `sqrt`, `div` — as lane
 bodies on the 32-bit lane, so a bf16 kernel stays 16-bit), both
-reduces, `matmul`, a symbolic loop bound, a symbolic grid, a gather, and a
+reduces, `matmul`, `rms_norm` over two tokens and the real hidden size, a
+symbolic loop bound, a symbolic grid, a gather, and a
 `gate_proj`-shaped GEMM over the whole grid (240 tiles, every datum checked).
 The allocator reuses `Dst` by liveness, so a kernel's *values* may outnumber
 the bank's slots: `softmax` needs eleven live values in eight slots.
 
 Open, in the order they block a release:
 
-- `rms_norm`'s gate never asserts and its numbers are wrong; it is a recorded
-  bug, not a passing kernel.
 - `ttsim` does not model the packer's `f32 -> bf16` conversion
   (`pack_fmt_conv_mode=0x105`), so that path — and every bf16 page written out
   of a 32-bit `Dst` — compiles but cannot be run here. It needs silicon.

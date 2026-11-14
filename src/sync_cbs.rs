@@ -71,17 +71,32 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
     // How many writes each ring has: a hoisted page must be produced exactly
     // once.
     let mut writes: BTreeMap<OpId, usize> = BTreeMap::new();
-    // The loads whose page a later `Src` reader still needs, and that reader.
+    // The loads whose page a later `Src` reader still needs, that reader, and
+    // the loop stack the reader sits in (so a read that repeats is released
+    // after its loop, not once per iteration).
     let mut pending: Vec<(OpId, u8)> = Vec::new();
-    let mut last_src: BTreeMap<OpId, OpId> = BTreeMap::new();
+    let mut last_src: BTreeMap<OpId, (OpId, Vec<OpId>)> = BTreeMap::new();
     let mut position: BTreeMap<OpId, usize> = BTreeMap::new();
     let mut section = 0u8;
 
     for (at, op) in k.ops() {
         position.insert(at, position.len());
         for (load, load_section) in &pending {
-            if *load_section == section && reads_source(op, *load) {
-                last_src.insert(*load, at);
+            if *load_section == section
+                && (reads_source(op, *load)
+                    // An FPU broadcast reads both operands from `Src` pages, so
+                    // its op is the page's last reader even though the IR names
+                    // it as an ordinary binary op. Without this the pop lands at
+                    // the load, before the unpack, and the producer may refill
+                    // the page under the unpacker.
+                    || crate::ir::broadcast_pair(k, op).is_some_and(|(tile, narrow)| {
+                        // A narrow operand that is a scalar immediate is a lane
+                        // constant, not a page (the same rule `lower::scalar_const`
+                        // folds): the op reads no `Src` page of its own.
+                        (tile == *load || narrow == *load) && !is_scalar_immediate(k, narrow)
+                    }))
+            {
+                last_src.insert(*load, (at, loops.clone()));
             }
         }
         match *op {
@@ -132,7 +147,7 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
 
     // A load whose page is still needed by a `Src` reader cannot have another
     // read of the same ring in between: that read would take the same page.
-    for (load, reader) in &last_src {
+    for (load, (reader, _)) in &last_src {
         let ring = consumer_ring(&consumers, *load)?;
         let (Some(&from), Some(&to)) = (position.get(load), position.get(reader)) else {
             eprintln!("libskamandros: sync_cbs: a load or its `Src` reader has no position");
@@ -194,10 +209,23 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
                 },
                 true,
             ));
+            // A page produced at the same depth is released after its last
+            // reader. When that reader sits inside a loop the load is outside
+            // of, the read repeats, so the release belongs after the loop.
             let pop_at = if consumer.writer || !last_src.contains_key(&consumer.at) {
                 consumer.at
             } else {
-                last_src[&consumer.at]
+                let (reader, stack) = &last_src[&consumer.at];
+                match stack.get(depth) {
+                    Some(outer) => {
+                        let Some(&end) = end_of.get(outer) else {
+                            eprintln!("libskamandros: sync_cbs: loop {outer} has no end");
+                            return Err(ttStatus::TT_INTERNAL_BUG);
+                        };
+                        end
+                    }
+                    None => *reader,
+                }
             };
             edits.push((
                 pop_at,
@@ -329,6 +357,23 @@ fn write_ring(op: &Op, rings: &BTreeSet<OpId>) -> Option<OpId> {
         Op::StoreTo { buffer, .. } if rings.contains(&buffer) => Some(buffer),
         Op::CopyTo { dst, .. } if rings.contains(&dst) => Some(dst),
         _ => None,
+    }
+}
+
+/// A scalar operand that is a lane immediate, not a page: a `const`, or a
+/// `cast`/`bitcast` chain ending at one (the lowering folds the cast into the
+/// immediate).
+fn is_scalar_immediate(k: &Kernel, value: OpId) -> bool {
+    if k.info(value).shape != crate::ir::RegShape::Scalar {
+        return false;
+    }
+    let mut at = value;
+    loop {
+        match *k.at(at) {
+            Op::Cast { src, .. } | Op::Bitcast { src, .. } => at = src,
+            Op::Const { .. } => return true,
+            _ => return false,
+        }
     }
 }
 

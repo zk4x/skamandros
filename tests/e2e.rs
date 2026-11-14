@@ -3619,6 +3619,31 @@ store 32,32 %bo [0] = %y
 copy 32,32 %out [0] = %bo [0]
 ";
 
+/// A `32,1` value whose page the *packer* wrote (`store %br = %n`) rather than
+/// a copy from a parameter: the narrow read names column 0 of faces 0 and 2,
+/// and every row of the tile is multiplied by its own row's first datum.
+const BROADCAST_COL_FROM_PACK: &str = "\
+version 9
+grid 1,1
+%px = param f32 1024
+%pm = param f32 1024
+%out = param f32 1024
+%bx = buffer f32 32,32
+%bm = buffer f32 32,32
+%br = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %bx [0] = %px [0]
+copy 32,32 %bm [0] = %pm [0]
+load 32,32 %x = %bx [0]
+load 32,32 %t = %bm [0]
+%n = neg %t
+store 32,32 %br [0] = %n
+load 32,1 %m = %br [0]
+%y = mul %x %m
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
+";
+
 /// A row and a column broadcast: `ELWADD`/`ELWMUL` with `SrcB`'s row 0, and
 /// `ELWSUB` with its column 0. Every datum is an integer, exact in TF32 and in
 /// the FPU's 32-bit `Dst`, so each result compares equal to the host's.
@@ -3718,6 +3743,215 @@ fn a_broadcast_reads_its_narrow_page() {
                 got[i]
             );
         }
+    }
+}
+
+/// The `rms_norm` second loop in miniature: a per-row factor (a packed `32,1`)
+/// and a per-tile scale, walked by a `loop` whose index is the copy's offset.
+/// `out[j] = x[j] · m · s[j]`, every datum.
+const SCALE_LOOP: &str = "\
+version 9
+grid 1,1
+%px = param f32 2048
+%ps = param f32 2048
+%pm = param f32 1024
+%out = param f32 2048
+%bx = buffer f32 32,32
+%bs = buffer f32 32,32
+%bm = buffer f32 32,32
+%br = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %bm [0] = %pm [0]
+load 32,32 %t = %bm [0]
+%n = neg %t
+store 32,32 %br [0] = %n
+load 32,1 %m = %br [0]
+%one = const i32 1
+%nn = const i32 2
+%j = loop %nn
+%oj = mul %j %one
+copy 32,32 %bx [0] = %px [%oj]
+load 32,32 %x2 = %bx [0]
+%y = mul %x2 %m
+copy 32,32 %bs [0] = %ps [%oj]
+load 32,32 %sc = %bs [0]
+%z = mul %y %sc
+store 32,32 %bo [0] = %z
+copy 32,32 %out [%oj] = %bo [0]
+endloop
+";
+
+/// The same operands, straight line: if this passes, the `loop` is what breaks
+/// the tile operand.
+#[test]
+fn a_scale_straight_line_keeps_every_datum() {
+    let x: Vec<f32> = (0..2048)
+        .map(|i| {
+            let (row, column) = tile_rc(i % 1024);
+            ((row as i32 * 3 + (column as i32 + (i / 1024) as i32) * 5) % 7) as f32 - 3.0
+        })
+        .collect();
+    let s: Vec<f32> = (0..2048)
+        .map(|i| {
+            let (row, column) = tile_rc(i % 1024);
+            1.0 + (row as i32 + column as i32 + i as i32) as f32 * 0.25
+        })
+        .collect();
+    let t: Vec<f32> = (0..1024)
+        .map(|i| {
+            let (row, column) = tile_rc(i);
+            if column == 0 {
+                (row % 5) as f32 - 2.0
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let xb: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let sb: Vec<u8> = s.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let tb: Vec<u8> = t.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_tensors(SCALE_STRAIGHT, &[&xb, &sb, &tb], 2048 * 4);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for j in 0..2 {
+        for i in 0..1024 {
+            let (row, column) = tile_rc(i);
+            let want = x[j * 1024 + i] * -t[tile_index(row, 0)] * s[j * 1024 + i];
+            assert_eq!(
+                got[j * 1024 + i],
+                want,
+                "tile {j}, datum {i} at ({row}, {column}): got {}, want {want}",
+                got[j * 1024 + i]
+            );
+        }
+    }
+}
+
+/// The loop that `rms_norm` uses to walk the hidden tiles, with the same three
+/// operands: a tile, a per-row factor and a per-tile scale.
+#[test]
+fn a_scale_loop_keeps_every_datum() {
+    let x: Vec<f32> = (0..2048)
+        .map(|i| {
+            let (row, column) = tile_rc(i % 1024);
+            ((row as i32 * 3 + (column as i32 + (i / 1024) as i32) * 5) % 7) as f32 - 3.0
+        })
+        .collect();
+    let s: Vec<f32> = (0..2048)
+        .map(|i| {
+            let (row, column) = tile_rc(i % 1024);
+            1.0 + (row as i32 + column as i32 + i as i32) as f32 * 0.25
+        })
+        .collect();
+    let t: Vec<f32> = (0..1024)
+        .map(|i| {
+            let (row, column) = tile_rc(i);
+            if column == 0 {
+                (row % 5) as f32 - 2.0
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let xb: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let sb: Vec<u8> = s.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let tb: Vec<u8> = t.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_tensors(SCALE_LOOP, &[&xb, &sb, &tb], 2048 * 4);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for j in 0..2 {
+        for i in 0..1024 {
+            let (row, column) = tile_rc(i);
+            let want = x[j * 1024 + i] * -t[tile_index(row, 0)] * s[j * 1024 + i];
+            assert_eq!(
+                got[j * 1024 + i],
+                want,
+                "tile {j}, datum {i} at ({row}, {column}): got {}, want {want}",
+                got[j * 1024 + i]
+            );
+        }
+    }
+}
+
+/// The same three operands without the `loop`: two tiles, each loaded, scaled
+/// by a per-row factor and a per-tile scale, and written back.
+const SCALE_STRAIGHT: &str = "\
+version 9
+grid 1,1
+%px = param f32 2048
+%ps = param f32 2048
+%pm = param f32 1024
+%out = param f32 2048
+%bx = buffer f32 32,32
+%bs = buffer f32 32,32
+%bm = buffer f32 32,32
+%br = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %bm [0] = %pm [0]
+load 32,32 %t = %bm [0]
+%n = neg %t
+store 32,32 %br [0] = %n
+load 32,1 %m = %br [0]
+copy 32,32 %bx [0] = %px [0]
+load 32,32 %x0 = %bx [0]
+%y0 = mul %x0 %m
+copy 32,32 %bs [0] = %ps [0]
+load 32,32 %s0 = %bs [0]
+%z0 = mul %y0 %s0
+store 32,32 %bo [0] = %z0
+copy 32,32 %out [0] = %bo [0]
+%one = const i32 1
+copy 32,32 %bx [0] = %px [%one]
+load 32,32 %x1 = %bx [0]
+%y1 = mul %x1 %m
+copy 32,32 %bs [0] = %ps [%one]
+load 32,32 %s1 = %bs [0]
+%z1 = mul %y1 %s1
+store 32,32 %bo [0] = %z1
+copy 32,32 %out [%one] = %bo [0]
+";
+
+/// The narrow page written by the packer, not by a parameter copy: softmax and
+/// `rms_norm` both hand the FPU a `32,1`/`1,32` whose page came out of a `store`,
+/// and the read must be the same column/row it is for a parameter's page.
+#[test]
+fn a_broadcast_reads_a_packed_narrow_page() {
+    let x: Vec<f32> = (0..1024)
+        .map(|i| {
+            let (row, column) = tile_rc(i);
+            ((row as i32 * 3 + column as i32 * 5) % 7) as f32 - 3.0
+        })
+        .collect();
+    // `%n = neg %t` is packed, and `%m` is its column 0: `-t[row][0]`.
+    let t: Vec<f32> = (0..1024)
+        .map(|i| {
+            let (row, column) = tile_rc(i);
+            if column == 0 {
+                (row % 5) as f32 - 2.0
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let t_bytes: Vec<u8> = t.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_tensors(BROADCAST_COL_FROM_PACK, &[&x_bytes, &t_bytes], 4096);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for i in 0..1024 {
+        let (row, column) = tile_rc(i);
+        let want = x[i] * -t[tile_index(row, 0)];
+        assert_eq!(
+            got[i], want,
+            "column mul from a packed page, datum {i} at ({row}, {column}): got {}, want {want}",
+            got[i]
+        );
     }
 }
 
@@ -3935,6 +4169,10 @@ fn rms_norm_runs_on_the_simulator() {
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect();
 
+    // The arithmetic is the hardware's — TF32 into the FPU, the SFPU's
+    // reciprocal, the Matrix Unit's fold — so this is a tolerance: the
+    // measured worst error is 1.8e-3 on datums of magnitude 4 or less, and
+    // 5e-3 catches a regression without hiding one.
     let mut worst = 0.0f32;
     let mut worst_at = (0usize, 0usize);
     for row in 0..SEQ {
@@ -3953,12 +4191,11 @@ fn rms_norm_runs_on_the_simulator() {
                 worst = error;
                 worst_at = (row, column);
             }
-            if error > 1e-2 {
-                eprintln!(
-                    "rms_norm token {row} column {column}: got {}, want {}",
-                    got[at], want
-                );
-            }
+            assert!(
+                error <= 5e-3,
+                "rms_norm token {row} column {column}: got {}, want {want} (error {error})",
+                got[at]
+            );
         }
     }
     eprintln!("rms_norm: worst error {worst} at {worst_at:?}");
