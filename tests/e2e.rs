@@ -45,7 +45,6 @@ const TT_OK: c_int = 0;
 const TT_ERROR_ARGUMENT: c_int = 1;
 const TT_ERROR_MODULE: c_int = 3;
 const TT_ERROR_VALUE_UNDEFINED: c_int = 14;
-const TT_ERROR_BF16_WIDEN: c_int = 153;
 const TT_TODO_PACK_F32_TO_BF16: c_int = 180;
 
 /// The `libskamandros.so` this test binary was built next to.
@@ -1525,6 +1524,74 @@ fn a_symbolic_grid_runs_each_tiles_own_slice() {
     );
 }
 
+/// The tail of a grid's work: `ntiles` need not divide the number of sites.
+/// Each site computes its own length — `base = ntiles / nsites`, plus one for
+/// the first `ntiles % nsites` sites — and its own starting tile, so no site
+/// ever names a tile past the end. The length is a comparison, a `cast` of the
+/// resulting `bool` and an addition, evaluated in RISC-V by every role; the
+/// loop is a `LoopReg` over that value. Here 11 tiles over 8 sites: sites 0-2
+/// copy two tiles, the rest one.
+const TAIL_TILES: &str = "\
+version 9
+%nx = param i32 0
+%ny = param i32 0
+%ntiles = param i32 0
+%in = param f32 11264
+%out = param f32 11264
+%b = buffer f32 32,32
+grid %nx,%ny
+%x = grid.x
+%y = grid.y
+%nsites = mul %nx %ny
+%row = mul %y %nx
+%site = add %row %x
+%base = div %ntiles %nsites
+%rem = mod %ntiles %nsites
+%last = cmplt %site %rem
+%extra = cast %last to i32
+%per = add %base %extra
+%before = mul %base %site
+%adj = sel %last %site %rem
+%start = add %before %adj
+%i = loop %per
+%t = add %start %i
+copy 32,32 %b [0] = %in [%t]
+copy 32,32 %out [%t] = %b [0]
+endloop
+";
+#[test]
+fn a_grid_tail_is_each_sites_own_loop_length() {
+    const NX: u64 = 4;
+    const NY: u64 = 2;
+    const TILES: u64 = 11;
+    const DATUMS: usize = 1024;
+    let input: Vec<f32> = (0..TILES as usize * DATUMS)
+        .map(|i| i as f32 * 0.5 - 3.0)
+        .collect();
+    let bytes: Vec<u8> = input.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_scalars(TAIL_TILES, &[NX, NY, TILES], &[&bytes], bytes.len());
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(got.len(), input.len());
+    let bad: Vec<usize> = input
+        .iter()
+        .zip(&got)
+        .enumerate()
+        .filter(|(_, (x, y))| x != y)
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "{} of {} datums differ, first {:?}, last {:?}",
+        bad.len(),
+        input.len(),
+        bad.first(),
+        bad.last()
+    );
+}
+
 /// Compile `program`, upload `input`, launch it once over one tile and return
 /// the output bytes. Two parameters, in then out.
 fn run_kernel(program: &str, input: &[u8], out_bytes: usize) -> Vec<u8> {
@@ -2121,25 +2188,126 @@ fn an_f32_dst_packed_into_a_bf16_page_is_refused() {
     }
 }
 
+/// bf16 into a 32-bit `Dst`: the widening is the `SrcA` -> `MOVA2D` move
+/// tt-lang's `copy_tile` makes, not an unpacker conversion. Every datum must
+/// come out the exact f32 its bf16 widens to, including the two zeros, the
+/// subnormals (the Matrix Unit flushes them) and the infinities.
 #[test]
-fn a_bf16_value_cannot_widen_through_dst() {
-    let lib = library();
-    let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
-    let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
+fn bf16_widens_through_srca_into_a_32_bit_dst() {
+    let count = 1024usize;
+    let mut patterns: Vec<u16> = (0..count)
+        .map(|i| truncate_to_bf16((i as f32 - 512.0) * 0.375))
+        .collect();
+    for (at, bits) in [
+        0x0000u16, // +0
+        0x8000,    // -0
+        0x7F80,    // +inf
+        0xFF80,    // -inf
+        0x0001,    // the smallest subnormal
+        0x807F,    // a negative subnormal
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        patterns[count - 1 - at] = bits;
+    }
+    let bytes: Vec<u8> = patterns.iter().flat_map(|h| h.to_le_bytes()).collect();
+    let out = run_kernel(CAST_BF16_TO_F32, &bytes, count * 4);
+    for (i, h) in patterns.iter().enumerate() {
+        let got = f32::from_le_bytes(out[4 * i..4 * i + 4].try_into().unwrap());
+        let want = widen_bf16(*h);
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "bf16 to f32, datum {i}: {h:#06x}"
+        );
+    }
+}
 
-    let mut module: *mut c_void = std::ptr::null_mut();
-    let mut err: *mut c_char = std::ptr::null_mut();
-    let code = unsafe {
-        compile(
-            CAST_BF16_TO_F32.as_ptr().cast(),
-            CAST_BF16_TO_F32.len(),
-            &mut module,
-            &mut err,
-        )
-    };
-    assert_eq!(code, TT_ERROR_BF16_WIDEN, "bf16 to f32 is refused");
-    assert!(module.is_null() && !err.is_null());
-    assert_eq!(take_error(&free, err), "TT_ERROR_BF16_WIDEN");
+/// A bf16 constant in a 16-bit kernel, in both spellings the format allows:
+/// `const bf16 <literal>` (the literal truncated into the datum, zyx's
+/// `bf16::from_f32`) and `const f32 <literal>` then `cast ... to bf16` (the
+/// documented way, and the one a caller reaches for when the coefficient is
+/// already f32). Both must reach the same lane immediate, and every datum is
+/// the bf16 of the product.
+#[test]
+fn a_bf16_constant_multiplies_in_both_spellings() {
+    let count = 1024usize;
+    let x: Vec<u16> = (0..count)
+        .map(|i| truncate_to_bf16((i as f32 - 512.0) * 0.375))
+        .collect();
+    let x_bytes: Vec<u8> = x.iter().flat_map(|h| h.to_le_bytes()).collect();
+    for literal in ["0.3", "-1.5", "0.5"] {
+        let value = literal.parse::<f32>().expect("a literal");
+        let c = widen_bf16(truncate_to_bf16(value));
+        for (spelling, consts) in [
+            ("const bf16", format!("%c = const bf16 {literal}\n")),
+            (
+                "f32 and cast",
+                format!("%k = const f32 {literal}\n%c = cast %k to bf16\n"),
+            ),
+        ] {
+            let program = format!(
+                "version 9
+grid 1,1
+%in = param bf16 1024
+%out = param bf16 1024
+%bi = buffer bf16 32,32
+%bo = buffer bf16 32,32
+copy 32,32 %bi [0] = %in [0]
+load 32,32 %x = %bi [0]
+{consts}%y = mul %x %c
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
+"
+            );
+            let out = run_kernel(&program, &x_bytes, count * 2);
+            for (i, h) in x.iter().enumerate() {
+                let got = u16::from_le_bytes(out[2 * i..2 * i + 2].try_into().unwrap());
+                // `sfpu_mul` keeps the sign of a zero result only when both
+                // operands are normal and their exponents sum into range;
+                // otherwise the result is `+0` (ttsim's `src/tensix.cpp`, the
+                // Blackhole arm).
+                let product = widen_bf16(*h) * c;
+                let want = if product == 0.0 {
+                    0
+                } else {
+                    truncate_to_bf16(product)
+                };
+                assert_eq!(got, want, "{spelling} {literal}: datum {i}");
+            }
+        }
+    }
+
+    // The same immediate in a 32-bit kernel: `const f32`, a tile operand, and
+    // the product at full precision.
+    let x: Vec<f32> = (0..count).map(|i| (i as f32 - 512.0) * 0.375).collect();
+    let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+    for literal in ["0.3", "-1.5", "0.5"] {
+        let c = literal.parse::<f32>().expect("a literal");
+        let program = format!(
+            "version 9
+grid 1,1
+%in = param f32 1024
+%out = param f32 1024
+%bi = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %bi [0] = %in [0]
+load 32,32 %x = %bi [0]
+%c = const f32 {literal}
+%y = mul %x %c
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
+"
+        );
+        let out = run_kernel(&program, &x_bytes, count * 4);
+        for (i, v) in x.iter().enumerate() {
+            let got = f32::from_le_bytes(out[4 * i..4 * i + 4].try_into().unwrap());
+            let product = v * c;
+            let want = if product == 0.0 { 0.0 } else { product };
+            assert_eq!(got, want, "f32 const {literal}: datum {i}");
+        }
+    }
 }
 
 /// `m = a x b` over two `f32` tiles: the operands ride the Matrix Unit's `SrcA`
@@ -2933,6 +3101,151 @@ fn col_reduce_oracle(input: &[f32], max: bool, scaler: Option<f32>) -> Vec<f32> 
         out[tile_index(0, column)] = folded * scaler.unwrap_or(1.0);
     }
     out
+}
+
+/// The four reduce forms in a 16-bit `Dst`: `sum row` (the Matrix Unit's
+/// `x @ scaler`), `sum col` and `max col` (`GAPOOL`/`GMPOOL`), and `max row`.
+/// Every datum is an integer, so bf16 carries each fold exactly.
+const REDUCE_SUM_ROW_BF16: &str = "\
+version 9
+grid 1,1
+%px = param bf16 1024
+%ps = param bf16 1024
+%out = param bf16 1024
+%bx = buffer bf16 32,32
+%bs = buffer bf16 32,32
+%bo = buffer bf16 32,32
+copy 32,32 %bx [0] = %px [0]
+copy 32,32 %bs [0] = %ps [0]
+%acc = acc bf16 32,1
+%zero = const f32 0
+store 32,32 %acc = %zero
+load 32,32 %x = %bx [0]
+load 32,32 %s = %bs [0]
+sum %acc %x %s
+store 32,32 %bo [0] = %acc
+copy 32,32 %out [0] = %bo [0]
+";
+
+const REDUCE_SUM_COL_BF16: &str = "\
+version 9
+grid 1,1
+%px = param bf16 1024
+%ps = param bf16 1024
+%out = param bf16 1024
+%bx = buffer bf16 32,32
+%bs = buffer bf16 32,32
+%bo = buffer bf16 32,32
+copy 32,32 %bx [0] = %px [0]
+copy 32,32 %bs [0] = %ps [0]
+%acc = acc bf16 1,32
+%zero = const f32 0
+store 32,32 %acc = %zero
+load 32,32 %x = %bx [0]
+load 32,32 %s = %bs [0]
+sum %acc %x %s
+store 32,32 %bo [0] = %acc
+copy 32,32 %out [0] = %bo [0]
+";
+
+const REDUCE_MAX_COL_BF16: &str = "\
+version 9
+grid 1,1
+%px = param bf16 1024
+%out = param bf16 1024
+%bx = buffer bf16 32,32
+%bo = buffer bf16 32,32
+copy 32,32 %bx [0] = %px [0]
+%acc = acc bf16 1,32
+%low = const f32 -1000
+store 32,32 %acc = %low
+load 32,32 %x = %bx [0]
+max %acc %x
+store 32,32 %bo [0] = %acc
+copy 32,32 %out [0] = %bo [0]
+";
+
+/// Every datum of a bf16 page, as the `u16` it is.
+fn bf16_pages(bytes: &[u8]) -> Vec<u16> {
+    bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+#[test]
+fn bf16_reduces_run_on_the_simulator() {
+    let count = 1024usize;
+    let x: Vec<u16> = (0..count)
+        .map(|i| truncate_to_bf16((i % 23) as f32 - 11.0))
+        .collect();
+    let x_bytes: Vec<u8> = x.iter().flat_map(|h| h.to_le_bytes()).collect();
+    let widened: Vec<f32> = x.iter().map(|h| widen_bf16(*h)).collect();
+
+    // `sum row`: column 0 of every row holds the row's fold times the scaler.
+    for factor in [1.0f32, 2.0f32] {
+        let mut scaler = vec![0.0f32; count];
+        for row in 0..32 {
+            scaler[tile_index(row, 0)] = factor;
+        }
+        let s_bytes: Vec<u8> = scaler
+            .iter()
+            .flat_map(|v| truncate_to_bf16(*v).to_le_bytes())
+            .collect();
+        let got = bf16_pages(&run_kernel_tensors(
+            REDUCE_SUM_ROW_BF16,
+            &[&x_bytes, &s_bytes],
+            count * 2,
+        ));
+        for row in 0..32 {
+            let sum: f32 = (0..32).map(|column| widened[tile_index(row, column)]).sum();
+            assert_eq!(
+                got[tile_index(row, 0)],
+                truncate_to_bf16(factor * sum),
+                "bf16 sum row, factor {factor}: row {row}"
+            );
+            for column in 1..32 {
+                assert_eq!(
+                    got[tile_index(row, column)],
+                    0,
+                    "bf16 sum row, factor {factor}: ({row}, {column}) is not zero"
+                );
+            }
+        }
+    }
+
+    // `sum col`: row 0 of every face holds the column's fold.
+    for factor in [1.0f32, 2.0f32] {
+        let mut scaler = vec![0.0f32; count];
+        for column in 0..32 {
+            scaler[tile_index(0, column)] = factor;
+            scaler[tile_index(16, column)] = factor;
+        }
+        let s_bytes: Vec<u8> = scaler
+            .iter()
+            .flat_map(|v| truncate_to_bf16(*v).to_le_bytes())
+            .collect();
+        let got = bf16_pages(&run_kernel_tensors(
+            REDUCE_SUM_COL_BF16,
+            &[&x_bytes, &s_bytes],
+            count * 2,
+        ));
+        let want = col_reduce_oracle(&widened, false, Some(factor));
+        for i in 0..count {
+            assert_eq!(
+                got[i],
+                truncate_to_bf16(want[i]),
+                "bf16 sum col, factor {factor}: datum {i}"
+            );
+        }
+    }
+
+    // `max col`, seeded below every datum.
+    let got = bf16_pages(&run_kernel(REDUCE_MAX_COL_BF16, &x_bytes, count * 2));
+    let want = col_reduce_oracle(&widened, true, None);
+    for i in 0..count {
+        assert_eq!(got[i], truncate_to_bf16(want[i]), "bf16 max col: datum {i}");
+    }
 }
 
 #[test]

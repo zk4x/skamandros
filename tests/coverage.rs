@@ -262,6 +262,62 @@ fn check_i32_pages(got: &[u8], want: &[i32], what: &str) {
     }
 }
 
+/// The bf16 datum a lane value truncates to: the SFPU's `BF16` store keeps the
+/// high half of the f32 (`0x43058000` becomes `0x4305`), so a 16-bit `Dst`
+/// kernel computes at f32 precision and lands at bf16 precision at the store.
+fn truncate_to_bf16(value: f32) -> u16 {
+    (value.to_bits() >> 16) as u16
+}
+
+/// A bf16 datum widened into the 32-bit lane. The SFPU flushes a datum whose
+/// exponent is zero (a subnormal, or a zero of either sign).
+fn widen_bf16(bits: u16) -> f32 {
+    if bits & 0x7f80 == 0 {
+        0.0
+    } else {
+        f32::from_bits(u32::from(bits) << 16)
+    }
+}
+
+/// The same positive, bounded values the f32 matrix uses, carried as the bf16
+/// datums a caller would hand in.
+fn bf16_values(count: usize, seed: usize) -> Vec<u16> {
+    f32_values(count, seed)
+        .iter()
+        .map(|v| truncate_to_bf16(*v))
+        .collect()
+}
+
+fn bf16_bytes(values: &[u16]) -> Vec<u8> {
+    values.iter().flat_map(|h| h.to_le_bytes()).collect()
+}
+
+/// Every datum of a bf16 kernel against the widen/op/truncate rule: the input
+/// is the exact f32 a bf16 widens to, the op runs in the f32 lane, and the
+/// store truncates. A case with a tolerance is an instruction the SFPU
+/// approximates, so the check allows two bf16 ulps; `tol == 0` is exact.
+fn check_bf16_pages(got: &[u8], want: &[f32], tol: f32, what: &str) {
+    assert_eq!(got.len(), want.len() * 2, "{what}: output size");
+    for (i, w) in want.iter().enumerate() {
+        let g = u16::from_le_bytes(got[2 * i..2 * i + 2].try_into().unwrap());
+        let expect = truncate_to_bf16(*w);
+        if tol == 0.0 {
+            assert_eq!(
+                g, expect,
+                "{what}: datum {i}: got {g:#06x}, want {expect:#06x} ({w})"
+            );
+        } else {
+            let (gv, wv) = (widen_bf16(g), *w);
+            let err = (gv - wv).abs() / wv.abs().max(1e-6);
+            let allowed = 0.008f32.max(tol);
+            assert!(
+                err <= allowed,
+                "{what}: datum {i}: got {gv}, want {wv} (rel {err} > {allowed})"
+            );
+        }
+    }
+}
+
 /// `pages` pages through one ring in a loop, one unary op in the body.
 fn unary_looped(dtype: &str, op: &str, pages: usize, bound: &str, scalars: &str) -> String {
     let size = pages * 1024;
@@ -457,6 +513,7 @@ const BINARY_CASES: &[BinaryCase] = &[
     ("%y = div %x %c", |a, b| a / b, 1e-6),
     ("%y = pow %x %c", |a, b| a.powf(b), 1e-4),
     ("%y = max %x %c", |a, b| a.max(b), 0.0),
+    ("%y = min %x %c", |a, b| a.min(b), 0.0),
     ("%t = cmplt %x %c\n%y = sel %t %x %c", |a, b| a.min(b), 0.0),
     ("%t = cmpgt %x %c\n%y = sel %t %x %c", |a, b| a.max(b), 0.0),
     ("%t = cmpge %x %c\n%y = sel %t %x %c", |a, b| a.max(b), 0.0),
@@ -672,5 +729,159 @@ fn every_i32_op_runs_in_a_loop_on_a_symbolic_grid() {
         let out = run_kernel_scalars(&program, &[2, 2, 2], &[&bx, &bc], 8192 * 4);
         let expect: Vec<i32> = x.iter().zip(&c).map(|(a, b)| want(*a, *b)).collect();
         check_i32_pages(&out, &expect, body);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bf16, four contexts
+// ---------------------------------------------------------------------------
+//
+// The bf16 column of the matrix. A 16-bit `Dst` kernel stores every datum as
+// bf16, so the op runs at f32 lane precision and the store truncates; the
+// oracle widens the bf16 input, applies the f32 rule, and truncates, which is
+// exact for every non-approximated instruction.
+
+/// The f32 the lane sees: the bf16 input widened.
+fn widened(values: &[u16]) -> Vec<f32> {
+    values.iter().map(|h| widen_bf16(*h)).collect()
+}
+
+/// The bf16 matrix's unary set: the instructions the SFPU runs on a 16-bit
+/// `Dst`. `floor`/`trunc`/`log2`/`sin`/`cos`/`reciprocal`/`sqrt` are unfolded
+/// into f32 bit manipulation (`bitcast` to `i32`, f32 constants), so a bf16
+/// operand has no spelling there yet; they are absent from this table rather
+/// than silently made f32.
+const BF16_UNARY_CASES: &[UnaryCase] = &[
+    ("neg", |x| -x, 0.0),
+    ("abs", |x| x.abs(), 0.0),
+    // `exp2` keeps `lower`'s machine body, so it runs in a 16-bit `Dst`.
+    ("exp2", |x| x.exp2(), 1e-5),
+];
+
+/// Every `BOp` the lane takes directly in 16-bit mode: the arithmetic, the two
+/// folds, and the ordered comparisons through `sel` (the `bool` lane is the
+/// `0xBF80`/`0` the store keeps).
+const BF16_BINARY_CASES: &[BinaryCase] = &[
+    ("%y = add %x %c", |a, b| a + b, 0.0),
+    ("%y = sub %x %c", |a, b| a - b, 0.0),
+    ("%y = mul %x %c", |a, b| a * b, 0.0),
+    ("%y = max %x %c", |a, b| a.max(b), 0.0),
+    ("%y = min %x %c", |a, b| a.min(b), 0.0),
+    ("%t = cmplt %x %c\n%y = sel %t %x %c", |a, b| a.min(b), 0.0),
+    ("%t = cmpgt %x %c\n%y = sel %t %x %c", |a, b| a.max(b), 0.0),
+    ("%t = cmpge %x %c\n%y = sel %t %x %c", |a, b| a.max(b), 0.0),
+    (
+        "%t = noteq %x %c\n%y = sel %t %x %c",
+        |a, b| if a != b { a } else { b },
+        0.0,
+    ),
+    (
+        "%t = eq %x %c\n%y = sel %t %x %c",
+        |a, b| if a == b { a } else { b },
+        0.0,
+    ),
+];
+
+#[test]
+fn every_unary_op_runs_in_a_loop_in_bf16() {
+    let bits = bf16_values(3072, 0);
+    let input = bf16_bytes(&bits);
+    let x = widened(&bits);
+    for &(op, want, tol) in BF16_UNARY_CASES {
+        let program = unary_looped("bf16", op, 3, "3", "");
+        let out = run_kernel_scalars(&program, &[], &[&input], 3072 * 2);
+        let expect: Vec<f32> = x.iter().map(|v| want(*v)).collect();
+        check_bf16_pages(&out, &expect, tol, op);
+    }
+}
+
+#[test]
+fn every_binary_op_runs_in_a_loop_in_bf16() {
+    let (xb, cb) = (bf16_values(3072, 0), bf16_values(3072, 1));
+    let (bx, bc) = (bf16_bytes(&xb), bf16_bytes(&cb));
+    let (x, c) = (widened(&xb), widened(&cb));
+    for &(body, want, tol) in BF16_BINARY_CASES {
+        let program = binary_looped("bf16", body, 3, "3", "");
+        let out = run_kernel_scalars(&program, &[], &[&bx, &bc], 3072 * 2);
+        let expect: Vec<f32> = x.iter().zip(&c).map(|(a, b)| want(*a, *b)).collect();
+        check_bf16_pages(&out, &expect, tol, body);
+    }
+}
+
+#[test]
+fn every_unary_op_runs_in_a_symbolic_loop_in_bf16() {
+    let bits = bf16_values(3072, 0);
+    let input = bf16_bytes(&bits);
+    let x = widened(&bits);
+    for &(op, want, tol) in BF16_UNARY_CASES {
+        let program = unary_looped("bf16", op, 3, "%n", "%n = param i32 0\n");
+        let out = run_kernel_scalars(&program, &[3], &[&input], 3072 * 2);
+        let expect: Vec<f32> = x.iter().map(|v| want(*v)).collect();
+        check_bf16_pages(&out, &expect, tol, op);
+    }
+}
+
+#[test]
+fn every_binary_op_runs_in_a_symbolic_loop_in_bf16() {
+    let (xb, cb) = (bf16_values(3072, 0), bf16_values(3072, 1));
+    let (bx, bc) = (bf16_bytes(&xb), bf16_bytes(&cb));
+    let (x, c) = (widened(&xb), widened(&cb));
+    for &(body, want, tol) in BF16_BINARY_CASES {
+        let program = binary_looped("bf16", body, 3, "%n", "%n = param i32 0\n");
+        let out = run_kernel_scalars(&program, &[3], &[&bx, &bc], 3072 * 2);
+        let expect: Vec<f32> = x.iter().zip(&c).map(|(a, b)| want(*a, *b)).collect();
+        check_bf16_pages(&out, &expect, tol, body);
+    }
+}
+
+#[test]
+fn every_unary_op_runs_on_a_symbolic_grid_in_bf16() {
+    let bits = bf16_values(4096, 0);
+    let input = bf16_bytes(&bits);
+    let x = widened(&bits);
+    for &(op, want, tol) in BF16_UNARY_CASES {
+        let program = unary_grid("bf16", op);
+        let out = run_kernel_scalars(&program, &[2, 2], &[&input], 4096 * 2);
+        let expect: Vec<f32> = x.iter().map(|v| want(*v)).collect();
+        check_bf16_pages(&out, &expect, tol, op);
+    }
+}
+
+#[test]
+fn every_binary_op_runs_on_a_symbolic_grid_in_bf16() {
+    let (xb, cb) = (bf16_values(4096, 0), bf16_values(4096, 1));
+    let (bx, bc) = (bf16_bytes(&xb), bf16_bytes(&cb));
+    let (x, c) = (widened(&xb), widened(&cb));
+    for &(body, want, tol) in BF16_BINARY_CASES {
+        let program = binary_grid("bf16", body);
+        let out = run_kernel_scalars(&program, &[2, 2], &[&bx, &bc], 4096 * 2);
+        let expect: Vec<f32> = x.iter().zip(&c).map(|(a, b)| want(*a, *b)).collect();
+        check_bf16_pages(&out, &expect, tol, body);
+    }
+}
+
+#[test]
+fn every_unary_op_runs_in_a_loop_on_a_symbolic_grid_in_bf16() {
+    let bits = bf16_values(8192, 0);
+    let input = bf16_bytes(&bits);
+    let x = widened(&bits);
+    for &(op, want, tol) in BF16_UNARY_CASES {
+        let program = unary_grid_loop("bf16", op);
+        let out = run_kernel_scalars(&program, &[2, 2, 2], &[&input], 8192 * 2);
+        let expect: Vec<f32> = x.iter().map(|v| want(*v)).collect();
+        check_bf16_pages(&out, &expect, tol, op);
+    }
+}
+
+#[test]
+fn every_binary_op_runs_in_a_loop_on_a_symbolic_grid_in_bf16() {
+    let (xb, cb) = (bf16_values(8192, 0), bf16_values(8192, 1));
+    let (bx, bc) = (bf16_bytes(&xb), bf16_bytes(&cb));
+    let (x, c) = (widened(&xb), widened(&cb));
+    for &(body, want, tol) in BF16_BINARY_CASES {
+        let program = binary_grid_loop("bf16", body);
+        let out = run_kernel_scalars(&program, &[2, 2, 2], &[&bx, &bc], 8192 * 2);
+        let expect: Vec<f32> = x.iter().zip(&c).map(|(a, b)| want(*a, *b)).collect();
+        check_bf16_pages(&out, &expect, tol, body);
     }
 }

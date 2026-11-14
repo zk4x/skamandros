@@ -169,6 +169,34 @@ pub fn bne(rs1: u8, rs2: u8, imm: i32) -> u32 {
     b_type(imm, rs2, rs1, 1, 0x63)
 }
 
+/// `slt rd, rs1, rs2`: 1 when `rs1 < rs2` as signed two's complement, else 0.
+/// This is the scalar comparison: a `bool` scalar is `1`/`0` in a GPR, so the
+/// result needs no widening.
+pub fn slt(rd: u8, rs1: u8, rs2: u8) -> u32 {
+    r_type(0, rs2, rs1, 2, rd, 0x33)
+}
+
+/// `sltu rd, rs1, rs2`: the unsigned form (`snez` is `sltu rd, x0, rs`).
+pub fn sltu(rd: u8, rs1: u8, rs2: u8) -> u32 {
+    r_type(0, rs2, rs1, 3, rd, 0x33)
+}
+
+/// `sltiu rd, rs1, imm`: the immediate unsigned compare (`seqz` is `sltiu
+/// rd, rs, 1`).
+pub fn sltiu(rd: u8, rs1: u8, imm: i32) -> u32 {
+    i_type(imm, rs1, 3, rd, 0x13)
+}
+
+/// `max rd, rs1, rs2`: the Zbb signed maximum, one instruction.
+pub fn max(rd: u8, rs1: u8, rs2: u8) -> u32 {
+    r_type(0x05, rs2, rs1, 6, rd, 0x33)
+}
+
+/// `min rd, rs1, rs2`: the Zbb signed minimum, one instruction.
+pub fn min(rd: u8, rs1: u8, rs2: u8) -> u32 {
+    r_type(0x05, rs2, rs1, 4, rd, 0x33)
+}
+
 /// `ret`: `jalr x0, 0(x1)`.
 pub fn ret() -> u32 {
     0x0000_8067

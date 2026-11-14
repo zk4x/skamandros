@@ -21,8 +21,7 @@ use crate::ir::{
     BOp, DType, Dim, Kernel, Op, OpId, RegShape, UOp, ValueInfo, access_shape, unit_of,
 };
 use crate::mir::{
-    Bcast, BinarySfpOp, Cb, CmpOp, Core, Dst, ElwOp, IOp, LReg, MachineKernel, MirOp, PackMask,
-    UnarySfpOp,
+    Bcast, BinarySfpOp, Cb, Core, Dst, ElwOp, IOp, LReg, MachineKernel, MirOp, PackMask, UnarySfpOp,
 };
 use crate::riscv::reg;
 use crate::status::ttStatus;
@@ -332,9 +331,16 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
             if let Some((tile, narrow)) = crate::ir::broadcast_pair(k, op)
                 && (v == tile || v == narrow)
             {
-                // The FPU's broadcast reads both operands from `Src` pages.
-                matmul_use.insert(v);
-                continue;
+                // A narrow operand that is a scalar *constant* is the binary
+                // lane op's immediate (see `scalar_const`), not an FPU page, so
+                // the tile still enters `Dst` and must be unpacked.
+                let immediate =
+                    k.info(narrow).shape == RegShape::Scalar && scalar_const(k, narrow).is_some();
+                if !immediate {
+                    // The FPU's broadcast reads both operands from `Src` pages.
+                    matmul_use.insert(v);
+                    continue;
+                }
             }
             match *op {
                 Op::Matmul { a, b, .. } if v == a || v == b => {
@@ -596,45 +602,118 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     ttStatus::TT_ERROR_BUFFER_NOT_PLACED
                 })?);
                 if lands_in_dst {
-                    // A bf16 page can only be unpacked into a bf16 `Dst`
-                    // (`BF16 -> BF16` is the unpacker's only Dst-path conversion
-                    // for it), so a bf16 buffer only enters a 16-bit kernel.
-                    // Reaching one from a 32-bit kernel needs SrcA/SrcB and the
-                    // widening `BF16 -> TF32` path.
+                    // A bf16 page cannot enter a 32-bit `Dst` through the
+                    // unpacker: `BF16 -> BF16` is its only Dst-path conversion
+                    // for that datum, and the `Dst` is one width for the whole
+                    // kernel. It goes through `SrcA` instead, which is what
+                    // tt-lang's `copy_tile` does for `typecast bf16 -> f32`
+                    // (`llk_math_eltwise_unary_sfpu_typecast` has "no SFPU
+                    // kernel needed" for that pair): the unpacker writes the
+                    // page into `SrcA` as bf16, and a 32-bit `Dst` reads it back
+                    // through `MOVA2D`, which treats the `SrcA` lane as TF32 and
+                    // writes the full 32-bit datum. A bf16 datum widens exactly
+                    // on that move (7 mantissa bits of 10, the exponent and
+                    // sign unchanged), so the `cast` that follows is a rename.
                     if wide && dtype == crate::ir::DType::Bf16 {
-                        let _ = (at, buffer);
-                        return Err(ttStatus::TT_ERROR_BF16_WIDEN);
+                        // The whole page at once: one `Z` plane per face, the
+                        // descriptor's four faces, 64 `SrcA` rows.
+                        m.push(Core::Unpack, MirOp::Setadczw { unit: 0, face: 0 });
+                        m.push(
+                            Core::Unpack,
+                            MirOp::UnpackConfig {
+                                unit: 0,
+                                to_src: true,
+                                dtype,
+                                haloize: false,
+                            },
+                        );
+                        m.push(Core::Unpack, MirOp::SetUnpackBase { cb, unit: 0 });
+                        m.push(
+                            Core::Unpack,
+                            MirOp::Unpacr {
+                                unit: 0,
+                                count: unit_shape.datums(),
+                                // `UNPACR`'s bit 6: `Set_Data_Valid` on
+                                // Blackhole (ttsim's schema and tt-metal's LLK
+                                // argument), the bank handover the math's
+                                // `MOVA2D` waits for. Without it the Matrix
+                                // Unit stalls forever on an invalid bank.
+                                flip: true,
+                            },
+                        );
+                        // The `Src` row counter starts at zero, as the unpack's
+                        // own destination does.
+                        m.push(
+                            Core::Math,
+                            MirOp::Setrwc {
+                                src_a: 0,
+                                src_b: 0,
+                                dst: 0,
+                                flip_src_a: false,
+                                flip_src_b: false,
+                                dst_cr: false,
+                            },
+                        );
+                        // `MOVA2D` moves eight rows per instruction, and a
+                        // 32-bit `Dst` holds a tile's 1024 datums in 64 rows.
+                        for band in 0..(DST_ROWS / 8) {
+                            m.push(
+                                Core::Math,
+                                MirOp::Mova2d {
+                                    use_dst32b_lo: false,
+                                    src_row: 8 * band,
+                                    addr_mod: 0,
+                                    move8_rows: true,
+                                    reg,
+                                    at: 8 * band,
+                                },
+                            );
+                        }
+                        // `SETRWC(CLR_A)`: the `SrcA` bank goes back to the
+                        // unpacker now that the Matrix Unit has read it.
+                        m.push(
+                            Core::Math,
+                            MirOp::Setrwc {
+                                src_a: 0,
+                                src_b: 0,
+                                dst: 0,
+                                flip_src_a: true,
+                                flip_src_b: false,
+                                dst_cr: false,
+                            },
+                        );
+                    } else {
+                        // The page's wait and release are the `wait`/`pop` ops
+                        // `add_movers` placed around this load.
+                        m.push(Core::Unpack, MirOp::Setdst { reg });
+                        m.push(Core::Unpack, MirOp::Setadczw { unit: 0, face: 0 });
+                        m.push(
+                            Core::Unpack,
+                            MirOp::Setadcx {
+                                unit: 0,
+                                first: 0,
+                                count: unit_shape.datums(),
+                            },
+                        );
+                        m.push(
+                            Core::Unpack,
+                            MirOp::UnpackConfig {
+                                unit: 0,
+                                to_src: false,
+                                dtype,
+                                haloize: false,
+                            },
+                        );
+                        m.push(Core::Unpack, MirOp::SetUnpackBase { cb, unit: 0 });
+                        m.push(
+                            Core::Unpack,
+                            MirOp::Unpacr {
+                                unit: 0,
+                                count: unit_shape.datums(),
+                                flip: false,
+                            },
+                        );
                     }
-                    // The page's wait and release are the `wait`/`pop` ops
-                    // `add_movers` placed around this load.
-                    m.push(Core::Unpack, MirOp::Setdst { reg });
-                    m.push(Core::Unpack, MirOp::Setadczw { unit: 0, face: 0 });
-                    m.push(
-                        Core::Unpack,
-                        MirOp::Setadcx {
-                            unit: 0,
-                            first: 0,
-                            count: unit_shape.datums(),
-                        },
-                    );
-                    m.push(
-                        Core::Unpack,
-                        MirOp::UnpackConfig {
-                            unit: 0,
-                            to_src: false,
-                            dtype,
-                            haloize: false,
-                        },
-                    );
-                    m.push(Core::Unpack, MirOp::SetUnpackBase { cb, unit: 0 });
-                    m.push(
-                        Core::Unpack,
-                        MirOp::Unpacr {
-                            unit: 0,
-                            count: unit_shape.datums(),
-                            flip: false,
-                        },
-                    );
                 }
                 // A `matmul` operand's page is waited for and released by its
                 // own `wait`/`pop` ops.
@@ -1076,20 +1155,15 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     }
                     match op {
                         BOp::Cmplt | BOp::Cmpgt | BOp::Cmpge => {
-                            let cmp = match op {
-                                BOp::Cmplt => CmpOp::Lt,
-                                BOp::Cmpgt => CmpOp::Gt,
-                                _ => CmpOp::Ge,
-                            };
-                            m.push(
-                                Core::Math,
-                                MirOp::Compare {
-                                    op: cmp,
-                                    a: la,
-                                    b: lb,
-                                    d: ld,
-                                },
-                            );
+                            let mut cmp = Vec::new();
+                            match op {
+                                BOp::Cmplt => sfp_lt(&mut cmp, la, lb, ld),
+                                BOp::Cmpgt => sfp_gt(&mut cmp, la, lb, ld),
+                                _ => sfp_ge(&mut cmp, la, lb, ld),
+                            }
+                            for op in cmp {
+                                m.push(Core::Math, op);
+                            }
                         }
                         // `a == b` is `!(a > b || a < b)`, two of the ordered
                         // tests this compiler already has, combined as
@@ -1097,24 +1171,12 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                         // `tt_sfp_compare` shape without its NaN and `-0`
                         // specials, which the ordered tests do not carry either.
                         BOp::Eq | BOp::NotEq => {
-                            m.push(
-                                Core::Math,
-                                MirOp::Compare {
-                                    op: CmpOp::Gt,
-                                    a: la,
-                                    b: lb,
-                                    d: LReg(3),
-                                },
-                            );
-                            m.push(
-                                Core::Math,
-                                MirOp::Compare {
-                                    op: CmpOp::Lt,
-                                    a: la,
-                                    b: lb,
-                                    d: LReg(4),
-                                },
-                            );
+                            let mut cmp = Vec::new();
+                            sfp_gt(&mut cmp, la, lb, LReg(3));
+                            sfp_lt(&mut cmp, la, lb, LReg(4));
+                            for op in cmp {
+                                m.push(Core::Math, op);
+                            }
                             m.push(
                                 Core::Math,
                                 MirOp::BinarySfp {
@@ -1135,14 +1197,17 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                                 );
                             }
                         }
-                        BOp::Max => m.push(
-                            Core::Math,
-                            MirOp::Max {
-                                a: la,
-                                b: lb,
-                                d: ld,
-                            },
-                        ),
+                        BOp::Max | BOp::Min => {
+                            let mut m_ops = Vec::new();
+                            if matches!(op, BOp::Max) {
+                                sfp_max(&mut m_ops, la, lb, ld);
+                            } else {
+                                sfp_min(&mut m_ops, la, lb, ld);
+                            }
+                            for op in m_ops {
+                                m.push(Core::Math, op);
+                            }
+                        }
                         _ => m.push(
                             Core::Math,
                             MirOp::BinarySfp {
@@ -1222,15 +1287,11 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                             dtype: storage(types.of(if_false).dtype),
                         },
                     );
-                    m.push(
-                        Core::Math,
-                        MirOp::Select {
-                            cond: lc,
-                            t: lt,
-                            f: lf,
-                            d: ld,
-                        },
-                    );
+                    let mut pick = Vec::new();
+                    sfp_select(&mut pick, lc, lt, lf, ld);
+                    for op in pick {
+                        m.push(Core::Math, op);
+                    }
                     m.push(
                         Core::Math,
                         MirOp::Sfpstore {
@@ -2515,6 +2576,65 @@ fn eval(
             role.push(MirOp::LoadCoord { reg: dest, axis });
             Ok(())
         }
+        // A comparison is index arithmetic too: it produces a `bool` scalar,
+        // which is `1`/`0` in a GPR (a datapath lane is `-1`/`0`), so the
+        // cast to an index is a rename and the branch is a plain `beq`.
+        Op::Binary { op, a, b, .. } if op.returns_bool() => {
+            eval(
+                k, types, role, param, loops, a, dest, scratch, counters, plan, cbs,
+            )?;
+            let right = scratch.take()?;
+            eval(
+                k, types, role, param, loops, b, right, scratch, counters, plan, cbs,
+            )?;
+            match op {
+                BOp::Cmplt => role.push(MirOp::IArith {
+                    op: IOp::Slt,
+                    d: dest,
+                    a: dest,
+                    b: right,
+                }),
+                BOp::Cmpgt => role.push(MirOp::IArith {
+                    op: IOp::Slt,
+                    d: dest,
+                    a: right,
+                    b: dest,
+                }),
+                // `a >= b` is `!(a < b)`.
+                BOp::Cmpge => {
+                    role.push(MirOp::IArith {
+                        op: IOp::Slt,
+                        d: dest,
+                        a: dest,
+                        b: right,
+                    });
+                    role.push(MirOp::IArith {
+                        op: IOp::Eq,
+                        d: dest,
+                        a: dest,
+                        b: reg::ZERO,
+                    });
+                }
+                BOp::Eq => role.push(MirOp::IArith {
+                    op: IOp::Eq,
+                    d: dest,
+                    a: dest,
+                    b: right,
+                }),
+                BOp::NotEq => role.push(MirOp::IArith {
+                    op: IOp::Ne,
+                    d: dest,
+                    a: dest,
+                    b: right,
+                }),
+                other => {
+                    let _ = other;
+                    return Err(ttStatus::TT_TODO_LOOP_ADDRESS);
+                }
+            }
+            scratch.give(right);
+            Ok(())
+        }
         Op::Binary { op, a, b, .. } => {
             let op = int_op(op).ok_or(ttStatus::TT_TODO_LOOP_ADDRESS)?;
             eval(
@@ -2531,6 +2651,54 @@ fn eval(
                 b: right,
             });
             scratch.give(right);
+            Ok(())
+        }
+        Op::Cast { src, dtype } => {
+            eval(
+                k, types, role, param, loops, src, dest, scratch, counters, plan, cbs,
+            )?;
+            match (k.info(src).dtype, dtype) {
+                // A bool scalar is already `1`/`0`.
+                (DType::Bool, DType::Bool) | (DType::Bool, DType::I32) => {}
+                // `(bool)x` is `x != 0`, exactly the datapath's cast.
+                (DType::I32, DType::Bool) => role.push(MirOp::IArith {
+                    op: IOp::Ne,
+                    d: dest,
+                    a: dest,
+                    b: reg::ZERO,
+                }),
+                (DType::I32, DType::I32) => {}
+                (from, to) => {
+                    let _ = (from, to);
+                    return Err(ttStatus::TT_TODO_LOOP_ADDRESS);
+                }
+            }
+            Ok(())
+        }
+        Op::Select {
+            cond,
+            if_true,
+            if_false,
+        } => {
+            let c = scratch.take()?;
+            eval(
+                k, types, role, param, loops, cond, c, scratch, counters, plan, cbs,
+            )?;
+            let f = scratch.take()?;
+            eval(
+                k, types, role, param, loops, if_false, f, scratch, counters, plan, cbs,
+            )?;
+            eval(
+                k, types, role, param, loops, if_true, dest, scratch, counters, plan, cbs,
+            )?;
+            role.push(MirOp::Cmov {
+                cond: c,
+                a: dest,
+                b: f,
+                d: dest,
+            });
+            scratch.give(f);
+            scratch.give(c);
             Ok(())
         }
         // A value the program put in a page: the movers read it out of L1, one
@@ -2617,8 +2785,100 @@ fn at_len(len: Dim) -> Dim {
     len
 }
 
-/// The RISC-V form of an index arithmetic op; a comparison, `max` or `pow` is
-/// not one.
+/// `SFPGT`'s `SET_VD`: write `-1`/`0` into the `VD` lane instead of the flags.
+const SFPSET_VD: u32 = 8;
+/// `SFPGT`'s `SET_CC`: set the lane flags.
+const SFPSET_CC: u32 = 1;
+/// `SFPENCC` takes the mask from `VW`: `first` 3 enables it (bit 0), 2 resets
+/// every lane's flag (bit 1), and `mod1` 10 is the form the SFPU bodies use.
+const SFPENCC_ON: MirOp = MirOp::SfpEncc {
+    first: 3,
+    second: 0,
+    mod1: 10,
+};
+const SFPENCC_OFF: MirOp = MirOp::SfpEncc {
+    first: 2,
+    second: 0,
+    mod1: 10,
+};
+
+/// `d = a < b` as `-1`/`0` lanes. `SFPGT` compares its `VD` lane against `VC`
+/// and writes the result into `VD`, so the right-hand value moves into the
+/// destination first.
+fn sfp_lt(role: &mut Vec<MirOp>, a: LReg, b: LReg, d: LReg) {
+    role.push(MirOp::SfpMov { a: b, d });
+    role.push(MirOp::SfpGt {
+        mod1: SFPSET_VD,
+        vc: a,
+        vd: d,
+    });
+}
+
+/// `d = a > b`, in the same shape.
+fn sfp_gt(role: &mut Vec<MirOp>, a: LReg, b: LReg, d: LReg) {
+    role.push(MirOp::SfpMov { a, d });
+    role.push(MirOp::SfpGt {
+        mod1: SFPSET_VD,
+        vc: b,
+        vd: d,
+    });
+}
+
+/// `d = a >= b`: the inverse of `<`, which `SFPLE` has as one instruction.
+fn sfp_ge(role: &mut Vec<MirOp>, a: LReg, b: LReg, d: LReg) {
+    role.push(MirOp::SfpMov { a: b, d });
+    role.push(MirOp::SfpLe {
+        mod1: SFPSET_VD,
+        vc: a,
+        vd: d,
+    });
+}
+
+/// `d = cond != 0 ? t : f`, lanewise. `d = f` first, then the lane flags from
+/// the condition (a lane bool is `-1`/`0`, and `SFPGT` against the zero lane
+/// turns `-1` into a set flag), then `d = t` only where the flag is set.
+fn sfp_select(role: &mut Vec<MirOp>, cond: LReg, t: LReg, f: LReg, d: LReg) {
+    role.push(MirOp::SfpMov { a: f, d });
+    role.push(SFPENCC_ON);
+    role.push(MirOp::SfpGt {
+        mod1: SFPSET_CC,
+        vc: cond,
+        vd: LReg(tt_isa::sfpu::LREG_ZERO as u16),
+    });
+    role.push(MirOp::SfpMov { a: t, d });
+    role.push(SFPENCC_OFF);
+}
+
+/// `d = a > b ? a : b`. With the flags set to `a > b`, the destination takes
+/// `b` everywhere and `a` where the flag holds.
+fn sfp_max(role: &mut Vec<MirOp>, a: LReg, b: LReg, d: LReg) {
+    role.push(MirOp::SfpMov { a: b, d });
+    role.push(SFPENCC_ON);
+    role.push(MirOp::SfpGt {
+        mod1: SFPSET_CC,
+        vc: b,
+        vd: a,
+    });
+    role.push(MirOp::SfpMov { a, d });
+    role.push(SFPENCC_OFF);
+}
+
+/// `d = a < b ? a : b`, the mirror: the destination takes `b` everywhere and
+/// `a` where `b > a`, i.e. where `a` is the smaller.
+fn sfp_min(role: &mut Vec<MirOp>, a: LReg, b: LReg, d: LReg) {
+    role.push(MirOp::SfpMov { a: b, d });
+    role.push(SFPENCC_ON);
+    role.push(MirOp::SfpGt {
+        mod1: SFPSET_CC,
+        vc: a,
+        vd: b,
+    });
+    role.push(MirOp::SfpMov { a, d });
+    role.push(SFPENCC_OFF);
+}
+
+/// The RISC-V form of an index arithmetic op; a comparison or `pow` is not
+/// one.
 fn int_op(op: BOp) -> Option<IOp> {
     Some(match op {
         BOp::Add => IOp::Add,
@@ -2631,6 +2891,8 @@ fn int_op(op: BOp) -> Option<IOp> {
         BOp::BitXor => IOp::Xor,
         BOp::BitShiftLeft => IOp::Sll,
         BOp::BitShiftRight => IOp::Srl,
+        BOp::Max => IOp::Max,
+        BOp::Min => IOp::Min,
         _ => return None,
     })
 }
@@ -2638,9 +2900,39 @@ fn int_op(op: BOp) -> Option<IOp> {
 /// The bits a scalar constant operand carries, if `v` is one: `lower` puts
 /// them in a lane instead of reading a `Dst` tile, which is what lets the
 /// unfold write its coefficients and masks as ordinary `const` values.
+/// The lane image of a constant's bits: a `bf16` constant is its sixteen-bit
+/// datum (zyx's `Constant::BF16([u8; 2])`), and a lane holds the f32 it widens
+/// to, the high half of that word.
+fn lane_image(dtype: crate::ir::DType, bits: u32) -> u32 {
+    match dtype {
+        crate::ir::DType::Bf16 => (bits & 0xffff) << 16,
+        _ => bits,
+    }
+}
+
+/// `bits` is `from`'s lane image; the same value as `to`'s, when a lane
+/// immediate can carry the conversion.
+fn convert_image(from: crate::ir::DType, to: crate::ir::DType, bits: u32) -> Option<u32> {
+    match (from, to) {
+        (a, b) if a == b => Some(bits),
+        // A bf16 datum is already the f32 image (it widened to reach the lane).
+        (crate::ir::DType::Bf16, crate::ir::DType::F32) => Some(bits),
+        // zyx's `bf16::from_f32`: `(x.to_bits() >> 16) as u16`, widened back.
+        (crate::ir::DType::F32, crate::ir::DType::Bf16) => Some((bits >> 16) << 16),
+        _ => None,
+    }
+}
+
 fn scalar_const(k: &Kernel, v: crate::ir::OpId) -> Option<u32> {
-    match k.op(v) {
-        Some(Op::Const { bits, .. }) => Some(*bits),
+    match *k.op(v)? {
+        Op::Const { dtype, bits } => Some(lane_image(dtype, bits)),
+        // A `cast` of a constant is the conversion it names, so both spellings
+        // reach the same immediate: `const bf16 0.3`, and `const f32 0.3`
+        // followed by `cast ... to bf16`.
+        Op::Cast { src, dtype } => {
+            let from = k.info(src).dtype;
+            scalar_const(k, src).and_then(|bits| convert_image(from, dtype, bits))
+        }
         _ => None,
     }
 }
@@ -2972,18 +3264,8 @@ fn rsqrt_body(
             lreg: LReg(7),
             bits: 0.0f32.to_bits(),
         });
-        role.push(MirOp::Compare {
-            op: CmpOp::Gt,
-            a: LReg(6),
-            b: LReg(7),
-            d: LReg(6),
-        });
-        role.push(MirOp::Compare {
-            op: CmpOp::Lt,
-            a: LReg(6),
-            b: LReg(7),
-            d: LReg(7),
-        });
+        sfp_gt(role, LReg(6), LReg(7), LReg(6));
+        sfp_lt(role, LReg(6), LReg(7), LReg(7));
         role.push(MirOp::BinarySfp {
             op: BinarySfpOp::BitOr,
             a: LReg(6),
@@ -2997,18 +3279,8 @@ fn rsqrt_body(
             lreg: LReg(4),
             bits: 0.0f32.to_bits(),
         });
-        role.push(MirOp::Compare {
-            op: CmpOp::Gt,
-            a: LReg(7),
-            b: LReg(4),
-            d: LReg(7),
-        });
-        role.push(MirOp::Compare {
-            op: CmpOp::Lt,
-            a: LReg(7),
-            b: LReg(4),
-            d: LReg(4),
-        });
+        sfp_gt(role, LReg(7), LReg(4), LReg(7));
+        sfp_lt(role, LReg(7), LReg(4), LReg(4));
         role.push(MirOp::BinarySfp {
             op: BinarySfpOp::BitOr,
             a: LReg(7),
@@ -3021,34 +3293,19 @@ fn rsqrt_body(
             b: LReg(7),
             d: LReg(6),
         });
-        role.push(MirOp::Select {
-            cond: LReg(6),
-            t: LReg(3),
-            f: LReg(5),
-            d: LReg(1),
-        });
+        sfp_select(role, LReg(6), LReg(3), LReg(5), LReg(1));
         // A negative input (but not `-0`) is NaN: tt-metal's `!FAST_APPROX`
         // tail.
         role.push(MirOp::LaneConst {
             lreg: LReg(6),
             bits: 0.0f32.to_bits(),
         });
-        role.push(MirOp::Compare {
-            op: CmpOp::Lt,
-            a: LReg(2),
-            b: LReg(6),
-            d: LReg(7),
-        });
+        sfp_lt(role, LReg(2), LReg(6), LReg(7));
         role.push(MirOp::LaneConst {
             lreg: LReg(6),
             bits: NAN_BITS,
         });
-        role.push(MirOp::Select {
-            cond: LReg(7),
-            t: LReg(6),
-            f: LReg(1),
-            d: LReg(3),
-        });
+        sfp_select(role, LReg(7), LReg(6), LReg(1), LReg(3));
         role.push(MirOp::Sfpstore {
             lreg: LReg(3),
             reg: out,
@@ -3124,30 +3381,10 @@ fn mod_body(role: &mut Vec<MirOp>) {
         bits: 2147483648.0f32.to_bits(),
     });
     role.push(MirOp::LaneConst { lreg: u, bits: 0 });
-    role.push(MirOp::Compare {
-        op: CmpOp::Lt,
-        a: x,
-        b: u,
-        d: t,
-    });
-    role.push(MirOp::Select {
-        cond: t,
-        t: s,
-        f: x,
-        d: x,
-    });
-    role.push(MirOp::Compare {
-        op: CmpOp::Lt,
-        a: y,
-        b: u,
-        d: t,
-    });
-    role.push(MirOp::Select {
-        cond: t,
-        t: s,
-        f: y,
-        d: y,
-    });
+    sfp_lt(role, x, u, t);
+    sfp_select(role, t, s, x, x);
+    sfp_lt(role, y, u, t);
+    sfp_select(role, t, s, y, y);
     // `inv = approx_recip(b)`, then one Newton step `inv *= (2 - b * inv)`,
     // which is `e = 1 - b * inv` and `inv = e * inv + inv`. The negated product
     // is a complement-sign move into a lane of its own: `SFPMAD` has no mode
@@ -3320,24 +3557,14 @@ fn mod_body(role: &mut Vec<MirOp>) {
     // r -= b;`. The second test sees the `r` the first branch may have
     // updated, exactly as `v_elseif` does.
     role.push(MirOp::LaneConst { lreg: u, bits: 0 });
-    role.push(MirOp::Compare {
-        op: CmpOp::Lt,
-        a: x,
-        b: u,
-        d: y,
-    });
+    sfp_lt(role, x, u, y);
     role.push(MirOp::SfpIadd {
         imm: (-1i32 & 0xfff) as u32,
         a: x,
         d: s,
         mod1: IADD_ARG_IMM | IADD_CC_NONE,
     });
-    role.push(MirOp::Compare {
-        op: CmpOp::Lt,
-        a: s,
-        b: u,
-        d: u,
-    });
+    sfp_lt(role, s, u, u);
     role.push(MirOp::BinarySfp {
         op: BinarySfpOp::BitAnd,
         a: y,
@@ -3350,39 +3577,19 @@ fn mod_body(role: &mut Vec<MirOp>) {
         b,
         d: s,
     });
-    role.push(MirOp::Select {
-        cond: y,
-        t: s,
-        f: x,
-        d: x,
-    });
-    role.push(MirOp::Compare {
-        op: CmpOp::Ge,
-        a: x,
-        b,
-        d: y,
-    });
+    sfp_select(role, y, s, x, x);
+    sfp_ge(role, x, b, y);
     role.push(MirOp::BinarySfp {
         op: BinarySfpOp::ISub,
         a: x,
         b,
         d: s,
     });
-    role.push(MirOp::Select {
-        cond: y,
-        t: s,
-        f: x,
-        d: x,
-    });
+    sfp_select(role, y, s, x, x);
     // `fmod`'s sign: the result has the dividend's sign (`checked_rem`'s,
     // RISC-V's `rem`).
     role.push(MirOp::LaneConst { lreg: s, bits: 0 });
-    role.push(MirOp::Compare {
-        op: CmpOp::Lt,
-        a,
-        b: s,
-        d: y,
-    });
+    sfp_lt(role, a, s, y);
     role.push(MirOp::LaneConst { lreg: t, bits: 0 });
     role.push(MirOp::BinarySfp {
         op: BinarySfpOp::ISub,
@@ -3390,12 +3597,7 @@ fn mod_body(role: &mut Vec<MirOp>) {
         b: x,
         d: s,
     });
-    role.push(MirOp::Select {
-        cond: y,
-        t: s,
-        f: x,
-        d: x,
-    });
+    sfp_select(role, y, s, x, x);
 }
 
 /// The `Dst` rows an SFPU body walks. An instruction covers 32 lanes, two

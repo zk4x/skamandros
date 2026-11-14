@@ -124,7 +124,6 @@ fn is_row_op(op: &MirOp) -> bool {
             | MirOp::LaneConst { .. }
             | MirOp::UnarySfp { .. }
             | MirOp::BinarySfp { .. }
-            | MirOp::Compare { .. }
             | MirOp::SfpMov { .. }
             | MirOp::SfpAbs { .. }
             | MirOp::SfpCast { .. }
@@ -138,8 +137,8 @@ fn is_row_op(op: &MirOp) -> bool {
             | MirOp::SfpMul24 { .. }
             | MirOp::SfpMad { .. }
             | MirOp::SfpStochRnd { .. }
-            | MirOp::Select { .. }
-            | MirOp::Max { .. }
+            | MirOp::SfpGt { .. }
+            | MirOp::SfpLe { .. }
     )
 }
 
@@ -381,7 +380,7 @@ fn build_group(
         // sweeps cannot collide no matter what physical lanes they used.
         let mut map: BTreeMap<LReg, LReg> = BTreeMap::new();
         for op in sweep.gap.iter().chain(sweep.rows[0].iter()) {
-            for (lreg, _) in lreg_touches(op) {
+            for (lreg, _) in op.lreg_params() {
                 if (8..16).contains(&lreg.0) {
                     continue;
                 }
@@ -474,12 +473,12 @@ fn allocate_body(
     dtype: DType,
 ) -> Result<(), ttStatus> {
     loop {
-        let regs: Vec<Vec<(u16, bool)>> = body
+        let regs: Vec<Vec<(u16, bool, bool)>> = body
             .iter()
             .map(|op| {
-                lreg_touches(op)
+                op.lreg_params()
                     .into_iter()
-                    .map(|(lreg, write)| (lreg.0, write))
+                    .map(|(lreg, use_)| (lreg.0, use_.reads(), use_.writes()))
                     .collect()
             })
             .collect();
@@ -502,7 +501,7 @@ fn allocate_body(
         let fresh = regs
             .iter()
             .flatten()
-            .map(|(id, _)| *id)
+            .map(|(id, _, _)| *id)
             .filter(|id| *id >= VIRTUAL)
             .max()
             .map_or(VIRTUAL, |id| id + 1);
@@ -565,7 +564,7 @@ fn mask_states(body: &[MirOp]) -> (Vec<bool>, Vec<bool>) {
 /// Liveness over one straight-line body: a name is live from its definition
 /// (or the body's start, when a read comes first) to its last touch. The scan
 /// is exact because a row body is one block.
-fn linear_scan(body: &[Vec<(u16, bool)>], budget: usize) -> Option<BTreeMap<u16, u8>> {
+fn linear_scan(body: &[Vec<(u16, bool, bool)>], budget: usize) -> Option<BTreeMap<u16, u8>> {
     let (def, last) = live_ranges(body);
     let mut order: Vec<(u16, i64, i64)> = last
         .iter()
@@ -590,18 +589,19 @@ fn linear_scan(body: &[Vec<(u16, bool)>], budget: usize) -> Option<BTreeMap<u16,
 
 /// A value's definition and last touch, over a straight-line body. A name read
 /// before it is written has no definition: it is live from the start.
-fn live_ranges(body: &[Vec<(u16, bool)>]) -> (BTreeMap<u16, i64>, BTreeMap<u16, i64>) {
+fn live_ranges(body: &[Vec<(u16, bool, bool)>]) -> (BTreeMap<u16, i64>, BTreeMap<u16, i64>) {
     let mut def: BTreeMap<u16, i64> = BTreeMap::new();
     let mut last: BTreeMap<u16, i64> = BTreeMap::new();
     let mut first_use: BTreeMap<u16, i64> = BTreeMap::new();
     for (at, touches) in body.iter().enumerate() {
-        for &(name, write) in touches {
+        for &(name, reads, writes) in touches {
             if name < VIRTUAL {
                 continue;
             }
-            if write {
+            if writes {
                 def.entry(name).or_insert(at as i64);
-            } else {
+            }
+            if reads {
                 first_use.entry(name).or_insert(at as i64);
             }
             last.insert(name, at as i64);
@@ -623,7 +623,7 @@ fn live_ranges(body: &[Vec<(u16, bool)>]) -> (BTreeMap<u16, i64>, BTreeMap<u16, 
 /// widest window wins, because one store and one reload then cover the whole
 /// run instead of one reload per use.
 fn split_at_pressure(
-    body: &[Vec<(u16, bool)>],
+    body: &[Vec<(u16, bool, bool)>],
     before: &[bool],
     after: &[bool],
     budget: usize,
@@ -664,7 +664,7 @@ fn split_at_pressure(
             continue;
         }
         let uses: Vec<usize> = (0..body.len())
-            .filter(|at| body[*at].iter().any(|&(touched, _)| touched == name))
+            .filter(|at| body[*at].iter().any(|&(touched, _, _)| touched == name))
             .collect();
         if uses.iter().any(|&at| at >= ra && at <= rb) {
             continue;
@@ -732,38 +732,6 @@ fn dst_touches(op: &MirOp) -> Vec<(Dst, bool)> {
         | MirOp::Movb2d { reg, .. } => vec![(reg, true)],
         MirOp::Movd2b { reg, .. } => vec![(reg, false)],
         MirOp::SetPackOffset { reg, .. } => vec![(reg, false)],
-        _ => Vec::new(),
-    }
-}
-
-/// The lane registers an op touches: the register and whether it writes.
-fn lreg_touches(op: &MirOp) -> Vec<(LReg, bool)> {
-    match *op {
-        MirOp::Sfpload { lreg, .. } | MirOp::LaneConst { lreg, .. } => vec![(lreg, true)],
-        MirOp::Sfpstore { lreg, .. } => vec![(lreg, false)],
-        MirOp::UnarySfp { a, d, .. } => vec![(a, false), (d, true)],
-        MirOp::BinarySfp { a, b, d, .. }
-        | MirOp::Compare { a, b, d, .. }
-        | MirOp::Max { a, b, d } => vec![(a, false), (b, false), (d, true)],
-        MirOp::Select { cond, t, f, d } => {
-            vec![(cond, false), (t, false), (f, false), (d, true)]
-        }
-        MirOp::SfpMov { a, d } | MirOp::SfpAbs { a, d, .. } => vec![(a, false), (d, true)],
-        MirOp::SfpCast { a, d, .. }
-        | MirOp::SfpExexp { a, d, .. }
-        | MirOp::SfpExman { a, d, .. }
-        | MirOp::SfpIadd { a, d, .. }
-        | MirOp::SfpArecip { a, d, .. }
-        | MirOp::SfpStochRnd { a, d, .. } => vec![(a, false), (d, true)],
-        MirOp::SfpShft { amount, a, d, .. } => {
-            vec![(amount, false), (a, false), (d, true)]
-        }
-        MirOp::SfpMul24 { a, b, d, .. } => vec![(a, false), (b, false), (d, true)],
-        MirOp::SfpMad { a, b, c, d, .. } => {
-            vec![(a, false), (b, false), (c, false), (d, true)]
-        }
-        MirOp::SfpSetcc { a, .. } => vec![(a, false)],
-        MirOp::SfpEncc { .. } => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -887,7 +855,12 @@ fn alloc_dsts(m: &mut MachineKernel) -> Result<(), ttStatus> {
 
 /// Assign the physical lane registers, rewriting every op that names one.
 fn alloc_lregs(m: &mut MachineKernel) -> Result<(), ttStatus> {
-    let live = ranges(m, lreg_touches);
+    let live = ranges(m, |op| {
+        op.lreg_params()
+            .into_iter()
+            .map(|(lreg, use_)| (lreg, use_.writes()))
+            .collect()
+    });
     let slots = usize::from(crate::alloc::LREGS);
     // Lane registers 8 upwards are the hardware's own constants (`LREG_ZERO`
     // is 9, `LREG_ONE` 10), not allocation slots: an op that names one keeps
@@ -958,65 +931,11 @@ fn rewrite_dsts(op: &mut MirOp, rename: &BTreeMap<Dst, Dst>) {
 
 /// Rewrite every lane register an op names.
 fn rewrite_lregs(op: &mut MirOp, rename: &BTreeMap<LReg, LReg>) {
-    let map = |reg: &mut LReg| {
+    op.map_lregs(|reg| {
         if let Some(to) = rename.get(reg) {
             *reg = *to;
         }
-    };
-    match op {
-        MirOp::Sfpload { lreg, .. }
-        | MirOp::Sfpstore { lreg, .. }
-        | MirOp::LaneConst { lreg, .. } => map(lreg),
-        MirOp::UnarySfp { a, d, .. } => {
-            map(a);
-            map(d);
-        }
-        MirOp::SfpMov { a, d } | MirOp::SfpAbs { a, d, .. } => {
-            map(a);
-            map(d);
-        }
-        MirOp::SfpCast { a, d, .. }
-        | MirOp::SfpExexp { a, d, .. }
-        | MirOp::SfpExman { a, d, .. }
-        | MirOp::SfpIadd { a, d, .. }
-        | MirOp::SfpArecip { a, d, .. }
-        | MirOp::SfpStochRnd { a, d, .. } => {
-            map(a);
-            map(d);
-        }
-        MirOp::SfpShft { amount, a, d, .. } => {
-            map(amount);
-            map(a);
-            map(d);
-        }
-        MirOp::SfpMul24 { a, b, d, .. } => {
-            map(a);
-            map(b);
-            map(d);
-        }
-        MirOp::SfpMad { a, b, c, d, .. } => {
-            map(a);
-            map(b);
-            map(c);
-            map(d);
-        }
-        MirOp::SfpSetcc { a, .. } => map(a),
-        MirOp::SfpEncc { .. } => {}
-        MirOp::BinarySfp { a, b, d, .. }
-        | MirOp::Compare { a, b, d, .. }
-        | MirOp::Max { a, b, d } => {
-            map(a);
-            map(b);
-            map(d);
-        }
-        MirOp::Select { cond, t, f, d } => {
-            map(cond);
-            map(t);
-            map(f);
-            map(d);
-        }
-        _ => {}
-    }
+    });
 }
 
 /// Place every ring in L1, in id order, and the `LocalCBInterface` table after
@@ -1251,7 +1170,7 @@ copy 32,32 %out [0] = %bo [0]
         );
         let used: BTreeSet<u16> = body
             .iter()
-            .flat_map(|op| lreg_touches(op))
+            .flat_map(|op| op.lreg_params())
             .map(|(lreg, _)| lreg.0)
             .filter(|id| !(8..16).contains(id))
             .collect();

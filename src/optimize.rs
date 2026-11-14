@@ -682,24 +682,28 @@ pub fn verify(m: &MachineKernel) -> Result<(), ttStatus> {
         // that the run it moves stays inside one register.
         let mut pack_at: Option<u32> = None;
         while at < ops.len() {
+            // Every lane operand, from the one table on `MirOp`: a read may be
+            // one of the hardware's constant lanes (8 upwards), a write must be
+            // a work lane.
+            for (lreg, use_) in ops[at].lreg_params() {
+                let limit = if use_.writes() {
+                    usize::from(crate::alloc::LREGS)
+                } else {
+                    16
+                };
+                if usize::from(lreg.0) >= limit {
+                    let _ = (name, at, lreg, use_);
+                    return Err(ttStatus::TT_ERROR_LANE_REGISTER);
+                }
+            }
             match ops[at] {
-                MirOp::Sfpload { lreg, reg, .. } => {
-                    if usize::from(lreg.0) >= usize::from(crate::alloc::LREGS) {
-                        let _ = (name, at, lreg);
-                        return Err(ttStatus::TT_ERROR_LANE_REGISTER);
-                    }
+                MirOp::Sfpload { reg, .. } => {
                     if reg.0 >= m.dst_slots() {
                         let _ = (name, at, reg);
                         return Err(ttStatus::TT_ERROR_DST_ROW);
                     }
                 }
-                MirOp::Sfpstore {
-                    lreg, reg, at: row, ..
-                } => {
-                    if usize::from(lreg.0) >= usize::from(crate::alloc::LREGS) {
-                        let _ = (name, at, lreg);
-                        return Err(ttStatus::TT_ERROR_LANE_REGISTER);
-                    }
+                MirOp::Sfpstore { reg, at: row, .. } => {
                     if reg.0 >= m.dst_slots() || row >= Dst::ROWS {
                         let _ = (name, at, reg, row);
                         return Err(ttStatus::TT_ERROR_DST_ROW);
@@ -710,85 +714,6 @@ pub fn verify(m: &MachineKernel) -> Result<(), ttStatus> {
                     if row & 1 != 0 {
                         let _ = (name, at, row);
                         return Err(ttStatus::TT_ERROR_DST_ROW_ODD);
-                    }
-                }
-                MirOp::LaneConst { lreg, .. } => {
-                    if usize::from(lreg.0) >= usize::from(crate::alloc::LREGS) {
-                        let _ = (name, at, lreg);
-                        return Err(ttStatus::TT_ERROR_LANE_REGISTER);
-                    }
-                }
-                MirOp::UnarySfp { a, d, .. } => {
-                    for lreg in [a, d] {
-                        if usize::from(lreg.0) >= usize::from(crate::alloc::LREGS) {
-                            let _ = (name, at, lreg);
-                            return Err(ttStatus::TT_ERROR_LANE_REGISTER);
-                        }
-                    }
-                }
-                MirOp::BinarySfp { a, b, d, .. } => {
-                    for lreg in [a, b, d] {
-                        if usize::from(lreg.0) >= usize::from(crate::alloc::LREGS) {
-                            let _ = (name, at, lreg);
-                            return Err(ttStatus::TT_ERROR_LANE_REGISTER);
-                        }
-                    }
-                }
-                MirOp::SfpMov { a, d } | MirOp::SfpAbs { a, d, .. } => {
-                    if usize::from(a.0) >= 16
-                        || usize::from(d.0) >= usize::from(crate::alloc::LREGS)
-                    {
-                        let _ = (name, at, a, d);
-                        return Err(ttStatus::TT_ERROR_LANE_REGISTER);
-                    }
-                }
-                MirOp::SfpCast { a, d, .. }
-                | MirOp::SfpExexp { a, d, .. }
-                | MirOp::SfpExman { a, d, .. }
-                | MirOp::SfpIadd { a, d, .. }
-                | MirOp::SfpArecip { a, d, .. }
-                | MirOp::SfpStochRnd { a, d, .. } => {
-                    // The source may be one of the hardware's constants
-                    // (lanes 8 upwards); the destination is a work lane.
-                    if usize::from(a.0) >= 16
-                        || usize::from(d.0) >= usize::from(crate::alloc::LREGS)
-                    {
-                        let _ = (name, at, a, d);
-                        return Err(ttStatus::TT_ERROR_LANE_REGISTER);
-                    }
-                }
-                MirOp::SfpShft { amount, a, d, .. } => {
-                    if usize::from(amount.0) >= 16
-                        || usize::from(a.0) >= 16
-                        || usize::from(d.0) >= usize::from(crate::alloc::LREGS)
-                    {
-                        let _ = (name, at, amount, a, d);
-                        return Err(ttStatus::TT_ERROR_LANE_REGISTER);
-                    }
-                }
-                MirOp::SfpMul24 { a, b, d, .. } => {
-                    if usize::from(a.0) >= 16
-                        || usize::from(b.0) >= 16
-                        || usize::from(d.0) >= usize::from(crate::alloc::LREGS)
-                    {
-                        let _ = (name, at, a, b, d);
-                        return Err(ttStatus::TT_ERROR_LANE_REGISTER);
-                    }
-                }
-                MirOp::SfpMad { a, b, c, d, .. } => {
-                    if usize::from(a.0) >= 16
-                        || usize::from(b.0) >= 16
-                        || usize::from(c.0) >= 16
-                        || usize::from(d.0) >= usize::from(crate::alloc::LREGS)
-                    {
-                        let _ = (name, at, a, b, c, d);
-                        return Err(ttStatus::TT_ERROR_LANE_REGISTER);
-                    }
-                }
-                MirOp::SfpSetcc { a, .. } => {
-                    if usize::from(a.0) >= 16 {
-                        let _ = (name, at, a);
-                        return Err(ttStatus::TT_ERROR_LANE_REGISTER);
                     }
                 }
                 MirOp::SfpEncc { .. } => {}
@@ -821,30 +746,6 @@ pub fn verify(m: &MachineKernel) -> Result<(), ttStatus> {
                     if at + 1 + len as usize > ops.len() {
                         let _ = (name, at);
                         return Err(ttStatus::TT_ERROR_REPEAT_BODY);
-                    }
-                }
-                MirOp::Compare { a, b, d, .. } => {
-                    for lreg in [a, b, d] {
-                        if usize::from(lreg.0) >= usize::from(crate::alloc::LREGS) {
-                            let _ = (name, at, lreg);
-                            return Err(ttStatus::TT_ERROR_LANE_REGISTER);
-                        }
-                    }
-                }
-                MirOp::Select { cond, t, f, d } => {
-                    for lreg in [cond, t, f, d] {
-                        if usize::from(lreg.0) >= usize::from(crate::alloc::LREGS) {
-                            let _ = (name, at, lreg);
-                            return Err(ttStatus::TT_ERROR_LANE_REGISTER);
-                        }
-                    }
-                }
-                MirOp::Max { a, b, d } => {
-                    for lreg in [a, b, d] {
-                        if usize::from(lreg.0) >= usize::from(crate::alloc::LREGS) {
-                            let _ = (name, at, lreg);
-                            return Err(ttStatus::TT_ERROR_LANE_REGISTER);
-                        }
                     }
                 }
                 MirOp::SetUnpackBase { cb, .. }
@@ -975,7 +876,27 @@ pub fn verify(m: &MachineKernel) -> Result<(), ttStatus> {
                         return Err(ttStatus::TT_ERROR_SETRWC);
                     }
                 }
-                MirOp::ThreadWord { .. } | MirOp::WaitMatrix => {}
+                // Checked by the lane table above and by the `Dst` rows they
+                // name; there is nothing else to look at.
+                MirOp::ThreadWord { .. }
+                | MirOp::WaitMatrix
+                | MirOp::LaneConst { .. }
+                | MirOp::UnarySfp { .. }
+                | MirOp::BinarySfp { .. }
+                | MirOp::SfpMov { .. }
+                | MirOp::SfpAbs { .. }
+                | MirOp::SfpCast { .. }
+                | MirOp::SfpExexp { .. }
+                | MirOp::SfpExman { .. }
+                | MirOp::SfpIadd { .. }
+                | MirOp::SfpShft { .. }
+                | MirOp::SfpSetcc { .. }
+                | MirOp::SfpArecip { .. }
+                | MirOp::SfpMul24 { .. }
+                | MirOp::SfpMad { .. }
+                | MirOp::SfpStochRnd { .. }
+                | MirOp::SfpGt { .. }
+                | MirOp::SfpLe { .. } => {}
                 MirOp::Trnspsrcb
                 | MirOp::AluAccCtrl { .. }
                 | MirOp::SrcAFormat { .. }
@@ -1002,7 +923,8 @@ pub fn verify(m: &MachineKernel) -> Result<(), ttStatus> {
                 | MirOp::Lw { .. }
                 | MirOp::Sw { .. }
                 | MirOp::NiuPoll { .. }
-                | MirOp::IArith { .. } => {}
+                | MirOp::IArith { .. }
+                | MirOp::Cmov { .. } => {}
                 MirOp::EndLoop => {
                     depth = depth.checked_sub(1).ok_or_else(|| {
                         let _ = (name, at);

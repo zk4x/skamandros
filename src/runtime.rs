@@ -167,6 +167,7 @@ fn grid_eval(
                     .checked_pow(u32::try_from(b).map_err(|_| ttStatus::TT_ERROR_GRID)?)
                     .ok_or(ttStatus::TT_ERROR_GRID)?,
                 BOp::Max => a.max(b),
+                BOp::Min => a.min(b),
                 BOp::BitAnd => a & b,
                 BOp::BitOr => a | b,
                 BOp::BitXor => a ^ b,

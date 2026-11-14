@@ -163,7 +163,15 @@ impl Fifo {
             }
             // `cb_wait_front`: poll until the page is published.
             Op::Wait { cb, n } => {
+                let depth = ring_depth(k, cb)?;
                 let asked = i64::from(n);
+                // tt-lang's `max(ConsumerOpen) <= capacity`: a wait is an
+                // acquisition of the ring, so the pages it holds open at once
+                // may not exceed the ring either, whatever the producer has
+                // published.
+                if self.at(cb).waited + asked > depth {
+                    return Err("a wait asks for more pages than the ring holds");
+                }
                 if self.at(cb).available() < asked {
                     return Err("a wait asks for a page that was never pushed");
                 }

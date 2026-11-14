@@ -15,8 +15,7 @@
 
 use crate::ir::DType;
 use crate::mir::{
-    Bcast, BinarySfpOp, Cb, CmpOp, Core, Dst, ElwOp, IOp, MachineKernel, MirOp, PackMask,
-    UnarySfpOp,
+    Bcast, BinarySfpOp, Cb, Core, Dst, ElwOp, IOp, MachineKernel, MirOp, PackMask, UnarySfpOp,
 };
 use crate::riscv::{self as rv, Asm, reg};
 use crate::status::ttStatus;
@@ -248,18 +247,39 @@ fn encode_int(
             out.li(reg, crate::mir::CORE_INFO + u32::from(axis) * 4);
             out.rv(rv::lw(reg, reg, 0));
         }
-        MirOp::IArith { op, d, a, b } => out.rv(match op {
-            IOp::Add => rv::add(d, a, b),
-            IOp::Sub => rv::sub(d, a, b),
-            IOp::Mul => rv::mul(d, a, b),
-            IOp::Div => rv::div(d, a, b),
-            IOp::Rem => rv::rem(d, a, b),
-            IOp::And => rv::and(d, a, b),
-            IOp::Or => rv::or(d, a, b),
-            IOp::Xor => rv::xor(d, a, b),
-            IOp::Sll => rv::sll(d, a, b),
-            IOp::Srl => rv::srl(d, a, b),
-        }),
+        MirOp::IArith { op, d, a, b } => match op {
+            IOp::Add => out.rv(rv::add(d, a, b)),
+            IOp::Sub => out.rv(rv::sub(d, a, b)),
+            IOp::Mul => out.rv(rv::mul(d, a, b)),
+            IOp::Div => out.rv(rv::div(d, a, b)),
+            IOp::Rem => out.rv(rv::rem(d, a, b)),
+            IOp::And => out.rv(rv::and(d, a, b)),
+            IOp::Or => out.rv(rv::or(d, a, b)),
+            IOp::Xor => out.rv(rv::xor(d, a, b)),
+            IOp::Sll => out.rv(rv::sll(d, a, b)),
+            IOp::Srl => out.rv(rv::srl(d, a, b)),
+            IOp::Max => out.rv(rv::max(d, a, b)),
+            IOp::Min => out.rv(rv::min(d, a, b)),
+            IOp::Slt => out.rv(rv::slt(d, a, b)),
+            // `eq`/`ne` are two words: the difference, then "is it zero" /
+            // "is it not zero". A bool scalar is `1`/`0`, so no widening step.
+            IOp::Eq => {
+                out.rv(rv::xor(d, a, b));
+                out.rv(rv::sltiu(d, d, 1));
+            }
+            IOp::Ne => {
+                out.rv(rv::xor(d, a, b));
+                out.rv(rv::sltu(d, reg::ZERO, d));
+            }
+        },
+        MirOp::Cmov { cond, a, b, d } => {
+            // `d` may alias either arm (`eval` passes `d == a`), so neither arm
+            // may be written before it is read: branch over both.
+            out.rv(rv::bne(cond, reg::ZERO, 12));
+            out.rv(rv::addi(d, b, 0));
+            out.rv(rv::jal(reg::ZERO, 8));
+            out.rv(rv::addi(d, a, 0));
+        }
         MirOp::LoopReg { reg } => open_loop_reg(out, loops, reg, pairs)?,
         _ => return Ok(false),
     }
@@ -440,13 +460,6 @@ fn semaphore_init(sems: &[(u8, u8)]) -> Result<Vec<Instruction>, ttStatus> {
         })?);
     }
     Ok(out)
-}
-
-/// `SFPENCC`: gate lanes by the lane flags (on) or stop doing so (off), and
-/// reset every lane's flag to true. Bit 0 of `Imm2` is `E`, bit 1 is `R`; `Mod1`
-/// 10 is `EI|RI`, as tt-metal's boot sequence uses.
-fn cc_mask(on: bool) -> Result<Instruction, tt_isa::isa::EncodeError> {
-    encode::sfpencc(if on { 3 } else { 2 }, 0, 10)
 }
 
 /// Announce, through `sem`, that every pipeline the condition mask selects has
@@ -1340,41 +1353,11 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), tt
             out.push(encode::sfpmov(u32::from(b), u32::from(d), 0).map_err(bad_isa)?);
             out.push(encode::sfpsetexp(0, u32::from(a), u32::from(d), 0).map_err(bad_isa)?);
         }
-        MirOp::Compare { op: cmp, a, b, d } => {
-            let set_vd = 8u32;
-            let (first, second) = match cmp {
-                CmpOp::Lt => (b, a),
-                CmpOp::Gt => (a, b),
-                CmpOp::Ge => (b, a),
-            };
-            out.push(encode::sfpmov(u32::from(first), u32::from(d), 0).map_err(bad_isa)?);
-            let i = match cmp {
-                CmpOp::Lt | CmpOp::Gt => {
-                    encode::sfpgt(u32::from(second), u32::from(d), set_vd).map_err(bad_isa)?
-                }
-                CmpOp::Ge => {
-                    encode::sfple(u32::from(second), u32::from(d), set_vd).map_err(bad_isa)?
-                }
-            };
-            out.push(i);
+        MirOp::SfpGt { mod1, vc, vd } => {
+            out.push(encode::sfpgt(u32::from(vc), u32::from(vd), mod1).map_err(bad_isa)?);
         }
-        MirOp::Select { cond, t, f, d } => {
-            // `d = f` in every lane, then `d = t` only where the condition's
-            // lane is true. `SFPGT` sets the lane flags from the condition
-            // (true means the sign-magnitude `0 > cond`, which is exactly a
-            // bool stored as `-1`), and `SFPMOV` is predicated on them.
-            out.push(encode::sfpmov(u32::from(f), u32::from(d), 0).map_err(bad_isa)?);
-            out.push(cc_mask(true).map_err(bad_isa)?);
-            out.push(
-                encode::sfpgt(
-                    u32::from(cond),
-                    tt_isa::sfpu::LREG_ZERO,
-                    1, // SFPGT_MOD1_SET_CC
-                )
-                .map_err(bad_isa)?,
-            );
-            out.push(encode::sfpmov(u32::from(t), u32::from(d), 0).map_err(bad_isa)?);
-            out.push(cc_mask(false).map_err(bad_isa)?);
+        MirOp::SfpLe { mod1, vc, vd } => {
+            out.push(encode::sfple(u32::from(vc), u32::from(vd), mod1).map_err(bad_isa)?);
         }
         MirOp::SfpMov { a, d } => {
             out.push(encode::sfpmov(u32::from(a), u32::from(d), 0).map_err(bad_isa)?);
@@ -1452,16 +1435,6 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), tt
                     .encode()
                     .map_err(bad_isa)?,
             );
-        }
-        MirOp::Max { a, b, d } => {
-            out.push(encode::sfpmov(u32::from(b), u32::from(d), 0).map_err(bad_isa)?);
-            out.push(cc_mask(true).map_err(bad_isa)?);
-            out.push(
-                encode::sfpgt(u32::from(b), u32::from(a), 1) // flags = a > b
-                    .map_err(bad_isa)?,
-            );
-            out.push(encode::sfpmov(u32::from(a), u32::from(d), 0).map_err(bad_isa)?);
-            out.push(cc_mask(false).map_err(bad_isa)?);
         }
         MirOp::Mvmul {
             reg,

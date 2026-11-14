@@ -228,6 +228,7 @@ pub enum BOp {
     Cmpgt,
     Cmpge,
     Max,
+    Min,
     Or,
     And,
     BitXor,
@@ -252,6 +253,7 @@ impl BOp {
             "cmpgt" => BOp::Cmpgt,
             "cmpge" => BOp::Cmpge,
             "max" => BOp::Max,
+            "min" => BOp::Min,
             "or" => BOp::Or,
             "and" => BOp::And,
             "bitxor" => BOp::BitXor,
@@ -848,6 +850,7 @@ impl Kernel {
                     BOp::Mod => a.checked_rem(b),
                     BOp::Pow => a.checked_pow(u32::try_from(b).ok()?),
                     BOp::Max => Some(a.max(b)),
+                    BOp::Min => Some(a.min(b)),
                     BOp::BitAnd => Some(a & b),
                     BOp::BitOr => Some(a | b),
                     BOp::BitXor => Some(a ^ b),
@@ -1027,9 +1030,11 @@ impl Kernel {
             }
             match *op {
                 Op::Const { dtype, .. } => {
-                    if dtype == DType::Bf16 {
-                        return Err(ttStatus::TT_ERROR_CONST_BF16);
-                    }
+                    // A `bf16` constant is one datum of the format, the way
+                    // zyx's `Constant::BF16` is: the 16 bits of the value (a
+                    // decimal literal is truncated into them, `bf16::from_f32`'s
+                    // `(x.to_bits() >> 16) as u16`), widened to the f32 image
+                    // wherever a lane reads it. A `bool` has no datum to write.
                     if dtype == DType::Bool {
                         return Err(ttStatus::TT_ERROR_CONST_BOOL);
                     }
@@ -2060,9 +2065,16 @@ fn literal(dtype: DType, bits: u32) -> Result<String, ttStatus> {
                 Ok(format!("{v}"))
             }
         }
-        DType::Bf16 => Err(crate::status::internal_bug(
-            "a bf16 constant reached the printer",
-        )),
+        DType::Bf16 => {
+            // The 16-bit datum is the f32 it widens to; printing that image
+            // truncates back to the same sixteen bits.
+            let v = f32::from_bits((bits & 0xffff) << 16);
+            if v.fract() == 0.0 {
+                Ok(format!("{v:.1}"))
+            } else {
+                Ok(format!("{v}"))
+            }
+        }
         DType::Bool => Err(crate::status::internal_bug(
             "a bool constant reached the printer",
         )),
@@ -2099,6 +2111,7 @@ fn binary_name(op: BOp) -> &'static str {
         BOp::Cmpgt => "cmpgt",
         BOp::Cmpge => "cmpge",
         BOp::Max => "max",
+        BOp::Min => "min",
         BOp::Or => "or",
         BOp::And => "and",
         BOp::BitXor => "bitxor",
@@ -2277,7 +2290,13 @@ impl<'a> Tokens<'a> {
                 .parse::<f32>()
                 .map(|v| v.to_bits())
                 .map_err(|_| ttStatus::TT_ERROR_PARSE),
-            _ => Err(ttStatus::TT_ERROR_CONST_BF16),
+            // zyx's `bf16::from_f32`: the high half of the literal's f32 bits,
+            // kept as the bf16 datum itself (the op's own two bytes).
+            DType::Bf16 => word
+                .parse::<f32>()
+                .map(|v| (v.to_bits() >> 16) & 0xffff)
+                .map_err(|_| ttStatus::TT_ERROR_PARSE),
+            DType::Bool => Err(ttStatus::TT_ERROR_CONST_BOOL),
         }
     }
 

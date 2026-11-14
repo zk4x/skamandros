@@ -36,7 +36,31 @@ constant dimensions, each `1` or a multiple of 32. Every `load`, `store` and
 datum — and its index counts those units. There is no implicit dtype conversion:
 `cast` converts with the C type's rounding, `bitcast` renames the same bits, and
 the dtypes are `f32`, `bf16`, `i32` and `bool`. The ops are zyx's `UOp` and
-`BOp` plus `sel`, `matmul`, `sum` and `max`; there is no `relu`/`elu`/`sigmoid`.
+`BOp` plus `sel`, `matmul`, `sum`, `max` and `min`; there is no
+`relu`/`elu`/`sigmoid`.
+
+### No implicit casts
+
+There are no implicit conversions, anywhere. Every binary op, `sel`, comparison
+and `copy` needs both sides to have the same dtype, and the verifier refuses a
+mixed pair with `TT_ERROR_NO_IMPLICIT_CAST`; there is no promotion, so an `f32`
+tile and an `i32` literal in one `add` is an error, not a widening. A
+conversion is always written out: `cast` (C rounding) or `bitcast` (the same
+bits under another name).
+
+A `bool` is not an index. A comparison produces a `bool`, and an `i32` context —
+a loop bound, an index, a shape term, an offset — refuses a `bool` operand with
+`TT_ERROR_DIMENSION_NOT_INDEX` (or `TT_ERROR_OFFSET_NOT_INDEX`): write
+`cast %c to i32`, which is `1` for true and `0` for false. The two forms of a
+`bool` are:
+
+- a scalar `bool`, used in index arithmetic and evaluated in RISC-V, is `1`/`0`;
+- a `bool` lane in a tile, where the comparison runs on the SFPU, is `-1`/`0`,
+  and `cast` to `i32` normalizes it to `1`/`0`.
+
+A conditional value is `sel %c %a %b` with a `bool` `%c`, never arithmetic on
+the `bool` itself; on the scalar side it is a RISC-V conditional move (`bne`
+over two moves — the ISA has no `cmov`).
 
 The compiler decides which machine programs each instruction belongs to, where
 each value lives, which lane registers its body uses, how a buffer is read, and
@@ -78,15 +102,25 @@ is 1. The text form is the only program form `ttCompile` reads.
 ## Status
 
 Working end to end through the C ABI: copies, elementwise arithmetic,
-comparisons, `sel`, casts and bitcasts, bf16, both reduces, `matmul`, a symbolic
-loop bound, a symbolic grid, a gather, `rms_norm`, and a `gate_proj`-shaped GEMM
-over the whole grid (240 tiles, every datum checked).
+comparisons, `sel`, casts and bitcasts, bf16 (constants, a bf16 page widening
+into a 32-bit `Dst` through `SrcA` and `MOVA2D`, and bf16 reduces), both
+reduces, `matmul`, a symbolic loop bound, a symbolic grid, a gather, and a
+`gate_proj`-shaped GEMM over the whole grid (240 tiles, every datum checked).
+The allocator reuses `Dst` by liveness, so a kernel's *values* may outnumber
+the bank's slots: `softmax` needs eleven live values in eight slots.
 
 Open, in the order they block a release:
 
-- `softmax` needs eleven live `Dst`; the bank has eight.
+- The transcendentals `log2`, `sin`, `cos`, `reciprocal`, `sqrt`, `floor`,
+  `trunc` (and so `div` and `pow`) unfold into f32 bit arithmetic, so a bf16
+  operand has to widen to f32 there; `exp2` and `rsqrt` are native bodies and
+  work on 16-bit `Dst`.
 - A `bf16` page out of a 32-bit `Dst` is refused as `TT_TODO_PACK_F32_TO_BF16`:
   the packer's conversion is built for silicon, but `ttsim` does not model it.
+- `max row` in a 16-bit `Dst` is wrong (the fold's transpose is written for a
+  32-bit `Dst` only); `sum row`, `sum col` and `max col` are correct.
+- `rms_norm`'s gate never asserts and its numbers are wrong; it is a recorded
+  bug, not a passing kernel.
 - The hardware link is not written: this runs on `ttsim` only.
 
 ## License

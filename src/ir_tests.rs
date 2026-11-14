@@ -99,6 +99,70 @@ fn a_zero_dimension_is_not_the_way_to_write_a_tensor() {
 }
 
 #[test]
+fn a_bf16_constant_is_the_high_half_of_its_literal() {
+    // zyx's `bf16::from_f32`: `(x.to_bits() >> 16) as u16`. The datum is the
+    // sixteen bits, and the text form is the f32 image they widen to, so the
+    // printer and the parser round trip.
+    for (literal, bits) in [
+        ("0.5", 0x3f00u32),
+        ("-1.5", 0xbfc0),
+        // Not bf16-exact: the low sixteen bits of the f32 are dropped.
+        ("0.3", 0x3e99),
+        ("1.1", 0x3f8c),
+        ("0.1", 0x3dcc),
+    ] {
+        let text = format!("version 9\n%c = const bf16 {literal}\ngrid 1,1\n");
+        let k = Kernel::parse(&text).expect("a bf16 constant parses");
+        let (_, op) = k.ops().next().expect("the constant");
+        assert_eq!(
+            *op,
+            Op::Const {
+                dtype: DType::Bf16,
+                bits
+            },
+            "{literal}"
+        );
+        // The printed form is the datum's f32 image; parsing it truncates back
+        // to the same sixteen bits.
+        let image = f32::from_bits(bits << 16);
+        let decimal = if image.fract() == 0.0 {
+            format!("{image:.1}")
+        } else {
+            format!("{image}")
+        };
+        let printed = k.to_string();
+        assert_eq!(
+            printed.lines().nth(1),
+            Some(format!("%c = const bf16 {decimal}").as_str()),
+            "the printed form of {literal}: {printed}"
+        );
+        let again = Kernel::parse(&format!("version 9\n%c = const bf16 {decimal}\ngrid 1,1\n"))
+            .expect("the printed constant parses back");
+        assert_eq!(
+            *again.ops().next().expect("the constant").1,
+            Op::Const {
+                dtype: DType::Bf16,
+                bits
+            }
+        );
+    }
+}
+
+#[test]
+fn a_bf16_constant_is_not_its_f32_literal() {
+    // `0.1` is neither a bf16 nor an f32 datum: the constant keeps the high
+    // half, which is a different number.
+    let text = "version 9\n%c = const bf16 0.1\ngrid 1,1\n";
+    let k = Kernel::parse(text).expect("it parses");
+    let (_, op) = k.ops().next().expect("the constant");
+    let Op::Const { bits, .. } = *op else {
+        unreachable!("the constant")
+    };
+    assert_eq!(bits, (0.1f32.to_bits() >> 16) & 0xffff);
+    assert_ne!(f32::from_bits(bits << 16), 0.1);
+}
+
+#[test]
 fn an_implicit_dtype_conversion_is_refused() {
     let text = "\
 version 9

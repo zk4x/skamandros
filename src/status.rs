@@ -76,6 +76,13 @@ pub enum ttStatus {
     /// A defined value has no name.
     TT_ERROR_VALUE_UNNAMED = 26,
     /// A bf16 constant is not exact; bf16 is written as f32 and cast.
+    ///
+    /// **Reserved, no longer produced (2026-11-14):** `Op::Const { Bf16 }` is
+    /// legal now. The literal is truncated into the sixteen bits the datum is
+    /// (zyx's `bf16::from_f32`, `(x.to_bits() >> 16) as u16`), the way the
+    /// SFPU's own `BF16` store truncates, and a `const f32` followed by
+    /// `cast ... to bf16` reaches the same immediate. The code stays because
+    /// ABI v1's error table publishes it.
     TT_ERROR_CONST_BF16 = 27,
     /// A bool constant is not a datum; a bool is produced by a comparison.
     TT_ERROR_CONST_BOOL = 28,
@@ -342,8 +349,13 @@ pub enum ttStatus {
     /// datum. The unpacker cannot widen bf16 into a 32-bit `Dst`, and a 16-bit
     /// `Dst` cannot pack `f32`/`i32` (`Unpackers/FormatConversion.md`,
     /// `tt_llk_*/common/inc/cunpack_common.h` and `cpack_common.h`), so the
-    /// conversion needs `SrcA`/`SrcB` and the Matrix Unit, which this compiler
-    /// does not place.
+    /// conversion was refused here until the `SrcA` route landed.
+    ///
+    /// **Reserved, no longer produced (2026-11-14):** `lower`'s load path now
+    /// takes a bf16 page into a 32-bit `Dst` through `SrcA` and `MOVA2D` (the
+    /// move tt-lang's `copy_tile` makes for `typecast bf16 -> f32`), which is
+    /// an exact widening. The code stays only because ABI v1's error table
+    /// already publishes it.
     TT_ERROR_BF16_WIDEN = 153,
     /// `matmul`'s operands or its accumulator's dtype are not a pair the Matrix
     /// Unit's `Src` path takes: both operands must be `f32` or `bf16` and equal,

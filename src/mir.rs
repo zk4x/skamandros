@@ -64,15 +64,6 @@ pub enum Bcast {
     Scalar,
 }
 
-/// A comparison a [`MirOp::Compare`] performs; the result is `-1` for true and
-/// `0` for false, lanewise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CmpOp {
-    Lt,
-    Gt,
-    Ge,
-}
-
 /// An integer operation the roles compute with RISC-V.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IOp {
@@ -86,6 +77,15 @@ pub enum IOp {
     Xor,
     Sll,
     Srl,
+    /// The signed maximum (Zbb `max`, one instruction).
+    Max,
+    /// The signed minimum (Zbb `min`, one instruction).
+    Min,
+    /// Comparisons, producing `1`/`0` in the destination: the scalar form of
+    /// `bool` (a datapath lane is `-1`/`0` instead).
+    Slt,
+    Eq,
+    Ne,
 }
 
 /// This core's `core_info`: the logical grid coordinate the host wrote before
@@ -256,13 +256,6 @@ pub enum MirOp {
         b: LReg,
         d: LReg,
     },
-    /// A lanewise comparison, `-1`/`0` into `d`.
-    Compare {
-        op: CmpOp,
-        a: LReg,
-        b: LReg,
-        d: LReg,
-    },
     /// `SFPMOV`: one lane into another, unchanged.
     SfpMov { a: LReg, d: LReg },
     /// `SFPABS`: the magnitude of `a`. `mod1` 0 negates a two's complement
@@ -327,15 +320,12 @@ pub enum MirOp {
     /// `SFPSTOCHRND`: `a` to a small integer, keeping `mod1`'s range, with
     /// `round`'s rounding.
     SfpStochRnd { mod1: u32, a: LReg, d: LReg },
-    /// `cond ? t : f`, lanewise, through the SFPU lane flags.
-    Select {
-        cond: LReg,
-        t: LReg,
-        f: LReg,
-        d: LReg,
-    },
-    /// The lanewise maximum, through the SFPU lane flags.
-    Max { a: LReg, b: LReg, d: LReg },
+    /// `SFPGT`: compare the lane `vd` against `vc`, writing `-1`/`0` into
+    /// `vd` (`mod1` bit 3, `SET_VD`) or setting the lane flags (`mod1` bit 0,
+    /// `SET_CC`). `vd` is both an operand and the destination.
+    SfpGt { mod1: u32, vc: LReg, vd: LReg },
+    /// `SFPLE`: `vd <= vc`, the same two ways.
+    SfpLe { mod1: u32, vc: LReg, vd: LReg },
     /// The unpacker's `Config` bank for `unit`.
     UnpackConfig {
         unit: u8,
@@ -491,8 +481,121 @@ pub enum MirOp {
     LoadCoord { reg: u8, axis: u8 },
     /// `d = a op b`, in RISC-V.
     IArith { op: IOp, d: u8, a: u8, b: u8 },
+    /// `d = cond != 0 ? a : b`, in RISC-V. The ISA has no conditional move
+    /// (no Zicond), so this is the branch form:
+    /// `bne cond, zero, +12; addi d, b, 0; jal zero, +8; addi d, a, 0` — four
+    /// words, which also keeps working when `d` aliases `a` or `b`.
+    Cmov { cond: u8, a: u8, b: u8, d: u8 },
     /// The branch back to the matching [`MirOp::Loop`] or [`MirOp::LoopReg`].
     EndLoop,
+}
+
+/// How an op uses one lane register. A single instruction reads its operands
+/// before it writes its destination, so a destination may share a register with
+/// a dying operand; a `ReadWrite` lane is both, like `SFPGT`'s `VD`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneUse {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+impl LaneUse {
+    /// Whether the lane is read.
+    pub fn reads(self) -> bool {
+        matches!(self, LaneUse::Read | LaneUse::ReadWrite)
+    }
+
+    /// Whether the lane is written.
+    pub fn writes(self) -> bool {
+        matches!(self, LaneUse::Write | LaneUse::ReadWrite)
+    }
+}
+
+impl MirOp {
+    /// Every lane register this op touches, in operand order.
+    ///
+    /// The one place the lane operands are listed: the allocator's liveness and
+    /// renaming, and `optimize::verify`'s lane bounds, all read this. An op
+    /// that gains a lane operand and is not added here is caught by
+    /// [`MirOp::map_lregs`]'s test, which walks the same table.
+    pub fn lreg_params(&self) -> Vec<(LReg, LaneUse)> {
+        use LaneUse::*;
+        match *self {
+            MirOp::Sfpload { lreg, .. } | MirOp::LaneConst { lreg, .. } => vec![(lreg, Write)],
+            MirOp::Sfpstore { lreg, .. } => vec![(lreg, Read)],
+            MirOp::UnarySfp { a, d, .. } => vec![(a, Read), (d, Write)],
+            MirOp::BinarySfp { a, b, d, .. } => vec![(a, Read), (b, Read), (d, Write)],
+            MirOp::SfpMov { a, d }
+            | MirOp::SfpAbs { a, d, .. }
+            | MirOp::SfpCast { a, d, .. }
+            | MirOp::SfpExexp { a, d, .. }
+            | MirOp::SfpExman { a, d, .. }
+            | MirOp::SfpIadd { a, d, .. }
+            | MirOp::SfpArecip { a, d, .. }
+            | MirOp::SfpStochRnd { a, d, .. } => vec![(a, Read), (d, Write)],
+            MirOp::SfpShft { amount, a, d, .. } => {
+                vec![(amount, Read), (a, Read), (d, Write)]
+            }
+            MirOp::SfpSetcc { a, .. } => vec![(a, Read)],
+            MirOp::SfpMul24 { a, b, d, .. } => vec![(a, Read), (b, Read), (d, Write)],
+            MirOp::SfpMad { a, b, c, d, .. } => {
+                vec![(a, Read), (b, Read), (c, Read), (d, Write)]
+            }
+            // The comparison reads its right-hand lane; with `SET_VD` it writes
+            // the result back into it, and with `SET_CC` it only sets the flags.
+            MirOp::SfpGt { vc, vd, mod1 } | MirOp::SfpLe { vc, vd, mod1 } => {
+                let use_ = if mod1 & 8 != 0 { ReadWrite } else { Read };
+                vec![(vc, Read), (vd, use_)]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Rewrite every lane operand through `f`. The mutable counterpart of
+    /// [`MirOp::lreg_params`]: the two list the same lanes, and the test below
+    /// holds them to it.
+    pub fn map_lregs(&mut self, mut f: impl FnMut(&mut LReg)) {
+        match self {
+            MirOp::Sfpload { lreg, .. }
+            | MirOp::Sfpstore { lreg, .. }
+            | MirOp::LaneConst { lreg, .. } => f(lreg),
+            MirOp::UnarySfp { a, d, .. }
+            | MirOp::SfpAbs { a, d, .. }
+            | MirOp::SfpCast { a, d, .. }
+            | MirOp::SfpExexp { a, d, .. }
+            | MirOp::SfpExman { a, d, .. }
+            | MirOp::SfpIadd { a, d, .. }
+            | MirOp::SfpArecip { a, d, .. }
+            | MirOp::SfpStochRnd { a, d, .. }
+            | MirOp::SfpMov { a, d } => {
+                f(a);
+                f(d);
+            }
+            MirOp::BinarySfp { a, b, d, .. } | MirOp::SfpMul24 { a, b, d, .. } => {
+                f(a);
+                f(b);
+                f(d);
+            }
+            MirOp::SfpMad { a, b, c, d, .. } => {
+                f(a);
+                f(b);
+                f(c);
+                f(d);
+            }
+            MirOp::SfpShft { amount, a, d, .. } => {
+                f(amount);
+                f(a);
+                f(d);
+            }
+            MirOp::SfpSetcc { a, .. } => f(a),
+            MirOp::SfpGt { vc, vd, .. } | MirOp::SfpLe { vc, vd, .. } => {
+                f(vc);
+                f(vd);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// One kernel's machine program: the ops, in one total order, and what they
@@ -686,14 +789,6 @@ fn write_op(f: &mut dyn fmt::Write, op: &MirOp) -> fmt::Result {
             lane(b),
             lane(d)
         ),
-        MirOp::Compare { op, a, b, d } => write!(
-            f,
-            "cmp{} {}, {} -> {}",
-            cmp_name(op),
-            lane(a),
-            lane(b),
-            lane(d)
-        ),
         MirOp::SfpMov { a, d } => write!(f, "sfpmov {} -> {}", lane(a), lane(d)),
         MirOp::SfpAbs { mod1, a, d } => write!(f, "sfpabs {mod1} {} -> {}", lane(a), lane(d)),
         MirOp::SfpCast { mod1, a, d } => {
@@ -743,15 +838,24 @@ fn write_op(f: &mut dyn fmt::Write, op: &MirOp) -> fmt::Result {
             lane(c),
             lane(d)
         ),
-        MirOp::Select { cond, t, f: no, d } => write!(
-            f,
-            "select {}, {}, {} -> {}",
-            lane(cond),
-            lane(t),
-            lane(no),
-            lane(d)
-        ),
-        MirOp::Max { a, b, d } => write!(f, "max {}, {} -> {}", lane(a), lane(b), lane(d)),
+        MirOp::SfpGt { mod1, vc, vd } => {
+            write!(
+                f,
+                "sfpgt {mod1}, {} > {} -> {}",
+                lane(vd),
+                lane(vc),
+                lane(vd)
+            )
+        }
+        MirOp::SfpLe { mod1, vc, vd } => {
+            write!(
+                f,
+                "sfple {mod1}, {} <= {} -> {}",
+                lane(vd),
+                lane(vc),
+                lane(vd)
+            )
+        }
         MirOp::UnpackConfig {
             unit,
             to_src,
@@ -944,6 +1048,9 @@ fn write_op(f: &mut dyn fmt::Write, op: &MirOp) -> fmt::Result {
         MirOp::IArith { op, d, a, b } => {
             write!(f, "{} {}, {}, {}", iop_name(op), rx(d), rx(a), rx(b))
         }
+        MirOp::Cmov { cond, a, b, d } => {
+            write!(f, "cmov {}, {}, {}, {}", rx(d), rx(a), rx(b), rx(cond))
+        }
         MirOp::EndLoop => write!(f, "endloop"),
     }
 }
@@ -969,14 +1076,6 @@ fn binary_name(op: BinarySfpOp) -> &'static str {
         BinarySfpOp::IAdd => "iadd",
         BinarySfpOp::ISub => "isub",
         BinarySfpOp::Setexp => "setexp",
-    }
-}
-
-fn cmp_name(op: CmpOp) -> &'static str {
-    match op {
-        CmpOp::Lt => "lt",
-        CmpOp::Gt => "gt",
-        CmpOp::Ge => "ge",
     }
 }
 
@@ -1016,5 +1115,10 @@ fn iop_name(op: IOp) -> &'static str {
         IOp::Xor => "xor",
         IOp::Sll => "sll",
         IOp::Srl => "srl",
+        IOp::Max => "max",
+        IOp::Min => "min",
+        IOp::Slt => "slt",
+        IOp::Eq => "eq",
+        IOp::Ne => "ne",
     }
 }
