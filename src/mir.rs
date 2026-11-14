@@ -175,32 +175,6 @@ impl From<Cb> for u32 {
     }
 }
 
-/// Identifier of an op in [`MachineKernel::ops`]: the machine side's own id
-/// space, one total order over all five cores.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct MId(pub u32);
-
-impl From<usize> for MId {
-    fn from(value: usize) -> Self {
-        Self(value as u32)
-    }
-}
-
-impl From<MId> for usize {
-    fn from(value: MId) -> Self {
-        value.0 as usize
-    }
-}
-
-impl SlabId for MId {
-    const ZERO: Self = Self(0);
-    const NULL: Self = Self(u32::MAX);
-
-    fn inc(&mut self) {
-        self.0 += 1;
-    }
-}
-
 /// The core a [`MirOp`] runs on.
 ///
 /// The two movers are RISC-V programs of their own (`Core::Reader` and
@@ -478,7 +452,7 @@ pub enum MirOp {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MachineKernel {
     /// Every op, in the order the lowering met it, with the core it runs on.
-    pub ops: Slab<MId, (Core, MirOp)>,
+    pub ops: Vec<(Core, MirOp)>,
     /// The circular buffers the ops name.
     pub cbs: Slab<Cb, CbInfo>,
     /// The `Dst` registers the ops name.
@@ -506,8 +480,8 @@ impl MachineKernel {
     pub fn stream(&self, core: Core) -> impl Iterator<Item = MirOp> + '_ {
         self.ops
             .iter()
-            .filter(move |(_, (c, op))| *c == core && !matches!(op, MirOp::Semset { .. }))
-            .map(|(_, (_, op))| *op)
+            .filter(move |(c, op)| *c == core && !matches!(op, MirOp::Semset { .. }))
+            .map(|(_, op)| *op)
     }
 
     /// The `Dst` registers the hardware has: eight in 32-bit mode, sixteen in
@@ -582,7 +556,7 @@ impl fmt::Display for MachineKernel {
         for (sem, value) in &self.sems {
             writeln!(f, "sem{sem} = {value}")?;
         }
-        for (_, (core, op)) in self.ops.iter() {
+        for (core, op) in self.ops.iter() {
             write!(f, "{}: ", core.name())?;
             write_op(f, op)?;
             writeln!(f)?;

@@ -41,7 +41,7 @@ fn ranges<Id: Copy + Ord + std::hash::Hash>(
     mut touched: impl FnMut(&MirOp) -> Vec<(Id, bool)>,
 ) -> BTreeMap<Id, (usize, usize)> {
     let mut live: BTreeMap<Id, (usize, usize)> = BTreeMap::new();
-    for (at, (_, (_, op))) in m.ops.iter().enumerate() {
+    for (at, (_, op)) in m.ops.iter().enumerate() {
         for (id, _write) in touched(op) {
             live.entry(id)
                 .and_modify(|(_, last)| *last = at)
@@ -113,7 +113,7 @@ fn alloc_dsts(m: &mut MachineKernel) -> Result<(), Error> {
         rename.insert(id, Dst(slot as u16));
     }
 
-    for (_, (_, op)) in m.ops.iter_mut() {
+    for (_, op) in m.ops.iter_mut() {
         rewrite_dsts(op, &rename);
     }
     // The slab becomes the physical registers: one entry per physical id, in
@@ -157,7 +157,7 @@ fn alloc_lregs(m: &mut MachineKernel) -> Result<(), Error> {
         rename.insert(id, LReg(slot as u16));
     }
 
-    for (_, (_, op)) in m.ops.iter_mut() {
+    for (_, op) in m.ops.iter_mut() {
         rewrite_lregs(op, &rename);
     }
     let mut dtys: Vec<Option<DType>> = vec![None; slots];

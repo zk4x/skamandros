@@ -70,7 +70,7 @@ type Edge = (Core, Core);
 pub fn reg_sync(m: &mut MachineKernel) {
     // The pass inserts hand-offs between ops, so it works on the order as a
     // vector and rebuilds the slab at the end.
-    let mut ops: Vec<(Core, MirOp)> = m.ops.iter().map(|(_, entry)| *entry).collect();
+    let mut ops: Vec<(Core, MirOp)> = m.ops.clone();
     // The unpacker's `Dst` target and, per unit, whether it is configured for
     // `Src`: an `UNPACR` writes `Dst` only when its unit is on the `Dst` path.
     let mut target: Option<Dst> = None;
@@ -419,12 +419,7 @@ pub fn reg_sync(m: &mut MachineKernel) {
             _ => None,
         })
         .collect();
-    inits.extend(ops);
-    let mut fresh = crate::slab::Slab::new();
-    for entry in inits {
-        fresh.push(entry);
-    }
-    m.ops = fresh;
+    m.ops = inits.into_iter().chain(ops).collect();
 }
 
 /// Collapse every run of identical consecutive row triples into one body plus a
@@ -434,7 +429,7 @@ pub fn reg_sync(m: &mut MachineKernel) {
 /// `Dst` rows advance by exactly one, so the body is the row-0 form and the
 /// repeat walks the rest.
 pub fn fuse(m: &mut MachineKernel) {
-    let entries: Vec<(Core, MirOp)> = m.ops.iter().map(|(_, entry)| *entry).collect();
+    let entries: Vec<(Core, MirOp)> = m.ops.clone();
     let mut fused: Vec<(Core, MirOp)> = Vec::with_capacity(entries.len());
     // The semaphore inits are not instructions and have no stream; they stay at
     // the front, which is where `reg_sync` put them.
@@ -484,11 +479,7 @@ pub fn fuse(m: &mut MachineKernel) {
             fused.push((role, op));
         }
     }
-    let mut fresh = crate::slab::Slab::new();
-    for entry in fused {
-        fresh.push(entry);
-    }
-    m.ops = fresh;
+    m.ops = fused;
 }
 
 /// The three ops at `at` if they are a lane-register row body.
@@ -911,7 +902,7 @@ copy 32,32 %out [0] = %b0 [0]
         m.ops
             .iter()
             .enumerate()
-            .filter(|(_, (_, (role, _)))| *role == Core::Math)
+            .filter(|(_, (role, _))| *role == Core::Math)
             .nth(n)
             .map(|(i, _)| i)
             .expect("the math stream has that many ops")
@@ -943,13 +934,9 @@ copy 32,32 %out [0] = %b0 [0]
         let mut m = machine();
         // Cut the body: a semaphore in the middle must stop fusion across it.
         let at = math_at(&m, 3 * 16);
-        let mut entries: Vec<(Core, MirOp)> = m.ops.iter().map(|(_, e)| *e).collect();
+        let mut entries: Vec<(Core, MirOp)> = m.ops.clone();
         entries.insert(at, (Core::Math, MirOp::SemPost { sem: 7 }));
-        let mut fresh = crate::slab::Slab::new();
-        for e in entries {
-            fresh.push(e);
-        }
-        m.ops = fresh;
+        m.ops = entries;
         fuse(&mut m);
         let repeats = math(&m)
             .iter()
@@ -963,15 +950,11 @@ copy 32,32 %out [0] = %b0 [0]
         let mut m = machine();
         // Row 1 negated with a different lane register: not the same body.
         let at = math_at(&m, 5);
-        let mut entries: Vec<(Core, MirOp)> = m.ops.iter().map(|(_, e)| *e).collect();
+        let mut entries: Vec<(Core, MirOp)> = m.ops.clone();
         if let MirOp::UnarySfp { d, .. } = &mut entries[at].1 {
             *d = LReg(5);
         }
-        let mut fresh = crate::slab::Slab::new();
-        for e in entries {
-            fresh.push(e);
-        }
-        m.ops = fresh;
+        m.ops = entries;
         fuse(&mut m);
         let repeats: Vec<u16> = math(&m)
             .iter()

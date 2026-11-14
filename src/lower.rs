@@ -1889,12 +1889,8 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
         ] {
             prologue.push((Core::Pack, op));
         }
-        let old: Vec<(Core, MirOp)> = m.ops.iter().map(|(_, (core, op))| (*core, *op)).collect();
-        let mut fresh = crate::slab::Slab::new();
-        for (core, op) in prologue.into_iter().chain(old) {
-            fresh.push((core, op));
-        }
-        m.ops = fresh;
+        // The ones page goes before every op the lowering emitted.
+        m.ops.splice(0..0, prologue);
     }
     Ok(m)
 }
@@ -2933,9 +2929,11 @@ fn copy_to(
         let _ = offset;
         return Err(Error::TT_TODO_MULTI_LANE);
     }
+    // A mover's program has its own counters: `t5` is its NIU base, so the
+    // compute roles' counters and its own `a1..a4` are not interchangeable.
     let mut ops = Vec::new();
-    let mut scratch = SCRATCH.iter().copied();
-    scalar(
+    let mut scratch = MOVER_TEMPS.iter().copied();
+    scalar_with(
         k,
         types,
         &mut ops,
@@ -2944,6 +2942,7 @@ fn copy_to(
         offset,
         reg::A5,
         &mut scratch,
+        &MOVER_COUNTERS,
     )?;
     ops.push(MirOp::Li {
         reg: reg::T4,
@@ -3041,7 +3040,7 @@ copy 32,32 %out [1] = %bo [0]
         let k = crate::mover::add_movers(&k).expect("the movers are added");
         let mut m = k.lower().expect("it lowers");
         crate::optimize::reg_sync(&mut m);
-        let ops: Vec<(Core, MirOp)> = m.ops.iter().map(|(_, entry)| *entry).collect();
+        let ops: Vec<(Core, MirOp)> = m.ops.clone();
         let pack = ops
             .iter()
             .position(|(role, op)| *role == Core::Pack && matches!(op, MirOp::SetPackOffset { .. }))

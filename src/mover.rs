@@ -352,7 +352,14 @@ impl Mover<'_> {
             let src = self.clone_value(into, src)?;
             let dst_offset = self.clone_value(into, dst_offset)?;
             let src_offset = self.clone_value(into, src_offset)?;
-            into.push(Op::Reserve { cb: ring });
+            // The producer reserves a free page and publishes it; the consumer
+            // waits for a published page and releases it (tt-metal's
+            // `writer_unary_1.cpp` is `cb_wait_front`/`cb_pop_front`).
+            if copy.reader {
+                into.push(Op::Reserve { cb: ring });
+            } else {
+                into.push(Op::Wait { cb: ring });
+            }
             into.push(Op::CopyTo {
                 dst,
                 src,
@@ -360,7 +367,11 @@ impl Mover<'_> {
                 src_offset,
                 shape,
             });
-            into.push(Op::Push { cb: ring });
+            if copy.reader {
+                into.push(Op::Push { cb: ring });
+            } else {
+                into.push(Op::Pop { cb: ring });
+            }
         }
         Ok(())
     }
