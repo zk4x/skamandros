@@ -746,16 +746,24 @@ fn widened(values: &[u16]) -> Vec<f32> {
     values.iter().map(|h| widen_bf16(*h)).collect()
 }
 
-/// The bf16 matrix's unary set: the instructions the SFPU runs on a 16-bit
-/// `Dst`. `floor`/`trunc`/`log2`/`sin`/`cos`/`reciprocal`/`sqrt` are unfolded
-/// into f32 bit manipulation (`bitcast` to `i32`, f32 constants), so a bf16
-/// operand has no spelling there yet; they are absent from this table rather
-/// than silently made f32.
+/// The bf16 matrix's unary set: the instructions the SFPU lane runs on a 16-bit
+/// `Dst`. The lane is 32 bits, so a bf16 datum widens on `SFPLOAD` and the store
+/// truncates — the transcendentals included, exactly as the f32 row runs them.
+/// `floor`/`trunc` are absent: they still round through an `i32` value in the
+/// IR, which makes the module 32-bit, and the bf16 page out of that `Dst` is the
+/// packer's conversion `ttsim` does not model.
 const BF16_UNARY_CASES: &[UnaryCase] = &[
     ("neg", |x| -x, 0.0),
     ("abs", |x| x.abs(), 0.0),
     // `exp2` keeps `lower`'s machine body, so it runs in a 16-bit `Dst`.
     ("exp2", |x| x.exp2(), 1e-5),
+    ("log2", f32::log2, 1e-5),
+    ("sin", f32::sin, 1e-5),
+    ("cos", f32::cos, 1e-5),
+    // The estimate-plus-Newton bodies: two bf16 ulps.
+    ("reciprocal", |x| 1.0 / x, 1.6e-2),
+    ("sqrt", f32::sqrt, 1.6e-2),
+    ("rsqrt", |x| 1.0 / x.sqrt(), 1.6e-2),
 ];
 
 /// Every `BOp` the lane takes directly in 16-bit mode: the arithmetic, the two
@@ -779,6 +787,16 @@ const BF16_BINARY_CASES: &[BinaryCase] = &[
         "%t = eq %x %c\n%y = sel %t %x %c",
         |a, b| if a == b { a } else { b },
         0.0,
+    ),
+    // `div` is a composition (`x * (1/y)`) and each stage of a 16-bit kernel
+    // stores bf16, so the oracle applies the same truncation the `Dst` does.
+    // `pow` is absent: `exp2(y log2 x)` stores the *exponent* as bf16, and one
+    // ulp there is `2^ulp` — up to 9 % of the result at these exponents — so a
+    // flat tolerance would gate nothing. Its f32 row still runs the composition.
+    (
+        "%y = div %x %c",
+        |a, b| widen_bf16(truncate_to_bf16(a * widen_bf16(truncate_to_bf16(1.0 / b)))),
+        2e-2,
     ),
 ];
 

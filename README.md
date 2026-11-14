@@ -114,6 +114,10 @@ the bank's slots: `softmax` needs eleven live values in eight slots.
 
 Open, in the order they block a release:
 
+- **The bf16 row fold over-accumulates by 13 % over 96 tiles** (found
+  2026-11-14, `tests/e2e.rs::bf16_sum_row_over_many_tiles`, ignored). It is the
+  rms_norm denominator, so a bf16 `rms_norm` is off by ~7 % until it is fixed;
+  `bf16_rms_norm_runs_on_the_simulator` is written and ignored beside it.
 - `ttsim` does not model the packer's `f32 -> bf16` conversion
   (`pack_fmt_conv_mode=0x105`), so that path — and every bf16 page written out
   of a 32-bit `Dst` — compiles but cannot be run here. It needs silicon.

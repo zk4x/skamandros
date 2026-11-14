@@ -4907,6 +4907,423 @@ fn gelu_runs_on_the_simulator() {
     );
 }
 
+/// The same chains in a bf16 kernel: the constants at the tile's dtype, a
+/// 16-bit `Dst`, and every stage stored as bf16 — so the oracle is the f32 rule
+/// on the widened input and the comparison is a tolerance (one bf16 datum per
+/// stage is 2^-7 relative).
+fn bf16_activation_program(chain: &str) -> String {
+    format!(
+        "\
+version 9
+grid 1,1
+%in = param bf16 1024
+%out = param bf16 1024
+%b0 = buffer bf16 32,32
+%bo = buffer bf16 32,32
+copy 32,32 %b0 [0] = %in [0]
+load 32,32 %x = %b0 [0]
+{chain}
+store 32,32 %bo [0] = %r
+copy 32,32 %out [0] = %bo [0]
+"
+    )
+}
+
+/// One bf16 activation chain: the chain's `const f32`s become `const bf16`, the
+/// input is the bf16 truncation, and the output is widened back for the check.
+fn check_bf16_activation(name: &str, chain: &str, want: impl Fn(f32) -> f32, tol: f32) {
+    let chain = chain.replace("const f32", "const bf16");
+    let host = activation_input();
+    let input: Vec<u8> = host
+        .iter()
+        .flat_map(|v| truncate_to_bf16(*v).to_le_bytes())
+        .collect();
+    let out = run_kernel(&bf16_activation_program(&chain), &input, host.len() * 2);
+    let mut worst = 0.0f32;
+    for (i, h) in host.iter().enumerate() {
+        let x = widen_bf16(truncate_to_bf16(*h));
+        let got = widen_bf16(u16::from_le_bytes(
+            out[2 * i..2 * i + 2].try_into().unwrap(),
+        ));
+        let expect = want(x);
+        let err = (got - expect).abs() / expect.abs().max(1.0);
+        worst = worst.max(err);
+        assert!(
+            err <= tol,
+            "{name}: datum {i} of {x}: got {got}, want {expect} (rel {err} > {tol})"
+        );
+    }
+    eprintln!("bf16 {name}: worst relative error {worst}");
+}
+
+/// The four activation chains llama's SwiGLU and the gate use, in a bf16
+/// kernel. Every stage is a bf16 value between instructions, so the reference
+/// is the f32 rule on the widened input and the tolerance is the truncation.
+#[test]
+fn bf16_activations_run_on_the_simulator() {
+    check_bf16_activation(
+        "sigmoid",
+        SIGMOID_CHAIN,
+        |x| 1.0 / (1.0 + (-x).exp()),
+        1.5e-2,
+    );
+    check_bf16_activation("silu", SILU_CHAIN, |x| x / (1.0 + (-x).exp()), 1.5e-2);
+    check_bf16_activation("tanh", TANH_CHAIN, f32::tanh, 1.5e-2);
+    check_bf16_activation(
+        "gelu",
+        GELU_CHAIN,
+        |x| {
+            let inner = (2.0f32 / std::f32::consts::PI).sqrt() * (x + 0.044715 * x * x * x);
+            0.5 * x * (1.0 + inner.tanh())
+        },
+        1.5e-2,
+    );
+}
+
+/// `rms_norm`'s bf16 shape: the same program with bf16 params/buffers, a bf16
+/// accumulator, and the coefficients at the tile's dtype. `%zero` stays f32
+/// because the accumulator's fill is the one thing that must be f32.
+const RMS_NORM_BF16: &str = "\
+version 9
+grid 1,1
+%px = param bf16 98304
+%ps = param bf16 98304
+%pone = param bf16 1024
+%out = param bf16 98304
+%bx = buffer bf16 32,32
+%bs = buffer bf16 32,32
+%bones = buffer bf16 32,32
+%bacc = buffer bf16 32,32
+%br = buffer bf16 32,32
+%bo = buffer bf16 32,32
+%acc = acc bf16 32,1
+%zero = const f32 0
+%one = const i32 1
+%n = const i32 96
+copy 32,32 %bones [0] = %pone [0]
+store 32,32 %acc = %zero
+%i = loop %n
+%oi = mul %i %one
+copy 32,32 %bx [0] = %px [%oi]
+load 32,32 %x = %bx [0]
+%sq = mul %x %x
+copy 32,32 %bones [0] = %pone [0]
+load 32,32 %ones = %bones [0]
+sum %acc %sq %ones
+endloop
+store 32,32 %bacc [0] = %acc
+load 32,32 %st = %bacc [0]
+%inv = const bf16 0.0003255208
+%mean = mul %st %inv
+%eps = const bf16 0.00001
+%a = add %mean %eps
+%r = rsqrt %a
+%j = loop %n
+%oj = mul %j %one
+copy 32,32 %bx [0] = %px [%oj]
+load 32,32 %x2 = %bx [0]
+store 32,32 %br [0] = %r
+load 32,1 %rr = %br [0]
+%y = mul %x2 %rr
+copy 32,32 %bs [0] = %ps [%oj]
+load 32,32 %sc = %bs [0]
+%z = mul %y %sc
+store 32,32 %bo [0] = %z
+copy 32,32 %out [%oj] = %bo [0]
+endloop
+";
+
+/// `sum row` over 96 tiles in a bf16 kernel: the accumulator is the 16-bit
+/// `Dst`, so every tile's fold is added to a bf16 datum. This is the rms_norm
+/// fold, isolated.
+const SUM_ROW_MANY_BF16: &str = "\
+version 9
+grid 1,1
+%px = param bf16 98304
+%pone = param bf16 1024
+%out = param bf16 1024
+%bx = buffer bf16 32,32
+%bones = buffer bf16 32,32
+%bacc = buffer bf16 32,32
+%bo = buffer bf16 32,32
+%acc = acc bf16 32,1
+%zero = const f32 0
+%one = const i32 1
+%n = const i32 96
+copy 32,32 %bones [0] = %pone [0]
+store 32,32 %acc = %zero
+%i = loop %n
+%oi = mul %i %one
+copy 32,32 %bx [0] = %px [%oi]
+load 32,32 %x = %bx [0]
+%sq = mul %x %x
+copy 32,32 %bones [0] = %pone [0]
+load 32,32 %ones = %bones [0]
+sum %acc %sq %ones
+endloop
+store 32,32 %bacc [0] = %acc
+load 32,32 %st = %bacc [0]
+store 32,32 %bo [0] = %st
+copy 32,32 %out [0] = %bo [0]
+";
+
+#[test]
+#[ignore = "the bf16 row fold over-accumulates by 13 % over 96 tiles; see TODO.md"]
+fn bf16_sum_row_over_many_tiles() {
+    const HIDDEN: usize = 3072;
+    const COLS: usize = HIDDEN / 32;
+    const SEQ: usize = 2;
+    let x_f: Vec<f32> = (0..32 * HIDDEN)
+        .map(|i| {
+            let (row, column) = (i / HIDDEN, i % HIDDEN);
+            if row < SEQ {
+                (((row as i32 * 97 + column as i32 * 31) % 17) - 8) as f32 * 0.5
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let xw: Vec<f32> = x_f
+        .iter()
+        .map(|v| widen_bf16(truncate_to_bf16(*v)))
+        .collect();
+    let tiled_x = tiled(32, HIDDEN, &xw);
+    let x_bytes: Vec<u8> = tiled_x
+        .iter()
+        .flat_map(|v| truncate_to_bf16(*v).to_le_bytes())
+        .collect();
+    let mut ones = vec![0u16; 1024];
+    for row in 0..32 {
+        ones[tile_index(row, 0)] = truncate_to_bf16(1.0);
+    }
+    let ones_bytes: Vec<u8> = ones.iter().flat_map(|h| h.to_le_bytes()).collect();
+    let out = run_kernel_tensors(SUM_ROW_MANY_BF16, &[&x_bytes, &ones_bytes], 1024 * 2);
+    let got: Vec<f32> = out
+        .chunks_exact(2)
+        .map(|c| widen_bf16(u16::from_le_bytes(c.try_into().unwrap())))
+        .collect();
+    for row in 0..SEQ {
+        let want: f32 = (0..HIDDEN)
+            .map(|column| {
+                let x = xw[row * HIDDEN + column];
+                x * x
+            })
+            .sum();
+        let at = tile_index(row, 0);
+        let err = (got[at] - want).abs() / want;
+        assert!(
+            err <= 2e-2,
+            "bf16 sum row over {COLS} tiles, row {row}: got {}, want {want} (rel {err})",
+            got[at]
+        );
+    }
+}
+
+/// `rms_norm` at layer 0's shape in a bf16 kernel: every stage is a bf16 datum,
+/// so the reference is the f32 rule on the widened inputs and the tolerance
+/// covers the truncations (the 96-tile fold included).
+#[test]
+#[ignore = "blocked by the bf16 row fold (see bf16_sum_row_over_many_tiles)"]
+fn bf16_rms_norm_runs_on_the_simulator() {
+    const HIDDEN: usize = 3072;
+    const COLS: usize = HIDDEN / 32;
+    const SEQ: usize = 2;
+    const EPS: f32 = 1e-5;
+    let x_f: Vec<f32> = (0..32 * HIDDEN)
+        .map(|i| {
+            let (row, column) = (i / HIDDEN, i % HIDDEN);
+            if row < SEQ {
+                (((row as i32 * 97 + column as i32 * 31) % 17) - 8) as f32 * 0.5
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let scale_f: Vec<f32> = (0..32 * HIDDEN)
+        .map(|i| {
+            let row = i / HIDDEN;
+            if row < SEQ {
+                ((i % HIDDEN) % 7) as f32 * 0.25 + 0.5
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    // The kernel's input is the bf16 truncation; the oracle widens it back.
+    let xw: Vec<f32> = x_f
+        .iter()
+        .map(|v| widen_bf16(truncate_to_bf16(*v)))
+        .collect();
+    let sw: Vec<f32> = scale_f
+        .iter()
+        .map(|v| widen_bf16(truncate_to_bf16(*v)))
+        .collect();
+    let tiled_x = tiled(32, HIDDEN, &xw);
+    let tiled_s = tiled(32, HIDDEN, &sw);
+    let x_bytes: Vec<u8> = tiled_x
+        .iter()
+        .flat_map(|v| truncate_to_bf16(*v).to_le_bytes())
+        .collect();
+    let s_bytes: Vec<u8> = tiled_s
+        .iter()
+        .flat_map(|v| truncate_to_bf16(*v).to_le_bytes())
+        .collect();
+    let mut ones = vec![0u16; 1024];
+    for row in 0..32 {
+        ones[tile_index(row, 0)] = truncate_to_bf16(1.0);
+    }
+    let ones_bytes: Vec<u8> = ones.iter().flat_map(|h| h.to_le_bytes()).collect();
+    let out = run_kernel_tensors(
+        RMS_NORM_BF16,
+        &[&x_bytes, &s_bytes, &ones_bytes],
+        COLS * 1024 * 2,
+    );
+    let got: Vec<f32> = out
+        .chunks_exact(2)
+        .map(|c| widen_bf16(u16::from_le_bytes(c.try_into().unwrap())))
+        .collect();
+    let mut worst = 0.0f32;
+    let mut worst_at = (0usize, 0usize);
+    // The oracle mirrors the datapath: each instruction's result is a bf16
+    // datum, so every stage truncates, and the 96-tile fold accumulates in the
+    // 16-bit `Dst` (tt-metal's row reduce has no fp32 accumulation on Blackhole,
+    // #47311 — the truncating adds bias the sum low, by design).
+    let bf = |v: f32| widen_bf16(truncate_to_bf16(v));
+    let inv = bf(1.0 / HIDDEN as f32);
+    let eps = bf(EPS);
+    for row in 0..SEQ {
+        let mut acc = 0.0f32;
+        for tile in 0..COLS {
+            let mut tile_sum = 0.0f32;
+            for column in 0..32 {
+                let x = xw[row * HIDDEN + tile * 32 + column];
+                tile_sum += x * x;
+            }
+            acc = bf(acc + tile_sum);
+        }
+        let mean = bf(acc * inv);
+        let rms = bf((bf(mean + eps)).sqrt().recip());
+        for column in 0..HIDDEN {
+            let y = bf(xw[row * HIDDEN + column] * rms);
+            let want = bf(y * sw[row * HIDDEN + column]);
+            let at = (column / 32) * 1024 + tile_index(row, column % 32);
+            let error = (got[at] - want).abs();
+            if error > worst {
+                worst = error;
+                worst_at = (row, column);
+            }
+            // Two bf16 ulps: the lane's `rsqrt` and the tile-internal fold are
+            // f32 and can land on the other side of a truncation boundary.
+            assert!(
+                error <= 2.0 * (want.abs().max(1.0) * 0.0078125 * 2.0),
+                "bf16 rms_norm token {row} column {column}: got {}, want {want} (error {error})",
+                got[at]
+            );
+        }
+    }
+    eprintln!("bf16 rms_norm: worst error {worst} at {worst_at:?}");
+}
+
+/// `softmax` down a tile's columns in a bf16 kernel: a 16-bit `Dst`, a bf16
+/// accumulator, and constants at the tile's dtype.
+const SOFTMAX_COL_BF16: &str = "\
+version 9
+grid 1,1
+%px = param bf16 1024
+%ps = param bf16 1024
+%out = param bf16 1024
+%bx = buffer bf16 32,32
+%bs = buffer bf16 32,32
+%bsum = buffer bf16 32,32
+%binv = buffer bf16 32,32
+%bo = buffer bf16 32,32
+copy 32,32 %bx [0] = %px [0]
+copy 32,32 %bs [0] = %ps [0]
+%m = acc bf16 1,32
+%low = const f32 -1000
+store 32,32 %m = %low
+load 32,32 %x = %bx [0]
+max %m %x
+%d = sub %x %m
+%k = const bf16 1.442695
+%p = mul %d %k
+%e = exp2 %p
+%s = acc bf16 1,32
+%zero = const f32 0
+store 32,32 %s = %zero
+load 32,32 %ones = %bs [0]
+sum %s %e %ones
+store 32,32 %bsum [0] = %s
+load 32,32 %st = %bsum [0]
+%inv = div %ones %st
+store 32,32 %binv [0] = %inv
+load 1,32 %ri = %binv [0]
+%y = mul %e %ri
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
+";
+
+/// `softmax` down a tile's columns in a bf16 kernel: the fold is 32 terms, so
+/// the truncations stay small; every datum is checked against the host's
+/// column softmax of the widened input, and each column sums to one.
+#[test]
+fn bf16_softmax_runs_on_the_simulator() {
+    let x: Vec<u16> = (0..1024)
+        .map(|i| {
+            let (row, column) = tile_rc(i);
+            truncate_to_bf16(((row as i32 * 7 + column as i32 * 3) % 11) as f32 / 4.0 - 1.25)
+        })
+        .collect();
+    let xw: Vec<f32> = x.iter().map(|h| widen_bf16(*h)).collect();
+    let x_bytes: Vec<u8> = x.iter().flat_map(|h| h.to_le_bytes()).collect();
+    let mut scaler = vec![0u16; 1024];
+    for column in 0..32 {
+        scaler[tile_index(0, column)] = truncate_to_bf16(1.0);
+        scaler[tile_index(16, column)] = truncate_to_bf16(1.0);
+    }
+    let s_bytes: Vec<u8> = scaler.iter().flat_map(|h| h.to_le_bytes()).collect();
+    let mut want = vec![0.0f32; 1024];
+    for column in 0..32 {
+        let hi = (0..32)
+            .map(|row| xw[tile_index(row, column)])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = (0..32)
+            .map(|row| (xw[tile_index(row, column)] - hi).exp())
+            .collect();
+        let sum: f32 = exps.iter().sum();
+        for row in 0..32 {
+            want[tile_index(row, column)] = exps[row] / sum;
+        }
+    }
+    let out = run_kernel_tensors(SOFTMAX_COL_BF16, &[&x_bytes, &s_bytes], 1024 * 2);
+    let got: Vec<f32> = out
+        .chunks_exact(2)
+        .map(|c| widen_bf16(u16::from_le_bytes(c.try_into().unwrap())))
+        .collect();
+    let mut worst = 0.0f32;
+    for i in 0..1024 {
+        let (row, column) = tile_rc(i);
+        let error = (got[i] - want[i]).abs();
+        worst = worst.max(error);
+        // Two bf16 ulps of the result: the exponentials and the reciprocal are
+        // bf16 data between instructions. Measured worst is 7.6e-4.
+        assert!(
+            error <= 2e-3,
+            "bf16 softmax, datum {i} at ({row}, {column}): got {}, want {}",
+            got[i],
+            want[i]
+        );
+    }
+    for column in 0..32 {
+        let sum: f32 = (0..32).map(|row| got[tile_index(row, column)]).sum();
+        assert!(
+            (sum - 1.0).abs() <= 5e-2,
+            "bf16 softmax: column {column} sums to {sum}, not one"
+        );
+    }
+    eprintln!("bf16 softmax: worst error {worst}");
+}
+
 /// The embedding gather as pure data movement: the row of ids is copied in as a
 /// whole row, and the copy that follows names that row as its index — one base
 /// per lane — so each lane pulls one weight row into the tile the last copy
