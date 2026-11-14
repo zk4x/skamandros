@@ -12,6 +12,8 @@
 //! it holds the id of one of the three slabs, so a pass can rename what an op
 //! touches without touching the op.
 
+use core::fmt;
+
 use crate::ir::{DType, Dim, Error};
 use crate::slab::{Slab, SlabId};
 
@@ -533,5 +535,423 @@ impl MachineKernel {
     /// the register it names.
     pub fn verify(&self) -> Result<(), Error> {
         crate::optimize::verify(self)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The printed form
+// ---------------------------------------------------------------------------
+
+impl fmt::Display for MachineKernel {
+    /// The machine kernel as assembly: the allocations first, then every op in
+    /// the one order, tagged with the core it runs on.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (id, info) in self.cbs.iter() {
+            writeln!(
+                f,
+                "cb{} = ring {} {},{} x{}",
+                id.0,
+                info.dtype.name(),
+                info.page[0],
+                info.page[1],
+                info.len
+            )?;
+        }
+        for (id, info) in self.dsts.iter() {
+            writeln!(
+                f,
+                "dst{} = {} {},{}",
+                id.0,
+                info.dtype.name(),
+                info.shape[0],
+                info.shape[1]
+            )?;
+        }
+        for (id, dtype) in self.lregs.iter() {
+            writeln!(f, "lreg{} = lane {}", id.0, dtype.name())?;
+        }
+        writeln!(
+            f,
+            "mode = {}",
+            if self.dst_is_16_bit {
+                "16-bit"
+            } else {
+                "32-bit"
+            }
+        )?;
+        for (sem, value) in &self.sems {
+            writeln!(f, "sem{sem} = {value}")?;
+        }
+        for (_, (core, op)) in self.ops.iter() {
+            write!(f, "{}: ", core.name())?;
+            write_op(f, op)?;
+            writeln!(f)?;
+        }
+        Ok(())
+    }
+}
+
+impl Core {
+    /// The name a program's lines are tagged with.
+    pub fn name(self) -> &'static str {
+        match self {
+            Core::Reader => "reader",
+            Core::Unpack => "unpack",
+            Core::Math => "math",
+            Core::Pack => "pack",
+            Core::Writer => "writer",
+        }
+    }
+}
+
+fn lane(reg: LReg) -> String {
+    format!("lreg{}", reg.0)
+}
+
+fn dst_addr(reg: Dst, at: u32) -> String {
+    format!("dst{}[{}]", reg.0, at)
+}
+
+fn cb_name(cb: Cb) -> String {
+    format!("cb{}", cb.0)
+}
+
+fn rx(reg: u8) -> String {
+    format!("x{reg}")
+}
+
+/// One instruction, in the assembly form: the mnemonic and its operands, the
+/// way the encoder's comments name them.
+fn write_op(f: &mut dyn fmt::Write, op: &MirOp) -> fmt::Result {
+    match *op {
+        MirOp::Sfpload {
+            lreg,
+            reg,
+            at,
+            dtype,
+        } => write!(
+            f,
+            "sfpload {} <- {}, {}",
+            lane(lreg),
+            dst_addr(reg, at),
+            dtype.name()
+        ),
+        MirOp::Sfpstore {
+            lreg,
+            reg,
+            at,
+            dtype,
+        } => write!(
+            f,
+            "sfpstore {}, {} <- {}",
+            dst_addr(reg, at),
+            dtype.name(),
+            lane(lreg)
+        ),
+        MirOp::LaneConst { lreg, bits } => write!(f, "laneconst {} = 0x{bits:08x}", lane(lreg)),
+        MirOp::UnarySfp { op, a, d } => {
+            write!(f, "{} {} -> {}", unary_name(op), lane(a), lane(d))
+        }
+        MirOp::BinarySfp { op, a, b, d } => write!(
+            f,
+            "{} {}, {} -> {}",
+            binary_name(op),
+            lane(a),
+            lane(b),
+            lane(d)
+        ),
+        MirOp::Compare { op, a, b, d } => write!(
+            f,
+            "cmp{} {}, {} -> {}",
+            cmp_name(op),
+            lane(a),
+            lane(b),
+            lane(d)
+        ),
+        MirOp::Cast { from, to, a, d } => write!(
+            f,
+            "cast {} -> {} ({} -> {})",
+            lane(a),
+            lane(d),
+            from.name(),
+            to.name()
+        ),
+        MirOp::Select { cond, t, f: no, d } => write!(
+            f,
+            "select {}, {}, {} -> {}",
+            lane(cond),
+            lane(t),
+            lane(no),
+            lane(d)
+        ),
+        MirOp::Max { a, b, d } => write!(f, "max {}, {} -> {}", lane(a), lane(b), lane(d)),
+        MirOp::UnpackConfig {
+            unit,
+            to_src,
+            dtype,
+            haloize,
+        } => write!(
+            f,
+            "unpack_config u{unit} {}{}{}",
+            if to_src { "src" } else { "dst" },
+            if haloize { " haloize" } else { "" },
+            format_args!(" {}", dtype.name())
+        ),
+        MirOp::Unpacr { unit, count, flip } => write!(
+            f,
+            "unpacr u{unit} {count}{}",
+            if flip { " flip" } else { "" }
+        ),
+        MirOp::Setadczw { unit, face } => write!(f, "setadczw u{unit} face {face}"),
+        MirOp::Setadcx { unit, first, count } => {
+            write!(f, "setadcx u{unit} {first}..{}", first + count)
+        }
+        MirOp::Mvmul {
+            reg,
+            at,
+            addr_mod,
+            flip_a,
+            flip_b,
+        } => write!(
+            f,
+            "mvmul {}, am{addr_mod}{}{}",
+            dst_addr(reg, at),
+            if flip_a { " flip_a" } else { "" },
+            if flip_b { " flip_b" } else { "" }
+        ),
+        MirOp::Elw {
+            op,
+            bcast,
+            addr_mod,
+            reg,
+            at,
+        } => write!(
+            f,
+            "elw{} {} {}, am{addr_mod}",
+            elw_name(op),
+            dst_addr(reg, at),
+            bcast_name(bcast)
+        ),
+        MirOp::Gapool {
+            flip_src_b,
+            flip_src_a,
+            addr_mod,
+            reg,
+            at,
+        } => write!(
+            f,
+            "gapool {}, am{addr_mod}{}{}",
+            dst_addr(reg, at),
+            if flip_src_a { " flip_a" } else { "" },
+            if flip_src_b { " flip_b" } else { "" }
+        ),
+        MirOp::Gmpool {
+            flip_src_b,
+            flip_src_a,
+            addr_mod,
+            arg_max,
+            reg,
+            at,
+        } => write!(
+            f,
+            "gmpool {}, am{addr_mod} argmax{arg_max}{}{}",
+            dst_addr(reg, at),
+            if flip_src_a { " flip_a" } else { "" },
+            if flip_src_b { " flip_b" } else { "" }
+        ),
+        MirOp::Movd2b {
+            use_dst32b_lo,
+            src_row,
+            addr_mod,
+            move4_rows,
+            reg,
+            at,
+        } => write!(
+            f,
+            "movd2b {} -> srcb[{src_row}], am{addr_mod}{}{}",
+            dst_addr(reg, at),
+            if move4_rows { " 4rows" } else { "" },
+            if use_dst32b_lo { " lo" } else { "" }
+        ),
+        MirOp::Movb2d {
+            use_dst32b_lo,
+            src_row,
+            addr_mod,
+            move4_rows,
+            reg,
+            at,
+        } => write!(
+            f,
+            "movb2d srcb[{src_row}] -> {}, am{addr_mod}{}{}",
+            dst_addr(reg, at),
+            if move4_rows { " 4rows" } else { "" },
+            if use_dst32b_lo { " lo" } else { "" }
+        ),
+        MirOp::Movb2a {
+            src_a_row,
+            addr_mod,
+            move4_rows,
+            src_b_row,
+        } => write!(
+            f,
+            "movb2a srcb[{src_b_row}] -> srca[{src_a_row}], am{addr_mod}{}",
+            if move4_rows { " 4rows" } else { "" }
+        ),
+        MirOp::Mova2d {
+            use_dst32b_lo,
+            src_row,
+            addr_mod,
+            move8_rows,
+            reg,
+            at,
+        } => write!(
+            f,
+            "mova2d srca[{src_row}] -> {}, am{addr_mod}{}{}",
+            dst_addr(reg, at),
+            if move8_rows { " 8rows" } else { "" },
+            if use_dst32b_lo { " lo" } else { "" }
+        ),
+        MirOp::Trnspsrcb => write!(f, "trnspsrcb"),
+        MirOp::AluAccCtrl {
+            fp32,
+            zero_flag_src,
+        } => write!(
+            f,
+            "alu_acc_ctrl {}{}",
+            if fp32 { "fp32" } else { "16b" },
+            if zero_flag_src { " keep_denorm" } else { "" }
+        ),
+        MirOp::SrcAFormat { dtype } => write!(f, "srca_format {}", dtype.name()),
+        MirOp::Setrwc {
+            src_a,
+            src_b,
+            dst,
+            flip_src_a,
+            flip_src_b,
+            dst_cr,
+        } => write!(
+            f,
+            "setrwc a{src_a} b{src_b} d{dst}{}{}{}",
+            if flip_src_a { " flip_a" } else { "" },
+            if flip_src_b { " flip_b" } else { "" },
+            if dst_cr { " dst_cr" } else { "" }
+        ),
+        MirOp::ThreadWord { addr, value } => write!(f, "threadword 0x{addr:04x} = {value}"),
+        MirOp::WaitMatrix => write!(f, "wait_matrix"),
+        MirOp::Setdst { reg } => write!(f, "setdst dst{}", reg.0),
+        MirOp::SetPackBase { cb } => write!(f, "setpackbase {}", cb_name(cb)),
+        MirOp::SetPackConfig { dtype, mask } => {
+            write!(f, "setpackconfig {} {}", dtype.name(), mask_name(mask))
+        }
+        MirOp::SetPackOffset { reg, at } => write!(f, "setpackoffset {}", dst_addr(reg, at)),
+        MirOp::PackRows { rows, last } => {
+            write!(f, "packrows {rows}{}", if last { " last" } else { "" })
+        }
+        MirOp::SetUnpackBase { cb, unit } => {
+            write!(f, "setunpackbase {} u{unit}", cb_name(cb))
+        }
+        MirOp::CbWait { cb } => write!(f, "cbwait {}", cb_name(cb)),
+        MirOp::CbPop { cb } => write!(f, "cbpop {}", cb_name(cb)),
+        MirOp::CbReserve { cb } => write!(f, "cbreserve {}", cb_name(cb)),
+        MirOp::CbPush { cb } => write!(f, "cbpush {}", cb_name(cb)),
+        MirOp::Semset { sem, value } => write!(f, "semset {sem} = {value}"),
+        MirOp::SemPost { sem } => write!(f, "sempost {sem}"),
+        MirOp::SemWait { sem, before } => write!(f, "semwait {sem} before {before}"),
+        MirOp::SemWaitFree { sem } => write!(f, "semwaitfree {sem}"),
+        MirOp::Repeat { len, count } => write!(f, "repeat {count} x {len}"),
+        MirOp::Loop { count } => write!(f, "loop {count}"),
+        MirOp::LoopReg { reg } => write!(f, "loop {}", rx(reg)),
+        MirOp::Li { reg, value } => write!(f, "li {}, {value}", rx(reg)),
+        MirOp::LoadArg { reg, arg } => write!(f, "lw {}, {arg}(a0)", rx(reg)),
+        MirOp::LoadCoord { reg, axis } => write!(f, "lw {}, core_info+{}(0)", rx(reg), axis * 4),
+        MirOp::IArith { op, d, a, b } => {
+            write!(f, "{} {}, {}, {}", iop_name(op), rx(d), rx(a), rx(b))
+        }
+        MirOp::EndLoop => write!(f, "endloop"),
+        MirOp::Copy {
+            cb,
+            param,
+            bytes,
+            offset,
+            inbound,
+        } => write!(
+            f,
+            "copy {} {} param{param}[{}] {bytes} bytes",
+            if inbound { "<-" } else { "->" },
+            cb_name(cb),
+            rx(offset)
+        ),
+    }
+}
+
+fn unary_name(op: UnarySfpOp) -> &'static str {
+    match op {
+        UnarySfpOp::Neg => "neg",
+        UnarySfpOp::Abs => "abs",
+        UnarySfpOp::BitNot => "bitnot",
+        UnarySfpOp::Exexp => "exexp",
+    }
+}
+
+fn binary_name(op: BinarySfpOp) -> &'static str {
+    match op {
+        BinarySfpOp::Add => "fadd",
+        BinarySfpOp::Sub => "fsub",
+        BinarySfpOp::Mul => "fmul",
+        BinarySfpOp::BitAnd => "and",
+        BinarySfpOp::BitOr => "or",
+        BinarySfpOp::BitXor => "xor",
+        BinarySfpOp::Shl => "shl",
+        BinarySfpOp::Shr => "shr",
+        BinarySfpOp::IAdd => "iadd",
+        BinarySfpOp::ISub => "isub",
+        BinarySfpOp::Setexp => "setexp",
+    }
+}
+
+fn cmp_name(op: CmpOp) -> &'static str {
+    match op {
+        CmpOp::Lt => "lt",
+        CmpOp::Gt => "gt",
+        CmpOp::Ge => "ge",
+    }
+}
+
+fn elw_name(op: ElwOp) -> &'static str {
+    match op {
+        ElwOp::Add => "add",
+        ElwOp::Sub => "sub",
+        ElwOp::Mul => "mul",
+    }
+}
+
+fn bcast_name(bcast: Bcast) -> &'static str {
+    match bcast {
+        Bcast::Row => "row",
+        Bcast::Col => "col",
+        Bcast::Scalar => "scalar",
+    }
+}
+
+fn mask_name(mask: PackMask) -> &'static str {
+    match mask {
+        PackMask::None => "none",
+        PackMask::Col => "col",
+        PackMask::Row => "row",
+    }
+}
+
+fn iop_name(op: IOp) -> &'static str {
+    match op {
+        IOp::Add => "add",
+        IOp::Sub => "sub",
+        IOp::Mul => "mul",
+        IOp::Div => "div",
+        IOp::Rem => "rem",
+        IOp::And => "and",
+        IOp::Or => "or",
+        IOp::Xor => "xor",
+        IOp::Sll => "sll",
+        IOp::Sra => "sra",
     }
 }

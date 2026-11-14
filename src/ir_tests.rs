@@ -1069,3 +1069,42 @@ copy 32,32 %out [0] = %bo [0]
         S::TT_TODO_REDUCE,
     );
 }
+
+/// An inspection: the loop kernel's IR after every step, printed in the
+/// assembly form. Added for the reader; whether it stays is the user's call.
+#[test]
+fn show_the_loop_kernel_after_each_step() {
+    const LOOP: &str = "\
+version 9
+grid 1,1
+%in = param f32 2048
+%out = param f32 2048
+%bi = buffer f32 32,64
+%bo = buffer f32 32,64
+%two = const i32 2
+%step = const i32 1
+%i = loop %two
+%o = mul %i %step
+copy 32,32 %bi [%o] = %in [%o]
+load 32,32 %x = %bi [%o]
+%y = neg %x
+store 32,32 %bo [%o] = %y
+copy 32,32 %out [%o] = %bo [%o]
+endloop
+";
+    let k = Kernel::parse(LOOP).expect("the loop kernel parses");
+    println!("== parsed ==\n{k}");
+    let k = crate::unfold::unfold(&k).expect("unfold");
+    println!("== unfolded ==\n{k}");
+    let k = crate::mover::add_movers(&k).expect("movers");
+    println!("== movers ==\n{k}");
+    let mut m = k.lower().expect("lower");
+    println!("== lowered ==\n{m}");
+    crate::optimize::reg_sync(&mut m);
+    println!("== reg_sync ==\n{m}");
+    crate::optimize::fuse(&mut m);
+    println!("== fused ==\n{m}");
+    m.alloc().expect("alloc");
+    m.plan_cbs().expect("plan_cbs");
+    println!("== allocated ==\n{m}");
+}
