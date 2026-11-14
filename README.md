@@ -114,10 +114,17 @@ the bank's slots: `softmax` needs eleven live values in eight slots.
 
 Open, in the order they block a release:
 
-- **The bf16 row fold over-accumulates by 13 % over 96 tiles** (found
-  2026-11-14, `tests/e2e.rs::bf16_sum_row_over_many_tiles`, ignored). It is the
-  rms_norm denominator, so a bf16 `rms_norm` is off by ~7 % until it is fixed;
-  `bf16_rms_norm_runs_on_the_simulator` is written and ignored beside it.
+- **The 16-bit `Dst` accumulates at bf16, and the 32-bit `stage` mislays a
+  computed tile.** The acc's declared dtype is the fold's dtype (the verifier
+  now takes a wider acc), so a `bf16` accumulator over 96 tiles of `x²` drifts
+  +13.2 % (`tests/e2e.rs::bf16_sum_row_over_many_tiles`, ignored) — the per-tile
+  steps are quantized to the `Dst`'s bf16 ulp, so it is the accumulator, not the
+  fold. `acc f32` over bf16 tiles compiles but a wide module stages the computed
+  operand through the packer's `0x105` conversion, which ttsim does not model.
+  In an all-f32 kernel the fold with *loaded* tiles is exact; with a *computed*
+  (`stage`d) tile the page comes back mislaid (every output row nonzero,
+  ~column sums, period 16). That staging bug is the next blocker; then
+  `bf16_rms_norm_runs_on_the_simulator` can name `acc f32`.
 - `ttsim` does not model the packer's `f32 -> bf16` conversion
   (`pack_fmt_conv_mode=0x105`), so that path — and every bf16 page written out
   of a 32-bit `Dst` — compiles but cannot be run here. It needs silicon.

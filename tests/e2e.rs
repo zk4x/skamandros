@@ -5119,6 +5119,362 @@ fn bf16_sum_row_over_many_tiles() {
     }
 }
 
+fn sum_row_probe_program(n: u32, dt: &str, acc: &str, out: &str) -> String {
+    format!(
+        "\
+version 9
+grid 1,1
+%px = param {dt} 98304
+%pone = param {dt} 1024
+%out = param {out} 1024
+%bx = buffer {dt} 32,32
+%bones = buffer {dt} 32,32
+%bacc = buffer {out} 32,32
+%bo = buffer {out} 32,32
+%acc = acc {acc} 32,1
+%zero = const f32 0
+%one = const i32 1
+%n = const i32 {n}
+copy 32,32 %bones [0] = %pone [0]
+store 32,32 %acc = %zero
+%i = loop %n
+%oi = mul %i %one
+copy 32,32 %bx [0] = %px [%oi]
+load 32,32 %x = %bx [0]
+%sq = mul %x %x
+copy 32,32 %bones [0] = %pone [0]
+load 32,32 %ones = %bones [0]
+sum %acc %sq %ones
+endloop
+store 32,32 %bacc [0] = %acc
+load 32,32 %st = %bacc [0]
+store 32,32 %bo [0] = %st
+copy 32,32 %out [0] = %bo [0]
+"
+    )
+}
+
+/// The same fold with the squares already in the page: no computed value is
+/// staged, so the Matrix Unit reads the page the reader moved in. It is the A/B
+/// for `sum_row_probe_program`: same matmul, same accumulator, no `stage`.
+fn sum_loaded_probe_program(n: u32, dt: &str, acc: &str, out: &str) -> String {
+    format!(
+        "\
+version 9
+grid 1,1
+%px = param {dt} 98304
+%pone = param {dt} 1024
+%out = param {out} 1024
+%bx = buffer {dt} 32,32
+%bones = buffer {dt} 32,32
+%bacc = buffer {out} 32,32
+%bo = buffer {out} 32,32
+%acc = acc {acc} 32,1
+%zero = const f32 0
+%one = const i32 1
+%n = const i32 {n}
+copy 32,32 %bones [0] = %pone [0]
+store 32,32 %acc = %zero
+%i = loop %n
+%oi = mul %i %one
+copy 32,32 %bx [0] = %px [%oi]
+load 32,32 %x = %bx [0]
+copy 32,32 %bones [0] = %pone [0]
+load 32,32 %ones = %bones [0]
+sum %acc %x %ones
+endloop
+store 32,32 %bacc [0] = %acc
+load 32,32 %st = %bacc [0]
+store 32,32 %bo [0] = %st
+copy 32,32 %out [0] = %bo [0]
+"
+    )
+}
+
+#[test]
+fn probe_bf16_row_fold() {
+    const HIDDEN: usize = 3072;
+    const SEQ: usize = 2;
+    let x_f: Vec<f32> = (0..32 * HIDDEN)
+        .map(|i| {
+            let (row, column) = (i / HIDDEN, i % HIDDEN);
+            if row < SEQ {
+                (((row as i32 * 97 + column as i32 * 31) % 17) - 8) as f32 * 0.5
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let xw: Vec<f32> = x_f
+        .iter()
+        .map(|v| widen_bf16(truncate_to_bf16(*v)))
+        .collect();
+    let tiled_x = tiled(32, HIDDEN, &xw);
+    let x_bytes: Vec<u8> = tiled_x
+        .iter()
+        .flat_map(|v| truncate_to_bf16(*v).to_le_bytes())
+        .collect();
+    let mut ones = vec![0u16; 1024];
+    for row in 0..32 {
+        ones[tile_index(row, 0)] = truncate_to_bf16(1.0);
+    }
+    let ones_bytes: Vec<u8> = ones.iter().flat_map(|h| h.to_le_bytes()).collect();
+    let tile_sums: Vec<f32> = (0..HIDDEN / 32)
+        .map(|t| {
+            (0..32)
+                .map(|c| {
+                    let x = xw[t * 32 + c];
+                    x * x
+                })
+                .sum()
+        })
+        .collect();
+    let mut prev_got = 0.0f32;
+    let mut prev_want = 0.0f32;
+    for n in 1u32..=96 {
+        let out = run_kernel_tensors(
+            &sum_row_probe_program(n, "bf16", "bf16", "bf16"),
+            &[&x_bytes, &ones_bytes],
+            1024 * 2,
+        );
+        let got = widen_bf16(u16::from_le_bytes(out[0..2].try_into().unwrap()));
+        let want: f32 = tile_sums[..n as usize].iter().sum();
+        eprintln!(
+            "n {n}: got {got} want {want} delta {} step {} tilesum {}",
+            got - want,
+            got - prev_got,
+            tile_sums[n as usize - 1]
+        );
+        prev_got = got;
+        prev_want = want;
+    }
+    let _ = prev_want;
+    // The host model of the 16-bit accumulator: each tile adds its two
+    // 16-column halves into a `Dst` that rounds to bf16 after every add. The
+    // squares themselves are the SFPU's bf16 products.
+    let round_bf16 = |v: f32| {
+        let bits = v.to_bits();
+        let bias = 0x7FFF + ((bits >> 16) & 1);
+        f32::from_bits((bits.wrapping_add(bias)) & 0xFFFF_0000)
+    };
+    let sq: Vec<f32> = (0..HIDDEN).map(|c| round_bf16(xw[c] * xw[c])).collect();
+    for parts in [1usize, 2, 4, 8] {
+        let width = 32 / parts;
+        let mut acc = 0.0f32;
+        for n in 1..=96 {
+            for p in 0..parts {
+                let at = (n - 1) * 32 + p * width;
+                let partial: f32 = sq[at..at + width].iter().sum();
+                acc = round_bf16(acc + partial);
+            }
+        }
+        eprintln!("model {parts} partials of {width}: n96 acc {acc}");
+    }
+    for unit in [1.0f32, 2.0, 0.5, 3.0, 4.0, 8.0] {
+        let u: Vec<f32> = (0..32 * HIDDEN).map(|_| unit).collect();
+        let tiled_u = tiled(32, HIDDEN, &u);
+        let u_bytes: Vec<u8> = tiled_u
+            .iter()
+            .flat_map(|v| truncate_to_bf16(*v).to_le_bytes())
+            .collect();
+        let out = run_kernel_tensors(
+            &sum_row_probe_program(96, "bf16", "bf16", "bf16"),
+            &[&u_bytes, &ones_bytes],
+            1024 * 2,
+        );
+        let row0 = widen_bf16(u16::from_le_bytes(out[0..2].try_into().unwrap()));
+        let row1 = widen_bf16(u16::from_le_bytes(out[2..4].try_into().unwrap()));
+        eprintln!(
+            "uniform {unit}, 96 tiles: row0 {row0}, row1 {row1}, want {}",
+            96.0 * 32.0 * unit * unit
+        );
+    }
+    // The same tile repeated 96 times, and 96 rotations of it: every tile's
+    // true sum is identical, so only the fold's accumulation or the per-tile
+    // staging can move the result.
+    let pattern: Vec<f32> = (0..1024)
+        .map(|i| (((i % 32) * 31 + (i / 32) * 17) % 9) as f32 * 0.5 + 0.25)
+        .collect();
+    let pattern_row0: f32 = (0..32)
+        .map(|c| {
+            let v = pattern[c];
+            v * v
+        })
+        .sum();
+    let mut repeated = vec![0f32; 32 * HIDDEN];
+    for t in 0..HIDDEN / 32 {
+        for r in 0..32 {
+            for c in 0..32 {
+                repeated[r * HIDDEN + t * 32 + c] = pattern[r * 32 + c];
+            }
+        }
+    }
+    let repeated_bytes: Vec<u8> = tiled(32, HIDDEN, &repeated)
+        .iter()
+        .flat_map(|v| truncate_to_bf16(*v).to_le_bytes())
+        .collect();
+    let out = run_kernel_tensors(
+        &sum_row_probe_program(96, "bf16", "bf16", "bf16"),
+        &[&repeated_bytes, &ones_bytes],
+        1024 * 2,
+    );
+    let got = widen_bf16(u16::from_le_bytes(out[0..2].try_into().unwrap()));
+    eprintln!(
+        "pattern repeated 96 tiles: got {got}, want {}, rel {}",
+        pattern_row0 * 96.0,
+        (got - pattern_row0 * 96.0) / (pattern_row0 * 96.0)
+    );
+    let mut rotated = vec![0f32; 32 * HIDDEN];
+    for t in 0..HIDDEN / 32 {
+        for r in 0..32 {
+            for c in 0..32 {
+                rotated[r * HIDDEN + t * 32 + c] = pattern[((r + t) % 32) * 32 + c];
+            }
+        }
+    }
+    let rotated_bytes: Vec<u8> = tiled(32, HIDDEN, &rotated)
+        .iter()
+        .flat_map(|v| truncate_to_bf16(*v).to_le_bytes())
+        .collect();
+    let out = run_kernel_tensors(
+        &sum_row_probe_program(96, "bf16", "bf16", "bf16"),
+        &[&rotated_bytes, &ones_bytes],
+        1024 * 2,
+    );
+    let got = widen_bf16(u16::from_le_bytes(out[0..2].try_into().unwrap()));
+    eprintln!(
+        "pattern rotated 96 tiles: got {got}, want {}, rel {}",
+        pattern_row0 * 96.0,
+        (got - pattern_row0 * 96.0) / (pattern_row0 * 96.0)
+    );
+    {
+        let out = run_kernel_tensors(
+            &sum_row_probe_program(96, "bf16", "bf16", "bf16"),
+            &[&x_bytes, &ones_bytes],
+            1024 * 2,
+        );
+        let got: Vec<f32> = out
+            .chunks_exact(2)
+            .map(|c| widen_bf16(u16::from_le_bytes(c.try_into().unwrap())))
+            .collect();
+        for row in 0..4 {
+            let want: f32 = (0..HIDDEN)
+                .map(|c| {
+                    let x = xw[row * HIDDEN + c];
+                    x * x
+                })
+                .sum();
+            eprintln!(
+                "row {row}: got {} want {want} rel {}",
+                got[tile_index(row, 0)],
+                (got[tile_index(row, 0)] - want) / want
+            );
+        }
+    }
+    let x_f32: Vec<u8> = xw.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let ones_f32: Vec<u8> = ones
+        .iter()
+        .flat_map(|h| widen_bf16(*h).to_le_bytes())
+        .collect();
+    // A bf16 tile folded into an f32 acc is accepted by the verifier now, but a
+    // wide module packs the staged bf16 operand through `pack_fmt_conv_mode`
+    // `0x105`, which ttsim does not model (PACR aborts); that form needs
+    // silicon, so it is not run here.
+    for n in [1u32, 2, 4, 8, 16, 32, 48, 96] {
+        let out = run_kernel_tensors(
+            &sum_row_probe_program(n, "f32", "f32", "f32"),
+            &[&x_f32, &ones_f32],
+            1024 * 4,
+        );
+        let got = f32::from_le_bytes(out[0..4].try_into().unwrap());
+        let want: f32 = tile_sums[..n as usize].iter().sum();
+        eprintln!(
+            "f32 acc, {n} tiles: got {got}, want {want}, rel {}",
+            (got - want) / want
+        );
+    }
+    for unit in [1.0f32, 1.25, 1.5, 2.5, 3.0, 4.0] {
+        let u: Vec<f32> = (0..32 * HIDDEN).map(|_| unit).collect();
+        let tiled_u = tiled(32, HIDDEN, &u);
+        let u_bytes: Vec<u8> = tiled_u.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let out = run_kernel_tensors(
+            &sum_row_probe_program(96, "f32", "f32", "f32"),
+            &[&u_bytes, &ones_f32],
+            1024 * 4,
+        );
+        let row0 = f32::from_le_bytes(out[0..4].try_into().unwrap());
+        eprintln!(
+            "f32 uniform {unit}, 96 tiles: row0 {row0}, want {}",
+            96.0 * 32.0 * unit * unit
+        );
+    }
+    let out = run_kernel_tensors(
+        &sum_row_probe_program(96, "f32", "f32", "f32"),
+        &[&x_f32, &ones_f32],
+        1024 * 4,
+    );
+    let out = run_kernel_tensors(
+        &sum_row_probe_program(1, "f32", "f32", "f32"),
+        &[&x_f32, &ones_f32],
+        1024 * 4,
+    );
+    let one: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for row in 0..32 {
+        let v = one[tile_index(row, 0)];
+        if v != 0.0 {
+            let want: f32 = (0..32)
+                .map(|c| {
+                    let x = xw[row * HIDDEN + c];
+                    x * x
+                })
+                .sum();
+            eprintln!("f32 n1 row {row}: got {v}, want {want}");
+        }
+    }
+    eprintln!(
+        "f32 first datums: {:?}",
+        out[0..32]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect::<Vec<_>>()
+    );
+    // The A/B: the squares are in the page, so nothing is staged.
+    let sq_f32: Vec<f32> = (0..32 * HIDDEN)
+        .map(|i| {
+            let x = xw[i];
+            x * x
+        })
+        .collect();
+    let sq_bytes: Vec<u8> = tiled(32, HIDDEN, &sq_f32)
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let out = run_kernel_tensors(
+        &sum_loaded_probe_program(1, "f32", "f32", "f32"),
+        &[&sq_bytes, &ones_f32],
+        1024 * 4,
+    );
+    let one: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for row in 0..32 {
+        let v = one[tile_index(row, 0)];
+        if v != 0.0 || row < 2 {
+            let want: f32 = (0..32)
+                .map(|c| {
+                    let x = xw[row * HIDDEN + c];
+                    x * x
+                })
+                .sum();
+            eprintln!("f32 loaded n1 row {row}: got {v}, want {want}");
+        }
+    }
+}
+
 /// `rms_norm` at layer 0's shape in a bf16 kernel: every stage is a bf16 datum,
 /// so the reference is the f32 rule on the widened inputs and the tolerance
 /// covers the truncations (the 96-tile fold included).

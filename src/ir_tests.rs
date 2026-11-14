@@ -1015,6 +1015,35 @@ fn the_reduce_forms_parse() {
     }
 }
 
+/// The accumulator's declared dtype is the fold's: a bf16 tile folded into an
+/// f32 `Dst` is a legal program (the fold accumulates at the acc's width).
+#[test]
+fn a_wider_acc_parses_and_compiles() {
+    const PROGRAM: &str = "\
+version 9
+grid 1,1
+%px = param bf16 1024
+%ps = param bf16 1024
+%out = param f32 1024
+%bx = buffer bf16 32,32
+%bs = buffer bf16 32,32
+%bo = buffer f32 32,32
+copy 32,32 %bx [0] = %px [0]
+copy 32,32 %bs [0] = %ps [0]
+%m = acc f32 32,1
+%zero = const f32 0
+store 32,32 %m = %zero
+load 32,32 %x = %bx [0]
+load 32,32 %s = %bs [0]
+sum %m %x %s
+store 32,32 %bo [0] = %m
+copy 32,32 %out [0] = %bo [0]
+";
+    let k = Kernel::parse(PROGRAM).expect("the bf16 tile into an f32 acc parses");
+    let m = compile::compile(&k).unwrap_or_else(|e| panic!("it compiles: {e}"));
+    assert_eq!(m.params.len(), 3);
+}
+
 #[test]
 fn a_sum_row_compiles_to_the_matrix_unit() {
     let k = Kernel::parse(&reduce_program("32,1", "sum %m %x %s", true)).expect("it parses");

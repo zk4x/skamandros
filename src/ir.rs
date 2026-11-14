@@ -1383,7 +1383,10 @@ impl Kernel {
             let _ = at;
             return Err(ttStatus::TT_ERROR_REDUCE_OPERAND);
         }
-        if x.dtype != a.dtype {
+        // The accumulator's declared dtype is the dtype the fold accumulates
+        // into: it may be wider than the tile (a bf16 tile into an f32 `Dst`),
+        // never narrower.
+        if x.dtype != a.dtype && !(x.dtype == DType::Bf16 && a.dtype == DType::F32) {
             let _ = (x.dtype, a.dtype);
             return Err(ttStatus::TT_ERROR_REDUCE_DTYPE);
         }
