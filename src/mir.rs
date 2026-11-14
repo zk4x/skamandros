@@ -454,6 +454,17 @@ pub enum MirOp {
     IArith { op: IOp, d: u8, a: u8, b: u8 },
     /// The branch back to the matching [`MirOp::Loop`] or [`MirOp::LoopReg`].
     EndLoop,
+    /// One NoC request the movers issue: `bytes` from the parameter at launch
+    /// argument `param`, whose byte offset is in `offset` (a RISC-V register the
+    /// surrounding ops filled), into (`inbound`) or out of the page `cb`'s ring
+    /// pointer names.
+    Copy {
+        cb: Cb,
+        param: u32,
+        bytes: u32,
+        offset: u8,
+        inbound: bool,
+    },
 }
 
 /// One kernel's machine program: the ops, in one total order, and what they
@@ -484,15 +495,16 @@ pub struct MachineKernel {
 
 impl MachineKernel {
     /// Append `op` to `core`'s program.
-    pub fn push(&mut self, core: Core, op: MirOp) -> MId {
-        self.ops.push((core, op))
+    pub fn push(&mut self, core: Core, op: MirOp) {
+        self.ops.push((core, op));
     }
 
-    /// One core's program, in program order.
+    /// One core's program, in program order. The semaphore inits are not
+    /// instructions and have no program of their own, so they are not here.
     pub fn stream(&self, core: Core) -> impl Iterator<Item = MirOp> + '_ {
         self.ops
             .iter()
-            .filter(move |(_, (c, _))| *c == core)
+            .filter(move |(_, (c, op))| *c == core && !matches!(op, MirOp::Semset { .. }))
             .map(|(_, (_, op))| *op)
     }
 

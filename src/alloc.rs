@@ -20,6 +20,8 @@ use crate::mir::{Cb, CbInfo, Core, Dst, DstInfo, LReg, MachineKernel, MirOp};
 
 /// Bytes per `Dst` register in 32-bit mode.
 const DST_BYTES: u32 = 32 * 32 * 4;
+/// Writable lane registers (`SFPLOAD`/`SFPSTORE` address `L0..L7`).
+pub const LREGS: u8 = 8;
 /// Alignment every ring starts at: the NoC requires the two addresses of a
 /// request to be congruent, and every copy's L1 side is a page start.
 const ALIGN: u32 = 64;

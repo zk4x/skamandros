@@ -785,10 +785,45 @@ impl Kernel {
     }
 }
 
+/// The two operands of an FPU broadcast, in `(tile, narrow)` order: an `add`,
+/// `sub` or `mul` of a tile with a row, a column or a datum goes through the
+/// FPU's `BroadcastType`, and both sides come from `Src` pages.
+pub(crate) fn broadcast_pair(k: &Kernel, op: &Op) -> Option<(OpId, OpId)> {
+    let Op::Binary { op, a, b } = *op else {
+        return None;
+    };
+    if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+        return None;
+    }
+    let (x, y) = (k.info(a), k.info(b));
+    if !matches!(x.dtype, DType::F32 | DType::Bf16) || !matches!(y.dtype, DType::F32 | DType::Bf16)
+    {
+        return None;
+    }
+    match (x.shape, y.shape) {
+        (RegShape::Tile, RegShape::Row | RegShape::Column | RegShape::Scalar) => Some((a, b)),
+        (RegShape::Row | RegShape::Column | RegShape::Scalar, RegShape::Tile) => Some((b, a)),
+        _ => None,
+    }
+}
+
 /// The crate's error: the one C ABI enum, [`crate::status::ttStatus`]. The
 /// `Error` name is an alias for it, not a second error type and not a second
 /// enum.
 pub use crate::status::ttStatus as Error;
+
+/// Rewrite every operand of `op` through `map`, the id translation a pass
+/// builds as it copies a program (zyx's `renumber`).
+pub fn renumber(op: &mut Op, map: &BTreeMap<OpId, OpId>) -> Result<(), Error> {
+    for param in op.parameters_mut() {
+        let to = map
+            .get(param)
+            .copied()
+            .ok_or(Error::TT_ERROR_VALUE_UNDEFINED)?;
+        *param = to;
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Shapes
@@ -845,7 +880,7 @@ fn cb_ring(shape: [Dim; 2], dtype: DType) -> Result<([Dim; 2], Dim), Error> {
 }
 
 /// The register shape a copy's or an access's `[Dim; 2]` unit names.
-fn access_shape(shape: [Dim; 2]) -> Result<RegShape, Error> {
+pub(crate) fn access_shape(shape: [Dim; 2]) -> Result<RegShape, Error> {
     let [a, b] = shape;
     Ok(match (a, b) {
         (0, _) | (_, 0) => return Err(Error::TT_ERROR_ZERO_DIMENSION),
@@ -1119,14 +1154,17 @@ impl Kernel {
                     if !matches!(unit, RegShape::Row | RegShape::Tile) {
                         return Err(Error::TT_ERROR_COPY_UNIT);
                     }
-                    self.expect_index_scalar(param_offset, at)?;
-                    self.expect_index_scalar(buffer_offset, at)?;
+                    let lanes = self.expect_offset(param_offset, at)?;
+                    let page = self.expect_offset(buffer_offset, at)?;
+                    if page != 1 {
+                        return Err(Error::TT_TODO_MULTI_LANE);
+                    }
                     let (page, len) = match *self.at(buffer) {
                         Op::Cb { page, len, .. } => (page, len),
                         _ => return Err(Error::TT_ERROR_NOT_A_BUFFER),
                     };
                     let (unit_shape, _, _) = unit_of(page, self.dtype(buffer))?;
-                    if shape[0] * shape[1] != unit_shape.datums() {
+                    if lanes.checked_mul(shape[0] * shape[1]) != Some(unit_shape.datums()) {
                         return Err(Error::TT_ERROR_COPY_LANES);
                     }
                     let _ = len;
@@ -1139,7 +1177,9 @@ impl Kernel {
                 } => {
                     let b = self.info(buffer);
                     let unit = access_shape(shape)?;
-                    self.expect_index_scalar(offset, at)?;
+                    if self.expect_offset(offset, at)? != 1 {
+                        return Err(Error::TT_TODO_MULTI_LANE);
+                    }
                     let datums = shape[0] * shape[1];
                     if b.kind == ValueKind::Param {
                         if unit != RegShape::Tile || b.shape != RegShape::Tile {
@@ -1168,7 +1208,9 @@ impl Kernel {
                     let v = self.info(src);
                     let b = self.info(buffer);
                     let unit = access_shape(shape)?;
-                    self.expect_index_scalar(offset, at)?;
+                    if self.expect_offset(offset, at)? != 1 {
+                        return Err(Error::TT_TODO_MULTI_LANE);
+                    }
                     let datums = shape[0] * shape[1];
                     if b.kind == ValueKind::Acc {
                         if unit != RegShape::Tile {
@@ -1232,22 +1274,19 @@ impl Kernel {
                     }
                 }
                 Op::Unary { a, .. } => {
-                    if !is_value(self.info(a).kind) {
+                    if !is_value(&self.info(a)) {
                         return Err(Error::TT_ERROR_UNARY_OPERAND);
                     }
                 }
                 Op::Binary { op, a, b } => {
                     let (ia, ib) = (self.info(a), self.info(b));
-                    if !is_value(ia.kind) || !is_value(ib.kind) {
+                    if !is_value(&ia) || !is_value(&ib) {
                         return Err(Error::TT_ERROR_BINARY_OPERANDS);
                     }
                     if op.is_logical() && (ia.dtype != DType::Bool || ib.dtype != DType::Bool) {
                         return Err(Error::TT_ERROR_BINARY_LOGICAL_NOT_BOOL);
                     }
-                    if ia.dtype != ib.dtype
-                        && ia.shape != RegShape::Scalar
-                        && ib.shape != RegShape::Scalar
-                    {
+                    if ia.dtype != ib.dtype {
                         return Err(Error::TT_ERROR_NO_IMPLICIT_CAST);
                     }
                 }
@@ -1257,7 +1296,7 @@ impl Kernel {
                     if_false,
                 } => {
                     if self.dtype(cond) != DType::Bool {
-                        return Err(Error::TT_ERROR_SELECT_OPERANDS);
+                        return Err(Error::TT_ERROR_CONDITION_NOT_BOOL);
                     }
                     if self.dtype(if_true) != self.dtype(if_false) {
                         return Err(Error::TT_ERROR_SELECT_CAST);
@@ -1267,14 +1306,21 @@ impl Kernel {
                     }
                 }
                 Op::Matmul { acc, a, b } => {
-                    if self.info(acc).shape != RegShape::Tile {
-                        return Err(Error::TT_ERROR_MATMUL_OPERANDS);
+                    if self.info(acc).kind != ValueKind::Acc
+                        || self.info(acc).shape != RegShape::Tile
+                    {
+                        return Err(Error::TT_ERROR_MATMUL_ACC);
                     }
                     if self.info(a).shape != RegShape::Tile || self.info(b).shape != RegShape::Tile
                     {
                         return Err(Error::TT_ERROR_MATMUL_OPERAND);
                     }
-                    if self.info(a).dtype != self.info(b).dtype {
+                    // The operands share a dtype; the accumulator may be wider
+                    // (bf16 operands accumulate in f32), never narrower.
+                    if !self.info(a).dtype.is_float()
+                        || self.info(a).dtype != self.info(b).dtype
+                        || (self.info(a).dtype == DType::F32 && self.info(acc).dtype == DType::Bf16)
+                    {
                         return Err(Error::TT_ERROR_MATMUL_DTYPE);
                     }
                 }
@@ -1322,6 +1368,21 @@ impl Kernel {
             return Err(Error::TT_ERROR_ENDLOOP_WITHOUT_LOOP);
         }
         Ok(())
+    }
+
+    /// An index: a value of the index dtype, whose shape is how many lanes it
+    /// names (a row or a column is 32 bases, a tile 1024).
+    fn expect_offset(&self, value: OpId, at: usize) -> Result<u32, Error> {
+        let info = self.info(value);
+        if info.dtype != INDEX {
+            let _ = at;
+            return Err(Error::TT_ERROR_OFFSET_NOT_INDEX);
+        }
+        Ok(match info.shape {
+            RegShape::Scalar => 1,
+            RegShape::Row | RegShape::Column => 32,
+            RegShape::Tile => 1024,
+        })
     }
 
     /// A shape term must be a scalar of the index dtype.
@@ -1378,11 +1439,16 @@ impl Kernel {
 /// The values the datapath may take as an operand: a literal, a loop index, a
 /// grid coordinate or a register value. Parameters, buffers, accumulators and
 /// shapes are named by their own ops and never flow through the datapath.
-fn is_value(kind: ValueKind) -> bool {
-    matches!(
-        kind,
-        ValueKind::Const | ValueKind::Induction | ValueKind::GridCoord | ValueKind::Register
-    )
+fn is_value(info: &ValueInfo) -> bool {
+    match info.kind {
+        ValueKind::Const | ValueKind::Induction | ValueKind::GridCoord | ValueKind::Register => {
+            true
+        }
+        // A scalar parameter carries its value, so the movers can compute with
+        // it; a tensor parameter, a buffer or an accumulator never flows.
+        ValueKind::Param => info.shape == RegShape::Scalar,
+        ValueKind::Buffer | ValueKind::Acc | ValueKind::Shape => false,
+    }
 }
 
 /// The register shape an accumulator's fixed shape names.
@@ -2108,9 +2174,25 @@ impl<'a> Tokens<'a> {
         self.skip_space();
         let rest = self.rest();
         let end = rest
-            .find(|c: char| c.is_whitespace() || c == ',' || c == '[' || c == ']' || c == '=')
+            .find(|c: char| {
+                c.is_whitespace() || c == ',' || c == '[' || c == ']' || c == '=' || c == '.'
+            })
             .unwrap_or(rest.len());
         if end == 0 { None } else { Some(&rest[..end]) }
+    }
+
+    /// One whitespace-delimited token, punctuation included: a literal like
+    /// `0.5` has a `.` in it.
+    fn token(&mut self) -> Option<&'a str> {
+        self.skip_space();
+        let rest = self.rest();
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        if end == 0 {
+            return None;
+        }
+        let token = &rest[..end];
+        self.at += end;
+        Some(token)
     }
 
     fn word(&mut self) -> Option<&'a str> {
@@ -2206,12 +2288,14 @@ impl<'a> Tokens<'a> {
             Some("bf16") => Ok(DType::Bf16),
             Some("i32") => Ok(DType::I32),
             Some("bool") => Ok(DType::Bool),
+            // A real format with no path yet: named, never guessed.
+            Some("tf32") => Err(Error::TT_TODO_TF32),
             _ => Err(Error::TT_ERROR_PARSE),
         }
     }
 
     fn literal(&mut self, dtype: DType) -> Result<u32, Error> {
-        let word = self.word().ok_or(Error::TT_ERROR_PARSE)?;
+        let word = self.token().ok_or(Error::TT_ERROR_PARSE)?;
         match dtype {
             DType::I32 => word
                 .parse::<i32>()

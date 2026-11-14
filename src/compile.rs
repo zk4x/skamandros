@@ -38,7 +38,7 @@ pub fn compile(k: &Kernel) -> Result<Module, Error> {
 /// `render` is read-only: everything that had to be decided (the rings' places,
 /// the registers, the grid and the parameters) was decided before it.
 pub fn render(m: &MachineKernel) -> Result<Module, Error> {
-    let words = encode::encode(m)?;
+    let words = encode::encode(m)?.words()?;
     let setup = encode::setup(&m.sems)?;
     let mut cbs: Vec<CbInfo> = m.cbs.iter().map(|(_, info)| *info).collect();
     cbs.sort_by_key(|info| info.base);

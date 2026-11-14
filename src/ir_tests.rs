@@ -52,7 +52,9 @@ matmul %m %a %b
 ";
 
     let k = Kernel::parse(PROGRAM).unwrap_or_else(|e| panic!("the unified program parses: {e}"));
-    assert_eq!(k.len(), 31, "every op of the unified program");
+    // The literal dims, the shapes and the interned indices are ops of their
+    // own now, so the count is the program's plus what the text form implies.
+    assert_eq!(k.len(), 46, "every op of the unified program");
 
     // Symbolic grid and symbolic parameter dims, with the grid after the values
     // it reads: a scalar parameter is a rank-0 shape.
@@ -64,9 +66,10 @@ grid %d,8
 ";
 
     let k = Kernel::parse(SYMBOLIC).unwrap_or_else(|e| panic!("the symbolic program parses: {e}"));
+    // The literal dim, the shape and the grid's two terms are ops of their own.
     assert_eq!(
         k.len(),
-        3,
+        6,
         "the scalar param, the tensor param and the grid"
     );
 }
@@ -112,7 +115,7 @@ grid 1,1
 fn a_use_before_its_definition_is_refused() {
     let text = "version 9\n%x = add %a %b\n%a = const i32 1\n%b = const i32 2\ngrid 1,1\n";
     let err = Kernel::parse(text).expect_err("undefined value");
-    assert_eq!(err, ttStatus::TT_ERROR_PARSE);
+    assert_eq!(err, ttStatus::TT_ERROR_VALUE_UNDEFINED);
 }
 
 #[test]
@@ -224,13 +227,10 @@ grid 1,1
     assert!(
         staged
             .ops()
-            .filter(|(_, op)| matches!(
-                op,
-                Op::Load {
-                    offset: OpId::NULL,
-                    ..
-                }
-            ))
+            .filter(|(_, op)| match *op {
+                Op::Load { offset, .. } => staged.const_i32(*offset) == Some(0),
+                _ => false,
+            })
             .count()
             == 1,
         "the staged load reads its buffer at zero"
@@ -331,9 +331,16 @@ load 1,32 %rows = %ib [0]
 copy 1,32 %wb [0] = %w [%rows]
 copy 32,32 %out [0] = %wb [0]
 ";
+    // The gather is one request per lane, and the mover reads the lane bases out
+    // of the page it copied: a compile-time L1 address, which the re-model moved
+    // to `plan_cbs` (after the lowering). Until the mover's program is emitted
+    // after the placement, the form is refused as that TODO rather than
+    // mis-lowered.
     let k = Kernel::parse(GATHER).expect("the vector index is 32 lanes");
-    let m = compile::compile(&k).expect("the lanes compile");
-    assert!(!m.reader.is_empty(), "the gather is data movement");
+    assert_eq!(
+        compile::compile(&k).expect_err("the gather is data movement"),
+        S::TT_TODO_MULTI_LANE
+    );
 
     // A tile per lane would need 32 pages, not one.
     assert_eq!(
@@ -856,7 +863,7 @@ fn an_acc_is_one_32x32_tile_of_an_accumulating_dtype() {
     for shape in ["1,32", "32,1", "1,1", "32,32"] {
         let text = format!("version 9\n%m = acc f32 {shape}\ngrid 1,1\n");
         let k = Kernel::parse(&text).unwrap_or_else(|e| panic!("acc f32 {shape}: {e}"));
-        assert_eq!(k.len(), 2, "acc f32 {shape}");
+        assert_eq!(k.len(), 4, "acc f32 {shape}");
     }
     // `tf32` is a real format with no path yet: named, never guessed.
     case(
