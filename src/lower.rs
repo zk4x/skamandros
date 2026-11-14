@@ -763,15 +763,9 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                             dtype: storage(from),
                         },
                     );
-                    m.push(
-                        Core::Math,
-                        MirOp::Cast {
-                            from: lane(from),
-                            to: lane(dtype),
-                            a: la,
-                            d: ld,
-                        },
-                    );
+                    for op in cast_lanes(lane(from), lane(dtype), la, ld, LReg(2))? {
+                        m.push(Core::Math, op);
+                    }
                     m.push(
                         Core::Math,
                         MirOp::Sfpstore {
@@ -805,7 +799,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                 }
                 if op == UOp::Rsqrt {
                     let mut body = Vec::new();
-                    rsqrt_body(&mut body, src, out, &rows, la, dtype);
+                    rsqrt_body(&mut body, src, out, &rows, la, dtype)?;
                     for op in body {
                         m.push(Core::Math, op);
                     }
@@ -932,6 +926,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                                 | BOp::BitXor
                                 | BOp::BitShiftLeft
                                 | BOp::BitShiftRight
+                                | BOp::Mod
                                 | BOp::Cmplt
                                 | BOp::Cmpgt
                                 | BOp::Cmpge
@@ -966,6 +961,67 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                 } else {
                     dtype
                 };
+                // `mod` on `i32` is an exact integer remainder, not a float
+                // shortcut: it is tt-metal's `fmod_int32`, whose body `mod_body`
+                // spells out instruction by instruction. It keeps its operands
+                // in lanes 0 and 1 and leaves the result in lane 3, so the
+                // constant hoisting below does not apply: both operands are
+                // loaded per row.
+                if op == BOp::Mod {
+                    for &row in &rows {
+                        match ca {
+                            Some(bits) => m.push(
+                                Core::Math,
+                                MirOp::LaneConst {
+                                    lreg: LReg(0),
+                                    bits,
+                                },
+                            ),
+                            None => m.push(
+                                Core::Math,
+                                MirOp::Sfpload {
+                                    lreg: LReg(0),
+                                    reg: dst_reg(alloc, owner(k, a))?,
+                                    at: row,
+                                    dtype,
+                                },
+                            ),
+                        }
+                        match cb {
+                            Some(bits) => m.push(
+                                Core::Math,
+                                MirOp::LaneConst {
+                                    lreg: LReg(1),
+                                    bits,
+                                },
+                            ),
+                            None => m.push(
+                                Core::Math,
+                                MirOp::Sfpload {
+                                    lreg: LReg(1),
+                                    reg: dst_reg(alloc, owner(k, b))?,
+                                    at: row,
+                                    dtype,
+                                },
+                            ),
+                        }
+                        let mut body = Vec::new();
+                        mod_body(&mut body);
+                        for op in body {
+                            m.push(Core::Math, op);
+                        }
+                        m.push(
+                            Core::Math,
+                            MirOp::Sfpstore {
+                                lreg: LReg(3),
+                                reg: out,
+                                at: row,
+                                dtype: out_dtype,
+                            },
+                        );
+                    }
+                    continue;
+                }
                 // The constant lanes live for the whole sweep, so they are set
                 // once, before the first row. The one exception is a right
                 // shift's amount: its encoding negates the amount in its own
@@ -2697,8 +2753,8 @@ fn exp2_body(
             });
         }
         // The result's exponent is the polynomial's plus n.
-        role.push(MirOp::UnarySfp {
-            op: UnarySfpOp::Exexp,
+        role.push(MirOp::SfpExexp {
+            mod1: 1,
             a: LReg(4),
             d: LReg(3),
         });
@@ -2749,7 +2805,7 @@ fn rsqrt_body(
     rows: &[u32],
     la: LReg,
     dtype: crate::ir::DType,
-) {
+) -> Result<(), ttStatus> {
     // `_init_sqrt_`'s accurate-mode constants.
     const MAGIC: u32 = 0x5f11_10a0;
     const P1: f32 = 2.2825186;
@@ -2764,15 +2820,9 @@ fn rsqrt_body(
             at: row,
             dtype,
         });
-        // `x` lives in lane 2 for the rest of the row: the lane a `cast` picks
-        // as scratch is the lowest one that is neither its operands, so lane 0
-        // has to be free (`cast_lanes`'s `scratch`).
-        role.push(MirOp::Cast {
-            from: crate::ir::DType::F32,
-            to: crate::ir::DType::F32,
-            a: la,
-            d: LReg(2),
-        });
+        // `x` lives in lane 2 for the rest of the row: the cast is a plain move
+        // here, and lane 2 is the body's first scratch lane.
+        role.push(MirOp::SfpMov { a: la, d: LReg(2) });
         // `i = bits(x) >> 1`, logically: the amount lane holds the integer 1 and
         // `SFPSHFT` negates it in its own lane.
         role.push(MirOp::LaneConst {
@@ -2915,12 +2965,9 @@ fn rsqrt_body(
             b: LReg(2),
             d: LReg(5),
         });
-        role.push(MirOp::Cast {
-            from: DType::I32,
-            to: DType::F32,
-            a: LReg(5),
-            d: LReg(6),
-        });
+        for op in cast_lanes(DType::I32, DType::F32, LReg(5), LReg(6), LReg(0))? {
+            role.push(op);
+        }
         role.push(MirOp::LaneConst {
             lreg: LReg(7),
             bits: 0.0f32.to_bits(),
@@ -2943,12 +2990,9 @@ fn rsqrt_body(
             b: LReg(7),
             d: LReg(6),
         });
-        role.push(MirOp::Cast {
-            from: DType::I32,
-            to: DType::F32,
-            a: LReg(2),
-            d: LReg(7),
-        });
+        for op in cast_lanes(DType::I32, DType::F32, LReg(2), LReg(7), LReg(0))? {
+            role.push(op);
+        }
         role.push(MirOp::LaneConst {
             lreg: LReg(4),
             bits: 0.0f32.to_bits(),
@@ -3012,6 +3056,346 @@ fn rsqrt_body(
             dtype,
         });
     }
+    Ok(())
+}
+
+/// `i32` `mod` on one row: tt-metal's `fmod_int32`, in lanes 0..8.
+///
+/// The body is `compute_unsigned_remainder_int32` of
+/// `ckernel_sfpu_binary_remainder.h` with the sign fix of
+/// `ckernel_sfpu_binary_fmod.h`. Both operands are taken to magnitudes in two's
+/// complement and widened to FP32; the divisor is reciprocated with one Newton
+/// step, the quotient's mantissa is multiplied back out as a 23-bit integer, and
+/// the error the reciprocal leaves is measured in FP32 and removed with a second
+/// `SFPMUL24` pair. The last adjustment clamps the remainder into `[0, b)` and
+/// the negation at the end gives `fmod`'s sign of the dividend.
+///
+/// Nothing here is a float shortcut: every step is an integer or a bounded
+/// integer conversion, so the result is the exact remainder for all `i32`.
+///
+/// The dividend is read from lane 0 and the divisor from lane 1; the result is
+/// left in lane 3. Lanes 2..7 are scratch, and the hardware's own `1.0` is read
+/// where a constant is needed (`LREG_ONE`); zero, 2^31, 2^33 and the shift
+/// amounts are `SFPLOADI`s, since a `Compare` reads two work lanes.
+fn mod_body(role: &mut Vec<MirOp>) {
+    // Mode words from the vendored `sfpi_constants.h` (Blackhole).
+    const IADD_ARG_IMM: u32 = 1;
+    const IADD_CC_NONE: u32 = 4;
+    const SHFT_ARITHMETIC: u32 = 2;
+    const CAST_SM32_TO_FP32_RNE: u32 = 0;
+    /// `MantissaMode::FractionOnly` (`SFPEXMAN_MOD1_PAD9`).
+    const EXMAN_FRACTION_ONLY: u32 = 1;
+    const STOCHRND_FP32_TO_UINT16: u32 = 6;
+    let one = LReg(tt_isa::sfpu::LREG_ONE as u16);
+    // The lanes the body names. `a` stays untouched to the end: the sign of
+    // the dividend is the sign of the result.
+    let a = LReg(0);
+    let b = LReg(1);
+    let p = LReg(2);
+    let x = LReg(3);
+    let y = LReg(4);
+    let s = LReg(5);
+    let t = LReg(6);
+    let u = LReg(7);
+
+    // |a| and |b| in two's complement. `INT_MIN` keeps its `0x8000_0000`,
+    // which the sign-magnitude cast below reads as `-0.0`.
+    role.push(MirOp::SfpAbs { mod1: 0, a, d: p });
+    role.push(MirOp::SfpAbs {
+        mod1: 0,
+        a: b,
+        d: b,
+    });
+    // The magnitudes as FP32. The cast reads the bits as a sign-magnitude
+    // integer, so a magnitude of 2^31 becomes `-0.0`; the compare is
+    // sign-magnitude too (`-0.0 < +0.0`), so that lane is replaced by 2^31.
+    role.push(MirOp::SfpCast {
+        mod1: CAST_SM32_TO_FP32_RNE,
+        a: p,
+        d: x,
+    });
+    role.push(MirOp::SfpCast {
+        mod1: CAST_SM32_TO_FP32_RNE,
+        a: b,
+        d: y,
+    });
+    role.push(MirOp::LaneConst {
+        lreg: s,
+        bits: 2147483648.0f32.to_bits(),
+    });
+    role.push(MirOp::LaneConst { lreg: u, bits: 0 });
+    role.push(MirOp::Compare {
+        op: CmpOp::Lt,
+        a: x,
+        b: u,
+        d: t,
+    });
+    role.push(MirOp::Select {
+        cond: t,
+        t: s,
+        f: x,
+        d: x,
+    });
+    role.push(MirOp::Compare {
+        op: CmpOp::Lt,
+        a: y,
+        b: u,
+        d: t,
+    });
+    role.push(MirOp::Select {
+        cond: t,
+        t: s,
+        f: y,
+        d: y,
+    });
+    // `inv = approx_recip(b)`, then one Newton step `inv *= (2 - b * inv)`,
+    // which is `e = 1 - b * inv` and `inv = e * inv + inv`. The negated product
+    // is a complement-sign move into a lane of its own: `SFPMAD` has no mode
+    // that negates the product.
+    role.push(MirOp::SfpArecip {
+        mod1: 0,
+        a: y,
+        d: s,
+    });
+    role.push(MirOp::UnarySfp {
+        op: UnarySfpOp::Neg,
+        a: s,
+        d: t,
+    });
+    role.push(MirOp::SfpMad {
+        mod1: 0,
+        a: t,
+        b: y,
+        c: one,
+        d: t,
+    });
+    role.push(MirOp::SfpMad {
+        mod1: 0,
+        a: t,
+        b: s,
+        c: s,
+        d: s,
+    });
+    // `q = a * inv + 2^33`: the alignment factor puts the quotient in the
+    // mantissa's top bits, which `SFPEXMAN` then extracts as an integer.
+    role.push(MirOp::LaneConst {
+        lreg: t,
+        bits: 8589934592.0f32.to_bits(),
+    });
+    role.push(MirOp::SfpMad {
+        mod1: 0,
+        a: x,
+        b: s,
+        c: t,
+        d: u,
+    });
+    role.push(MirOp::SfpExman {
+        mod1: EXMAN_FRACTION_ONLY,
+        a: u,
+        d: u,
+    });
+    // `qb = (q << 10) * b` in the low 23 bits of the product, then the
+    // approximate remainder `r = a - qb`.
+    role.push(MirOp::SfpMul24 {
+        upper: false,
+        a: u,
+        b,
+        d: t,
+    });
+    role.push(MirOp::LaneConst { lreg: x, bits: 10 });
+    role.push(MirOp::SfpShft {
+        mod1: SHFT_ARITHMETIC,
+        amount: x,
+        a: t,
+        d: t,
+    });
+    role.push(MirOp::BinarySfp {
+        op: BinarySfpOp::ISub,
+        a: p,
+        b: t,
+        d: t,
+    });
+    // The correction the reciprocal's error left: `|r| / b` rounded to a
+    // 16-bit integer, multiplied back out as a 32-bit product assembled from
+    // two 23-bit halves and `b >> 23`.
+    role.push(MirOp::SfpAbs {
+        mod1: 0,
+        a: t,
+        d: x,
+    });
+    role.push(MirOp::SfpCast {
+        mod1: CAST_SM32_TO_FP32_RNE,
+        a: x,
+        d: x,
+    });
+    role.push(MirOp::BinarySfp {
+        op: BinarySfpOp::Mul,
+        a: x,
+        b: s,
+        d: x,
+    });
+    role.push(MirOp::SfpStochRnd {
+        mod1: STOCHRND_FP32_TO_UINT16,
+        a: x,
+        d: y,
+    });
+    role.push(MirOp::SfpMul24 {
+        upper: false,
+        a: y,
+        b,
+        d: p,
+    });
+    role.push(MirOp::SfpMul24 {
+        upper: true,
+        a: y,
+        b,
+        d: x,
+    });
+    role.push(MirOp::LaneConst {
+        lreg: s,
+        bits: (-23i32) as u32,
+    });
+    role.push(MirOp::SfpShft {
+        mod1: SHFT_ARITHMETIC,
+        amount: s,
+        a: b,
+        d: u,
+    });
+    role.push(MirOp::SfpMul24 {
+        upper: false,
+        a: y,
+        b: u,
+        d: u,
+    });
+    role.push(MirOp::BinarySfp {
+        op: BinarySfpOp::IAdd,
+        a: x,
+        b: u,
+        d: u,
+    });
+    role.push(MirOp::LaneConst { lreg: s, bits: 23 });
+    role.push(MirOp::SfpShft {
+        mod1: SHFT_ARITHMETIC,
+        amount: s,
+        a: u,
+        d: u,
+    });
+    role.push(MirOp::BinarySfp {
+        op: BinarySfpOp::IAdd,
+        a: p,
+        b: u,
+        d: u,
+    });
+    // `signed_tmp = (tmp ^ r_sign) - r_sign`, with the arithmetic shift's
+    // `0`/`-1` mask, then `r -= signed_tmp`.
+    role.push(MirOp::LaneConst {
+        lreg: s,
+        bits: (-31i32) as u32,
+    });
+    role.push(MirOp::SfpShft {
+        mod1: SHFT_ARITHMETIC,
+        amount: s,
+        a: t,
+        d: x,
+    });
+    role.push(MirOp::BinarySfp {
+        op: BinarySfpOp::BitXor,
+        a: u,
+        b: x,
+        d: u,
+    });
+    role.push(MirOp::BinarySfp {
+        op: BinarySfpOp::ISub,
+        a: u,
+        b: x,
+        d: x,
+    });
+    role.push(MirOp::BinarySfp {
+        op: BinarySfpOp::ISub,
+        a: t,
+        b: x,
+        d: x,
+    });
+    // Clamp into `[0, b)`: `if (r < 0 && (r - 1) < 0) r += b; else if (r >= b)
+    // r -= b;`. The second test sees the `r` the first branch may have
+    // updated, exactly as `v_elseif` does.
+    role.push(MirOp::LaneConst { lreg: u, bits: 0 });
+    role.push(MirOp::Compare {
+        op: CmpOp::Lt,
+        a: x,
+        b: u,
+        d: y,
+    });
+    role.push(MirOp::SfpIadd {
+        imm: (-1i32 & 0xfff) as u32,
+        a: x,
+        d: s,
+        mod1: IADD_ARG_IMM | IADD_CC_NONE,
+    });
+    role.push(MirOp::Compare {
+        op: CmpOp::Lt,
+        a: s,
+        b: u,
+        d: u,
+    });
+    role.push(MirOp::BinarySfp {
+        op: BinarySfpOp::BitAnd,
+        a: y,
+        b: u,
+        d: y,
+    });
+    role.push(MirOp::BinarySfp {
+        op: BinarySfpOp::IAdd,
+        a: x,
+        b,
+        d: s,
+    });
+    role.push(MirOp::Select {
+        cond: y,
+        t: s,
+        f: x,
+        d: x,
+    });
+    role.push(MirOp::Compare {
+        op: CmpOp::Ge,
+        a: x,
+        b,
+        d: y,
+    });
+    role.push(MirOp::BinarySfp {
+        op: BinarySfpOp::ISub,
+        a: x,
+        b,
+        d: s,
+    });
+    role.push(MirOp::Select {
+        cond: y,
+        t: s,
+        f: x,
+        d: x,
+    });
+    // `fmod`'s sign: the result has the dividend's sign (`checked_rem`'s,
+    // RISC-V's `rem`).
+    role.push(MirOp::LaneConst { lreg: s, bits: 0 });
+    role.push(MirOp::Compare {
+        op: CmpOp::Lt,
+        a,
+        b: s,
+        d: y,
+    });
+    role.push(MirOp::LaneConst { lreg: t, bits: 0 });
+    role.push(MirOp::BinarySfp {
+        op: BinarySfpOp::ISub,
+        a: t,
+        b: x,
+        d: s,
+    });
+    role.push(MirOp::Select {
+        cond: y,
+        t: s,
+        f: x,
+        d: x,
+    });
 }
 
 /// The `Dst` rows an SFPU body walks. An instruction covers 32 lanes, two
@@ -3431,6 +3815,162 @@ fn binary(op: BOp, at: OpId) -> Result<BinarySfpOp, ttStatus> {
             Err(ttStatus::TT_TODO_BINARY_SFPU)
         }
     }
+}
+
+/// The lane sequence that converts `a` into `d`. A conversion is not one
+/// instruction, so the machine IR carries the instructions it is made of; `t`
+/// is the one scratch lane the sequence needs. Every lane the sequence names
+/// is an operand of some op, which is what lets the allocation passes see and
+/// reuse them.
+fn cast_lanes(from: DType, to: DType, a: LReg, d: LReg, t: LReg) -> Result<Vec<MirOp>, ttStatus> {
+    // Mode words from the vendored `sfpi_constants.h` (Blackhole).
+    const CAST_INT32_TO_SM32: u32 = 3;
+    const CAST_INT32_TO_FP32_RNE: u32 = 0;
+    const EXEXP_CC_SGN_COMP: u32 = 2 | 8;
+    const IADD_ARG_IMM: u32 = 1;
+    const IADD_2SCOMP_LREG_DST: u32 = 2;
+    const IADD_CC_NONE: u32 = 4;
+    const SETCC_NE0: u32 = 2;
+    const ENCC_ALL: u32 = 0;
+    const MASK_ON: u32 = 10;
+    let zero = LReg(tt_isa::sfpu::LREG_ZERO as u16);
+    let mut out: Vec<MirOp> = Vec::new();
+    match (from, to) {
+        (DType::F32, DType::F32) | (DType::I32, DType::I32) | (DType::Bool, DType::Bool) => {
+            out.push(MirOp::SfpMov { a, d });
+        }
+        (DType::I32, DType::F32) => {
+            // Two's complement to sign-magnitude, then sign-magnitude to FP32
+            // (round to nearest even) -- the pair tt-metal's
+            // `_calculate_typecast_int32_to_fp32_` splits into abs/cast/setsgn.
+            out.push(MirOp::SfpCast {
+                mod1: CAST_INT32_TO_SM32,
+                a,
+                d: t,
+            });
+            out.push(MirOp::SfpCast {
+                mod1: CAST_INT32_TO_FP32_RNE,
+                a: t,
+                d,
+            });
+        }
+        (DType::F32, DType::I32) => {
+            // The exponent's lane flags decide which lanes saturate, so the
+            // condition mask is on for the whole sequence.
+            out.push(MirOp::SfpEncc {
+                first: 3,
+                second: 0,
+                mod1: MASK_ON,
+            });
+            out.push(MirOp::LaneConst { lreg: d, bits: 0 });
+            out.push(MirOp::SfpExexp {
+                mod1: EXEXP_CC_SGN_COMP,
+                a,
+                d: t,
+            });
+            // Saturated lanes keep `INT_MIN` (`0x8000_0000`).
+            out.push(MirOp::LaneConst {
+                lreg: d,
+                bits: 0x8000_0000,
+            });
+            out.push(MirOp::SfpIadd {
+                imm: (-31i32 & 0xfff) as u32,
+                a: t,
+                d: t,
+                mod1: IADD_ARG_IMM,
+            });
+            out.push(MirOp::SfpIadd {
+                imm: 8,
+                a: t,
+                d: t,
+                mod1: IADD_ARG_IMM | IADD_CC_NONE,
+            });
+            out.push(MirOp::SfpExman { mod1: 0, a, d });
+            out.push(MirOp::SfpShft {
+                mod1: 0,
+                amount: t,
+                a: d,
+                d,
+            });
+            out.push(MirOp::SfpEncc {
+                first: 0,
+                second: 0,
+                mod1: ENCC_ALL,
+            });
+            out.push(MirOp::SfpSetcc { mod1: 0, a });
+            out.push(MirOp::SfpIadd {
+                imm: 0,
+                a: zero,
+                d,
+                mod1: IADD_2SCOMP_LREG_DST | IADD_CC_NONE,
+            });
+            out.push(MirOp::SfpEncc {
+                first: 2,
+                second: 0,
+                mod1: MASK_ON,
+            });
+        }
+        (DType::Bool, DType::I32) | (DType::Bool, DType::F32) => {
+            // A comparison's true has the sign bit set and its false is zero,
+            // so a logical shift by 31 is the C value: one or zero. A negative
+            // amount in the lane is a right shift.
+            out.push(MirOp::LaneConst {
+                lreg: t,
+                bits: (-31i32) as u32,
+            });
+            out.push(MirOp::SfpShft {
+                mod1: 0,
+                amount: t,
+                a,
+                d,
+            });
+            if to == DType::F32 {
+                out.push(MirOp::SfpCast {
+                    mod1: CAST_INT32_TO_FP32_RNE,
+                    a: d,
+                    d,
+                });
+            }
+        }
+        (_, DType::Bool) => {
+            // `x != 0`, with `-1.0f` as the true a comparison writes.
+            out.push(MirOp::SfpEncc {
+                first: 3,
+                second: 0,
+                mod1: MASK_ON,
+            });
+            let cond = if from == DType::F32 {
+                // `|x|` first: `-0.0` is zero and a NaN is not.
+                out.push(MirOp::UnarySfp {
+                    op: UnarySfpOp::Abs,
+                    a,
+                    d: t,
+                });
+                t
+            } else {
+                a
+            };
+            out.push(MirOp::SfpMov { a: zero, d });
+            out.push(MirOp::SfpSetcc {
+                mod1: SETCC_NE0,
+                a: cond,
+            });
+            out.push(MirOp::LaneConst {
+                lreg: d,
+                bits: 0xbf80_0000,
+            });
+            out.push(MirOp::SfpEncc {
+                first: 2,
+                second: 0,
+                mod1: MASK_ON,
+            });
+        }
+        (DType::Bf16, _) | (_, DType::Bf16) => {
+            let _ = (a, d, t);
+            return Err(ttStatus::TT_TODO_CAST);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

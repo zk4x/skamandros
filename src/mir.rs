@@ -24,9 +24,6 @@ pub enum UnarySfpOp {
     Neg,
     Abs,
     BitNot,
-    /// `d = the exponent field of a`, as a two's complement integer and
-    /// without the 127 bias (`SFPEXEXP`).
-    Exexp,
 }
 
 /// One binary SFPU instruction: two lane registers into a third.
@@ -266,13 +263,70 @@ pub enum MirOp {
         b: LReg,
         d: LReg,
     },
-    /// A lanewise conversion from `from` to `to`, in the SFPU's 32-bit lane.
-    Cast {
-        from: DType,
-        to: DType,
+    /// `SFPMOV`: one lane into another, unchanged.
+    SfpMov { a: LReg, d: LReg },
+    /// `SFPABS`: the magnitude of `a`. `mod1` 0 negates a two's complement
+    /// word (and leaves `INT_MIN` alone), 1 clears the sign bit of an FP32.
+    SfpAbs { mod1: u32, a: LReg, d: LReg },
+    /// `SFPCAST`: one conversion mode, lanewise. `mod1` 0 is
+    /// `INT32_TO_FP32_RNE`, 2 `SM32_TO_INT32`, 3 `INT32_TO_SM32`.
+    SfpCast { mod1: u32, a: LReg, d: LReg },
+    /// `SFPEXEXP`: `a`'s exponent field, as an integer. `mod1` is the
+    /// instruction's mode word: bit 3 is the "no debias" bit and bits 1:0 pick
+    /// the condition-code source (2 is "sign/complement").
+    SfpExexp { mod1: u32, a: LReg, d: LReg },
+    /// `SFPEXMAN`: `a`'s mantissa field, as an integer. `mod1` 1 (`PAD9`) is
+    /// the fraction alone; 0 puts the implicit one in bit 23.
+    SfpExman { mod1: u32, a: LReg, d: LReg },
+    /// `SFPIADD`: `d = a + imm` (or `a + VC` when `mod1`'s argument bit is
+    /// clear), with `a` in the instruction's `VC` slot. Modifier 4 is
+    /// "leave the lane flags alone", 2 the two's-complement `VC - VD` form.
+    SfpIadd {
+        imm: u32,
+        a: LReg,
+        d: LReg,
+        mod1: u32,
+    },
+    /// `SFPSHFT`: `d = a` shifted by the amount in `amount`'s lane. `mod1` 2
+    /// is the arithmetic (sign-extending) right shift; without it the shift is
+    /// logical.
+    SfpShft {
+        mod1: u32,
+        amount: LReg,
         a: LReg,
         d: LReg,
     },
+    /// `SFPSETCC`: set the lane condition mask from `a`. It writes no lane, so
+    /// the op has no destination: `VD` is only the backdoor-load gate, and the
+    /// encoder passes 0 there.
+    SfpSetcc { mod1: u32, a: LReg },
+    /// `SFPENCC`: enable, disable or reset the lane condition mask. Bit 0 of
+    /// `first` sets it, bit 1 resets every lane's flag.
+    SfpEncc { first: u32, second: u32, mod1: u32 },
+    /// `SFPARECIP`: one quadratic estimate of `1/a` (or of `e^a`).
+    SfpArecip { mod1: u32, a: LReg, d: LReg },
+    /// `SFPMUL24`: the low (or, with `upper`, the high) 23 bits of the product
+    /// of two 23-bit integers.
+    SfpMul24 {
+        upper: bool,
+        a: LReg,
+        b: LReg,
+        d: LReg,
+    },
+    /// `SFPMAD`: `d = a * b + c` in one rounding step. `mod1`'s bit 1 is
+    /// "negate the addend" (`a * b - c`), the form the hardware uses for a
+    /// bare multiply; a negated *product* is a `SfpMov` in the complement-sign
+    /// form, since the instruction has no mode for it.
+    SfpMad {
+        mod1: u32,
+        a: LReg,
+        b: LReg,
+        c: LReg,
+        d: LReg,
+    },
+    /// `SFPSTOCHRND`: `a` to a small integer, keeping `mod1`'s range, with
+    /// `round`'s rounding.
+    SfpStochRnd { mod1: u32, a: LReg, d: LReg },
     /// `cond ? t : f`, lanewise, through the SFPU lane flags.
     Select {
         cond: LReg,
@@ -640,13 +694,54 @@ fn write_op(f: &mut dyn fmt::Write, op: &MirOp) -> fmt::Result {
             lane(b),
             lane(d)
         ),
-        MirOp::Cast { from, to, a, d } => write!(
+        MirOp::SfpMov { a, d } => write!(f, "sfpmov {} -> {}", lane(a), lane(d)),
+        MirOp::SfpAbs { mod1, a, d } => write!(f, "sfpabs {mod1} {} -> {}", lane(a), lane(d)),
+        MirOp::SfpCast { mod1, a, d } => {
+            write!(f, "sfpcast {mod1} {} -> {}", lane(a), lane(d))
+        }
+        MirOp::SfpExexp { mod1, a, d } => {
+            write!(f, "sfpexexp {mod1} {} -> {}", lane(a), lane(d))
+        }
+        MirOp::SfpExman { mod1, a, d } => {
+            write!(f, "sfpexman {mod1} {} -> {}", lane(a), lane(d))
+        }
+        MirOp::SfpIadd { imm, a, d, mod1 } => {
+            write!(f, "sfpiadd {imm:#x}, {} -> {} ({mod1})", lane(a), lane(d))
+        }
+        MirOp::SfpShft { mod1, amount, a, d } => write!(
             f,
-            "cast {} -> {} ({} -> {})",
+            "sfpshft {mod1}, amount {}, {} -> {}",
+            lane(amount),
             lane(a),
-            lane(d),
-            from.name(),
-            to.name()
+            lane(d)
+        ),
+        MirOp::SfpSetcc { mod1, a } => write!(f, "sfpsetcc {mod1} {}", lane(a)),
+        MirOp::SfpEncc {
+            first,
+            second,
+            mod1,
+        } => write!(f, "sfpencc {first:#x}, {second} ({mod1})"),
+        MirOp::SfpArecip { mod1, a, d } => {
+            write!(f, "sfparecip {mod1} {} -> {}", lane(a), lane(d))
+        }
+        MirOp::SfpMul24 { upper, a, b, d } => write!(
+            f,
+            "sfpmul24 {} {}, {} -> {}",
+            if upper { "high" } else { "low" },
+            lane(a),
+            lane(b),
+            lane(d)
+        ),
+        MirOp::SfpStochRnd { mod1, a, d } => {
+            write!(f, "sfpstochrnd {mod1} {} -> {}", lane(a), lane(d))
+        }
+        MirOp::SfpMad { mod1, a, b, c, d } => write!(
+            f,
+            "sfpmad {mod1}, {} * {} + {} -> {}",
+            lane(a),
+            lane(b),
+            lane(c),
+            lane(d)
         ),
         MirOp::Select { cond, t, f: no, d } => write!(
             f,
@@ -858,7 +953,6 @@ fn unary_name(op: UnarySfpOp) -> &'static str {
         UnarySfpOp::Neg => "neg",
         UnarySfpOp::Abs => "abs",
         UnarySfpOp::BitNot => "bitnot",
-        UnarySfpOp::Exexp => "exexp",
     }
 }
 

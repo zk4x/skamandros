@@ -73,13 +73,29 @@ fn lreg_touches(op: &MirOp) -> Vec<(LReg, bool)> {
     match *op {
         MirOp::Sfpload { lreg, .. } | MirOp::LaneConst { lreg, .. } => vec![(lreg, true)],
         MirOp::Sfpstore { lreg, .. } => vec![(lreg, false)],
-        MirOp::UnarySfp { a, d, .. } | MirOp::Cast { a, d, .. } => vec![(a, false), (d, true)],
+        MirOp::UnarySfp { a, d, .. } => vec![(a, false), (d, true)],
         MirOp::BinarySfp { a, b, d, .. }
         | MirOp::Compare { a, b, d, .. }
         | MirOp::Max { a, b, d } => vec![(a, false), (b, false), (d, true)],
         MirOp::Select { cond, t, f, d } => {
             vec![(cond, false), (t, false), (f, false), (d, true)]
         }
+        MirOp::SfpMov { a, d } | MirOp::SfpAbs { a, d, .. } => vec![(a, false), (d, true)],
+        MirOp::SfpCast { a, d, .. }
+        | MirOp::SfpExexp { a, d, .. }
+        | MirOp::SfpExman { a, d, .. }
+        | MirOp::SfpIadd { a, d, .. }
+        | MirOp::SfpArecip { a, d, .. }
+        | MirOp::SfpStochRnd { a, d, .. } => vec![(a, false), (d, true)],
+        MirOp::SfpShft { amount, a, d, .. } => {
+            vec![(amount, false), (a, false), (d, true)]
+        }
+        MirOp::SfpMul24 { a, b, d, .. } => vec![(a, false), (b, false), (d, true)],
+        MirOp::SfpMad { a, b, c, d, .. } => {
+            vec![(a, false), (b, false), (c, false), (d, true)]
+        }
+        MirOp::SfpSetcc { a, .. } => vec![(a, false)],
+        MirOp::SfpEncc { .. } => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -204,8 +220,14 @@ fn alloc_dsts(m: &mut MachineKernel) -> Result<(), ttStatus> {
 /// Assign the physical lane registers, rewriting every op that names one.
 fn alloc_lregs(m: &mut MachineKernel) -> Result<(), ttStatus> {
     let live = ranges(m, lreg_touches);
-    let slots = 8usize;
-    let mut order: Vec<(LReg, (usize, usize))> = live.into_iter().collect();
+    let slots = usize::from(crate::alloc::LREGS);
+    // Lane registers 8 upwards are the hardware's own constants (`LREG_ZERO`
+    // is 9, `LREG_ONE` 10), not allocation slots: an op that names one keeps
+    // it, so a sequence can read a constant without spending a work lane.
+    let mut order: Vec<(LReg, (usize, usize))> = live
+        .into_iter()
+        .filter(|(id, _)| usize::from(*id) < slots)
+        .collect();
     order.sort_by_key(|(_, (first, last))| (*first, *last));
 
     let mut rename: BTreeMap<LReg, LReg> = BTreeMap::new();
@@ -277,10 +299,41 @@ fn rewrite_lregs(op: &mut MirOp, rename: &BTreeMap<LReg, LReg>) {
         MirOp::Sfpload { lreg, .. }
         | MirOp::Sfpstore { lreg, .. }
         | MirOp::LaneConst { lreg, .. } => map(lreg),
-        MirOp::UnarySfp { a, d, .. } | MirOp::Cast { a, d, .. } => {
+        MirOp::UnarySfp { a, d, .. } => {
             map(a);
             map(d);
         }
+        MirOp::SfpMov { a, d } | MirOp::SfpAbs { a, d, .. } => {
+            map(a);
+            map(d);
+        }
+        MirOp::SfpCast { a, d, .. }
+        | MirOp::SfpExexp { a, d, .. }
+        | MirOp::SfpExman { a, d, .. }
+        | MirOp::SfpIadd { a, d, .. }
+        | MirOp::SfpArecip { a, d, .. }
+        | MirOp::SfpStochRnd { a, d, .. } => {
+            map(a);
+            map(d);
+        }
+        MirOp::SfpShft { amount, a, d, .. } => {
+            map(amount);
+            map(a);
+            map(d);
+        }
+        MirOp::SfpMul24 { a, b, d, .. } => {
+            map(a);
+            map(b);
+            map(d);
+        }
+        MirOp::SfpMad { a, b, c, d, .. } => {
+            map(a);
+            map(b);
+            map(c);
+            map(d);
+        }
+        MirOp::SfpSetcc { a, .. } => map(a),
+        MirOp::SfpEncc { .. } => {}
         MirOp::BinarySfp { a, b, d, .. }
         | MirOp::Compare { a, b, d, .. }
         | MirOp::Max { a, b, d } => {

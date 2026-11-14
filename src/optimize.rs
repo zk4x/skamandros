@@ -699,14 +699,64 @@ pub fn verify(m: &MachineKernel) -> Result<(), ttStatus> {
                         }
                     }
                 }
-                MirOp::Cast { a, d, .. } => {
-                    for lreg in [a, d] {
-                        if usize::from(lreg.0) >= usize::from(crate::alloc::LREGS) {
-                            let _ = (name, at, lreg);
-                            return Err(ttStatus::TT_ERROR_LANE_REGISTER);
-                        }
+                MirOp::SfpMov { a, d } | MirOp::SfpAbs { a, d, .. } => {
+                    if usize::from(a.0) >= 16
+                        || usize::from(d.0) >= usize::from(crate::alloc::LREGS)
+                    {
+                        let _ = (name, at, a, d);
+                        return Err(ttStatus::TT_ERROR_LANE_REGISTER);
                     }
                 }
+                MirOp::SfpCast { a, d, .. }
+                | MirOp::SfpExexp { a, d, .. }
+                | MirOp::SfpExman { a, d, .. }
+                | MirOp::SfpIadd { a, d, .. }
+                | MirOp::SfpArecip { a, d, .. }
+                | MirOp::SfpStochRnd { a, d, .. } => {
+                    // The source may be one of the hardware's constants
+                    // (lanes 8 upwards); the destination is a work lane.
+                    if usize::from(a.0) >= 16
+                        || usize::from(d.0) >= usize::from(crate::alloc::LREGS)
+                    {
+                        let _ = (name, at, a, d);
+                        return Err(ttStatus::TT_ERROR_LANE_REGISTER);
+                    }
+                }
+                MirOp::SfpShft { amount, a, d, .. } => {
+                    if usize::from(amount.0) >= 16
+                        || usize::from(a.0) >= 16
+                        || usize::from(d.0) >= usize::from(crate::alloc::LREGS)
+                    {
+                        let _ = (name, at, amount, a, d);
+                        return Err(ttStatus::TT_ERROR_LANE_REGISTER);
+                    }
+                }
+                MirOp::SfpMul24 { a, b, d, .. } => {
+                    if usize::from(a.0) >= 16
+                        || usize::from(b.0) >= 16
+                        || usize::from(d.0) >= usize::from(crate::alloc::LREGS)
+                    {
+                        let _ = (name, at, a, b, d);
+                        return Err(ttStatus::TT_ERROR_LANE_REGISTER);
+                    }
+                }
+                MirOp::SfpMad { a, b, c, d, .. } => {
+                    if usize::from(a.0) >= 16
+                        || usize::from(b.0) >= 16
+                        || usize::from(c.0) >= 16
+                        || usize::from(d.0) >= usize::from(crate::alloc::LREGS)
+                    {
+                        let _ = (name, at, a, b, c, d);
+                        return Err(ttStatus::TT_ERROR_LANE_REGISTER);
+                    }
+                }
+                MirOp::SfpSetcc { a, .. } => {
+                    if usize::from(a.0) >= 16 {
+                        let _ = (name, at, a);
+                        return Err(ttStatus::TT_ERROR_LANE_REGISTER);
+                    }
+                }
+                MirOp::SfpEncc { .. } => {}
                 MirOp::Setdst { reg } => {
                     if reg.0 >= m.dst_slots() {
                         let _ = (name, at, reg);
