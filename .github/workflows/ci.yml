@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lib:
+    # The library's own checks: format, build, the generated C header, unit
+    # tests, docs. The end-to-end suite is not run here: it needs Tenstorrent's
+    # functional simulator, a large download from a third-party release, and
+    # unit tests are not the measure anyway.
+    #
+    # `Cargo.toml` names `tt-isa` by path until 0.1.1 is on crates.io, and a
+    # GitHub checkout cannot satisfy `../tt-isa`, so this job goes green with
+    # that one-line dependency change and nothing else.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup toolchain install 1.85 --profile minimal --component rustfmt --no-self-update
+          rustup default 1.85
+      - name: Format
+        run: cargo fmt --check
+      - name: Build
+        run: cargo build --release --lib
+      - name: The C header sits next to the library
+        run: test -s target/release/skamandros.h
+      - name: Unit tests
+        run: cargo test --lib
+      - name: Docs
+        run: cargo doc --no-deps

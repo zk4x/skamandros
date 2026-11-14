@@ -45,11 +45,11 @@ type Launch = unsafe extern "C" fn(*mut c_void, *const u64, usize, *mut *mut c_c
 /// Error codes, as the header defines them.
 const TT_OK: c_int = 0;
 const TT_ERROR_ARGUMENT: c_int = 1;
-const TT_ERROR_PROGRAM: c_int = 2;
 const TT_ERROR_MODULE: c_int = 3;
 const TT_ERROR_VALUE_UNDEFINED: c_int = 14;
 const TT_ERROR_NOT_TTIR: c_int = 10;
 const TT_ERROR_BF16_WIDEN: c_int = 153;
+const TT_TODO_PACK_F32_TO_BF16: c_int = 180;
 
 /// The `libskamandros.so` this test binary was built next to.
 fn library_path() -> PathBuf {
@@ -1847,25 +1847,6 @@ fn widen_bf16(bits: u16) -> f32 {
     }
 }
 
-/// The packer's f32-to-bf16 conversion: NaN is canonicalized, the value rounds
-/// half up, and a result in the bf16 subnormal range is flushed to zero
-/// (`tensix.cpp`, the `intermediate_format == 5` arm of the packer). This is the
-/// only place a bf16 datum is rounded when the kernel runs a 32-bit `Dst`.
-fn packer_bf16(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let bits = if bits & 0x7fff_ffff > 0x7f80_0000 {
-        (bits & 0x8000_0000) | 0x7f80_0000
-    } else {
-        bits
-    };
-    let rounded = bits.wrapping_add(0x8000) >> 16;
-    if rounded & 0x7fff < 0x80 {
-        0
-    } else {
-        rounded as u16
-    }
-}
-
 /// bf16 arithmetic in the 16-bit `Dst`: two tiles in, one out, every datum the
 /// SFPU's widening and truncating round trip.
 const BF16_TWO_LOAD: &str = "\
@@ -2156,62 +2137,35 @@ fn bf16_casts_run_on_the_simulator() {
     }
 }
 
-/// Narrowing *into* a bf16 buffer out of a 32-bit `Dst` is the packer's format
-/// conversion, which tt-metal supports (`is_packer_to_L1_early_conversion_supported`:
-/// `Float32 -> Float16_b`) but ttsim does not model: the packer asks for
-/// `pack_fmt_conv_mode=0x105` and the simulator exits with
-/// `UnimplementedFunctionality`. The kernel is still built for silicon; the gate
-/// runs where the conversion exists.
+/// A bf16 page written out of a 32-bit `Dst` is the packer's own conversion
+/// (`pack_fmt_conv_mode=0x105`): tt-metal's kernels use it
+/// (`is_packer_to_L1_early_conversion_supported`: `Float32 -> Float16_b`) and
+/// the instruction is built for silicon, but `ttsim` exits with
+/// `UnimplementedFunctionality`. Nothing in this tree can run the result, so the
+/// compiler refuses the program rather than leaving it to abort the simulator.
 #[test]
-#[ignore = "ttsim does not model the f32-Dst to bf16-L1 pack (pack_fmt_conv_mode=0x105)"]
-fn narrowing_to_bf16_from_a_32_bit_dst_is_the_packers() {
-    let count = 1024usize;
+fn an_f32_dst_packed_into_a_bf16_page_is_refused() {
+    let lib = library();
+    let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
+    let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
 
-    // f32 to bf16: the packer's conversion, including its NaN canonicalization
-    // and its flush of the bf16 subnormal range.
-    let mut floats = vec![
-        0.0f32,
-        -0.0,
-        f32::INFINITY,
-        f32::NEG_INFINITY,
-        f32::NAN,
-        1.0,
-    ];
-    let mut seed = 0x5eed_u32;
-    while floats.len() < count {
-        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        if seed & 0x7f80_0000 == 0 || seed & 0x7f80_0000 == 0x7f80_0000 {
-            continue;
-        }
-        floats.push(f32::from_bits(seed));
-    }
-    let f32_bytes: Vec<u8> = floats.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let out = run_kernel(CAST_F32_TO_BF16, &f32_bytes, count * 2);
-    for (i, v) in floats.iter().enumerate() {
-        let got = u16::from_le_bytes(out[2 * i..2 * i + 2].try_into().unwrap());
+    for program in [CAST_F32_TO_BF16, CAST_I32_TO_BF16, CAST_BOOL_TO_BF16] {
+        let mut module: *mut c_void = std::ptr::null_mut();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let code = unsafe {
+            compile(
+                program.as_ptr().cast(),
+                program.len(),
+                &mut module,
+                &mut err,
+            )
+        };
         assert_eq!(
-            got,
-            packer_bf16(*v),
-            "f32 to bf16, datum {i}: {v} ({:#010x})",
-            v.to_bits()
+            code, TT_TODO_PACK_F32_TO_BF16,
+            "a 32-bit Dst packed into a bf16 page is refused"
         );
-    }
-
-    // i32 to bf16: `(float)i`, then the packer.
-    let ints: Vec<i32> = (0..count).map(|i| (i as i32 - 512) * 4099).collect();
-    let i32_bytes: Vec<u8> = ints.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let out = run_kernel(CAST_I32_TO_BF16, &i32_bytes, count * 2);
-    for (i, v) in ints.iter().enumerate() {
-        let got = u16::from_le_bytes(out[2 * i..2 * i + 2].try_into().unwrap());
-        assert_eq!(got, packer_bf16(*v as f32), "i32 to bf16, datum {i}: {v}");
-    }
-
-    // A bool to bf16: one or zero, through the same narrowing.
-    let out = run_kernel(CAST_BOOL_TO_BF16, &f32_bytes, count * 2);
-    for (i, v) in floats.iter().enumerate() {
-        let got = u16::from_le_bytes(out[2 * i..2 * i + 2].try_into().unwrap());
-        let want = if *v < 0.0 { 0x3f80 } else { 0 };
-        assert_eq!(got, want, "bool to bf16, datum {i}: {v}");
+        assert!(module.is_null() && !err.is_null());
+        assert_eq!(take_error(&free, err), "TT_TODO_PACK_F32_TO_BF16");
     }
 }
 

@@ -1798,6 +1798,11 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(
                 cb_base_pack(out, cb)?;
             }
             MirOp::SetPackConfig { dtype, mask } => {
+                // A bf16 page out of a 32-bit `Dst` is the packer's own
+                // conversion, which `ttsim` does not model.
+                if !dst_is_16_bit && dtype == DType::Bf16 {
+                    return Err(Error::TT_TODO_PACK_F32_TO_BF16);
+                }
                 if last_config == Some((dtype, mask)) {
                     continue;
                 }

@@ -6,9 +6,6 @@ A kernel compiler and driver for Tenstorrent Blackhole, shipped as
 Skamandros (Σκάμανδρος) is the river god of the river beside Troy, called Xanthos
 by the gods. A *torrent* is a river: this is the god of the torrent.
 
-The crate's name is not the artifact's: a consumer links `libskamandros.so` and
-calls its C functions (`tt*`), and the program format is `TTIR`.
-
 ## What it is
 
 One semantic program in, a set of machine programs out.
@@ -72,10 +69,11 @@ measure; the end-to-end suite is.
 
 ## The C ABI
 
-`include/skamandros.h` declares it: `ttCompile`, `ttMemAlloc`, `ttMemcpyH2D`,
-`ttMemcpyD2H`, `ttLaunch`, `ttModuleUnload`, `ttInit`, `ttRelease` and `ttFree`,
-each returning a `ttStatus` and writing a message the caller frees with
-`ttFree`. `ttAbiVersion` is 2.
+The build generates `skamandros.h` next to `libskamandros.so`, from the code
+that declares it: `ttCompile`, `ttMemAlloc`, `ttMemcpyH2D`, `ttMemcpyD2H`,
+`ttLaunch`, `ttModuleUnload`, `ttInit`, `ttRelease` and `ttFree`, each returning
+a `ttStatus` and writing a message the caller frees with `ttFree`. `ttAbiVersion`
+is 2.
 
 ## Status
 
@@ -91,6 +89,8 @@ Open, in the order they block a release:
 - `softmax` needs nine live `Dst`; the bank has eight.
 - `Kernel::from_bytes` is a `todo!()`, so `ttModuleLoad` panics across the ABI;
   `param bool` and `buffer bool` do the same in the verifier.
+- A `bf16` page out of a 32-bit `Dst` is refused as `TT_TODO_PACK_F32_TO_BF16`:
+  the packer's conversion is built for silicon, but `ttsim` does not model it.
 - The hardware link is not written: this runs on `ttsim` only.
 
 ## License

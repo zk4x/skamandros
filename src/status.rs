@@ -447,6 +447,12 @@ pub enum ttStatus {
     /// pool is a free list with no spill slot — a role's program has no frame —
     /// so a deeper expression is refused rather than reusing a live register.
     TT_ERROR_REGISTERS_EXHAUSTED = 179,
+    /// A 32-bit `Dst` is about to be packed into a `bf16` page. The packer does
+    /// that conversion in hardware (`pack_fmt_conv_mode=0x105`) and tt-metal's
+    /// kernels use it, but `ttsim` exits with `UnimplementedFunctionality`, so
+    /// nothing in this tree can run the result: refused until the driver link
+    /// can exercise it.
+    TT_TODO_PACK_F32_TO_BF16 = 180,
 }
 
 impl ttStatus {
@@ -632,6 +638,7 @@ impl ttStatus {
             ttStatus::TT_ERROR_REDUCE_ACC_SHAPE => "TT_ERROR_REDUCE_ACC_SHAPE",
             ttStatus::TT_TODO_TF32 => "TT_TODO_TF32",
             ttStatus::TT_ERROR_REGISTERS_EXHAUSTED => "TT_ERROR_REGISTERS_EXHAUSTED",
+            ttStatus::TT_TODO_PACK_F32_TO_BF16 => "TT_TODO_PACK_F32_TO_BF16",
             ttStatus::TT_ERROR_DST_ROW_ODD => "TT_ERROR_DST_ROW_ODD",
         }
     }
