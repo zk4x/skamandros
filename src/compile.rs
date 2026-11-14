@@ -30,7 +30,6 @@ pub fn compile(k: &Kernel) -> Result<Module, Error> {
     // hardware's limits, so it runs before the check that enforces them.
     machine.alloc()?;
     machine.verify()?;
-    machine.plan_cbs()?;
     machine.render()
 }
 

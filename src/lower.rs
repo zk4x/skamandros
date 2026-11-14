@@ -187,6 +187,11 @@ fn prepare(k: &Kernel) -> Result<(Plan, MachineKernel, Alloc), Error> {
     }
     m.grid = crate::compile::grid_terms(k)?;
     m.params = crate::compile::parameter_kinds(k);
+    // The rings are placed *before* the walk: a mover that names a page's L1
+    // address (a copy whose index is read out of a page) needs it here, and the
+    // ring set is already final — the program's rings, the ones page and the
+    // staging pages are all minted above.
+    m.plan_cbs()?;
     Ok((plan, m, Alloc { place, lreg }))
 }
 
