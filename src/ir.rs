@@ -224,7 +224,7 @@ pub struct ValueInfo {
 /// result); `BitOr`/`BitAnd`/`BitXor`/`BitShiftLeft`/`BitShiftRight`/`Mod` are
 /// integer (`i32`); the rest operate on two values of the same dtype.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BinOp {
+pub enum BOp {
     Add,
     Sub,
     Mul,
@@ -246,53 +246,53 @@ pub enum BinOp {
     Eq,
 }
 
-impl BinOp {
-    fn from_name(name: &str) -> Option<BinOp> {
+impl BOp {
+    fn from_name(name: &str) -> Option<BOp> {
         Some(match name {
-            "add" => BinOp::Add,
-            "sub" => BinOp::Sub,
-            "mul" => BinOp::Mul,
-            "div" => BinOp::Div,
-            "pow" => BinOp::Pow,
-            "mod" => BinOp::Mod,
-            "cmplt" => BinOp::Cmplt,
-            "cmpgt" => BinOp::Cmpgt,
-            "cmpge" => BinOp::Cmpge,
-            "max" => BinOp::Max,
-            "or" => BinOp::Or,
-            "and" => BinOp::And,
-            "bitxor" => BinOp::BitXor,
-            "bitor" => BinOp::BitOr,
-            "bitand" => BinOp::BitAnd,
-            "bitshiftleft" => BinOp::BitShiftLeft,
-            "bitshiftright" => BinOp::BitShiftRight,
-            "noteq" => BinOp::NotEq,
-            "eq" => BinOp::Eq,
+            "add" => BOp::Add,
+            "sub" => BOp::Sub,
+            "mul" => BOp::Mul,
+            "div" => BOp::Div,
+            "pow" => BOp::Pow,
+            "mod" => BOp::Mod,
+            "cmplt" => BOp::Cmplt,
+            "cmpgt" => BOp::Cmpgt,
+            "cmpge" => BOp::Cmpge,
+            "max" => BOp::Max,
+            "or" => BOp::Or,
+            "and" => BOp::And,
+            "bitxor" => BOp::BitXor,
+            "bitor" => BOp::BitOr,
+            "bitand" => BOp::BitAnd,
+            "bitshiftleft" => BOp::BitShiftLeft,
+            "bitshiftright" => BOp::BitShiftRight,
+            "noteq" => BOp::NotEq,
+            "eq" => BOp::Eq,
             _ => return None,
         })
     }
 
-    fn from_tag(tag: u8) -> Option<BinOp> {
+    fn from_tag(tag: u8) -> Option<BOp> {
         Some(match tag {
-            0 => BinOp::Add,
-            1 => BinOp::Sub,
-            2 => BinOp::Mul,
-            3 => BinOp::Div,
-            4 => BinOp::Pow,
-            5 => BinOp::Mod,
-            6 => BinOp::Cmplt,
-            7 => BinOp::Cmpgt,
-            8 => BinOp::Cmpge,
-            9 => BinOp::Max,
-            10 => BinOp::Or,
-            11 => BinOp::And,
-            12 => BinOp::BitXor,
-            13 => BinOp::BitOr,
-            14 => BinOp::BitAnd,
-            15 => BinOp::BitShiftLeft,
-            16 => BinOp::BitShiftRight,
-            17 => BinOp::NotEq,
-            18 => BinOp::Eq,
+            0 => BOp::Add,
+            1 => BOp::Sub,
+            2 => BOp::Mul,
+            3 => BOp::Div,
+            4 => BOp::Pow,
+            5 => BOp::Mod,
+            6 => BOp::Cmplt,
+            7 => BOp::Cmpgt,
+            8 => BOp::Cmpge,
+            9 => BOp::Max,
+            10 => BOp::Or,
+            11 => BOp::And,
+            12 => BOp::BitXor,
+            13 => BOp::BitOr,
+            14 => BOp::BitAnd,
+            15 => BOp::BitShiftLeft,
+            16 => BOp::BitShiftRight,
+            17 => BOp::NotEq,
+            18 => BOp::Eq,
             _ => return None,
         })
     }
@@ -301,7 +301,7 @@ impl BinOp {
     pub const fn returns_bool(self) -> bool {
         matches!(
             self,
-            BinOp::Cmplt | BinOp::Cmpgt | BinOp::Cmpge | BinOp::NotEq | BinOp::Eq
+            BOp::Cmplt | BOp::Cmpgt | BOp::Cmpge | BOp::NotEq | BOp::Eq
         )
     }
 
@@ -309,24 +309,24 @@ impl BinOp {
     pub const fn is_integer_only(self) -> bool {
         matches!(
             self,
-            BinOp::Mod
-                | BinOp::BitAnd
-                | BinOp::BitOr
-                | BinOp::BitXor
-                | BinOp::BitShiftLeft
-                | BinOp::BitShiftRight
+            BOp::Mod
+                | BOp::BitAnd
+                | BOp::BitOr
+                | BOp::BitXor
+                | BOp::BitShiftLeft
+                | BOp::BitShiftRight
         )
     }
 
     /// The logical ops take and return a `bool`.
     pub const fn is_logical(self) -> bool {
-        matches!(self, BinOp::Or | BinOp::And)
+        matches!(self, BOp::Or | BOp::And)
     }
 }
 
 /// A unary register op, the same set as zyx's `UOp`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnOp {
+pub enum UOp {
     Neg,
     Not,
     BitNot,
@@ -342,41 +342,41 @@ pub enum UnOp {
     Abs,
 }
 
-impl UnOp {
-    fn from_name(name: &str) -> Option<UnOp> {
+impl UOp {
+    fn from_name(name: &str) -> Option<UOp> {
         Some(match name {
-            "neg" => UnOp::Neg,
-            "not" => UnOp::Not,
-            "bitnot" => UnOp::BitNot,
-            "exp2" => UnOp::Exp2,
-            "log2" => UnOp::Log2,
-            "reciprocal" => UnOp::Reciprocal,
-            "sqrt" => UnOp::Sqrt,
-            "rsqrt" => UnOp::Rsqrt,
-            "sin" => UnOp::Sin,
-            "cos" => UnOp::Cos,
-            "floor" => UnOp::Floor,
-            "trunc" => UnOp::Trunc,
-            "abs" => UnOp::Abs,
+            "neg" => UOp::Neg,
+            "not" => UOp::Not,
+            "bitnot" => UOp::BitNot,
+            "exp2" => UOp::Exp2,
+            "log2" => UOp::Log2,
+            "reciprocal" => UOp::Reciprocal,
+            "sqrt" => UOp::Sqrt,
+            "rsqrt" => UOp::Rsqrt,
+            "sin" => UOp::Sin,
+            "cos" => UOp::Cos,
+            "floor" => UOp::Floor,
+            "trunc" => UOp::Trunc,
+            "abs" => UOp::Abs,
             _ => return None,
         })
     }
 
-    fn from_tag(tag: u8) -> Option<UnOp> {
+    fn from_tag(tag: u8) -> Option<UOp> {
         Some(match tag {
-            0 => UnOp::Neg,
-            1 => UnOp::Not,
-            2 => UnOp::BitNot,
-            3 => UnOp::Exp2,
-            4 => UnOp::Log2,
-            5 => UnOp::Reciprocal,
-            6 => UnOp::Sqrt,
-            7 => UnOp::Rsqrt,
-            8 => UnOp::Sin,
-            9 => UnOp::Cos,
-            10 => UnOp::Floor,
-            11 => UnOp::Trunc,
-            12 => UnOp::Abs,
+            0 => UOp::Neg,
+            1 => UOp::Not,
+            2 => UOp::BitNot,
+            3 => UOp::Exp2,
+            4 => UOp::Log2,
+            5 => UOp::Reciprocal,
+            6 => UOp::Sqrt,
+            7 => UOp::Rsqrt,
+            8 => UOp::Sin,
+            9 => UOp::Cos,
+            10 => UOp::Floor,
+            11 => UOp::Trunc,
+            12 => UOp::Abs,
             _ => return None,
         })
     }
@@ -468,9 +468,9 @@ pub enum Op {
     /// The same bits under another name, between dtypes of equal width.
     Bitcast { dtype: DType, src: OpId },
     /// One unary register op.
-    Unary { op: UnOp, a: OpId },
+    Unary { op: UOp, a: OpId },
     /// One binary register op, with implicit broadcast.
-    Binary { op: BinOp, a: OpId, b: OpId },
+    Binary { op: BOp, a: OpId, b: OpId },
     /// Branchless select: `cond ? if_true : if_false`. `cond` is a `bool`; the
     /// two values have the same dtype and the result has their shape.
     Select {
@@ -792,7 +792,7 @@ pub(crate) fn broadcast_pair(k: &Kernel, op: &Op) -> Option<(OpId, OpId)> {
     let Op::Binary { op, a, b } = *op else {
         return None;
     };
-    if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+    if !matches!(op, BOp::Add | BOp::Sub | BOp::Mul) {
         return None;
     }
     let (x, y) = (k.info(a), k.info(b));
@@ -908,25 +908,25 @@ impl Kernel {
                 let a = self.const_i32(a)?;
                 let b = self.const_i32(b)?;
                 match op {
-                    BinOp::Add => Some(a.wrapping_add(b)),
-                    BinOp::Sub => Some(a.wrapping_sub(b)),
-                    BinOp::Mul => Some(a.wrapping_mul(b)),
-                    BinOp::Div => a.checked_div(b),
-                    BinOp::Mod => a.checked_rem(b),
-                    BinOp::Pow => a.checked_pow(u32::try_from(b).ok()?),
-                    BinOp::Max => Some(a.max(b)),
-                    BinOp::BitAnd => Some(a & b),
-                    BinOp::BitOr => Some(a | b),
-                    BinOp::BitXor => Some(a ^ b),
-                    BinOp::BitShiftLeft => a.checked_shl(u32::try_from(b).ok()?),
-                    BinOp::BitShiftRight => a.checked_shr(u32::try_from(b).ok()?),
-                    BinOp::Cmplt
-                    | BinOp::Cmpgt
-                    | BinOp::Cmpge
-                    | BinOp::Eq
-                    | BinOp::NotEq
-                    | BinOp::Or
-                    | BinOp::And => None,
+                    BOp::Add => Some(a.wrapping_add(b)),
+                    BOp::Sub => Some(a.wrapping_sub(b)),
+                    BOp::Mul => Some(a.wrapping_mul(b)),
+                    BOp::Div => a.checked_div(b),
+                    BOp::Mod => a.checked_rem(b),
+                    BOp::Pow => a.checked_pow(u32::try_from(b).ok()?),
+                    BOp::Max => Some(a.max(b)),
+                    BOp::BitAnd => Some(a & b),
+                    BOp::BitOr => Some(a | b),
+                    BOp::BitXor => Some(a ^ b),
+                    BOp::BitShiftLeft => a.checked_shl(u32::try_from(b).ok()?),
+                    BOp::BitShiftRight => a.checked_shr(u32::try_from(b).ok()?),
+                    BOp::Cmplt
+                    | BOp::Cmpgt
+                    | BOp::Cmpge
+                    | BOp::Eq
+                    | BOp::NotEq
+                    | BOp::Or
+                    | BOp::And => None,
                 }
             }
             _ => None,
@@ -1865,12 +1865,12 @@ impl Parser {
             }
             other => {
                 let id = self.ops.len();
-                if let Some(op) = UnOp::from_name(other) {
+                if let Some(op) = UOp::from_name(other) {
                     let a = t.value(&self.symbols)?;
                     t.end()?;
                     self.define(name, id)?;
                     self.push(Op::Unary { op, a });
-                } else if let Some(op) = BinOp::from_name(other) {
+                } else if let Some(op) = BOp::from_name(other) {
                     let a = t.value(&self.symbols)?;
                     let b = t.value(&self.symbols)?;
                     t.end()?;
@@ -2099,45 +2099,45 @@ fn literal(dtype: DType, bits: u32) -> String {
     }
 }
 
-fn unary_name(op: UnOp) -> &'static str {
+fn unary_name(op: UOp) -> &'static str {
     match op {
-        UnOp::Neg => "neg",
-        UnOp::Not => "not",
-        UnOp::BitNot => "bitnot",
-        UnOp::Exp2 => "exp2",
-        UnOp::Log2 => "log2",
-        UnOp::Reciprocal => "reciprocal",
-        UnOp::Sqrt => "sqrt",
-        UnOp::Rsqrt => "rsqrt",
-        UnOp::Sin => "sin",
-        UnOp::Cos => "cos",
-        UnOp::Floor => "floor",
-        UnOp::Trunc => "trunc",
-        UnOp::Abs => "abs",
+        UOp::Neg => "neg",
+        UOp::Not => "not",
+        UOp::BitNot => "bitnot",
+        UOp::Exp2 => "exp2",
+        UOp::Log2 => "log2",
+        UOp::Reciprocal => "reciprocal",
+        UOp::Sqrt => "sqrt",
+        UOp::Rsqrt => "rsqrt",
+        UOp::Sin => "sin",
+        UOp::Cos => "cos",
+        UOp::Floor => "floor",
+        UOp::Trunc => "trunc",
+        UOp::Abs => "abs",
     }
 }
 
-fn binary_name(op: BinOp) -> &'static str {
+fn binary_name(op: BOp) -> &'static str {
     match op {
-        BinOp::Add => "add",
-        BinOp::Sub => "sub",
-        BinOp::Mul => "mul",
-        BinOp::Div => "div",
-        BinOp::Pow => "pow",
-        BinOp::Mod => "mod",
-        BinOp::Cmplt => "cmplt",
-        BinOp::Cmpgt => "cmpgt",
-        BinOp::Cmpge => "cmpge",
-        BinOp::Max => "max",
-        BinOp::Or => "or",
-        BinOp::And => "and",
-        BinOp::BitXor => "bitxor",
-        BinOp::BitOr => "bitor",
-        BinOp::BitAnd => "bitand",
-        BinOp::BitShiftLeft => "bitshiftleft",
-        BinOp::BitShiftRight => "bitshiftright",
-        BinOp::NotEq => "noteq",
-        BinOp::Eq => "eq",
+        BOp::Add => "add",
+        BOp::Sub => "sub",
+        BOp::Mul => "mul",
+        BOp::Div => "div",
+        BOp::Pow => "pow",
+        BOp::Mod => "mod",
+        BOp::Cmplt => "cmplt",
+        BOp::Cmpgt => "cmpgt",
+        BOp::Cmpge => "cmpge",
+        BOp::Max => "max",
+        BOp::Or => "or",
+        BOp::And => "and",
+        BOp::BitXor => "bitxor",
+        BOp::BitOr => "bitor",
+        BOp::BitAnd => "bitand",
+        BOp::BitShiftLeft => "bitshiftleft",
+        BOp::BitShiftRight => "bitshiftright",
+        BOp::NotEq => "noteq",
+        BOp::Eq => "eq",
     }
 }
 

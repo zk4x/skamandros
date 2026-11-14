@@ -47,7 +47,7 @@ const TT_OK: c_int = 0;
 const TT_ERROR_ARGUMENT: c_int = 1;
 const TT_ERROR_PROGRAM: c_int = 2;
 const TT_ERROR_MODULE: c_int = 3;
-const TT_ERROR_PARSE: c_int = 8;
+const TT_ERROR_VALUE_UNDEFINED: c_int = 14;
 const TT_ERROR_NOT_TTIR: c_int = 10;
 const TT_ERROR_BF16_WIDEN: c_int = 153;
 
@@ -217,11 +217,11 @@ fn a_refused_program_comes_back_as_an_error_not_a_crash() {
     let mut err: *mut c_char = std::ptr::null_mut();
     let code = unsafe { compile(bad.as_ptr().cast(), bad.len(), &mut module, &mut err) };
     assert_eq!(
-        code, TT_ERROR_PARSE,
+        code, TT_ERROR_VALUE_UNDEFINED,
         "a use before its definition is refused"
     );
     assert!(module.is_null() && !err.is_null());
-    assert_eq!(take_error(&free, err), "TT_ERROR_PARSE");
+    assert_eq!(take_error(&free, err), "TT_ERROR_VALUE_UNDEFINED");
 }
 
 #[test]

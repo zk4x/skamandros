@@ -3,7 +3,7 @@
 
 //! The compiled program: what a launch runs.
 
-use crate::ir::BinOp;
+use crate::ir::BOp;
 
 /// What a launch argument for one parameter is: a value or an address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +22,7 @@ pub enum GridTerm {
     Const(u32),
     /// The value of parameter `i` (program order), which must be a scalar.
     Param(u32),
-    Binary(BinOp, Box<GridTerm>, Box<GridTerm>),
+    Binary(BOp, Box<GridTerm>, Box<GridTerm>),
 }
 
 impl Default for GridTerm {

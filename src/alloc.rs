@@ -16,10 +16,8 @@
 use std::collections::BTreeMap;
 
 use crate::ir::{DType, Error};
-use crate::mir::{Cb, CbInfo, Core, Dst, DstInfo, LReg, MachineKernel, MirOp};
+use crate::mir::{Cb, CbInfo, Dst, DstInfo, LReg, MachineKernel, MirOp};
 
-/// Bytes per `Dst` register in 32-bit mode.
-const DST_BYTES: u32 = 32 * 32 * 4;
 /// Writable lane registers (`SFPLOAD`/`SFPSTORE` address `L0..L7`).
 pub const LREGS: u8 = 8;
 /// Alignment every ring starts at: the NoC requires the two addresses of a
@@ -180,7 +178,7 @@ fn alloc_lregs(m: &mut MachineKernel) -> Result<(), Error> {
 
 /// Rewrite every `Dst` an op names.
 fn rewrite_dsts(op: &mut MirOp, rename: &BTreeMap<Dst, Dst>) {
-    let mut map = |reg: &mut Dst| {
+    let map = |reg: &mut Dst| {
         if let Some(to) = rename.get(reg) {
             *reg = *to;
         }
@@ -203,7 +201,7 @@ fn rewrite_dsts(op: &mut MirOp, rename: &BTreeMap<Dst, Dst>) {
 
 /// Rewrite every lane register an op names.
 fn rewrite_lregs(op: &mut MirOp, rename: &BTreeMap<LReg, LReg>) {
-    let mut map = |reg: &mut LReg| {
+    let map = |reg: &mut LReg| {
         if let Some(to) = rename.get(reg) {
             *reg = *to;
         }
@@ -285,6 +283,7 @@ pub fn plan_cbs(m: &mut MachineKernel) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mir::Core;
 
     /// Two values that do not overlap share one physical register.
     #[test]

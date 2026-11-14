@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 
 use crate::ir::{
-    BinOp, DType, Dim, Error, Kernel, Op, OpId, RegShape, UnOp, ValueInfo, access_shape, unit_of,
+    BOp, DType, Dim, Error, Kernel, Op, OpId, RegShape, UOp, ValueInfo, access_shape, unit_of,
 };
 use crate::mir::{
     Bcast, BinarySfpOp, Cb, CmpOp, Core, Dst, ElwOp, IOp, LReg, MachineKernel, MirOp, PackMask,
@@ -77,7 +77,7 @@ impl Pool {
     }
 
     fn take(&mut self) -> Result<u8, Error> {
-        self.free.pop().ok_or(Error::TT_TODO_LOOP_ADDRESS)
+        self.free.pop().ok_or(Error::TT_ERROR_REGISTERS_EXHAUSTED)
     }
 
     fn give(&mut self, reg: u8) {
@@ -260,7 +260,7 @@ impl Kernel {
 fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
     let types = Types { k };
     let types = &types;
-    let (mut plan, mut m, alloc) = prepare(k)?;
+    let (plan, mut m, alloc) = prepare(k)?;
     let alloc = &alloc;
 
     // The dtype a value occupies `Dst` with. 16-bit mode stores every value as
@@ -775,7 +775,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                 // `exp2` is the one transcendental no IR op spells: its
                 // exponent assembly is `SFPEXEXP`/`SFPSETEXP`, so it is a body
                 // here rather than a line in `src/unfold.rs`.
-                if op == UnOp::Exp2 {
+                if op == UOp::Exp2 {
                     let mut body = Vec::new();
                     exp2_body(&mut body, src, out, &rows, la, dtype);
                     for op in body {
@@ -783,7 +783,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                     }
                     continue;
                 }
-                if op == UnOp::Rsqrt {
+                if op == UOp::Rsqrt {
                     let mut body = Vec::new();
                     rsqrt_body(&mut body, src, out, &rows, la, dtype);
                     for op in body {
@@ -849,7 +849,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                     // one operand is the tile, the other its row, column or
                     // scalar. Both come from pages, so each is a `load`'s page
                     // or the compiler's staged one.
-                    if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+                    if !matches!(op, BOp::Add | BOp::Sub | BOp::Mul) {
                         let _ = (op, left.shape, right.shape);
                         return Err(Error::TT_TODO_BROADCAST);
                     }
@@ -864,7 +864,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                     // The instruction is `SrcA op SrcB` and the tile is the
                     // one that can be `SrcA`, so a difference with the narrow
                     // value on the left has no lowering.
-                    if op == BinOp::Sub && tile != a {
+                    if op == BOp::Sub && tile != a {
                         let _ = (a, b);
                         return Err(Error::TT_TODO_BROADCAST);
                     }
@@ -901,18 +901,18 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                     crate::ir::DType::I32
                         if matches!(
                             op,
-                            BinOp::Add
-                                | BinOp::Sub
-                                | BinOp::BitAnd
-                                | BinOp::BitOr
-                                | BinOp::BitXor
-                                | BinOp::BitShiftLeft
-                                | BinOp::BitShiftRight
-                                | BinOp::Cmplt
-                                | BinOp::Cmpgt
-                                | BinOp::Cmpge
-                                | BinOp::Eq
-                                | BinOp::NotEq
+                            BOp::Add
+                                | BOp::Sub
+                                | BOp::BitAnd
+                                | BOp::BitOr
+                                | BOp::BitXor
+                                | BOp::BitShiftLeft
+                                | BOp::BitShiftRight
+                                | BOp::Cmplt
+                                | BOp::Cmpgt
+                                | BOp::Cmpge
+                                | BOp::Eq
+                                | BOp::NotEq
                         ) =>
                     {
                         crate::ir::DType::I32
@@ -920,7 +920,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                     // A bool lane is `-1`/`0`, so the bitwise and/or *is* the
                     // logical one (this is what zyx's `tt_sfp_integer` does for
                     // `BOp::And`/`Or` too).
-                    crate::ir::DType::Bool if matches!(op, BinOp::And | BinOp::Or) => {
+                    crate::ir::DType::Bool if matches!(op, BOp::And | BOp::Or) => {
                         crate::ir::DType::Bool
                     }
                     other => {
@@ -936,7 +936,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                 // the integer format; everything else keeps the operands'.
                 let out_dtype = if matches!(
                     op,
-                    BinOp::Cmplt | BinOp::Cmpgt | BinOp::Cmpge | BinOp::Eq | BinOp::NotEq
+                    BOp::Cmplt | BOp::Cmpgt | BOp::Cmpge | BOp::Eq | BOp::NotEq
                 ) {
                     storage(crate::ir::DType::Bool)
                 } else {
@@ -947,7 +947,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                 // shift's amount: its encoding negates the amount in its own
                 // lane (there is no other way to ask `SFPSHFT` for the other
                 // direction), so it is re-loaded per row.
-                let reload_amount = matches!(op, BinOp::BitShiftRight);
+                let reload_amount = matches!(op, BOp::BitShiftRight);
                 if let Some(bits) = ca {
                     m.push(Core::Math, MirOp::LaneConst { lreg: la, bits });
                 }
@@ -988,10 +988,10 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                         );
                     }
                     match op {
-                        BinOp::Cmplt | BinOp::Cmpgt | BinOp::Cmpge => {
+                        BOp::Cmplt | BOp::Cmpgt | BOp::Cmpge => {
                             let cmp = match op {
-                                BinOp::Cmplt => CmpOp::Lt,
-                                BinOp::Cmpgt => CmpOp::Gt,
+                                BOp::Cmplt => CmpOp::Lt,
+                                BOp::Cmpgt => CmpOp::Gt,
                                 _ => CmpOp::Ge,
                             };
                             m.push(
@@ -1009,7 +1009,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                         // sign-magnitude `-1`/`0` lanes. This is zyx's
                         // `tt_sfp_compare` shape without its NaN and `-0`
                         // specials, which the ordered tests do not carry either.
-                        BinOp::Eq | BinOp::NotEq => {
+                        BOp::Eq | BOp::NotEq => {
                             m.push(
                                 Core::Math,
                                 MirOp::Compare {
@@ -1037,7 +1037,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                                     d: ld,
                                 },
                             );
-                            if matches!(op, BinOp::Eq) {
+                            if matches!(op, BOp::Eq) {
                                 m.push(
                                     Core::Math,
                                     MirOp::UnarySfp {
@@ -1048,7 +1048,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                                 );
                             }
                         }
-                        BinOp::Max => m.push(
+                        BOp::Max => m.push(
                             Core::Math,
                             MirOp::Max {
                                 a: la,
@@ -1064,8 +1064,8 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, Error> {
                                 // `SFPMAD`'s float ones.
                                 op: if left.dtype == crate::ir::DType::I32 {
                                     match op {
-                                        BinOp::Add => BinarySfpOp::IAdd,
-                                        BinOp::Sub => BinarySfpOp::ISub,
+                                        BOp::Add => BinarySfpOp::IAdd,
+                                        BOp::Sub => BinarySfpOp::ISub,
                                         other => binary(other, at)?,
                                     }
                                 } else {
@@ -2045,7 +2045,7 @@ fn fpu_broadcast(
     alloc: &Alloc,
     acc_mask: &BTreeMap<OpId, PackMask>,
     value: crate::ir::OpId,
-    op: BinOp,
+    op: BOp,
     tile: crate::ir::OpId,
     narrow: crate::ir::OpId,
     bcast: Bcast,
@@ -2131,7 +2131,7 @@ fn fpu_broadcast(
     // destination (tt-isa's measured encoding; `ELWADD`/`ELWSUB` overwrite).
     // That is also how the four fidelity phases add up, so the result section is
     // zeroed first and the phases accumulate onto nothing.
-    if matches!(op, BinOp::Mul) {
+    if matches!(op, BOp::Mul) {
         m.push(
             Core::Math,
             MirOp::LaneConst {
@@ -2218,16 +2218,16 @@ fn fpu_broadcast(
         // `HiFi4`; `ELWADD`/`ELWSUB` are one pass at any fidelity, which is why
         // only the multiply repeats. The last pass clears the phase and steps
         // the counters on to the next eight rows.
-        let phases: u32 = if matches!(op, BinOp::Mul) { 4 } else { 1 };
+        let phases: u32 = if matches!(op, BOp::Mul) { 4 } else { 1 };
         for half in 0..2u32 {
             for phase in 0..phases {
                 m.push(
                     Core::Math,
                     MirOp::Elw {
                         op: match op {
-                            BinOp::Add => ElwOp::Add,
-                            BinOp::Sub => ElwOp::Sub,
-                            BinOp::Mul => ElwOp::Mul,
+                            BOp::Add => ElwOp::Add,
+                            BOp::Sub => ElwOp::Sub,
+                            BOp::Mul => ElwOp::Mul,
                             other => {
                                 unreachable!("the caller admits add, sub and mul, not {other:?}")
                             }
@@ -2505,18 +2505,18 @@ fn at_len(len: Dim) -> Dim {
 
 /// The RISC-V form of an index arithmetic op; a comparison, `max` or `pow` is
 /// not one.
-fn int_op(op: BinOp) -> Option<IOp> {
+fn int_op(op: BOp) -> Option<IOp> {
     Some(match op {
-        BinOp::Add => IOp::Add,
-        BinOp::Sub => IOp::Sub,
-        BinOp::Mul => IOp::Mul,
-        BinOp::Div => IOp::Div,
-        BinOp::Mod => IOp::Rem,
-        BinOp::BitAnd => IOp::And,
-        BinOp::BitOr => IOp::Or,
-        BinOp::BitXor => IOp::Xor,
-        BinOp::BitShiftLeft => IOp::Sll,
-        BinOp::BitShiftRight => IOp::Sra,
+        BOp::Add => IOp::Add,
+        BOp::Sub => IOp::Sub,
+        BOp::Mul => IOp::Mul,
+        BOp::Div => IOp::Div,
+        BOp::Mod => IOp::Rem,
+        BOp::BitAnd => IOp::And,
+        BOp::BitOr => IOp::Or,
+        BOp::BitXor => IOp::Xor,
+        BOp::BitShiftLeft => IOp::Sll,
+        BOp::BitShiftRight => IOp::Sra,
         _ => return None,
     })
 }
@@ -3348,11 +3348,11 @@ fn index_page(
 /// Follow a bitcast to the value that owns the `Dst` slot: a bitcast has no
 /// home of its own. The definition is the value itself, so this is a walk of
 /// the chain, not a table.
-fn unary(op: UnOp, at: OpId) -> Result<UnarySfpOp, Error> {
+fn unary(op: UOp, at: OpId) -> Result<UnarySfpOp, Error> {
     match op {
-        UnOp::Neg => Ok(UnarySfpOp::Neg),
-        UnOp::Abs => Ok(UnarySfpOp::Abs),
-        UnOp::BitNot => Ok(UnarySfpOp::BitNot),
+        UOp::Neg => Ok(UnarySfpOp::Neg),
+        UOp::Abs => Ok(UnarySfpOp::Abs),
+        UOp::BitNot => Ok(UnarySfpOp::BitNot),
         other => {
             let _ = (at, other);
             Err(Error::TT_TODO_UNARY_SFPU)
@@ -3360,16 +3360,16 @@ fn unary(op: UnOp, at: OpId) -> Result<UnarySfpOp, Error> {
     }
 }
 
-fn binary(op: BinOp, at: OpId) -> Result<BinarySfpOp, Error> {
+fn binary(op: BOp, at: OpId) -> Result<BinarySfpOp, Error> {
     match op {
-        BinOp::Add => Ok(BinarySfpOp::Add),
-        BinOp::Sub => Ok(BinarySfpOp::Sub),
-        BinOp::Mul => Ok(BinarySfpOp::Mul),
-        BinOp::And | BinOp::BitAnd => Ok(BinarySfpOp::BitAnd),
-        BinOp::Or | BinOp::BitOr => Ok(BinarySfpOp::BitOr),
-        BinOp::BitXor => Ok(BinarySfpOp::BitXor),
-        BinOp::BitShiftLeft => Ok(BinarySfpOp::Shl),
-        BinOp::BitShiftRight => Ok(BinarySfpOp::Shr),
+        BOp::Add => Ok(BinarySfpOp::Add),
+        BOp::Sub => Ok(BinarySfpOp::Sub),
+        BOp::Mul => Ok(BinarySfpOp::Mul),
+        BOp::And | BOp::BitAnd => Ok(BinarySfpOp::BitAnd),
+        BOp::Or | BOp::BitOr => Ok(BinarySfpOp::BitOr),
+        BOp::BitXor => Ok(BinarySfpOp::BitXor),
+        BOp::BitShiftLeft => Ok(BinarySfpOp::Shl),
+        BOp::BitShiftRight => Ok(BinarySfpOp::Shr),
         other => {
             let _ = (at, other);
             Err(Error::TT_TODO_BINARY_SFPU)

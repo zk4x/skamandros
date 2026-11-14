@@ -137,7 +137,7 @@ fn grid_eval(
     params: &[u64],
 ) -> Result<i64, Error> {
     use crate::compile::GridTerm;
-    use crate::ir::BinOp;
+    use crate::ir::BOp;
     let value = match term {
         GridTerm::Const(n) => i64::from(*n),
         GridTerm::Param(index) => {
@@ -153,22 +153,22 @@ fn grid_eval(
             let a = grid_eval(a, module, params)?;
             let b = grid_eval(b, module, params)?;
             match op {
-                BinOp::Add => a.checked_add(b).ok_or(Error::TT_ERROR_GRID)?,
-                BinOp::Sub => a.checked_sub(b).ok_or(Error::TT_ERROR_GRID)?,
-                BinOp::Mul => a.checked_mul(b).ok_or(Error::TT_ERROR_GRID)?,
-                BinOp::Div => a.checked_div(b).ok_or(Error::TT_ERROR_GRID)?,
-                BinOp::Mod => a.checked_rem(b).ok_or(Error::TT_ERROR_GRID)?,
-                BinOp::Pow => a
+                BOp::Add => a.checked_add(b).ok_or(Error::TT_ERROR_GRID)?,
+                BOp::Sub => a.checked_sub(b).ok_or(Error::TT_ERROR_GRID)?,
+                BOp::Mul => a.checked_mul(b).ok_or(Error::TT_ERROR_GRID)?,
+                BOp::Div => a.checked_div(b).ok_or(Error::TT_ERROR_GRID)?,
+                BOp::Mod => a.checked_rem(b).ok_or(Error::TT_ERROR_GRID)?,
+                BOp::Pow => a
                     .checked_pow(u32::try_from(b).map_err(|_| Error::TT_ERROR_GRID)?)
                     .ok_or(Error::TT_ERROR_GRID)?,
-                BinOp::Max => a.max(b),
-                BinOp::BitAnd => a & b,
-                BinOp::BitOr => a | b,
-                BinOp::BitXor => a ^ b,
-                BinOp::BitShiftLeft => a
+                BOp::Max => a.max(b),
+                BOp::BitAnd => a & b,
+                BOp::BitOr => a | b,
+                BOp::BitXor => a ^ b,
+                BOp::BitShiftLeft => a
                     .checked_shl(u32::try_from(b).map_err(|_| Error::TT_ERROR_GRID)?)
                     .ok_or(Error::TT_ERROR_GRID)?,
-                BinOp::BitShiftRight => a
+                BOp::BitShiftRight => a
                     .checked_shr(u32::try_from(b).map_err(|_| Error::TT_ERROR_GRID)?)
                     .ok_or(Error::TT_ERROR_GRID)?,
                 _ => {

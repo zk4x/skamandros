@@ -443,6 +443,10 @@ pub enum ttStatus {
     /// can name it until the storage, the Src format selection and the
     /// explicit casts are wired.
     TT_TODO_TF32 = 178,
+    /// An index expression needs more RISC-V registers than its role has. The
+    /// pool is a free list with no spill slot — a role's program has no frame —
+    /// so a deeper expression is refused rather than reusing a live register.
+    TT_ERROR_REGISTERS_EXHAUSTED = 179,
 }
 
 impl ttStatus {
@@ -627,6 +631,7 @@ impl ttStatus {
             ttStatus::TT_TODO_BROADCAST_SFPU => "TT_TODO_BROADCAST_SFPU",
             ttStatus::TT_ERROR_REDUCE_ACC_SHAPE => "TT_ERROR_REDUCE_ACC_SHAPE",
             ttStatus::TT_TODO_TF32 => "TT_TODO_TF32",
+            ttStatus::TT_ERROR_REGISTERS_EXHAUSTED => "TT_ERROR_REGISTERS_EXHAUSTED",
             ttStatus::TT_ERROR_DST_ROW_ODD => "TT_ERROR_DST_ROW_ODD",
         }
     }
