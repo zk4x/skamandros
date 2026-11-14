@@ -5191,6 +5191,31 @@ copy 32,32 %out [0] = %bo [0]
     )
 }
 
+/// Store a computed f32 tile to a declared buffer, in the same loop the fold
+/// stages it: the pack path without `stage`'s compiler-owned page.
+fn mul_store_probe_program(n: u32, dt: &str) -> String {
+    format!(
+        "\
+version 9
+grid 1,1
+%px = param {dt} 98304
+%out = param {dt} 98304
+%bx = buffer {dt} 32,32
+%bsq = buffer {dt} 32,32
+%one = const i32 1
+%n = const i32 {n}
+%i = loop %n
+%oi = mul %i %one
+copy 32,32 %bx [0] = %px [%oi]
+load 32,32 %x = %bx [0]
+%sq = mul %x %x
+store 32,32 %bsq [0] = %sq
+copy 32,32 %out [%oi] = %bsq [0]
+endloop
+"
+    )
+}
+
 #[test]
 fn probe_bf16_row_fold() {
     const HIDDEN: usize = 3072;
@@ -5371,7 +5396,12 @@ fn probe_bf16_row_fold() {
             );
         }
     }
-    let x_f32: Vec<u8> = xw.iter().flat_map(|v| v.to_le_bytes()).collect();
+    // The f32 input must be in the page layout, exactly as the bf16 one is: the
+    // kernel's `copy` reads page 0 of the parameter.
+    let x_f32: Vec<u8> = tiled(32, HIDDEN, &xw)
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
     let ones_f32: Vec<u8> = ones
         .iter()
         .flat_map(|h| widen_bf16(*h).to_le_bytes())
@@ -5392,6 +5422,7 @@ fn probe_bf16_row_fold() {
             "f32 acc, {n} tiles: got {got}, want {want}, rel {}",
             (got - want) / want
         );
+        assert_eq!(got, want, "f32 acc over {n} tiles");
     }
     for unit in [1.0f32, 1.25, 1.5, 2.5, 3.0, 4.0] {
         let u: Vec<f32> = (0..32 * HIDDEN).map(|_| unit).collect();
@@ -5407,12 +5438,8 @@ fn probe_bf16_row_fold() {
             "f32 uniform {unit}, 96 tiles: row0 {row0}, want {}",
             96.0 * 32.0 * unit * unit
         );
+        assert_eq!(row0, 96.0 * 32.0 * unit * unit, "f32 uniform {unit}");
     }
-    let out = run_kernel_tensors(
-        &sum_row_probe_program(96, "f32", "f32", "f32"),
-        &[&x_f32, &ones_f32],
-        1024 * 4,
-    );
     let out = run_kernel_tensors(
         &sum_row_probe_program(1, "f32", "f32", "f32"),
         &[&x_f32, &ones_f32],
@@ -5424,15 +5451,13 @@ fn probe_bf16_row_fold() {
         .collect();
     for row in 0..32 {
         let v = one[tile_index(row, 0)];
-        if v != 0.0 {
-            let want: f32 = (0..32)
-                .map(|c| {
-                    let x = xw[row * HIDDEN + c];
-                    x * x
-                })
-                .sum();
-            eprintln!("f32 n1 row {row}: got {v}, want {want}");
-        }
+        let want: f32 = (0..32)
+            .map(|c| {
+                let x = xw[row * HIDDEN + c];
+                x * x
+            })
+            .sum();
+        assert_eq!(v, want, "f32 computed n1 row {row}");
     }
     eprintln!(
         "f32 first datums: {:?}",
@@ -5463,15 +5488,27 @@ fn probe_bf16_row_fold() {
         .collect();
     for row in 0..32 {
         let v = one[tile_index(row, 0)];
-        if v != 0.0 || row < 2 {
-            let want: f32 = (0..32)
-                .map(|c| {
-                    let x = xw[row * HIDDEN + c];
-                    x * x
-                })
-                .sum();
-            eprintln!("f32 loaded n1 row {row}: got {v}, want {want}");
-        }
+        let want: f32 = (0..32)
+            .map(|c| {
+                let x = xw[row * HIDDEN + c];
+                x * x
+            })
+            .sum();
+        assert_eq!(v, want, "f32 loaded n1 row {row}");
+    }
+    // The pack path on its own: store the computed tile to a declared buffer.
+    let tiled_sq = tiled(32, HIDDEN, &sq_f32);
+    let out = run_kernel_tensors(
+        &mul_store_probe_program(1, "f32"),
+        &[&x_f32],
+        HIDDEN * 32 * 4,
+    );
+    let stored: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for i in 0..1024 {
+        assert_eq!(stored[i], tiled_sq[i], "the packed square at datum {i}");
     }
 }
 
