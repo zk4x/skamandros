@@ -5516,7 +5516,7 @@ fn probe_bf16_row_fold() {
 /// so the reference is the f32 rule on the widened inputs and the tolerance
 /// covers the truncations (the 96-tile fold included).
 #[test]
-#[ignore = "blocked by the bf16 row fold (see bf16_sum_row_over_many_tiles)"]
+#[ignore = "the bf16 fold quantises to the Dst ulp (+13.2 % over 96 tiles) and the accurate `acc f32` form packs through 0x105, which ttsim does not model by decision; silicon only — see TODO.md"]
 fn bf16_rms_norm_runs_on_the_simulator() {
     const HIDDEN: usize = 3072;
     const COLS: usize = HIDDEN / 32;
