@@ -394,6 +394,11 @@ fn launch_steps(
         // launch with no compute program has no semaphores to set up.
         if compute && !module.setup.is_empty() {
             stage_role(device, 0, &module.setup, ARGS_AT)?;
+            // The arguments and the setup program are in L1; the generation that
+            // starts T0 on them is a store to a different address, so the tile
+            // is made to show every earlier write first (tt-metal's `l1_membar`
+            // before a launch).
+            device.l1_barrier()?;
             let mb = mailbox::launch::Mailbox::of(0);
             let generation = device.start(mb)?;
             device.await_launch(mb, generation)?;
@@ -431,6 +436,10 @@ fn launch_steps(
             enables |= ROLE_ENABLE[thread];
         }
         let mb = mailbox::launch::Mailbox::b();
+        // Every program and launch word of this tile is staged; the generation
+        // below is the store that lets a core read them, so the tile is made to
+        // show them first (`l1_membar`, as before the setup run).
+        device.l1_barrier()?;
         let (text, words) = if module.reader.is_empty() {
             (0, 0)
         } else {

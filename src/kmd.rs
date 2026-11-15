@@ -103,12 +103,15 @@ pub mod abi {
     /// merged or reordered).
     pub mod mapping_id {
         pub const RESOURCE0_UC: u32 = 1;
+        pub const RESOURCE0_WC: u32 = 2;
     }
 
-    /// `TENSTORRENT_LOCK_CTL_*` at the values this module uses (`ioctl.h:212-215`).
+    /// `TENSTORRENT_LOCK_CTL_*` at the value this module uses (`ioctl.h:212-215`).
+    /// `RELEASE` (1) is deliberately not declared: tt-kmd frees a descriptor's
+    /// resource locks itself when it closes (`chardev.c:1103`), after the
+    /// close-time cleanup write, which is the order this driver wants.
     pub mod lock {
         pub const ACQUIRE: u32 = 0;
-        pub const RELEASE: u32 = 1;
     }
 
     /// `tenstorrent_get_device_info` (`ioctl.h:47-66`).
@@ -337,18 +340,23 @@ impl Drop for Bar {
 /// One Blackhole reached through one `/dev/tenstorrent/N`.
 ///
 /// Holds the file descriptor the driver ties the session lock and the cleanup
-/// write to, BAR0, and the 2 MiB window the driver allocated for this session.
-/// tt-kmd exposes no configuration-space ioctl — `GetDeviceInfo` carries
-/// identity, not the BARs — and nothing here needs configuration space: the BARs
-/// come from `QUERY_MAPPINGS`.
+/// write to, BAR0 in both of the driver's views, and the 2 MiB window the driver
+/// allocated for this session. tt-kmd exposes no configuration-space ioctl —
+/// `GetDeviceInfo` carries identity, not the BARs — and nothing here needs
+/// configuration space: the BARs come from `QUERY_MAPPINGS`.
 pub struct Kmd {
-    // Declared before `fd` so the aperture is unmapped before the descriptor it
-    // was mapped through is closed.
+    // Declared before `fd` so the apertures are unmapped before the descriptor
+    // they were mapped through is closed.
+    /// BAR0 uncached: the TLB configuration array, the PCIe NIU's configuration
+    /// word and the ARC's APB doorbell. Stores here must not be merged.
     bar0: Bar,
+    /// BAR0 write-combined: the TLB windows themselves, where bulk L1 and DRAM
+    /// bytes go. tt-metal takes its windows this way (`TlbManager::configure_tlb`
+    /// passes `TlbMapping::WC`, `tlb_manager.cpp:44`) and its registers through
+    /// the uncached view (`pci_device.cpp:531-536`).
+    bar0_wc: Bar,
     fd: File,
     window: u32,
-    /// Was the session lock taken? Then it is ours to give back.
-    locked: bool,
 }
 
 impl Kmd {
@@ -402,33 +410,37 @@ impl Kmd {
             );
             return Err(ttStatus::TT_ERROR_NOT_BLACKHOLE);
         }
-        // BAR0, uncached. The window configuration array lives in it and is
-        // documented as dword-only registers; a write-combining view is free to
-        // merge and reorder stores, which for a configuration register is silent
-        // corruption (tt-metal maps BAR0 UC for this reason, `pci_device.cpp:533`).
+        // BAR0 in both of the driver's views. The configuration array, the NIU's
+        // configuration word and the ARC's doorbell registers are dword-only and
+        // must not be merged or reordered, so they go through the uncached view;
+        // the TLB windows carry bulk bytes, which is what write-combining is for
+        // (tt-metal: `PCIDevice` maps BAR0 UC, `pci_device.cpp:531-536`, and
+        // `TlbManager::configure_tlb` asks for `TlbMapping::WC` windows,
+        // `tlb_manager.cpp:44`).
         let mappings =
-            query_mappings(fd.as_fd(), 6).map_err(|e| failed("querying the BAR mappings", e))?;
-        let bar0_mapping = mappings
-            .iter()
-            .find(|m| m.mapping_id == abi::mapping_id::RESOURCE0_UC)
-            .copied()
-            .ok_or_else(|| {
-                eprintln!("libskamandros: {path:?} reports no uncached BAR0 mapping");
-                ttStatus::TT_ERROR_DEVICE
-            })?;
-        if bar0_mapping.mapping_size != BAR0_BYTES {
-            eprintln!(
-                "libskamandros: {path:?} reports BAR0 as {} bytes, not {BAR0_BYTES}",
-                bar0_mapping.mapping_size
-            );
-            return Err(ttStatus::TT_ERROR_DEVICE);
-        }
-        let bar0 = Bar::new(fd.as_fd(), bar0_mapping.mapping_base, BAR0_BYTES as usize)
-            .map_err(|e| failed("mapping BAR0", e))?;
+            query_mappings(fd.as_fd(), 8).map_err(|e| failed("querying the BAR mappings", e))?;
+        let bar0 = Bar::new(
+            fd.as_fd(),
+            bar0_mapping(&mappings, abi::mapping_id::RESOURCE0_UC, &path, "uncached")?,
+            BAR0_BYTES as usize,
+        )
+        .map_err(|e| failed("mapping BAR0 uncached", e))?;
+        let bar0_wc = Bar::new(
+            fd.as_fd(),
+            bar0_mapping(
+                &mappings,
+                abi::mapping_id::RESOURCE0_WC,
+                &path,
+                "write-combined",
+            )?,
+            BAR0_BYTES as usize,
+        )
+        .map_err(|e| failed("mapping BAR0 write-combined", e))?;
 
         // Claim the card. The lock is advisory — it cannot stop `tt-smi` — but it
         // does stop a second `libskamandros`, which is the case a session can
-        // control. Held until this `Kmd` is dropped.
+        // control. Held until this descriptor closes, which is when tt-kmd frees
+        // it, after the close-time cleanup write (`chardev.c:1101-1104`).
         let locked = lock(fd.as_fd(), SESSION_LOCK, abi::lock::ACQUIRE)
             .map_err(|e| failed("taking the session lock", e))?;
         if !locked {
@@ -458,9 +470,9 @@ impl Kmd {
 
         Ok(Kmd {
             bar0,
+            bar0_wc,
             fd,
             window: tlb.out_id,
-            locked,
         })
     }
 
@@ -469,7 +481,7 @@ impl Kmd {
         self.window
     }
 
-    /// Write `bytes` into BAR0 at `offset`.
+    /// Write `bytes` into BAR0 at `offset`, uncached.
     pub fn bar0_write(&self, offset: u64, bytes: &[u8]) -> Result<(), ttStatus> {
         let end = offset
             .checked_add(bytes.len() as u64)
@@ -481,7 +493,7 @@ impl Kmd {
         Ok(())
     }
 
-    /// Read `out.len()` bytes of BAR0 at `offset`.
+    /// Read `out.len()` bytes of BAR0 at `offset`, uncached.
     pub fn bar0_read(&self, offset: u64, out: &mut [u8]) -> Result<(), ttStatus> {
         let end = offset
             .checked_add(out.len() as u64)
@@ -490,6 +502,39 @@ impl Kmd {
             return Err(ttStatus::TT_ERROR_BAR0_NOT_DECODED);
         }
         self.bar0.read(offset as usize, out);
+        Ok(())
+    }
+
+    /// Write `bytes` into the window aperture at `offset`, write-combined, and
+    /// push them out.
+    ///
+    /// This is the bulk path: L1 images, mailbox words, DRAM tensors. The fence
+    /// is what makes the write visible before anything the host does next — a
+    /// retarget, a configuration register `bar0_write` puts in a different
+    /// mapping, the generation that starts a core — because a write-combining
+    /// buffer is not obligated to drain on its own.
+    pub fn window_write(&self, offset: u64, bytes: &[u8]) -> Result<(), ttStatus> {
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .ok_or(ttStatus::TT_ERROR_BAR0_OVERFLOW)?;
+        if end > BAR0_BYTES {
+            return Err(ttStatus::TT_ERROR_BAR0_NOT_DECODED);
+        }
+        self.bar0_wc.write(offset as usize, bytes);
+        flush_writes();
+        Ok(())
+    }
+
+    /// Read `out.len()` bytes of the window aperture at `offset`. Reads of
+    /// write-combined memory are not cached, so they see the card.
+    pub fn window_read(&self, offset: u64, out: &mut [u8]) -> Result<(), ttStatus> {
+        let end = offset
+            .checked_add(out.len() as u64)
+            .ok_or(ttStatus::TT_ERROR_BAR0_OVERFLOW)?;
+        if end > BAR0_BYTES {
+            return Err(ttStatus::TT_ERROR_BAR0_NOT_DECODED);
+        }
+        self.bar0_wc.read(offset as usize, out);
         Ok(())
     }
 
@@ -517,28 +562,63 @@ impl Kmd {
 }
 
 impl Drop for Kmd {
-    /// Give the window and the lock back, so a later session need not restart
-    /// the process to get them.
+    /// Give the window back, so a later session need not restart the process to
+    /// get it.
+    ///
+    /// The session lock is deliberately *not* released here. tt-kmd frees a
+    /// descriptor's resource locks itself, after the close-time cleanup write
+    /// (`tt_cdev_release`: `tt_cdev_release_noc_cleanup` then
+    /// `tt_cdev_release_resource_locks`, `chardev.c:1101-1104`). Releasing it
+    /// early would let a second `libskamandros` claim the card in the window
+    /// between this release and the descriptor closing, and the cleanup write
+    /// this fd registered would then hold *that* process's cores.
     fn drop(&mut self) {
         let mut arg = abi::FreeTlb { in_id: self.window };
         if let Err(e) = call(self.fd.as_fd(), abi::FREE_TLB, &mut arg) {
             eprintln!("libskamandros: freeing the TLB window: {e}");
         }
-        if self.locked {
-            // SAFETY: as for every ioctl here.
-            let mut arg = abi::LockCtl {
-                in_output_size_bytes: (std::mem::size_of::<abi::LockCtl>()
-                    - std::mem::offset_of!(abi::LockCtl, out_value))
-                    as u32,
-                in_flags: abi::lock::RELEASE,
-                in_index: SESSION_LOCK,
-                ..Default::default()
-            };
-            if let Err(e) = call(self.fd.as_fd(), abi::LOCK_CTL, &mut arg) {
-                eprintln!("libskamandros: releasing the session lock: {e}");
-            }
-        }
     }
+}
+
+/// Push this core's write-combining buffers to the device.
+///
+/// Stores through the write-combined BAR0 view are buffered, and a later store
+/// through the uncached view — a window retarget, a configuration register, a
+/// mask — can leave before them. tt-metal fences for the same reason around its
+/// barriers (`tt_driver_atomics::sfence`, `local_chip.cpp:474-500`).
+fn flush_writes() {
+    // `SFENCE` is the instruction x86 defines as flushing the write-combining
+    // buffers; elsewhere a sequentially consistent fence is the equivalent.
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `sfence` takes no operands and touches no memory; it only orders
+    // this core's stores.
+    unsafe {
+        core::arch::x86_64::_mm_sfence();
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+/// BAR0's mmap key for one of the driver's views, after checking the driver
+/// reports the whole BAR through it.
+fn bar0_mapping(
+    mappings: &[abi::Mapping],
+    id: u32,
+    path: &Path,
+    what: &str,
+) -> Result<u64, ttStatus> {
+    let Some(mapping) = mappings.iter().find(|m| m.mapping_id == id).copied() else {
+        eprintln!("libskamandros: {path:?} reports no {what} BAR0 mapping");
+        return Err(ttStatus::TT_ERROR_DEVICE);
+    };
+    if mapping.mapping_size != BAR0_BYTES {
+        eprintln!(
+            "libskamandros: {path:?} reports BAR0 {what} as {} bytes, not {BAR0_BYTES}",
+            mapping.mapping_size
+        );
+        return Err(ttStatus::TT_ERROR_DEVICE);
+    }
+    Ok(mapping.mapping_base)
 }
 
 /// `QUERY_MAPPINGS` — the BAR apertures and the mmap keys that reach them.

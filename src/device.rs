@@ -95,14 +95,36 @@ const AICLK_IDLE: u32 = 800;
 const ARC_MESSAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1_000);
 const AICLK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// How long the ARC is given to come up: tt-kmd's `ARC_MSG_READY_MS`
+/// (`blackhole.c:69`), user decision 2026-11-15.
+///
+/// tt-metal waits up to `ARC_STARTUP_TIMEOUT` = 300 s for the same status
+/// (`timeouts.hpp:14`). Half a second is longer than tt-kmd's own bound allows
+/// for a card the driver has already brought up, and a card still booting that
+/// long after the module let us open is reported rather than waited on.
+const ARC_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+/// The interval between two reads of the ARC's boot-status word.
+const ARC_READY_POLL: std::time::Duration = std::time::Duration::from_micros(100);
+
+/// The two values a host-to-device L1 barrier alternates through, tt-metal's
+/// `MemBarFlag { SET = 0xaa, RESET = 0xbb }`
+/// (`umd/device/types/cluster_types.hpp:106-109`) written to
+/// [`tt_isa::mailbox::BARRIER`].
+const L1_BARRIER_SET: u32 = 0xAA;
+const L1_BARRIER_RESET: u32 = 0xBB;
+/// How many times the L1 barrier word is read before the tile is declared not to
+/// answer. A flush is one or two round trips.
+const L1_BARRIER_POLLS: u32 = 1000;
+
 /// First DRAM byte this driver hands out.
 ///
 /// tt-metal reserves the bottom of every channel for the DRAM barrier (one
 /// alignment word at offset 0), the profiler block (empty in a build without
 /// Tracy) and the device-print dispatch region (`DRAM_ALIGNMENT + 1 MiB`), so
-/// its `UNRESERVED` base is `0x1_0080` (`bh_hal.cpp:33-83`, `:329-332`). This
-/// driver writes none of those regions, but starting above them keeps its data
-/// out of anything the card's own dispatch would touch.
+/// its `UNRESERVED` base is `0x10_0080` — 128 bytes and a mebibyte
+/// (`bh_hal.cpp:33-83`, `:329-332`). This driver writes none of those regions,
+/// but starting above them keeps its data out of anything the card's own
+/// dispatch would touch.
 const DRAM_FIRST: u64 = 0x10_0080;
 
 /// Simulated cycles one core may take to answer before it is declared stuck.
@@ -244,6 +266,9 @@ enum Link {
 }
 
 impl Link {
+    /// Device registers: the TLB configuration array, the PCIe NIU's
+    /// configuration word, the ARC's APB doorbell. Uncached on the card: these
+    /// are registers, and a merged or reordered store is silent corruption.
     fn mem_write(&self, paddr: u64, bytes: &[u8]) {
         match self {
             Link::Sim(lib) => lib.mem_write(paddr, bytes),
@@ -261,6 +286,30 @@ impl Link {
             Link::Driver(kmd) => {
                 let offset = bar0_offset(paddr).expect("a BAR0 address this driver read");
                 kmd.bar0_read(offset, out)
+                    .expect("a BAR0 address this driver read");
+            }
+        }
+    }
+
+    /// Window bytes: L1 and DRAM through the tile-addressed TLB aperture.
+    /// Write-combined on the card, and fenced by the link once a write is out.
+    fn bulk_write(&self, paddr: u64, bytes: &[u8]) {
+        match self {
+            Link::Sim(lib) => lib.mem_write(paddr, bytes),
+            Link::Driver(kmd) => {
+                let offset = bar0_offset(paddr).expect("a BAR0 address this driver wrote");
+                kmd.window_write(offset, bytes)
+                    .expect("a BAR0 address this driver wrote");
+            }
+        }
+    }
+
+    fn bulk_read(&self, paddr: u64, out: &mut [u8]) {
+        match self {
+            Link::Sim(lib) => lib.mem_read(paddr, out),
+            Link::Driver(kmd) => {
+                let offset = bar0_offset(paddr).expect("a BAR0 address this driver read");
+                kmd.window_read(offset, out)
                     .expect("a BAR0 address this driver read");
             }
         }
@@ -572,6 +621,10 @@ impl Device {
             launch_seq: 0,
             placed: Vec::new(),
         };
+        // The ARC publishes every address the rest of this reads, so it is
+        // waited for first, as tt-metal waits before it creates its messenger or
+        // its telemetry reader.
+        device.wait_arc_ready()?;
         if !device.translation_enabled()? {
             eprintln!(
                 "libskamandros: the NIU is not translating coordinates; this driver addresses \
@@ -609,6 +662,48 @@ impl Device {
         // silicon, so this belongs to bringing the device up.
         device.set_power_state(true)?;
         Ok(device)
+    }
+
+    /// Wait for the ARC to report that it is up, before anything reads its
+    /// memory.
+    ///
+    /// tt-metal's device init reads one scratch word (`probe_arc`) and then
+    /// waits here *before* it creates either its message queue or its telemetry
+    /// reader (`TTDevice::init_tt_device`, `tt_device.cpp:119-123`):
+    /// `BlackholeTTDevice::wait_arc_core_start` polls `SCRATCH_RAM_2` until its
+    /// low three bits read `0x5` (`blackhole_tt_device.cpp:182-203`). Everything
+    /// this driver learns about the chip — the harvesting masks, the DRAM mask,
+    /// the clock — is read from addresses the ARC publishes, so the same wait
+    /// belongs before the first of those reads.
+    ///
+    /// All ones is the NoC not answering, the state tt-kmd turns into `-EIO`
+    /// (`blackhole.c:543-545`); it is reported rather than polled.
+    fn wait_arc_ready(&mut self) -> Result<(), ttStatus> {
+        use tt_isa::arc;
+        let arc_tile = arc::arc_tile();
+        let started = std::time::Instant::now();
+        loop {
+            let status = self.arc_word(arc_tile, arc::BOOT_STATUS)?;
+            if status == u32::MAX {
+                eprintln!(
+                    "libskamandros: the ARC's boot-status word at {:#x} did not answer; the \
+                     NoC is not routing to the ARC tile",
+                    arc::BOOT_STATUS
+                );
+                return Err(ttStatus::TT_ERROR_DEVICE);
+            }
+            if status & 0x7 == arc::BOOT_STATUS_READY {
+                return Ok(());
+            }
+            if started.elapsed() >= ARC_READY_TIMEOUT {
+                eprintln!(
+                    "libskamandros: the ARC's boot status still reads {status:#010x} after \
+                     {ARC_READY_TIMEOUT:?}; refusing to read its memory"
+                );
+                return Err(ttStatus::TT_ERROR_TELEMETRY);
+            }
+            std::thread::sleep(ARC_READY_POLL);
+        }
     }
 
     /// Does the NIU translate coordinates?
@@ -1087,6 +1182,40 @@ impl Device {
         self.window_read(ep, offset, out)
     }
 
+    /// Flush this tile's L1: write the barrier word and wait for it to read
+    /// back, twice with different values.
+    ///
+    /// tt-metal's `l1_membar` -> `insert_host_to_device_barrier`
+    /// (`local_chip.cpp:472-508`): a barrier writes `0xAA`, waits for the tile
+    /// to show it, then does the same with `0xBB`, so every L1 write the host
+    /// made before it — the program, the launch words, the arguments — has
+    /// reached the tile before a core reads it. The word is
+    /// [`tt_isa::mailbox::BARRIER`], which no core reads: tt-metal's own
+    /// `MEM_L1_BARRIER` would land inside this driver's B image.
+    pub fn l1_barrier(&mut self) -> Result<(), ttStatus> {
+        for flag in [L1_BARRIER_SET, L1_BARRIER_RESET] {
+            self.write32(mailbox::BARRIER, flag)?;
+            let mut polls = 0u32;
+            loop {
+                if self.read32(mailbox::BARRIER)? == flag {
+                    break;
+                }
+                polls += 1;
+                if polls == L1_BARRIER_POLLS {
+                    eprintln!(
+                        "libskamandros: the L1 barrier word at {:#x} of tile ({}, {}) did not \
+                         show {flag:#04x}; the host's writes are not reaching the tile",
+                        mailbox::BARRIER,
+                        self.tile.x(),
+                        self.tile.y()
+                    );
+                    return Err(ttStatus::TT_ERROR_DEVICE);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Write into this tile's L1.
     pub fn l1_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), ttStatus> {
         self.check_l1(address, bytes.len())?;
@@ -1488,7 +1617,7 @@ impl Device {
             let bar = self.window_bar_offset() + offset;
             check_bar0(bar, here)?;
             self.link
-                .mem_write(BAR0_BASE + bar, &bytes[done..done + here]);
+                .bulk_write(BAR0_BASE + bar, &bytes[done..done + here]);
             done += here;
         }
         Ok(())
@@ -1510,7 +1639,7 @@ impl Device {
             let bar = self.window_bar_offset() + offset;
             check_bar0(bar, here)?;
             self.link
-                .mem_read(BAR0_BASE + bar, &mut out[done..done + here]);
+                .bulk_read(BAR0_BASE + bar, &mut out[done..done + here]);
             done += here;
         }
         Ok(())
