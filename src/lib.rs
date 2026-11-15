@@ -16,6 +16,7 @@ mod compile;
 mod device;
 mod encode;
 mod ir;
+mod kmd;
 mod lower;
 mod mir;
 mod module;

@@ -21,6 +21,7 @@ use std::sync::OnceLock;
 
 use libloading::{Library, Symbol};
 
+use crate::kmd::{DEVICE_ID_BLACKHOLE, Kmd, VENDOR_ID_TENSTORRENT};
 use crate::status::ttStatus;
 use tt_isa::dram::{CHANNEL_BYTES, Dram, DramChannel};
 use tt_isa::l1;
@@ -44,12 +45,20 @@ const TLB_CONFIG_BASE: u64 = 0x1FC0_0000;
 const WINDOW: u16 = 0;
 const WINDOW_SIZE: u64 = 2 * 1024 * 1024;
 
-/// Device ID of a Blackhole.
-const VENDOR_ID_TENSTORRENT: u16 = 0x1E52;
-const DEVICE_ID_BLACKHOLE: u16 = 0xB140;
-
 /// Simulated cycles one core may take to answer before it is declared stuck.
+///
+/// On silicon there are no simulated cycles, so the same number is read as
+/// nanoseconds and floored at [`SILICON_MIN_WAIT`] (`tt-device`
+/// `core_control.rs:489-521`).
 pub const BUDGET: u64 = 400_000;
+
+/// The shortest wall-clock wait on silicon, whatever the budget says.
+///
+/// A budget is written in simulated cycles, and converted at a nominal 1 GHz —
+/// so the gates' 400 000 cycles would be 0.4 ms, less than a handful of MMIO
+/// round trips through a TLB window. The floor makes a silicon timeout mean "the
+/// core is not doing this" rather than "the host asked too quickly".
+pub const SILICON_MIN_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Simulated cycles advanced between two polls of a mailbox word.
 const CYCLES_PER_POLL: u32 = 512;
@@ -170,42 +179,87 @@ unsafe extern "C" fn dma_read_unexpected(paddr: u64, _dst: *mut c_void, size: u3
 enum Link {
     /// The simulator: `dlopen`ed `libttsim_bh.so`, entry points resolved once.
     Sim(&'static Lib),
-    /// `/dev/tenstorrent/N` through the driver. Not written yet, and nothing
-    /// constructs it until [`Device::open_hardware`] does.
-    #[allow(dead_code)]
-    Driver,
+    /// `/dev/tenstorrent/N` through tt-kmd, opened by [`Device::open_hardware`].
+    Driver(Kmd),
 }
 
 impl Link {
     fn config_rd32(&self, bdf: u32, offset: u32) -> u32 {
         match self {
             Link::Sim(lib) => lib.config_rd32(bdf, offset),
-            Link::Driver => todo!("the tt-kmd link is not written yet (TODO.md)"),
+            Link::Driver(kmd) => {
+                // One card per `Kmd`, and configuration space is per card.
+                debug_assert_eq!(bdf, 0);
+                kmd.config_rd32(offset).unwrap_or(u32::MAX)
+            }
         }
     }
 
     fn mem_write(&self, paddr: u64, bytes: &[u8]) {
         match self {
             Link::Sim(lib) => lib.mem_write(paddr, bytes),
-            Link::Driver => todo!("the tt-kmd link is not written yet (TODO.md)"),
+            Link::Driver(kmd) => {
+                let offset = bar0_offset(paddr).expect("a BAR0 address this driver wrote");
+                kmd.bar0_write(offset, bytes)
+                    .expect("a BAR0 address this driver wrote");
+            }
         }
     }
 
     fn mem_read(&self, paddr: u64, out: &mut [u8]) {
         match self {
             Link::Sim(lib) => lib.mem_read(paddr, out),
-            Link::Driver => todo!("the tt-kmd link is not written yet (TODO.md)"),
+            Link::Driver(kmd) => {
+                let offset = bar0_offset(paddr).expect("a BAR0 address this driver read");
+                kmd.bar0_read(offset, out)
+                    .expect("a BAR0 address this driver read");
+            }
         }
     }
 
+    /// The wait budget, and how the device advances time.
+    ///
+    /// The simulator advances only inside [`Link::clock`]; silicon advances on its
+    /// own, so the same budget is read as nanoseconds and floored at
+    /// [`SILICON_MIN_WAIT`]. That is the port of `tt-device`'s rule
+    /// (`core_control.rs:489-521`): a budget written in simulated cycles is a
+    /// fraction of a millisecond on silicon — less than a handful of MMIO round
+    /// trips — and a caller needs a wall-clock deadline instead.
     fn clock(&self, n: u32) {
         match self {
             Link::Sim(lib) => lib.clock(n),
-            // The simulator advances time with a call; silicon waits, so the
-            // driver arm will be a no-op and every wait a real poll.
-            Link::Driver => todo!("the tt-kmd link is not written yet (TODO.md)"),
+            // Nothing to do: time passes by itself on silicon.
+            Link::Driver(_) => {}
         }
     }
+
+    /// The TLB window this session writes: window 0 in the simulator, and the
+    /// index the driver arbitrated on the card.
+    fn window(&self) -> u16 {
+        match self {
+            Link::Sim(_) => WINDOW,
+            Link::Driver(kmd) => kmd.window() as u16,
+        }
+    }
+
+    fn is_simulated(&self) -> bool {
+        matches!(self, Link::Sim(_))
+    }
+}
+
+/// A BAR0-relative offset from the address the window accessors use.
+///
+/// Everything above the link names a *physical* BAR0 address — `BAR0_BASE` plus
+/// the BAR offset — because that is what `libttsim` decodes. The driver maps BAR0
+/// itself, so the base is subtracted once, here, with the range checked: an
+/// address off the mapping is a bug in this driver, not a device fault.
+fn bar0_offset(paddr: u64) -> Result<u64, ttStatus> {
+    let offset = paddr.wrapping_sub(BAR0_BASE);
+    if paddr < BAR0_BASE || offset >= crate::kmd::BAR0_BYTES {
+        let _ = paddr;
+        return Err(ttStatus::TT_ERROR_BAR0_NOT_DECODED);
+    }
+    Ok(offset)
 }
 
 unsafe extern "C" fn dma_write_unexpected(paddr: u64, _src: *const c_void, size: u32) {
@@ -394,6 +448,15 @@ impl Device {
             launch_seq: 0,
             placed: Vec::new(),
         };
+        // Before any tile is named: with translation off, a logical column number
+        // is a physical one, and the first n of them are the wrong set.
+        if !device.translation_enabled()? {
+            eprintln!(
+                "libskamandros: the NIU is not translating coordinates; this driver addresses \
+                 tensix tiles logically and would name a fused-off column"
+            );
+            return Err(ttStatus::TT_ERROR_DEVICE);
+        }
         let tensix = device.probe_tensix()?;
         device.tiles = tensix.tiles().collect();
         device.columns = tensix.enabled_column_count();
@@ -410,16 +473,141 @@ impl Device {
         Ok(device)
     }
 
-    /// Take the hardware device through `/dev/tenstorrent/N`.
+    /// Take the card through `/dev/tenstorrent/N`.
     ///
-    /// The port is recorded in `TODO.md` with six open questions — the window
-    /// layout, how the device is selected, which error variants the driver needs,
-    /// what of `tt-mapping`/`tt-host` carries over, the wall-clock budget, and the
-    /// DRAM base — so this refuses rather than quietly opening the simulator under
-    /// a second name.
+    /// The same `Device` as [`Device::open`], over the driver link: BAR0 mapped
+    /// through tt-kmd, one window the driver arbitrated, and the card's telemetry
+    /// consulted before any Tensix tile is named. The node is the first the driver
+    /// enumerates, which is what tt-metal's `enumerate_devices()[0]` is
+    /// (`pci_device.cpp:195-215`).
+    ///
+    /// Not yet reachable: how `ttInit` chooses between this and [`Device::open`] is
+    /// the one ordering item left open (`TODO.md`).
     #[allow(dead_code)]
     pub fn open_hardware() -> Result<Device, ttStatus> {
-        Err(ttStatus::TT_ERROR_UNSUPPORTED)
+        let nodes = Kmd::enumerate()?;
+        let index = *nodes.first().ok_or(ttStatus::TT_ERROR_NO_DEVICE)?;
+        let kmd = Kmd::open(index)?;
+        let link = Link::Driver(kmd);
+
+        // The live Tensix grid comes from the ARC's telemetry, never from the
+        // part's population: a harvested chip refuses accesses to a fused-off
+        // tile's registers, and a guessed full grid writes exactly there.
+        let mut device = Device {
+            link,
+            shadow: None,
+            tile: tt_isa::arc::arc_tile(),
+            tiles: Vec::new(),
+            columns: 0,
+            dram: Dram::FULL,
+            dram_used: 0x10_0000,
+            exec_started: Vec::new(),
+            launch_seq: 0,
+            placed: Vec::new(),
+        };
+        if !device.translation_enabled()? {
+            eprintln!(
+                "libskamandros: the NIU is not translating coordinates; this driver addresses \
+                 tensix tiles logically and would name a fused-off column"
+            );
+            return Err(ttStatus::TT_ERROR_DEVICE);
+        }
+        let tensix = device.probe_tensix()?;
+        device.tiles = tensix.tiles().collect();
+        device.columns = tensix.enabled_column_count();
+        device.tile = *device
+            .tiles
+            .first()
+            .ok_or(ttStatus::TT_ERROR_NO_TENSIX_TILE)?;
+        device.dram = device.probe_dram()?;
+
+        // Nothing on the card is ours until now, and a previous process leaves
+        // its cores running: hold the five on every tile, clear the launch state,
+        // and register the one write that survives this process dying. The driver
+        // performs that write when the descriptor closes, whatever closed it
+        // (`tt_cdev_release_noc_cleanup`, `chardev.c:1021-1030`).
+        device.quiesce()?;
+        let held = Core::B.soft_reset_mask()
+            | Core::T0.soft_reset_mask()
+            | Core::T1.soft_reset_mask()
+            | Core::T2.soft_reset_mask()
+            | Core::NC.soft_reset_mask();
+        let first = device.tile;
+        if let Link::Driver(kmd) = &device.link {
+            kmd.hold_on_close(first.x(), first.y(), tensix::SOFT_RESET_0, held)?;
+        }
+        Ok(device)
+    }
+
+    /// Which GDDR channels can hold data, from the ARC's telemetry.
+    ///
+    /// tt-metal reads `ENABLED_GDDR` and inverts it
+    /// (`BlackholeTTDevice::get_chip_info`, `blackhole_tt_device.cpp:146-149`,
+    /// `~read_entry & 0xFF`); the driver's own sysfs cannot answer it, because
+    /// `tt_telemetry_probe` caches only the tags that back an attribute. This
+    /// driver uses channel 0 only, and a part with that channel fused off is not
+    /// one it can drive — [`Device::dram_channel`] says so loudly rather than
+    /// addressing memory that is not there.
+    /// Does the NIU translate coordinates?
+    ///
+    /// Every Tensix tile this driver names is a *logical* coordinate: with
+    /// translation on, the NIU maps it onto a surviving physical column, which is
+    /// why the first `n` columns of the grid are the right ones on a harvested chip
+    /// ([`tt_isa::noc::grid::Tensix`]). With translation off those numbers are
+    /// physical and the first `n` are the wrong set — a write to a fused-off tile,
+    /// which is a hung NoC.
+    ///
+    /// tt-metal reads the same bit before building any coordinate
+    /// (`BlackholeTTDevice::get_noc_translation_enabled`, `blackhole_tt_device.cpp:123-135`):
+    /// BAR0 at the PCIe NIU's configuration register, bit 14. ttsim decodes the same
+    /// BAR0 window (`PCIE_NIU0_BASE 0x1FD04000`) and reports the bit set, so this is
+    /// checked on both targets rather than assumed.
+    fn translation_enabled(&mut self) -> Result<bool, ttStatus> {
+        /// `NIU_CFG_NOC0_BAR_PCIE_ADDR` (`blackhole_implementation.hpp:266`) plus the
+        /// 0x100 tt-metal adds (`blackhole_tt_device.cpp:129`).
+        const NIU_CFG_0: u64 = 0x1FD0_4100;
+        let mut word = [0u8; 4];
+        self.link.mem_read(BAR0_BASE + NIU_CFG_0, &mut word);
+        let cfg = u32::from_le_bytes(word);
+        Ok((cfg >> 14) & 1 != 0)
+    }
+
+    fn probe_dram(&mut self) -> Result<Dram, ttStatus> {
+        use tt_isa::arc;
+        let arc_tile = arc::arc_tile();
+        let table = u64::from(self.arc_word(arc_tile, arc::TELEMETRY_PTR)?);
+        let values = u64::from(self.arc_word(arc_tile, arc::TELEMETRY_DATA)?);
+        if !arc::is_within_csm(table, 8) || !arc::is_within_csm(values, 4) {
+            let _ = (table, values);
+            return Err(ttStatus::TT_ERROR_TELEMETRY);
+        }
+        let version = self.arc_word(arc_tile, table)?;
+        let entries = self.arc_word(arc_tile, table + 4)?;
+        let tag_table = 8 + 4 * u64::from(entries);
+        if version > arc::TELEMETRY_MAX_MAJOR_VERSION
+            || entries > arc::TELEMETRY_MAX_ENTRIES
+            || !arc::is_within_csm(table, tag_table)
+        {
+            let _ = (version, entries);
+            return Err(ttStatus::TT_ERROR_TELEMETRY);
+        }
+        let mut enabled = None;
+        for i in 0..u64::from(entries) {
+            let entry = self.arc_word(arc_tile, table + 8 + 4 * i)?;
+            if entry & 0xFFFF != u32::from(arc::tag::ENABLED_GDDR) {
+                continue;
+            }
+            let at = values + 4 * u64::from(entry >> 16);
+            if !arc::is_within_csm(at, 4) {
+                let _ = at;
+                return Err(ttStatus::TT_ERROR_TELEMETRY);
+            }
+            enabled = Some(self.arc_word(arc_tile, at)?);
+        }
+        // An absent tag names nothing, and guessing a full part from firmware
+        // that does not publish it is the mistake this walk exists to avoid.
+        let mask = enabled.ok_or(ttStatus::TT_ERROR_TELEMETRY)?;
+        Ok(Dram::from_usable_mask(!(mask as u8)))
     }
 
     /// This chip's live Tensix columns, from the ARC's telemetry table.
@@ -644,12 +832,19 @@ impl Device {
     }
 
     /// Wait until `predicate` accepts the word at `address`.
+    ///
+    /// On the simulator nothing happens outside [`Device::clock`], so the budget
+    /// is simulated cycles. On silicon time passes by itself and the same number
+    /// is a wall-clock deadline, floored at [`SILICON_MIN_WAIT`] (`tt-device`
+    /// `core_control.rs:489-521`).
     pub fn wait_for(
         &mut self,
         address: u64,
         mut predicate: impl FnMut(u32) -> bool,
     ) -> Result<u32, ttStatus> {
         let mut waited = 0u64;
+        let started = std::time::Instant::now();
+        let limit = std::time::Duration::from_nanos(BUDGET).max(SILICON_MIN_WAIT);
         loop {
             let value = self.read32(address)?;
             if predicate(value) {
@@ -660,7 +855,12 @@ impl Device {
                 let _ = code;
                 return Err(ttStatus::TT_ERROR_FIRMWARE_PANIC);
             }
-            if waited >= BUDGET {
+            let expired = if self.link.is_simulated() {
+                waited >= BUDGET
+            } else {
+                started.elapsed() >= limit
+            };
+            if expired {
                 let _ = value;
                 return Err(ttStatus::TT_ERROR_FIRMWARE_TIMEOUT);
             }
@@ -871,12 +1071,17 @@ impl Device {
     }
 
     /// Wait for a launch's `ACK`, or report its panic or a timeout.
+    ///
+    /// The budget is simulated cycles on the simulator and wall clock on silicon,
+    /// as [`Device::wait_for`] describes.
     pub fn await_launch(
         &mut self,
         mb: mailbox::launch::Mailbox,
         generation: u32,
     ) -> Result<(), ttStatus> {
         let mut waited = 0u64;
+        let started = std::time::Instant::now();
+        let limit = std::time::Duration::from_nanos(BUDGET).max(SILICON_MIN_WAIT);
         loop {
             if self.read32(mb.ack())? == generation {
                 return Ok(());
@@ -884,7 +1089,12 @@ impl Device {
             if self.read32(mb.status())? == status::PANICKED {
                 return Err(ttStatus::TT_ERROR_PROGRAM_REFUSED);
             }
-            if waited >= BUDGET {
+            let expired = if self.link.is_simulated() {
+                waited >= BUDGET
+            } else {
+                started.elapsed() >= limit
+            };
+            if expired {
                 return Err(ttStatus::TT_ERROR_FIRMWARE_TIMEOUT);
             }
             self.clock(CYCLES_PER_POLL);
@@ -945,7 +1155,7 @@ impl Device {
             let offset = at - base;
             let here = (bytes.len() - done).min((WINDOW_SIZE - offset) as usize);
             self.retarget(tile, base)?;
-            let bar = window_bar_offset() + offset;
+            let bar = self.window_bar_offset() + offset;
             check_bar0(bar, here)?;
             self.link
                 .mem_write(BAR0_BASE + bar, &bytes[done..done + here]);
@@ -967,7 +1177,7 @@ impl Device {
             let offset = at - base;
             let here = (out.len() - done).min((WINDOW_SIZE - offset) as usize);
             self.retarget(tile, base)?;
-            let bar = window_bar_offset() + offset;
+            let bar = self.window_bar_offset() + offset;
             check_bar0(bar, here)?;
             self.link
                 .mem_read(BAR0_BASE + bar, &mut out[done..done + here]);
@@ -1014,9 +1224,11 @@ impl Device {
     }
 }
 
-/// The byte offset of this driver's window within BAR0.
-const fn window_bar_offset() -> u64 {
-    WINDOW as u64 * WINDOW_SIZE
+/// The byte offset of this session's window within BAR0.
+impl Device {
+    fn window_bar_offset(&self) -> u64 {
+        u64::from(self.link.window()) * WINDOW_SIZE
+    }
 }
 
 /// Refuse an access BAR0 would not decode: past the window aperture, or into

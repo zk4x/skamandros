@@ -128,7 +128,11 @@ Open, in the order they block a release:
   of a 32-bit `Dst` — compiles but cannot be run here. It needs silicon.
 - `trunc`/`floor` still round through `i32` in the IR, so a bf16 kernel that
   uses them runs 32-bit and its bf16 output hits that same packer path.
-- The hardware link is not written: this runs on `ttsim` only.
+- The hardware link is written but has never run on silicon: `Device::open_hardware`
+  opens the card through tt-kmd (`src/kmd.rs`), maps BAR0, takes the session
+  lock and a driver-allocated 2 MiB window, and the same `Device` surface runs on
+  both. Nothing chooses between the two constructors yet — `ttInit` still opens
+  the simulator — so this is unticked until a kernel runs through both.
 
 ## License
 
