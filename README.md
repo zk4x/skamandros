@@ -1,21 +1,23 @@
 # skamandros
 
 A kernel compiler and driver for Tenstorrent Blackhole, shipped as
-`libskamandros.so` and `libskamandros.h`.
+`libskamandros.so` and `skamandros.h`.
 
-    "since he was engaged on the left, by the banks of Skamandros, where the death-toll was highest and the war-cries rose"
+    "since he was engaged on the left, by the banks of Skamandros,
+     where the death-toll was highest and the war-cries rose"
 
 ## Why?
 
-Tenstorrent has amazing and powerful hardware, but the software is a bit unwieldy. This library has been produced
-during ~5 months of working on zyx tenstorrent backend and my failures to utilize tt-metal.
+Tenstorrent has amazing and powerful hardware, but the software is a bit unwieldy. This library was produced
+over ~5 months of working on the zyx Tenstorrent backend and my failures to utilize tt-metal.
 
-# How?
+## How?
 
-One ptx like assembly gets compiled and dispatched to all tenstorrent baby cores. Both firmware and compiler is single libskamandros.so,
-less than 1 MB on the disk.
+A PTX-like assembly gets compiled and dispatched to all the Tenstorrent baby cores. Firmware and compiler are both
+inside one `libskamandros.so`, about 1 MB on the disk.
 
-This is a simple matmul with distributed on grid of tensix cores with symbolic dims.
+A simple matmul, distributed over a grid of Tensix cores, with symbolic dims:
+
 ```
 version 9
 %nx = param i32 0
@@ -72,7 +74,7 @@ or an `i32` value; a scalar parameter is the shape `0`, and a buffer is two cons
 Every `load`, `store` and `copy` names its unit — `32,32` a tile, `1,32` a row, `32,1` a column, `1,1` one
 datum — and its index counts those units. There is no implicit dtype conversion: `cast` converts with the C type's rounding,
 `bitcast` renames the same bits, and the dtypes are `f32`, `bf16`, `i32` and `bool`. The ops are [zyx's](https://github.com/zk4x/zyx) `UOp` and
-`BOp` plus `matmul`, `sum`, `max` and `min`; there is no `relu`/`elu`/`sigmoid` - these can be written manually using other
+`BOp` plus `matmul`, `sum` and `max`; there is no `relu`/`elu`/`sigmoid` - these can be written manually using other
 primitive ops and *skamandros automatically optimizes memory allocation around them* (that is automatic **fusion**, no llks,
 [you are welcome](https://github.com/geohot/tt-tiny)).
 
@@ -97,16 +99,20 @@ how a buffer is read, and which core runs what: a reader on RISCV B, the unpacke
 Two IRs carry it: the virtual `Op` (one id space — an `OpId` *is* the value) and the machine `MirOp` (one ISA instruction, or a structural pair).
 
 So it's similar to PTX or LLVM (though no phi nodes) in that the compiler handles scheduling, allocation and some small simple
-optimizations. This is fully deterministic compiler. Other ML compilers (e.g. zyx) can then search over different configs using skamandros
+optimizations. This is a fully deterministic compiler. Other ML compilers (e.g. zyx) can then search over different configs using skamandros
 as their last step of the lowering.
 
 ## Install
 
+The build compiles the device firmware into the library, so two toolchain pieces come first:
+
 ```bash
+rustup target add riscv32im-unknown-none-elf   # the firmware's cores
+rustup component add llvm-tools                # objcopy/objdump, for the images
 cargo build --release
 ```
 
-This creates in target/release directory both libskamandros.so and skamandros.h, you can copy them to your path.
+This writes `libskamandros.so` and `skamandros.h` into `target/release`; copy both to your path.
 For usage, look at examples and tests.
 
 ## The C ABI
@@ -124,8 +130,8 @@ The build generates `skamandros.h` next to `libskamandros.so`, from the code tha
 - `ttRelease` — closes the device and returns the chip to its idle operating point; a later `ttInit` opens a fresh one. Module handles are unaffected.
 - `ttFree` — frees an error message this library returned. A null pointer is a no-op, and module handles are not freed here.
 
-Each returns a `ttStatus` and writing a message the caller frees with `ttFree`. `ttAbiVersion`
-is 1. The text form is the only program form `ttCompile` reads.
+Every call but `ttAbiVersion` and `ttFree` returns a `ttStatus`, and on failure writes a message the caller frees with
+`ttFree`. The text form is the only program form `ttCompile` reads.
 
 ## Building and testing
 
@@ -165,7 +171,7 @@ Working end to end through the C ABI:
   stays 16-bit,
 - [x] both reduces,
 - [x] `matmul`,
-- [x] `rms_norm` over two tokens and the real hidden size,
+- [ ] `rms_norm` over two tokens and the real hidden size — it is red on the card, green on sim
 - [x] a symbolic loop bound,
 - [x] a symbolic grid,
 - [x] a gather,

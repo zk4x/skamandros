@@ -20,7 +20,7 @@ default = ["tenstorrent"]
 tenstorrent = []
 
 [dependencies]
-tt-isa = { path = "../tt-isa" }
+tt-isa = "0.2.0"
 libloading = "0.8"
 libc = "0.2"
 # zyx's line: the slab's `SerBin`/`DeBin` impls are copied with the file.

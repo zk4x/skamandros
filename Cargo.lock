@@ -51,7 +51,9 @@ dependencies = [
 
 [[package]]
 name = "tt-isa"
-version = "0.1.0"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b6addaf2f1866f00c926079f31985b8fddffc21dd6f20e2714f3ece65b7c848"
 
 [[package]]
 name = "windows-link"
