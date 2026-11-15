@@ -62,8 +62,19 @@ const ARC_FW_INT_VAL: u32 = 65_536;
 
 /// `NIU_CFG_NOC0_BAR_PCIE_ADDR` (`blackhole_implementation.hpp:266`) plus the
 /// 0x100 tt-metal adds (`blackhole_tt_device.cpp:129`). Bit 14 is the
-/// coordinate-translation enable; the low six bits are the PCIe tile's X.
+/// coordinate-translation enable. The low twelve bits are reserved — they carry
+/// no coordinate (`NoC/MemoryMap.md:228-238`), so nothing reads a tile's X here.
 const NIU_CFG_0: u64 = 0x1FD0_4100;
+
+/// The PCIe tile NIU's `NOC_NODE_ID`: `NIU_CFG_NOC0_BAR_PCIE_ADDR + 0x44`
+/// (`blackhole_implementation.hpp:298`, and `get_read_checking_offset`,
+/// `:419-420`). Bits 0-5 are the NIU's X coordinate (`NoC/MemoryMap.md:174-186`),
+/// and this is the register tt-metal reads with `get_pcie_x_coordinate`
+/// (`blackhole_tt_device.cpp:290-292`) to decide whether the ARC answers over
+/// AXI (`is_arc_available_over_axi`, `:296-303`).
+const NIU_NODE_ID: u64 = 0x1FD0_4044;
+// Both are registers of the same NIU, whose window starts at 0x1FD0_4000.
+const _: () = assert!(NIU_NODE_ID + 0xBC == NIU_CFG_0);
 
 /// `BlackholeArcMessageQueue` (`blackhole_arc_message_queue.hpp:51-58`): an
 /// eight-word header of double-wrapping pointers, then two rings of eight-word
@@ -94,6 +105,24 @@ const AICLK_IDLE: u32 = 800;
 /// `ARC_MESSAGE_TIMEOUT` and `AICLK_TIMEOUT` (`umd/device/utils/timeouts.hpp:12,25`).
 const ARC_MESSAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1_000);
 const AICLK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+/// `DRAM_TRAINING_TIMEOUT` (`umd/device/utils/timeouts.hpp:22`), the bound on
+/// waiting for a channel's firmware training.
+const DRAM_TRAINING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// A trained GDDR channel's two-bit state in `GDDR_STATUS`
+/// (`FirmwareInfoProvider::get_modern_dram_statuses`,
+/// `firmware_info_provider.cpp:470-488`); `0b10` and `0b11` are failures, which
+/// is what testing the high bit finds, and `0b00` is still training.
+const GDDR_TRAINED: u32 = 0b01;
+const GDDR_FAILED: u32 = 0b10;
+
+/// The cadence of a silicon poll: tt-metal's `poll_until` busy-polls for
+/// `busy_poll_window` and then sleeps `poll_interval` between reads
+/// (`umd/device/common/utils.hpp:136-159`; the ARC startup uses 1 ms and 10 µs,
+/// `blackhole_tt_device.cpp:184-195`). Every read is a PCIe round trip on the
+/// tile whose cores the poll is waiting for, so an unpaced loop is traffic
+/// against the kernel it is waiting on.
+const POLL_BUSY_WINDOW: std::time::Duration = std::time::Duration::from_millis(1);
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_micros(10);
 
 /// How long the ARC is given to come up: tt-kmd's `ARC_MSG_READY_MS`
 /// (`blackhole.c:69`), user decision 2026-11-15.
@@ -641,6 +670,59 @@ impl Device {
             .ok_or(ttStatus::TT_ERROR_NO_TENSIX_TILE)?;
         device.dram = device.probe_dram()?;
 
+        // Firmware trains each GDDR channel after power-up, and tt-metal waits
+        // for every enabled channel before it touches DRAM (`LocalChip`'s
+        // constructor -> `wait_chip_to_be_ready`, `local_chip.cpp:107-112`,
+        // `chip.cpp:81-95`). The status is `GDDR_STATUS`'s two bits per channel
+        // (`firmware_info_provider.cpp:470-488`). A channel that failed is
+        // refused rather than retrained: tt-metal's recovery is
+        // `TOGGLE_GDDR_RESET`, an ARC message that disturbs the card's DRAM, and
+        // this driver sends no reset (user decision 2026-11-15). tt-metal ends
+        // its wait when the tag is absent, and so does this.
+        let enabled = device.dram.enabled_mask();
+        let started = std::time::Instant::now();
+        loop {
+            let Some(status) = device.arc_tag(tt_isa::arc::tag::GDDR_STATUS)? else {
+                eprintln!(
+                    "libskamandros: telemetry carries no GDDR training status; not waiting for \
+                     training"
+                );
+                break;
+            };
+            let mut failed = None;
+            let mut trained = true;
+            for bank in 0..u32::from(tt_isa::dram::CHANNELS) {
+                if enabled & (1 << bank) == 0 {
+                    continue;
+                }
+                let state = (status >> (2 * bank)) & 0x3;
+                if state == GDDR_TRAINED {
+                    continue;
+                }
+                trained = false;
+                if state & GDDR_FAILED != 0 {
+                    failed = Some(bank);
+                }
+            }
+            if let Some(bank) = failed {
+                eprintln!(
+                    "libskamandros: GDDR channel {bank} failed training (status word {status:#010x}); \
+                     refusing to use DRAM, and not retraining it"
+                );
+                return Err(ttStatus::TT_ERROR_TELEMETRY);
+            }
+            if trained {
+                break;
+            }
+            if started.elapsed() >= DRAM_TRAINING_TIMEOUT {
+                eprintln!(
+                    "libskamandros: GDDR training still reads {status:#010x} after \
+                     {DRAM_TRAINING_TIMEOUT:?}; refusing to use DRAM"
+                );
+                return Err(ttStatus::TT_ERROR_TELEMETRY);
+            }
+        }
+
         // Nothing on the card is ours until now, and a previous process leaves
         // its cores running: hold the five on every tile, clear the launch state,
         // and register the one write that survives this process dying. The driver
@@ -977,10 +1059,11 @@ impl Device {
         // Ring the doorbell: tt-metal writes `ARC_FW_INT_VAL` to `ARC_FW_INT_ADDR`
         // through the APB, which is BAR0 when the PCIe tile is at X 11 and the
         // ARC's NoC aperture otherwise (`write_to_arc_apb`,
-        // `blackhole_tt_device.cpp:237-257`).
-        let mut niu = [0u8; 4];
-        self.link.mem_read(BAR0_BASE + NIU_CFG_0, &mut niu);
-        if u32::from_le_bytes(niu) & 0x3F == 11 {
+        // `blackhole_tt_device.cpp:237-257`). The X comes from the NIU's node-id
+        // register, as tt-metal reads it; `NIU_CFG_0`'s low bits are reserved.
+        let mut node = [0u8; 4];
+        self.link.mem_read(BAR0_BASE + NIU_NODE_ID, &mut node);
+        if u32::from_le_bytes(node) & 0x3F == 11 {
             self.bar_write32(ARC_APB_BAR0 + ARC_FW_INT_ADDR, ARC_FW_INT_VAL)?;
         } else {
             self.window_write(
@@ -1310,7 +1393,13 @@ impl Device {
             let expired = if self.link.is_simulated() {
                 waited >= BUDGET
             } else {
-                started.elapsed() >= limit
+                let elapsed = started.elapsed();
+                // tt-metal's cadence: tight for the first millisecond, then a
+                // sleep between reads (`poll_until`, `utils.hpp:136-159`).
+                if elapsed > POLL_BUSY_WINDOW {
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                elapsed >= limit
             };
             if expired {
                 let _ = value;
@@ -1544,7 +1633,12 @@ impl Device {
             let expired = if self.link.is_simulated() {
                 waited >= BUDGET
             } else {
-                started.elapsed() >= limit
+                let elapsed = started.elapsed();
+                // As in `wait_for`: tt-metal's busy window, then its interval.
+                if elapsed > POLL_BUSY_WINDOW {
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                elapsed >= limit
             };
             if expired {
                 return Err(ttStatus::TT_ERROR_FIRMWARE_TIMEOUT);
