@@ -518,6 +518,11 @@ struct UnpackState {
     x1: [u32; 2],
     /// Per unpacker: the `Config` bank in effect.
     cfg: [Option<UnpackCfg>; 2],
+    /// The `SRCA_SET_SetOvrdWithAddr` word as last written. It is its own
+    /// runtime state, not part of an unpacker's config bank: a `Dst` unpack
+    /// clears it, so a `Src` unpack that reuses a cached config still has to
+    /// set it again. The prologue wrote it to zero (`thread_config`).
+    override_set: Option<bool>,
 }
 
 fn encode_unpack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(), ttStatus> {
@@ -532,7 +537,11 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result
     // Every role is called with `a0` = the launch arguments; word 2 is the CB
     // interface table (`tt-metal`'s `ARG_IFACE`).
     out.rv(rv::lw(reg::A6, reg::A0, crate::mover::ARG_IFACE as i32 * 4));
-    let mut state = UnpackState::default();
+    let mut state = UnpackState {
+        // `thread_config` writes the toggle to zero before anything runs.
+        override_set: Some(false),
+        ..UnpackState::default()
+    };
     let mut loops = Vec::new();
     for op in ops {
         if encode_int(op, out, &mut loops, &COMPUTE_PAIRS)? {
@@ -547,8 +556,10 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result
                 // body that ends with a `Src` unpack and starts with a `Dst` one
                 // is how this went wrong: the second iteration's first `Src`
                 // write was elided and `SRCA_SET_SetOvrdWithAddr` stayed clear
-                // under an unpack to `Src`, which ttsim refuses.
+                // under an unpack to `Src`, which ttsim refuses. The toggle is
+                // the same runtime state, so it is forgotten with the bank.
                 state.cfg = [None, None];
+                state.override_set = None;
                 open_loop(out, &mut loops, count)?;
             }
             MirOp::EndLoop => close_loop(out, &mut loops)?,
@@ -590,17 +601,24 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result
                         dst_is_16_bit,
                     }
                 };
-                if state.cfg[u] == Some(cfg) {
-                    continue;
-                }
                 // `SRCA_SET_SetOvrdWithAddr`: the Src path wants it set, the Dst
                 // path clear, and the unpacker reads it at execution time, so a
                 // role that does both toggles it here. ttsim refuses either
-                // combination otherwise.
-                out.push(thread_entry(
-                    thread::SRCA_SET_SetOvrdWithAddr,
-                    u16::from(to_src),
-                )?);
+                // combination otherwise. The toggle is written whenever it is
+                // not already what this config wants, even when the config
+                // bank itself is cached: a `Dst` unpack between two `Src`
+                // unpacks clears it, and the second `Src` unpack would
+                // otherwise read a page through an override it never enabled.
+                if state.override_set != Some(to_src) {
+                    out.push(thread_entry(
+                        thread::SRCA_SET_SetOvrdWithAddr,
+                        u16::from(to_src),
+                    )?);
+                    state.override_set = Some(to_src);
+                }
+                if state.cfg[u] == Some(cfg) {
+                    continue;
+                }
                 let mut words = ConfigWords::new();
                 match cfg {
                     UnpackCfg::Src { dtype, haloize } => {

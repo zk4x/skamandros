@@ -6069,7 +6069,6 @@ copy 32,32 %out [0] = %bo [0]
 ";
 
 #[test]
-#[ignore = "the unpacker's Src/Dst toggle is cached with the config and a Dst load between two Src unpacks leaves it clear; see TODO.md"]
 fn swiglu_runs_on_the_simulator() {
     let x: Vec<f32> = (0..1024)
         .map(|i| {
