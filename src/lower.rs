@@ -3073,6 +3073,11 @@ fn exp2_body(
 ) {
     const C231: u32 = 0x4B40_0000; // 1.5 * 2^23, exact
     const NEG_C231: u32 = 0xB4C0_0000; // the same bits, two's complement negated
+    // `SFPENCC`'s mask-on mode and the two `SFPSETCC` tests the body uses.
+    const MASK_ON: u32 = 10;
+    const SETCC_LT0: u32 = 0;
+    const SETCC_NE0: u32 = 2;
+    const NEG_ONE: u32 = 0xbf80_0000;
     debug_assert!(la.0 < 2, "the body's scratch lanes start at 2");
     // `n = bits(x + c231) - bits(c231)`: the integer subtraction tt-metal's
     // `_sfpu_round_to_nearest_int32_` does, and the exponent it adds.
@@ -3116,6 +3121,42 @@ fn exp2_body(
             a: LReg(3),
             b: LReg(6),
             d: la,
+        });
+        // The underflow predicate, carried in lane 6 (free once `n` is formed)
+        // until the result is ready: `nf + 126 < 0`, i.e. the result's true
+        // exponent is below the smallest normal. The exponent lane itself is an
+        // integer, so the test is made on the integer part as a float.
+        role.push(MirOp::LaneConst {
+            lreg: LReg(6),
+            bits: 0,
+        });
+        role.push(MirOp::LaneConst {
+            lreg: LReg(7),
+            bits: 126.0f32.to_bits(),
+        });
+        role.push(MirOp::BinarySfp {
+            op: BinarySfpOp::Add,
+            a: LReg(4),
+            b: LReg(7),
+            d: LReg(7),
+        });
+        role.push(MirOp::SfpEncc {
+            first: 3,
+            second: 0,
+            mod1: MASK_ON,
+        });
+        role.push(MirOp::SfpSetcc {
+            mod1: SETCC_LT0,
+            a: LReg(7),
+        });
+        role.push(MirOp::LaneConst {
+            lreg: LReg(6),
+            bits: NEG_ONE,
+        });
+        role.push(MirOp::SfpEncc {
+            first: 2,
+            second: 0,
+            mod1: MASK_ON,
         });
         // s = f ln 2, then the Horner chain into lane 4.
         role.push(MirOp::LaneConst {
@@ -3175,6 +3216,28 @@ fn exp2_body(
             a: LReg(4),
             b: LReg(5),
             d: LReg(5),
+        });
+        // Underflow: `2^k` with `k` below the smallest normal is zero. tt-metal's
+        // exp tests its clamped exponent the same way ("if k == 0, exp(x) = 0
+        // (fixes -inf case)"); without it `Setexp` wraps the exponent, and a
+        // masked score of `-1000` comes back around `1e34` instead of zero.
+        role.push(MirOp::SfpEncc {
+            first: 3,
+            second: 0,
+            mod1: MASK_ON,
+        });
+        role.push(MirOp::SfpSetcc {
+            mod1: SETCC_NE0,
+            a: LReg(6),
+        });
+        role.push(MirOp::LaneConst {
+            lreg: LReg(5),
+            bits: 0,
+        });
+        role.push(MirOp::SfpEncc {
+            first: 2,
+            second: 0,
+            mod1: MASK_ON,
         });
         role.push(MirOp::Sfpstore {
             lreg: LReg(5),

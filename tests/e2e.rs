@@ -5822,7 +5822,6 @@ fn softmax_scaler() -> Vec<f32> {
 }
 
 #[test]
-#[ignore = "exp2 does not saturate: a masked score of -1000 comes back ~1e34, not 0; see TODO.md"]
 fn a_causal_mask_hides_the_future_keys() {
     // `row` is the key, `column` the query: a query sees its own and every
     // earlier key, and nothing after it.
