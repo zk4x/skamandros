@@ -1159,3 +1159,35 @@ copy 32,32 %out [0] = %bo [0]
         S::TT_TODO_REDUCE,
     );
 }
+
+/// A ring written under one symbolic bound and read under another: nothing
+/// proves the two loops trip the same number of times, so some launch leaves
+/// one role waiting for a page that is never published. The refusal is the
+/// compile-time guarantee `sync_cbs::check_rings_balanced` gives.
+#[test]
+fn a_ring_moved_by_two_different_bounds_does_not_compile() {
+    const PROGRAM: &str = "\
+version 9
+grid 1,1
+%n = param i32 0
+%m = param i32 0
+%in = param f32 2048
+%out = param f32 2048
+%bi = buffer f32 32,64
+%bo = buffer f32 32,64
+%i = loop %n
+copy 32,32 %bi [0] = %in [0]
+endloop
+%j = loop %m
+load 32,32 %x = %bi [0]
+%y = neg %x
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
+endloop
+";
+    let k = Kernel::parse(PROGRAM).expect("the program parses");
+    assert_eq!(
+        compile::compile(&k).expect_err("the two bounds are not comparable"),
+        ttStatus::TT_ERROR_RING_UNBALANCED
+    );
+}

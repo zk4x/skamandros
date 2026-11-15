@@ -273,6 +273,7 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
         }
     }
     dedup_pushes(k)?;
+    check_rings_balanced(k)?;
     Ok(())
 }
 
@@ -339,6 +340,156 @@ fn dedup_pushes(k: &mut Kernel) -> Result<(), ttStatus> {
     Ok(())
 }
 
+/// Prove that no ring can deadlock.
+///
+/// A producer blocks in `reserve` while its ring is full; a consumer blocks in
+/// `wait` while the ring is empty. Neither can block forever unless one side
+/// finishes while the other still needs a page, so what has to hold, per ring,
+/// is that the pages its producers push and its consumers pop are the same
+/// number as a function of their enclosing trip counts. Then at every point the
+/// pages in flight stay inside the ring, the side that runs out of work is the
+/// side the other has already released, and a blocked role always has a
+/// counterpart that can still move. The allowance at the end is the ring's own
+/// depth — a producer one page ahead of its consumer is a pipeline, not a leak
+/// — which is the same allowance `verify`'s FIFO makes.
+///
+/// A page count is a sum of monomials: every hand-off contributes its pages
+/// times the product of its enclosing trip counts, and a product is a multiset
+/// of bound values. Bounds are compared structurally ([`Bounds`]) because the
+/// movers rebuild a bound for every segment they copy a loop into, so the same
+/// loop's bound has a different `OpId` on each core.
+///
+/// This is the guarantee, not a diagnostic. It is a compile-time refusal: a
+/// program that gets past it cannot have a role waiting for a page that is
+/// never published.
+fn check_rings_balanced(k: &Kernel) -> Result<(), ttStatus> {
+    let mut bounds = Bounds::default();
+    let mut labels: Vec<u32> = Vec::new();
+    let mut traffic: BTreeMap<OpId, BTreeMap<Vec<u32>, i64>> = BTreeMap::new();
+    let mut depth: BTreeMap<OpId, i64> = BTreeMap::new();
+    for (id, op) in k.ops() {
+        match *op {
+            Op::Cb { len, .. } => {
+                depth.insert(id, i64::from(len));
+            }
+            Op::Loop { bound } => labels.push(bounds.key(k, bound)?),
+            Op::EndLoop => {
+                if labels.pop().is_none() {
+                    return Err(crate::status::internal_bug(
+                        "sync_cbs: an end-of-loop has no open loop",
+                    ));
+                }
+            }
+            Op::Push { cb, n } => {
+                let monomial = monomial(&labels);
+                *traffic.entry(cb).or_default().entry(monomial).or_default() += i64::from(n);
+            }
+            Op::Pop { cb, n } => {
+                let monomial = monomial(&labels);
+                *traffic.entry(cb).or_default().entry(monomial).or_default() -= i64::from(n);
+            }
+            _ => {}
+        }
+    }
+    for (cb, monomials) in traffic {
+        let depth = depth.get(&cb).copied().unwrap_or(0);
+        for (monomial, left) in monomials {
+            let holds = if monomial.is_empty() {
+                // Pages no loop multiplies can only be a constant, and only a
+                // pipeline's leftover is allowed: never more than the ring
+                // holds, and never a consumer ahead of its producer.
+                left >= 0 && left <= depth
+            } else {
+                // A term in any trip count means the imbalance grows without
+                // bound, so some launch trips it.
+                left == 0
+            };
+            if !holds {
+                let _ = (cb, left);
+                return Err(ttStatus::TT_ERROR_RING_UNBALANCED);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A product of trip counts as the multiset of the bounds it multiplies: the
+/// product is commutative, so the order the loops are nested in does not
+/// matter, only which bounds and how many times each appears.
+fn monomial(labels: &[u32]) -> Vec<u32> {
+    let mut monomial = labels.to_vec();
+    monomial.sort_unstable();
+    monomial
+}
+
+/// The scenario a bound is, independent of the `OpId` a segment gives it.
+#[derive(Default)]
+struct Bounds {
+    /// Each value's key, once it has one.
+    of: BTreeMap<OpId, u32>,
+    /// The keys themselves: a value's op and its operands' keys.
+    sigs: BTreeMap<Sig, u32>,
+    next: u32,
+}
+
+/// What a value's key is computed from.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Sig {
+    /// A folded `i32`, so two spellings of one constant agree.
+    Int(i32),
+    /// A leaf the movers share across the segments they build, so its own id
+    /// is its identity.
+    Leaf(OpId),
+    Coord(u8),
+    Unary(u8, u32),
+    Binary(u8, u32, u32),
+    Cast(u8, bool, u32),
+    Select(u32, u32, u32),
+}
+
+impl Bounds {
+    /// The key of `value`, interning it on first sight.
+    fn key(&mut self, k: &Kernel, value: OpId) -> Result<u32, ttStatus> {
+        if let Some(key) = self.of.get(&value) {
+            return Ok(*key);
+        }
+        let sig = if let Some(n) = k.const_i32(value) {
+            Sig::Int(n)
+        } else {
+            match *k.at(value) {
+                Op::GridCoord { axis } => Sig::Coord(axis),
+                Op::Unary { op, a } => Sig::Unary(op as u8, self.key(k, a)?),
+                Op::Binary { op, a, b } => Sig::Binary(op as u8, self.key(k, a)?, self.key(k, b)?),
+                Op::Cast { dtype, src } => Sig::Cast(dtype as u8, false, self.key(k, src)?),
+                Op::Bitcast { dtype, src } => Sig::Cast(dtype as u8, true, self.key(k, src)?),
+                Op::Select {
+                    cond,
+                    if_true,
+                    if_false,
+                } => Sig::Select(
+                    self.key(k, cond)?,
+                    self.key(k, if_true)?,
+                    self.key(k, if_false)?,
+                ),
+                // A parameter or a variable is the prologue's: every segment
+                // names the same op.
+                _ => Sig::Leaf(value),
+            }
+        };
+        let key = match self.sigs.get(&sig) {
+            Some(key) => *key,
+            None => {
+                let key = self.next;
+                self.next += 1;
+                self.sigs.insert(sig, key);
+                key
+            }
+        };
+        self.of.insert(value, key);
+        Ok(key)
+    }
+}
+
 /// The ring a `load` reads.
 fn consumer_ring(consumers: &[Consumer], load: OpId) -> Result<OpId, ttStatus> {
     consumers
@@ -385,5 +536,198 @@ fn reads_source(op: &Op, value: OpId) -> bool {
         Op::Sum { x, s, .. } => x == value || s == value,
         Op::Max { x, .. } => x == value,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse a program, give it its movers and place its hand-offs. The check
+    /// under test is the last step of [`sync_cbs`], so a refusal here is the
+    /// balance, not the placement.
+    fn balance(text: &str) -> Result<(), ttStatus> {
+        let k = Kernel::parse(text).expect("the program parses");
+        let mut k = crate::mover::add_movers(&k).expect("the movers are added");
+        sync_cbs(&mut k)
+    }
+
+    /// One loop, both rings written and read inside it: the shape every
+    /// pipeline has, and the one the whole suite is built on.
+    const BALANCED: &str = "\
+version 9
+grid 1,1
+%n = param i32 0
+%in = param f32 2048
+%out = param f32 2048
+%bi = buffer f32 32,64
+%bo = buffer f32 32,64
+%step = const i32 1
+%i = loop %n
+%o = mul %i %step
+copy 32,32 %bi [0] = %in [%o]
+load 32,32 %x = %bi [0]
+%y = neg %x
+store 32,32 %bo [0] = %y
+copy 32,32 %out [%o] = %bo [0]
+endloop
+";
+
+    #[test]
+    fn a_balanced_pipeline_is_accepted() {
+        assert_eq!(balance(BALANCED), Ok(()));
+    }
+
+    /// The producer's loop and the consumer's are different loops with
+    /// different launch arguments. Nothing proves they trip the same number of
+    /// times, so for some arguments one role waits for a page that never comes.
+    #[test]
+    fn a_ring_moved_by_two_different_bounds_is_refused() {
+        let text = "\
+version 9
+grid 1,1
+%n = param i32 0
+%m = param i32 0
+%in = param f32 2048
+%out = param f32 2048
+%bi = buffer f32 32,64
+%bo = buffer f32 32,64
+%i = loop %n
+copy 32,32 %bi [0] = %in [0]
+endloop
+%j = loop %m
+load 32,32 %x = %bi [0]
+%y = neg %x
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
+endloop
+";
+        assert_eq!(
+            balance(text),
+            Err(ttStatus::TT_ERROR_RING_UNBALANCED),
+            "a producer loop and a consumer loop with different bounds"
+        );
+    }
+
+    /// The bound is an expression, so the movers rebuild it once per segment:
+    /// the two cores hold two distinct `OpId`s for the same trip count. The
+    /// bound's identity is structural, or this legal pipeline is refused.
+    #[test]
+    fn a_bound_rebuilt_per_segment_is_still_one_bound() {
+        let text = "\
+version 9
+grid 1,1
+%a = param i32 0
+%b = param i32 0
+%in = param f32 2048
+%out = param f32 2048
+%bi = buffer f32 32,64
+%bo = buffer f32 32,64
+%per = mul %a %b
+%step = const i32 1
+%i = loop %per
+%o = mul %i %step
+copy 32,32 %bi [0] = %in [%o]
+load 32,32 %x = %bi [0]
+%y = neg %x
+store 32,32 %bo [0] = %y
+copy 32,32 %out [%o] = %bo [0]
+endloop
+";
+        let k = Kernel::parse(text).expect("the program parses");
+        let mut k = crate::mover::add_movers(&k).expect("the movers are added");
+        let bounds: Vec<OpId> = k
+            .ops()
+            .filter_map(|(_, op)| match *op {
+                Op::Loop { bound } => Some(bound),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            bounds.len() >= 2,
+            "the loop is copied into more than one segment"
+        );
+        assert_ne!(
+            bounds[0], bounds[1],
+            "the movers rebuilt the bound, so identity would refuse it"
+        );
+        assert_eq!(sync_cbs(&mut k), Ok(()));
+    }
+
+    /// The same product of trip counts, with the loops nested in the opposite
+    /// order: a product is commutative, and only the multiset of bounds counts.
+    #[test]
+    fn nested_bounds_match_in_either_order() {
+        let text = "\
+version 9
+grid 1,1
+%n = param i32 0
+%m = param i32 0
+%in = param f32 2048
+%out = param f32 2048
+%bi = buffer f32 32,64
+%bo = buffer f32 32,64
+%i = loop %n
+%j = loop %m
+copy 32,32 %bi [0] = %in [0]
+endloop
+endloop
+%k = loop %m
+%l = loop %n
+load 32,32 %x = %bi [0]
+%y = neg %x
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
+endloop
+endloop
+";
+        assert_eq!(balance(text), Ok(()));
+    }
+
+    /// A ring may end holding pages — a producer one page ahead of its consumer
+    /// is a pipeline — as long as they fit in the ring.
+    #[test]
+    fn a_leftover_that_fits_the_ring_is_accepted() {
+        let text = "\
+version 9
+grid 1,1
+%in = param f32 2048
+%out = param f32 2048
+%bi = buffer f32 32,64
+%bo = buffer f32 32,32
+copy 32,32 %bi [0] = %in [0]
+load 32,32 %x = %bi [0]
+%y = neg %x
+copy 32,32 %bi [0] = %in [0]
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
+";
+        assert_eq!(balance(text), Ok(()));
+    }
+
+    /// One page more than the ring holds is a producer that blocks in
+    /// `reserve` with no consumer left to free a page.
+    #[test]
+    fn a_leftover_deeper_than_the_ring_is_refused() {
+        let text = "\
+version 9
+grid 1,1
+%in = param f32 2048
+%out = param f32 2048
+%bi = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %bi [0] = %in [0]
+load 32,32 %x = %bi [0]
+%y = neg %x
+copy 32,32 %bi [0] = %in [0]
+copy 32,32 %bi [0] = %in [0]
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
+";
+        assert_eq!(
+            balance(text),
+            Err(ttStatus::TT_ERROR_RING_UNBALANCED),
+            "two pages left in a one-page ring"
+        );
     }
 }

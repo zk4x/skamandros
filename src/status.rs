@@ -476,6 +476,16 @@ pub enum ttStatus {
     /// preconditions exclude, which the caller cannot cause. A message is on
     /// stderr, and nothing was compiled.
     TT_INTERNAL_BUG = 188,
+    /// A ring's producers and consumers do not move the same number of pages as
+    /// a function of their enclosing trip counts. One side then waits for a
+    /// page the other never publishes, and the blocked role spins until the
+    /// driver's watchdog ends the launch.
+    ///
+    /// The check is `sync_cbs::check_rings_balanced`: the page counts of both
+    /// sides are compared as sums of monomials over the enclosing loop bounds,
+    /// and a ring may end holding up to its own depth (a producer one page
+    /// ahead of its consumer is a pipeline, not a leak).
+    TT_ERROR_RING_UNBALANCED = 189,
 }
 
 impl ttStatus {
@@ -665,6 +675,7 @@ impl ttStatus {
             ttStatus::TT_TODO_RING_READ_OUTSIDE_LOOP => "TT_TODO_RING_READ_OUTSIDE_LOOP",
             ttStatus::TT_INTERNAL_BUG => "TT_INTERNAL_BUG",
             ttStatus::TT_ERROR_DST_ROW_ODD => "TT_ERROR_DST_ROW_ODD",
+            ttStatus::TT_ERROR_RING_UNBALANCED => "TT_ERROR_RING_UNBALANCED",
         }
     }
 }
