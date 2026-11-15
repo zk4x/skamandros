@@ -368,52 +368,6 @@ pub struct Kmd {
 }
 
 impl Kmd {
-    /// Every Blackhole this host can see, ordered by PCI address.
-    ///
-    /// Ordered by BDF, not by node number, because that is what tt-metal's
-    /// `PCIDevice::enumerate_devices` returns and its default device is the first
-    /// of that list (`sort_ids_based_on_bdf`, `pci_device.cpp:366-397`). On this
-    /// host there is one card, so the two orders agree; on a multi-card host they
-    /// need not, and the BDF order is the one the card's other tools use.
-    ///
-    /// The probe open is power-aware (`O_APPEND`), which tt-kmd reads as "change
-    /// nothing until asked" (`chardev.c:950-998`), so enumerating causes no power
-    /// transition — unlike [`Kmd::open`], whose legacy open asks for the busy
-    /// operating point.
-    pub fn enumerate() -> Result<Vec<u16>, ttStatus> {
-        let entries =
-            std::fs::read_dir(DEV_DIR).map_err(|e| failed("listing the device nodes", e))?;
-        let mut nodes: Vec<u16> = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|e| failed("listing the device nodes", e))?;
-            if let Some(n) = entry.file_name().to_str().and_then(|s| s.parse().ok()) {
-                nodes.push(n);
-            }
-        }
-        let mut identified: Vec<(String, u16)> = Vec::with_capacity(nodes.len());
-        for node in nodes {
-            let path = Path::new(DEV_DIR).join(node.to_string());
-            let fd = File::options()
-                .read(true)
-                .write(true)
-                .append(true)
-                .open(&path)
-                .map_err(|e| failed("opening the device to identify it", e))?;
-            let mut dev = abi::GetDeviceInfo {
-                in_output_size_bytes: (std::mem::size_of::<abi::GetDeviceInfo>() - 4) as u32,
-                ..Default::default()
-            };
-            call(fd.as_fd(), abi::GET_DEVICE_INFO, &mut dev)
-                .map_err(|e| failed("reading the device's identity", e))?;
-            if dev.vendor_id != VENDOR_ID_TENSTORRENT || dev.device_id != DEVICE_ID_BLACKHOLE {
-                continue;
-            }
-            identified.push((bdf(&dev), node));
-        }
-        identified.sort();
-        Ok(identified.into_iter().map(|(_, node)| node).collect())
-    }
-
     /// Open device `index`, check the driver's ioctl API, map BAR0, claim the
     /// session and allocate the window.
     ///

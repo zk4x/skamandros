@@ -473,21 +473,25 @@ impl Device {
         Ok(device)
     }
 
-    /// Take the card through `/dev/tenstorrent/N`.
+    /// Take the card through `/dev/tenstorrent/0`.
     ///
     /// The same `Device` as [`Device::open`], over the driver link: BAR0 mapped
     /// through tt-kmd, one window the driver arbitrated, and the card's telemetry
-    /// consulted before any Tensix tile is named. The node is the first the driver
-    /// enumerates, which is what tt-metal's `enumerate_devices()[0]` is
-    /// (`pci_device.cpp:195-215`).
+    /// consulted before any Tensix tile is named.
     ///
-    /// Not yet reachable: how `ttInit` chooses between this and [`Device::open`] is
-    /// the one ordering item left open (`TODO.md`).
-    #[allow(dead_code)]
+    /// Device 0 only (user decision 2026-11-15): on a multi-card host the node is
+    /// not chosen, so a second card is simply not reached. Opening it also requires
+    /// `TT_HARDWARE=1` for now — a bring-up gate that is dropped once a kernel has
+    /// run on the card — so nothing reaches silicon by accident.
     pub fn open_hardware() -> Result<Device, ttStatus> {
-        let nodes = Kmd::enumerate()?;
-        let index = *nodes.first().ok_or(ttStatus::TT_ERROR_NO_DEVICE)?;
-        let kmd = Kmd::open(index)?;
+        if std::env::var_os("TT_HARDWARE").as_deref() != Some(OsStr::new("1")) {
+            eprintln!(
+                "libskamandros: refusing to open the card: TT_HARDWARE=1 is required for now \
+                 (and TT_METAL_SIMULATOR is unset)"
+            );
+            return Err(ttStatus::TT_ERROR_DEVICE);
+        }
+        let kmd = Kmd::open(0)?;
         let link = Link::Driver(kmd);
 
         // The live Tensix grid comes from the ARC's telemetry, never from the

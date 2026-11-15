@@ -51,10 +51,21 @@ const fn slot(index: u32) -> u32 {
 }
 
 /// Open the device. Idempotent; the simulator is initialized once per process.
+///
+/// The transport is chosen the way tt-metal chooses: if `$TT_METAL_SIMULATOR`
+/// names a shared object, the simulator is used, and otherwise the card
+/// (`Device::open_hardware`). `TT_HARDWARE=1` is additionally required before this
+/// driver will touch silicon — a bring-up gate that goes away once a kernel has
+/// run on the card — so with neither variable set, [`init`] refuses rather than
+/// guessing which of the two the caller wanted.
 pub fn init() -> Result<(), ttStatus> {
     let mut device = lock()?;
     if device.is_none() {
-        *device = Some(Device::open()?);
+        let simulator = std::env::var_os(crate::device::LIB_PATH_ENV).filter(|p| !p.is_empty());
+        *device = Some(match simulator {
+            Some(_) => Device::open()?,
+            None => Device::open_hardware()?,
+        });
     }
     Ok(())
 }
