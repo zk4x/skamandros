@@ -1660,6 +1660,19 @@ impl Parser {
         }
         let k = self.take()?;
         k.check()?;
+        // The ring hand-offs are the compiler's, not the program's: `sync_cbs`
+        // places them after it has split the program into its roles, and a text
+        // program that names one has stepped into the machine representation.
+        // Refuse it as the caller error it is, at the boundary the caller
+        // crossed, rather than letting the pass report an internal bug later.
+        if k.ops().any(|(_, op)| {
+            matches!(
+                *op,
+                Op::Wait { .. } | Op::Reserve { .. } | Op::Push { .. } | Op::Pop { .. }
+            )
+        }) {
+            return Err(ttStatus::TT_ERROR_PROGRAM);
+        }
         Ok(k)
     }
 }

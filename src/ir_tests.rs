@@ -1191,3 +1191,33 @@ endloop
         ttStatus::TT_ERROR_RING_UNBALANCED
     );
 }
+
+/// The ring hand-offs are the compiler's. `sync_cbs` places them after the
+/// program is split into its roles, so a text program that names one has
+/// stepped into the machine representation: a caller error, not an internal
+/// bug, and refused at the boundary the caller crossed.
+#[test]
+fn a_program_may_not_write_its_own_ring_hand_offs() {
+    for word in ["wait", "reserve", "push", "pop"] {
+        let text = format!(
+            "\
+version 9
+grid 1,1
+%in = param f32 1024
+%out = param f32 1024
+%b = buffer f32 32,32
+%one = const i32 1
+copy 32,32 %b [0] = %in [0]
+%i = loop %one
+{word} %b 1
+endloop
+copy 32,32 %out [0] = %b [0]
+"
+        );
+        assert_eq!(
+            Kernel::parse(&text).err(),
+            Some(ttStatus::TT_ERROR_PROGRAM),
+            "`{word}` must be refused as a program error"
+        );
+    }
+}

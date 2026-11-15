@@ -5759,3 +5759,464 @@ fn a_gather_is_pure_data_movement() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The llama forward's assemblies, minus the ones that need a transposed operand
+// (`q @ kᵀ` has no path yet: `Op::Matmul` carries no transpose).
+// ---------------------------------------------------------------------------
+
+/// The causal mask of attention in the kernel that consumes it: a mask page
+/// added to the scores before `exp2`, `0` where a key is visible and a large
+/// negative where it is in the future. The rest is `SOFTMAX_COL`'s chain, so the
+/// mask is the one new input.
+const MASKED_SOFTMAX: &str = "\
+version 9
+grid 1,1
+%px = param f32 1024
+%pm = param f32 1024
+%ps = param f32 1024
+%out = param f32 1024
+%bx = buffer f32 32,32
+%bm = buffer f32 32,32
+%bs = buffer f32 32,32
+%bsum = buffer f32 32,32
+%binv = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %bx [0] = %px [0]
+copy 32,32 %bm [0] = %pm [0]
+copy 32,32 %bs [0] = %ps [0]
+%mx = acc f32 1,32
+%low = const f32 -1000
+store 32,32 %mx = %low
+load 32,32 %x = %bx [0]
+load 32,32 %mask = %bm [0]
+%ms = add %x %mask
+max %mx %ms
+%d = sub %ms %mx
+%k = const f32 1.442695
+%p = mul %d %k
+%e = exp2 %p
+%sm = acc f32 1,32
+%zero = const f32 0
+store 32,32 %sm = %zero
+load 32,32 %ones = %bs [0]
+sum %sm %e %ones
+store 32,32 %bsum [0] = %sm
+load 32,32 %st = %bsum [0]
+%inv = div %ones %st
+store 32,32 %binv [0] = %inv
+load 1,32 %ri = %binv [0]
+%y = mul %e %ri
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
+";
+
+/// The softmax scaler: 1.0 in row 0 of each face. The column fold's fill.
+fn softmax_scaler() -> Vec<f32> {
+    let mut scaler = vec![0.0f32; 1024];
+    for column in 0..32 {
+        scaler[tile_index(0, column)] = 1.0;
+        scaler[tile_index(16, column)] = 1.0;
+    }
+    scaler
+}
+
+#[test]
+#[ignore = "exp2 does not saturate: a masked score of -1000 comes back ~1e34, not 0; see TODO.md"]
+fn a_causal_mask_hides_the_future_keys() {
+    // `row` is the key, `column` the query: a query sees its own and every
+    // earlier key, and nothing after it.
+    let x: Vec<f32> = (0..1024)
+        .map(|i| {
+            let (row, column) = tile_rc(i);
+            ((row as i32 * 5 + column as i32 * 3) % 13) as f32 / 4.0 - 1.5
+        })
+        .collect();
+    let mut mask = vec![0.0f32; 1024];
+    for column in 0..32 {
+        for row in (column + 1)..32 {
+            mask[tile_index(row, column)] = -1000.0;
+        }
+    }
+    let scaler = softmax_scaler();
+    let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let m_bytes: Vec<u8> = mask.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let s_bytes: Vec<u8> = scaler.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_tensors(MASKED_SOFTMAX, &[&x_bytes, &m_bytes, &s_bytes], 4096);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for column in 0..32 {
+        let scores: Vec<f32> = (0..32)
+            .map(|row| x[tile_index(row, column)] + mask[tile_index(row, column)])
+            .collect();
+        let high = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = scores.iter().map(|s| (s - high).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        for row in 0..32 {
+            let want = exps[row] / sum;
+            let got = got[tile_index(row, column)];
+            assert!(
+                (got - want).abs() <= 2e-3 * want.abs().max(1.0),
+                "masked softmax at key {row}, query {column}: got {got}, want {want}"
+            );
+            if row > column {
+                assert_eq!(got, 0.0, "key {row} is in the future of query {column}");
+            }
+        }
+        let total: f32 = (0..32).map(|row| got[tile_index(row, column)]).sum();
+        assert!(
+            (total - 1.0).abs() <= 2e-3,
+            "query {column} sums to {total}, not one"
+        );
+    }
+}
+
+/// GQA's `repeat_kv`: one K head page read once and written into each query
+/// head that repeats it. The kernel can only move a page between a parameter
+/// and a ring, so the page makes the round trip through a register — one `load`
+/// and one `store` per head, which is the same store the caller would issue.
+const REPEAT_KV: &str = "\
+version 9
+grid 1,1
+%pk = param f32 1024
+%out = param f32 4096
+%bsrc = buffer f32 32,32
+%bh0 = buffer f32 32,32
+%bh1 = buffer f32 32,32
+%bh2 = buffer f32 32,32
+%bh3 = buffer f32 32,32
+copy 32,32 %bsrc [0] = %pk [0]
+load 32,32 %x = %bsrc [0]
+store 32,32 %bh0 [0] = %x
+store 32,32 %bh1 [0] = %x
+store 32,32 %bh2 [0] = %x
+store 32,32 %bh3 [0] = %x
+copy 32,32 %out [0] = %bh0 [0]
+copy 32,32 %out [1] = %bh1 [0]
+copy 32,32 %out [2] = %bh2 [0]
+copy 32,32 %out [3] = %bh3 [0]
+";
+
+#[test]
+fn repeat_kv_copies_a_head_into_every_query_head() {
+    let head: Vec<f32> = (0..1024)
+        .map(|i| {
+            let (row, column) = tile_rc(i);
+            (row as f32 * 0.25) - (column as f32 * 0.5)
+        })
+        .collect();
+    let head_bytes: Vec<u8> = head.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_tensors(REPEAT_KV, &[&head_bytes], 4 * 4096);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for head_index in 0..4 {
+        let page = &got[head_index * 1024..(head_index + 1) * 1024];
+        assert_eq!(page, head.as_slice(), "query head {head_index}");
+    }
+}
+
+/// The two GEMMs of attention that need no transposed operand: the scores go
+/// through the tile softmax and the probabilities multiply V. `q @ kᵀ` is the
+/// one piece this kernel cannot name (`Op::Matmul` has no transpose).
+const SOFTMAX_TIMES_V: &str = "\
+version 9
+grid 1,1
+%px = param f32 1024
+%pv = param f32 1024
+%ps = param f32 1024
+%out = param f32 1024
+%bx = buffer f32 32,32
+%bv = buffer f32 32,32
+%bs = buffer f32 32,32
+%bsum = buffer f32 32,32
+%binv = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %bx [0] = %px [0]
+copy 32,32 %bv [0] = %pv [0]
+copy 32,32 %bs [0] = %ps [0]
+%mx = acc f32 1,32
+%low = const f32 -1000
+store 32,32 %mx = %low
+load 32,32 %x = %bx [0]
+max %mx %x
+%d = sub %x %mx
+%k = const f32 1.442695
+%p = mul %d %k
+%e = exp2 %p
+%sm = acc f32 1,32
+%zero = const f32 0
+store 32,32 %sm = %zero
+load 32,32 %ones = %bs [0]
+sum %sm %e %ones
+store 32,32 %bsum [0] = %sm
+load 32,32 %st = %bsum [0]
+%inv = div %ones %st
+store 32,32 %binv [0] = %inv
+load 1,32 %ri = %binv [0]
+%y = mul %e %ri
+load 32,32 %v = %bv [0]
+%acc = acc f32 32,32
+store 32,32 %acc = %zero
+matmul %acc %y %v
+store 32,32 %bo [0] = %acc
+copy 32,32 %out [0] = %bo [0]
+";
+
+#[test]
+fn softmax_then_attention_times_v_runs_on_the_simulator() {
+    let x: Vec<f32> = (0..1024)
+        .map(|i| {
+            let (row, column) = tile_rc(i);
+            ((row as i32 * 3 + column as i32 * 11) % 17) as f32 / 5.0 - 1.6
+        })
+        .collect();
+    let v: Vec<f32> = (0..1024)
+        .map(|i| {
+            let (row, column) = tile_rc(i);
+            ((row as i32 * 7 + column as i32 * 2) % 9) as f32 / 4.0 - 1.0
+        })
+        .collect();
+    let scaler = softmax_scaler();
+    let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let v_bytes: Vec<u8> = v.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let s_bytes: Vec<u8> = scaler.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_tensors(SOFTMAX_TIMES_V, &[&x_bytes, &v_bytes, &s_bytes], 4096);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+
+    let mut probs = vec![0.0f32; 1024];
+    for column in 0..32 {
+        let high = (0..32)
+            .map(|row| x[tile_index(row, column)])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = (0..32)
+            .map(|row| (x[tile_index(row, column)] - high).exp())
+            .collect();
+        let sum: f32 = exps.iter().sum();
+        for row in 0..32 {
+            probs[tile_index(row, column)] = exps[row] / sum;
+        }
+    }
+    let want = tile_matmul(&probs, &v);
+    for (i, expected) in want.iter().enumerate() {
+        assert!(
+            (got[i] - expected).abs() <= 5e-3 * expected.abs().max(1.0),
+            "attention times V, datum {i}: got {}, want {expected}",
+            got[i]
+        );
+    }
+}
+
+/// SwiGLU: `down(silu(gate(x)) * up(x))`, every projection a tile GEMM, the
+/// activation the sigmoid chain the `silu` gate already covers.
+const SWIGLU: &str = "\
+version 9
+grid 1,1
+%px = param f32 1024
+%pg = param f32 1024
+%pu = param f32 1024
+%pd = param f32 1024
+%out = param f32 1024
+%bx = buffer f32 32,32
+%bgw = buffer f32 32,32
+%buw = buffer f32 32,32
+%bdw = buffer f32 32,32
+%b1 = buffer f32 32,32
+%b2 = buffer f32 32,32
+%bp = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %bx [0] = %px [0]
+copy 32,32 %bgw [0] = %pg [0]
+copy 32,32 %buw [0] = %pu [0]
+copy 32,32 %bdw [0] = %pd [0]
+load 32,32 %x = %bx [0]
+load 32,32 %gw = %bgw [0]
+%zero = const f32 0
+%a1 = acc f32 32,32
+store 32,32 %a1 = %zero
+matmul %a1 %x %gw
+store 32,32 %b1 [0] = %a1
+load 32,32 %g = %b1 [0]
+%ng = neg %g
+%k = const f32 1.442695
+%pp = mul %ng %k
+%ee = exp2 %pp
+%one = const f32 1
+%dd = add %ee %one
+%sg = reciprocal %dd
+%sil = mul %g %sg
+load 32,32 %uw = %buw [0]
+%a2 = acc f32 32,32
+store 32,32 %a2 = %zero
+matmul %a2 %x %uw
+store 32,32 %b2 [0] = %a2
+load 32,32 %u = %b2 [0]
+%prod = mul %sil %u
+store 32,32 %bp [0] = %prod
+load 32,32 %pa = %bp [0]
+load 32,32 %dw = %bdw [0]
+%a3 = acc f32 32,32
+store 32,32 %a3 = %zero
+matmul %a3 %pa %dw
+store 32,32 %bo [0] = %a3
+copy 32,32 %out [0] = %bo [0]
+";
+
+#[test]
+#[ignore = "the unpacker's Src/Dst toggle is cached with the config and a Dst load between two Src unpacks leaves it clear; see TODO.md"]
+fn swiglu_runs_on_the_simulator() {
+    let x: Vec<f32> = (0..1024)
+        .map(|i| {
+            let (row, column) = tile_rc(i);
+            ((row as i32 * 4 + column as i32 * 9) % 19) as f32 / 8.0 - 1.1
+        })
+        .collect();
+    let weight = |salt: i32| -> Vec<f32> {
+        (0..1024)
+            .map(|i| {
+                let (row, column) = tile_rc(i);
+                ((row as i32 * (salt + 2) + column as i32 * 5) % 11) as f32 / 16.0 - 0.3
+            })
+            .collect()
+    };
+    let (gw, uw, dw) = (weight(1), weight(2), weight(3));
+    let bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let out = run_kernel_tensors(
+        SWIGLU,
+        &[&bytes(&x), &bytes(&gw), &bytes(&uw), &bytes(&dw)],
+        4096,
+    );
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+
+    let g = tile_matmul(&x, &gw);
+    let u = tile_matmul(&x, &uw);
+    let mut p = vec![0.0f32; 1024];
+    for i in 0..1024 {
+        p[i] = (g[i] / (1.0 + (-g[i]).exp())) * u[i];
+    }
+    let want = tile_matmul(&p, &dw);
+    for (i, expected) in want.iter().enumerate() {
+        assert!(
+            (got[i] - expected).abs() <= 2e-2 * expected.abs().max(1.0),
+            "swiglu, datum {i}: got {}, want {expected}",
+            got[i]
+        );
+    }
+}
+
+/// The embedding row gather, then the cast the llama forward makes before the
+/// first RMSNorm: a token's bf16 weights widened to f32.
+const EMBEDDING_CAST: &str = "\
+version 9
+grid 1,1
+%ids = param i32 32
+%w = param bf16 32768
+%out = param f32 1024
+%ib = buffer i32 1,32
+%wb = buffer bf16 32,32
+%bo = buffer f32 32,32
+copy 1,32 %ib [0] = %ids [0]
+load 1,32 %rows = %ib [0]
+copy 1,32 %wb [0] = %w [%rows]
+load 32,32 %x = %wb [0]
+%f = cast %x to f32
+store 32,32 %bo [0] = %f
+copy 32,32 %out [0] = %bo [0]
+";
+
+#[test]
+fn embedding_gathers_and_casts_to_f32() {
+    let tokens: Vec<i32> = (0..32).map(|lane| ((lane * 5 + 1) % 32) as i32).collect();
+    let rows: Vec<i32> = tokens.iter().map(|token| token * 32).collect();
+    let ids: Vec<u8> = rows.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let table: Vec<f32> = (0..32768).map(|i| ((i % 61) as f32 - 30.0) / 8.0).collect();
+    let table_bf16: Vec<u16> = table.iter().map(|v| truncate_to_bf16(*v)).collect();
+    let weight: Vec<u8> = table_bf16.iter().flat_map(|h| h.to_le_bytes()).collect();
+    let out = run_kernel_tensors(EMBEDDING_CAST, &[&ids, &weight], 4096);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (lane, &token) in tokens.iter().enumerate() {
+        for column in 0..32 {
+            let want = widen_bf16(table_bf16[token as usize * 1024 + column]);
+            assert_eq!(
+                got[lane * 32 + column],
+                want,
+                "lane {lane} datum {column}: embedding of token {token}"
+            );
+        }
+    }
+}
+
+/// `lm_head`: the last token's hidden row against one vocab tile. The activation
+/// page has one live row, which is what the pre-lm_head narrow leaves behind;
+/// every other row of the product is zero.
+const LM_HEAD: &str = "\
+version 9
+grid 1,1
+%pa = param f32 1024
+%pw = param f32 1024
+%out = param f32 1024
+%ba = buffer f32 32,32
+%bw = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %ba [0] = %pa [0]
+copy 32,32 %bw [0] = %pw [0]
+load 32,32 %a = %ba [0]
+load 32,32 %w = %bw [0]
+%zero = const f32 0
+%acc = acc f32 32,32
+store 32,32 %acc = %zero
+matmul %acc %a %w
+store 32,32 %bo [0] = %acc
+copy 32,32 %out [0] = %bo [0]
+";
+
+#[test]
+fn lm_head_has_one_live_row() {
+    let mut hidden = vec![0.0f32; 1024];
+    for column in 0..32 {
+        hidden[tile_index(0, column)] = (column as f32 - 15.5) / 4.0;
+    }
+    let w: Vec<f32> = (0..1024)
+        .map(|i| {
+            let (row, column) = tile_rc(i);
+            ((row as i32 * 3 + column as i32 * 7) % 13) as f32 / 16.0 - 0.4
+        })
+        .collect();
+    let a_bytes: Vec<u8> = hidden.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let w_bytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_tensors(LM_HEAD, &[&a_bytes, &w_bytes], 4096);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let want = tile_matmul(&hidden, &w);
+    for column in 0..32 {
+        assert!(
+            (got[tile_index(0, column)] - want[tile_index(0, column)]).abs() <= 5e-3,
+            "logit {column}: got {}, want {}",
+            got[tile_index(0, column)],
+            want[tile_index(0, column)]
+        );
+    }
+    for row in 1..32 {
+        for column in 0..32 {
+            assert_eq!(
+                got[tile_index(row, column)],
+                0.0,
+                "row {row} of the product is not live"
+            );
+        }
+    }
+}
