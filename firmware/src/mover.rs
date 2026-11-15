@@ -76,14 +76,12 @@ fn writes() -> &'static mut Writes {
 /// waiting for them. Every request's range is a sub-range of the checked
 /// descriptor, so it is inside the channel and inside L1, with the congruence
 /// preserved. Reads go out on NoC #0; writes on NoC #0 from B, and from NC on
-/// the NIU the host chose (`M.at(dm::WRITE_NOC)`), each through the port of
-/// its channel that NIU owns nearest the one asked for
-/// (`DramChannel::port_for`).
+/// the NIU the host chose (`M.at(dm::WRITE_NOC)`), each out of the endpoint its
+/// channel prefers for that NoC (`DramChannel::preferred`).
 #[link_section = ".text.hot"]
 fn issue(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
     if !IS_NC && d.op == op::READ {
-        let port = d.range.channel().port_for(Niu::Noc0, d.port);
-        return issue_via::<false>(me, d, port);
+        return issue_via::<false>(me, d);
     }
     // B only reads and NC only writes (`Mover::permits`): the write path is
     // NC's alone, and NC has no read path.
@@ -108,18 +106,18 @@ fn issue_write(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
         };
     }
     if w.niu == Niu::Noc1 {
-        issue_via::<true>(w.me1, d, d.range.channel().port_for(Niu::Noc1, d.port))
+        issue_via::<true>(w.me1, d)
     } else {
-        issue_via::<false>(me, d, d.range.channel().port_for(Niu::Noc0, d.port))
+        issue_via::<false>(me, d)
     }
 }
 
-/// One descriptor's requests through NoC #1 (`NOC1`) or NoC #0, on `port`.
+/// One descriptor's requests through NoC #1 (`NOC1`) or NoC #0.
 #[inline(always)]
-fn issue_via<const NOC1: bool>(me: (u8, u8), d: Descriptor, port: u8) -> Result<(), u32> {
+fn issue_via<const NOC1: bool>(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
     let niu = if NOC1 { Niu::Noc1 } else { Niu::Noc0 };
     // The whole descriptor checked once; each request then only encoded.
-    let mv = DramMove::new(d.range, port, d.l1, d.op != op::READ, me, TXN, niu)
+    let mv = DramMove::new(d.range, d.l1, d.op != op::READ, me, TXN, niu)
         .map_err(|_| dm::error::ALIGNMENT)?;
     // B's reads on NoC #0 only, and only when the host chose the fast path
     // (`dm::READ_FAST`): each request then writes just the initiator words
@@ -1172,11 +1170,7 @@ fn call(
         if IS_NC {
             let descriptor =
                 Descriptor::decode(usable, read[0], read[1], read[2], read[3], read[4], read[5])?;
-            issue_via::<true>(
-                noc::me(Niu::Noc1),
-                descriptor,
-                descriptor.range.channel().port_for(Niu::Noc1, 0),
-            )?;
+            issue_via::<true>(noc::me(Niu::Noc1), descriptor)?;
         } else {
             exec(me, usable, read)?;
         }

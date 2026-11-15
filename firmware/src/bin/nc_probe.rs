@@ -80,8 +80,8 @@ fn wr(addr: u64, v: u32) {
 
 fn run() -> Result<(), u32> {
     let usable = rd(at(dm::USABLE));
-    let ch = Dram::from_usable_mask(usable as u8)
-        .channel(rd(at(dm::CHANNEL)) as u8)
+    let ch = Dram::from_enabled_mask(usable as u8)
+        .and_then(|dram| dram.channel(rd(at(dm::CHANNEL)) as u8))
         .ok_or(dm::error::RANGE)?;
     let len = rd(at(dm::LEN));
     let range = ch
@@ -93,7 +93,6 @@ fn run() -> Result<(), u32> {
     let write = Command::WriteDram {
         from_local: l1,
         to: range,
-        port: ch.port_for(Niu::Noc1, 1),
     };
     noc::issue(Niu::Noc1, &write, me1, TXN).map_err(|_| dm::error::ALIGNMENT)?;
     let (mask, ctrl) = kept(Niu::Noc1, &write, me1);
@@ -102,7 +101,6 @@ fn run() -> Result<(), u32> {
     noc::wait(TXN);
     let read = Command::ReadDram {
         from: range,
-        port: ch.port_for(Niu::Noc0, 1),
         to_local: l1 + len,
     };
     noc::issue(Niu::Noc0, &read, me0, TXN).map_err(|_| dm::error::ALIGNMENT)?;

@@ -627,8 +627,9 @@ pub mod noc {
     }
 
     /// Issue `cmd` from this tile, at coordinate `me`, under `txn`, through
-    /// `niu`. A GDDR request on a port `niu` does not own is refused
-    /// (`Command::registers`: both NoCs on one endpoint is the SYS-1419 hang).
+    /// `niu`. A GDDR request goes out of the endpoint its channel prefers for
+    /// `niu` (`DramChannel::preferred`), the two of which differ on every
+    /// channel: both NoCs on one endpoint is the SYS-1419 hang.
     ///
     /// First makes room under `txn`'s in-flight cap on `niu`: below it,
     /// nothing is read; at it, the counter is polled until a request completes

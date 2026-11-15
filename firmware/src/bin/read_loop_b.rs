@@ -89,8 +89,7 @@ fn repetition(m: u32, count: u32, txn: TxnId) {
                     finish(0xBAD);
                     spin()
                 };
-                let port = d.range.channel().port_for(Niu::Noc0, d.port);
-                let Ok(mv) = DramMove::new(d.range, port, d.l1, false, me, txn, Niu::Noc0) else {
+                let Ok(mv) = DramMove::new(d.range, d.l1, false, me, txn, Niu::Noc0) else {
                     finish(0xBAD);
                     spin()
                 };

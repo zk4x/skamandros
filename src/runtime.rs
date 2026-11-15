@@ -35,6 +35,26 @@ static DEVICE: Mutex<Option<Device>> = Mutex::new(None);
 const PROGRAM_AREA: u32 = crate::device::PROGRAM_AREA as u32;
 /// Bytes in one program-cache slot: `mailbox::MAX_WORDS` words.
 const SLOT_BYTES: u32 = 0x8000;
+/// The barrier word of a GDDR channel: offset 0, as tt-metal's
+/// `DRAM_BARRIER_BASE` (`bh_hal.cpp:34-37`, `DRAM_BARRIER_SIZE` = 64 bytes).
+/// It lies below [`crate::device`]'s first allocation, so a launch never reads
+/// a tensor there and no tensor is ever written there.
+const DRAM_BARRIER: u64 = 0;
+
+/// The two values tt-metal alternates through the barrier word (`MemBarFlag`,
+/// `umd/device/types/cluster_types.hpp:106-109`): a barrier writes one and
+/// reads it back, so every earlier write to the channel has been committed,
+/// and a value the previous barrier left behind can never be mistaken for this
+/// one because every barrier uses the other value first.
+const BARRIER_SET: u32 = 0xAA;
+const BARRIER_RESET: u32 = 0xBB;
+
+/// How many times the barrier word is read before the channel is declared not
+/// to answer. A flush is one or two PCIe round trips; a thousand reads is far
+/// past that and still bounded, so a channel that is not answering is reported
+/// rather than spun on.
+const BARRIER_POLLS: u32 = 1000;
+
 /// Slot 0 and 1: RISCV B's reader and writer. 3..6: T0/T1/T2. The arguments
 /// follow the last slot.
 const SLOT_READER: u32 = 0;
@@ -72,9 +92,24 @@ pub fn init() -> Result<(), ttStatus> {
 
 /// Close the device. DRAM allocations from this device are gone; a later
 /// [`init`] opens a fresh one over the same simulator.
+///
+/// On the card, the chip is returned to its idle operating point first, as
+/// tt-metal does when it closes a device (`LocalChip::close_device` ->
+/// `set_power_state(LONG_IDLE)`, `local_chip.cpp:195-211`). This path only moves
+/// the clock: it never resets the board — no `RESET_DEVICE` ioctl, no ARC reset
+/// message, no backend pulse. tt-metal's `close_device` also calls
+/// `assert_risc_reset(RiscType::ALL)`; that is a soft hold of the five cores, not
+/// a board reset, and this driver already has its own holds (`Device::quiesce`
+/// at open and `Kmd::hold_on_close` at descriptor close), so nothing here
+/// repeats it.
 pub fn release() -> Result<(), ttStatus> {
-    *lock()? = None;
-    Ok(())
+    let mut device = lock()?;
+    let result = match device.as_mut() {
+        Some(device) => device.set_power_state(false),
+        None => Ok(()),
+    };
+    *device = None;
+    result
 }
 
 /// Reserve `bytes` of DRAM and return its address.
@@ -247,6 +282,40 @@ fn launch_steps(
     params: &[u64],
     grid: [u32; 2],
 ) -> Result<(), ttStatus> {
+    // The host's writes to DRAM are posted, so a launch that reads them must
+    // flush first: tt-metal inserts its DRAM barrier before launching a kernel,
+    // "to ensure metadata and data to compute on are committed" and because
+    // "writes to device are not blocking unless strict TLB ordering is used"
+    // (`Cluster::dram_barrier`, `tt_cluster.cpp:1021-1031`). The barrier is the
+    // channel's own word, written and read back twice with different values
+    // (`LocalChip::insert_host_to_device_barrier` -> `set_membar_flag`,
+    // `local_chip.cpp:472-508`).
+    //
+    // Channel 0 only: every allocation this driver hands out is an offset in
+    // channel 0 (`Device::alloc_dram`), so one channel's barrier covers every
+    // byte a launch can read. A chip-wide barrier would have to visit all
+    // seven survivors.
+    for flag in [BARRIER_SET, BARRIER_RESET] {
+        device.dram_write(DRAM_BARRIER, &flag.to_le_bytes())?;
+        let mut back = [0u8; 4];
+        let mut polls = 0u32;
+        loop {
+            device.dram_read(DRAM_BARRIER, &mut back)?;
+            if u32::from_le_bytes(back) == flag {
+                break;
+            }
+            polls += 1;
+            if polls == BARRIER_POLLS {
+                eprintln!(
+                    "libskamandros: the DRAM barrier word at offset {DRAM_BARRIER:#x} of channel 0 \
+                     still reads {:#010x}, not {flag:#010x}: the host's writes are not reaching DRAM",
+                    u32::from_le_bytes(back)
+                );
+                return Err(ttStatus::TT_ERROR_DEVICE);
+            }
+        }
+    }
+
     // The logical grid the module asks for, as physical tiles, row-major. Each
     // tile's logical coordinate is what `grid.x`/`grid.y` read.
     let mut tiles = Vec::with_capacity(grid[0] as usize * grid[1] as usize);
@@ -264,7 +333,15 @@ fn launch_steps(
             return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
         }
     }
-    let compute = module.cores.iter().any(|words| !words.is_empty());
+    // Which programs this target can run: the card writes the unpacker's
+    // tile-descriptor tail, which `ttsim` refuses, so the compiler emitted both
+    // sets and the launch picks one (`Module::silicon_cores`).
+    let cores = if device.is_simulated() {
+        &module.cores
+    } else {
+        &module.silicon_cores
+    };
+    let compute = cores.iter().any(|words| !words.is_empty());
 
     // Every tile is staged, then all of them are started and joined, so the
     // grid runs concurrently rather than one core at a time.
@@ -295,6 +372,12 @@ fn launch_steps(
         info.extend_from_slice(&x.to_le_bytes());
         info.extend_from_slice(&y.to_le_bytes());
         device.l1_write(u64::from(crate::mir::CORE_INFO), &info)?;
+        // The mover's `USABLE` mailbox: the chip's `ENABLED_GDDR` word, in the
+        // compacted logical channel numbering its decoder uses
+        // (`tt_isa::dm::Descriptor::decode`). The mover reads it once when it
+        // starts, so it lands before the executor is released.
+        let mask = device.dram_mask();
+        device.write32(tt_isa::dm::USABLE, mask)?;
         if compute {
             device.release_tensix_backend()?;
         }
@@ -340,7 +423,7 @@ fn launch_steps(
             )?;
             enables |= mailbox::launch::ENABLE_NC;
         }
-        for (thread, words) in module.cores.iter().enumerate() {
+        for (thread, words) in cores.iter().enumerate() {
             if words.is_empty() {
                 continue;
             }

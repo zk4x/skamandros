@@ -41,8 +41,7 @@
 
 use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
-use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::status::ttStatus;
 
@@ -218,21 +217,6 @@ type Request = libc::c_int;
 #[cfg(not(target_env = "musl"))]
 type Request = libc::c_ulong;
 
-/// A device's PCI address as sysfs spells it: `domain:bus:device.function`.
-///
-/// `bus_dev_fn` packs function in bits 0-2, device in 3-7 and bus in 8-15
-/// (`ioctl.h:57`). Same spelling tt-metal builds for `/sys/bus/pci/devices/<bdf>`
-/// (`Kmd::open` above, and `pci_device.cpp:118-124`).
-fn bdf(dev: &abi::GetDeviceInfo) -> String {
-    format!(
-        "{:04x}:{:02x}:{:02x}.{}",
-        dev.pci_domain,
-        dev.bus_dev_fn >> 8,
-        (dev.bus_dev_fn >> 3) & 0x1F,
-        dev.bus_dev_fn & 0x7
-    )
-}
-
 /// One syscall failure, with the call named, as [`ttStatus::TT_ERROR_DEVICE`].
 ///
 /// The ABI's status codes are the caller's (they are numbered and public), and
@@ -353,14 +337,14 @@ impl Drop for Bar {
 /// One Blackhole reached through one `/dev/tenstorrent/N`.
 ///
 /// Holds the file descriptor the driver ties the session lock and the cleanup
-/// write to, the PCI configuration-space file (the only readable path to it:
-/// tt-kmd exposes no config-space ioctl — `GetDeviceInfo` carries identity, not
-/// the BARs), BAR0, and the 2 MiB window the driver allocated for this session.
+/// write to, BAR0, and the 2 MiB window the driver allocated for this session.
+/// tt-kmd exposes no configuration-space ioctl — `GetDeviceInfo` carries
+/// identity, not the BARs — and nothing here needs configuration space: the BARs
+/// come from `QUERY_MAPPINGS`.
 pub struct Kmd {
     // Declared before `fd` so the aperture is unmapped before the descriptor it
     // was mapped through is closed.
     bar0: Bar,
-    config: File,
     fd: File,
     window: u32,
     /// Was the session lock taken? Then it is ours to give back.
@@ -411,7 +395,6 @@ impl Kmd {
         };
         call(fd.as_fd(), abi::GET_DEVICE_INFO, &mut dev)
             .map_err(|e| failed("reading the device's identity", e))?;
-        let bdf = bdf(&dev);
         if dev.vendor_id != VENDOR_ID_TENSTORRENT || dev.device_id != DEVICE_ID_BLACKHOLE {
             eprintln!(
                 "libskamandros: {path:?} is {:#06x}:{:#06x}, not a Blackhole",
@@ -419,10 +402,6 @@ impl Kmd {
             );
             return Err(ttStatus::TT_ERROR_NOT_BLACKHOLE);
         }
-        let config_path = PathBuf::from(format!("/sys/bus/pci/devices/{bdf}/config"));
-        let config = File::open(&config_path)
-            .map_err(|e| failed("opening the PCI configuration space", e))?;
-
         // BAR0, uncached. The window configuration array lives in it and is
         // documented as dword-only registers; a write-combining view is free to
         // merge and reorder stores, which for a configuration register is silent
@@ -479,7 +458,6 @@ impl Kmd {
 
         Ok(Kmd {
             bar0,
-            config,
             fd,
             window: tlb.out_id,
             locked,
@@ -489,15 +467,6 @@ impl Kmd {
     /// The window index the driver allocated.
     pub fn window(&self) -> u32 {
         self.window
-    }
-
-    /// One dword of PCI configuration space, through sysfs.
-    pub fn config_rd32(&self, offset: u32) -> Result<u32, ttStatus> {
-        let mut buf = [0u8; 4];
-        self.config
-            .read_exact_at(&mut buf, u64::from(offset))
-            .map_err(|e| failed("reading PCI configuration space", e))?;
-        Ok(u32::from_le_bytes(buf))
     }
 
     /// Write `bytes` into BAR0 at `offset`.

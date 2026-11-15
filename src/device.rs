@@ -45,6 +45,66 @@ const TLB_CONFIG_BASE: u64 = 0x1FC0_0000;
 const WINDOW: u16 = 0;
 const WINDOW_SIZE: u64 = 2 * 1024 * 1024;
 
+/// The ARC's APB window: `ARC_APB_BAR0_XBAR_OFFSET_START`
+/// (`blackhole_implementation.hpp:222`), the last MiB of BAR0, and the same
+/// window over the NoC (`ARC_NOC_XBAR_ADDRESS_START`, `:237`).
+///
+/// Which one a write goes through is tt-metal's rule: the APB is reachable over
+/// AXI only when the PCIe tile is at X 11
+/// (`BlackholeTTDevice::is_arc_available_over_axi`, `blackhole_tt_device.cpp:296-303`).
+const ARC_APB_BAR0: u64 = 0x1FF0_0000;
+const ARC_APB_NOC: u64 = 0x8000_0000;
+
+/// `ARC_FW_INT_ADDR` / `ARC_FW_INT_VAL` (`blackhole_implementation.hpp:255-256`):
+/// the doorbell that wakes the ARC's message-queue handler.
+const ARC_FW_INT_ADDR: u64 = 0x0003_0100;
+const ARC_FW_INT_VAL: u32 = 65_536;
+
+/// `NIU_CFG_NOC0_BAR_PCIE_ADDR` (`blackhole_implementation.hpp:266`) plus the
+/// 0x100 tt-metal adds (`blackhole_tt_device.cpp:129`). Bit 14 is the
+/// coordinate-translation enable; the low six bits are the PCIe tile's X.
+const NIU_CFG_0: u64 = 0x1FD0_4100;
+
+/// `BlackholeArcMessageQueue` (`blackhole_arc_message_queue.hpp:51-58`): an
+/// eight-word header of double-wrapping pointers, then two rings of eight-word
+/// entries, the requests and then the responses.
+const ARC_QUEUE_HEADER_BYTES: u64 = 32;
+const ARC_QUEUE_ENTRY_BYTES: u64 = 32;
+/// The header's pointers, in words from the queue's base: request write,
+/// response read, request read, response write.
+const ARC_REQUEST_WPTR: u64 = 0;
+const ARC_RESPONSE_RPTR: u64 = 1;
+const ARC_REQUEST_RPTR: u64 = 4;
+const ARC_RESPONSE_WPTR: u64 = 5;
+/// The queue tt-metal sends on (`BlackholeArcMessageQueueIndex::APPLICATION`,
+/// `blackhole_arc.hpp:49-54`).
+const ARC_APPLICATION_QUEUE: u64 = 3;
+/// `ARC_MSG_RESPONSE_OK_LIMIT` (`blackhole_implementation.hpp:258`): a response
+/// status below it is a success, and its high half is the message's exit code.
+const ARC_RESPONSE_OK_LIMIT: u32 = 240;
+
+/// `AICLK_GO_BUSY` and `AICLK_GO_LONG_IDLE` (`arc_message_type`,
+/// `blackhole_implementation.hpp:59-67`).
+const AICLK_GO_BUSY: u32 = 0x52;
+const AICLK_GO_LONG_IDLE: u32 = 0x54;
+/// `AICLK_IDLE_VAL` (`blackhole_implementation.hpp:273`): the clock an
+/// `AICLK_GO_LONG_IDLE` is confirmed against.
+const AICLK_IDLE: u32 = 800;
+
+/// `ARC_MESSAGE_TIMEOUT` and `AICLK_TIMEOUT` (`umd/device/utils/timeouts.hpp:12,25`).
+const ARC_MESSAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1_000);
+const AICLK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// First DRAM byte this driver hands out.
+///
+/// tt-metal reserves the bottom of every channel for the DRAM barrier (one
+/// alignment word at offset 0), the profiler block (empty in a build without
+/// Tracy) and the device-print dispatch region (`DRAM_ALIGNMENT + 1 MiB`), so
+/// its `UNRESERVED` base is `0x1_0080` (`bh_hal.cpp:33-83`, `:329-332`). This
+/// driver writes none of those regions, but starting above them keeps its data
+/// out of anything the card's own dispatch would touch.
+const DRAM_FIRST: u64 = 0x10_0080;
+
 /// Simulated cycles one core may take to answer before it is declared stuck.
 ///
 /// On silicon there are no simulated cycles, so the same number is read as
@@ -184,17 +244,6 @@ enum Link {
 }
 
 impl Link {
-    fn config_rd32(&self, bdf: u32, offset: u32) -> u32 {
-        match self {
-            Link::Sim(lib) => lib.config_rd32(bdf, offset),
-            Link::Driver(kmd) => {
-                // One card per `Kmd`, and configuration space is per card.
-                debug_assert_eq!(bdf, 0);
-                kmd.config_rd32(offset).unwrap_or(u32::MAX)
-            }
-        }
-    }
-
     fn mem_write(&self, paddr: u64, bytes: &[u8]) {
         match self {
             Link::Sim(lib) => lib.mem_write(paddr, bytes),
@@ -244,6 +293,18 @@ impl Link {
 
     fn is_simulated(&self) -> bool {
         matches!(self, Link::Sim(_))
+    }
+}
+
+impl Device {
+    /// Is this device the simulator?
+    ///
+    /// The two targets differ in what a program may write: the unpacker's
+    /// tile-descriptor tail is written on the card and refused by `ttsim`, so
+    /// a launch stages [`crate::module::Module::silicon_cores`] here and
+    /// [`crate::module::Module::cores`] on the simulator.
+    pub fn is_simulated(&self) -> bool {
+        self.link.is_simulated()
     }
 }
 
@@ -417,11 +478,11 @@ impl Device {
             .unwrap_or_else(|| PathBuf::from("libttsim_bh.so"));
         let lib = Lib::open(path.as_os_str())?;
 
-        let link = Link::Sim(lib);
-
         // Chip 0 must answer configuration space, and it must be a Blackhole:
-        // every address constant above is Blackhole's.
-        let id = link.config_rd32(0, 0);
+        // every address constant above is Blackhole's. Only the simulator has a
+        // configuration-space path: tt-kmd exposes no ioctl for it, and the card's
+        // identity check is `GET_DEVICE_INFO` at open (`Kmd::open`).
+        let id = lib.config_rd32(0, 0);
         if id == u32::MAX {
             return Err(ttStatus::TT_ERROR_NO_DEVICE);
         }
@@ -431,6 +492,8 @@ impl Device {
             let _ = (vendor, device);
             return Err(ttStatus::TT_ERROR_NOT_BLACKHOLE);
         }
+
+        let link = Link::Sim(lib);
 
         // The live Tensix grid comes from the ARC's telemetry, never from the
         // part's population: ttsim v1.16 (and a harvested chip) refuses accesses
@@ -443,7 +506,7 @@ impl Device {
             tiles: Vec::new(),
             columns: 0,
             dram: Dram::FULL,
-            dram_used: 0x10_0000,
+            dram_used: DRAM_FIRST,
             exec_started: Vec::new(),
             launch_seq: 0,
             placed: Vec::new(),
@@ -504,7 +567,7 @@ impl Device {
             tiles: Vec::new(),
             columns: 0,
             dram: Dram::FULL,
-            dram_used: 0x10_0000,
+            dram_used: DRAM_FIRST,
             exec_started: Vec::new(),
             launch_seq: 0,
             placed: Vec::new(),
@@ -540,18 +603,14 @@ impl Device {
         if let Link::Driver(kmd) = &device.link {
             kmd.hold_on_close(first.x(), first.y(), tensix::SOFT_RESET_0, held)?;
         }
+        // tt-metal puts the chip at its busy operating point once the device is
+        // up (`Cluster::deassert_resets_and_set_power_state`, `cluster.cpp:1080-1099`).
+        // At the idle point the Matrix Unit's `Src` reads are unreliable on
+        // silicon, so this belongs to bringing the device up.
+        device.set_power_state(true)?;
         Ok(device)
     }
 
-    /// Which GDDR channels can hold data, from the ARC's telemetry.
-    ///
-    /// tt-metal reads `ENABLED_GDDR` and inverts it
-    /// (`BlackholeTTDevice::get_chip_info`, `blackhole_tt_device.cpp:146-149`,
-    /// `~read_entry & 0xFF`); the driver's own sysfs cannot answer it, because
-    /// `tt_telemetry_probe` caches only the tags that back an attribute. This
-    /// driver uses channel 0 only, and a part with that channel fused off is not
-    /// one it can drive — [`Device::dram_channel`] says so loudly rather than
-    /// addressing memory that is not there.
     /// Does the NIU translate coordinates?
     ///
     /// Every Tensix tile this driver names is a *logical* coordinate: with
@@ -567,15 +626,30 @@ impl Device {
     /// BAR0 window (`PCIE_NIU0_BASE 0x1FD04000`) and reports the bit set, so this is
     /// checked on both targets rather than assumed.
     fn translation_enabled(&mut self) -> Result<bool, ttStatus> {
-        /// `NIU_CFG_NOC0_BAR_PCIE_ADDR` (`blackhole_implementation.hpp:266`) plus the
-        /// 0x100 tt-metal adds (`blackhole_tt_device.cpp:129`).
-        const NIU_CFG_0: u64 = 0x1FD0_4100;
         let mut word = [0u8; 4];
         self.link.mem_read(BAR0_BASE + NIU_CFG_0, &mut word);
         let cfg = u32::from_le_bytes(word);
+        // A read the NoC did not answer comes back all ones, whose bit 14 is
+        // set: reading that as "translation is on" would be a sentinel mistaken
+        // for an answer, and every tile named afterwards would be a guess.
+        if cfg == u32::MAX {
+            eprintln!(
+                "libskamandros: the PCIe NIU's configuration register at 0x{NIU_CFG_0:08X} \
+                 did not answer; refusing to name any tile"
+            );
+            return Err(ttStatus::TT_ERROR_DEVICE);
+        }
         Ok((cfg >> 14) & 1 != 0)
     }
 
+    /// Which GDDR channels can hold data, from the ARC's telemetry.
+    ///
+    /// tt-metal reads `ENABLED_GDDR` and inverts it to obtain the *harvested*
+    /// mask (`BlackholeTTDevice::get_chip_info`,
+    /// `blackhole_tt_device.cpp:146-149`, `~read_entry & 0xFF`); the driver's own
+    /// sysfs cannot answer it, because `tt_telemetry_probe` caches only the tags
+    /// that back an attribute. The tag itself is the enabled mask, so this walk
+    /// must not invert it again.
     fn probe_dram(&mut self) -> Result<Dram, ttStatus> {
         use tt_isa::arc;
         let arc_tile = arc::arc_tile();
@@ -588,7 +662,11 @@ impl Device {
         let version = self.arc_word(arc_tile, table)?;
         let entries = self.arc_word(arc_tile, table + 4)?;
         let tag_table = 8 + 4 * u64::from(entries);
-        if version > arc::TELEMETRY_MAX_MAJOR_VERSION
+        // The header word is `major << 16 | minor << 8 | patch`, so the major
+        // version is its top byte, exactly as the driver reads it
+        // (`blackhole.c:485-497`). Comparing the whole word would refuse every
+        // firmware whose version is not literally 1.
+        if ((version >> 16) & 0xFF) > arc::TELEMETRY_MAX_MAJOR_VERSION
             || entries > arc::TELEMETRY_MAX_ENTRIES
             || !arc::is_within_csm(table, tag_table)
         {
@@ -609,9 +687,13 @@ impl Device {
             enabled = Some(self.arc_word(arc_tile, at)?);
         }
         // An absent tag names nothing, and guessing a full part from firmware
-        // that does not publish it is the mistake this walk exists to avoid.
+        // that does not publish it is the mistake this walk exists to avoid. The
+        // word is the *enabled* mask, which is the shape `Dram` is built from;
+        // tt-metal's inversion to a harvested mask
+        // (`blackhole_tt_device.cpp:146-149`) is its own bookkeeping, not this
+        // one's.
         let mask = enabled.ok_or(ttStatus::TT_ERROR_TELEMETRY)?;
-        Ok(Dram::from_usable_mask(!(mask as u8)))
+        Dram::from_enabled_mask(mask as u8).ok_or(ttStatus::TT_ERROR_TELEMETRY)
     }
 
     /// This chip's live Tensix columns, from the ARC's telemetry table.
@@ -621,11 +703,12 @@ impl Device {
     /// the entry count and the tag table from the table, whose words are
     /// `tag | offset << 16` and whose values live in the value block at that
     /// offset. The tag this driver needs is `ENABLED_TENSIX_COL`, whose bits
-    /// index the harvesting order rather than physical columns
-    /// (`NoC/Coordinates.md:54`: fused columns are remapped to maximal `X`, so
-    /// the survivors are a prefix). A chip that will not name its columns, or
-    /// names a shape the specification forbids, is refused: assuming a full part
-    /// writes to a fused-off tile, which ttsim v1.16 treats as undefined.
+    /// index the harvesting order rather than physical columns. It is read the
+    /// way tt-metal reads it ([`tt_isa::noc::grid::Tensix::from_enabled_column_mask`]),
+    /// and the survivors are a prefix of the translated columns whatever the bit
+    /// order (`NoC/Coordinates.md:54`). A chip that will not name its columns,
+    /// or names none at all, is refused: assuming a full part writes to a
+    /// fused-off tile, which ttsim v1.16 treats as undefined.
     fn probe_tensix(&mut self) -> Result<tt_isa::noc::grid::Tensix, ttStatus> {
         use tt_isa::arc;
         let arc_tile = arc::arc_tile();
@@ -641,7 +724,11 @@ impl Device {
         let entries = self.arc_word(arc_tile, table + 4)?;
         // The header is two words and the tag table follows it.
         let tag_table = 8 + 4 * u64::from(entries);
-        if version > arc::TELEMETRY_MAX_MAJOR_VERSION
+        // The header word is `major << 16 | minor << 8 | patch`, so the major
+        // version is its top byte, exactly as the driver reads it
+        // (`blackhole.c:485-497`). Comparing the whole word would refuse every
+        // firmware whose version is not literally 1.
+        if ((version >> 16) & 0xFF) > arc::TELEMETRY_MAX_MAJOR_VERSION
             || entries > arc::TELEMETRY_MAX_ENTRIES
             || !arc::is_within_csm(table, tag_table)
         {
@@ -661,6 +748,10 @@ impl Device {
             }
             enabled = Some(self.arc_word(arc_tile, at)?);
         }
+        // The tag is the *enabled* word; `from_enabled_column_mask` reads it the
+        // way tt-metal does (complement over the fourteen harvestable bits, then
+        // the count), which is also where bits above the fourteen columns are
+        // masked off.
         let mask = enabled.ok_or(ttStatus::TT_ERROR_TELEMETRY)?;
         tt_isa::noc::grid::Tensix::from_enabled_column_mask(mask)
             .ok_or(ttStatus::TT_ERROR_TELEMETRY)
@@ -672,6 +763,232 @@ impl Device {
         let mut bytes = [0u8; 4];
         self.window_read(arc_tile, address, &mut bytes)?;
         Ok(u32::from_le_bytes(bytes))
+    }
+
+    /// One ARC telemetry tag's value, or `None` if the table does not carry it.
+    ///
+    /// The walk is `probe_dram`'s: the pointers come from the ARC's reset-unit
+    /// scratch, the table's two header words give the version and the entry
+    /// count, and each tag entry is `tag | offset << 16` into the value block.
+    /// Every address firmware supplied is bounded by the CSM first, because a
+    /// CSM read is a NoC read and an unmapped ARC address hangs the host.
+    fn arc_tag(&mut self, tag: u16) -> Result<Option<u32>, ttStatus> {
+        use tt_isa::arc;
+        let arc_tile = arc::arc_tile();
+        let table = u64::from(self.arc_word(arc_tile, arc::TELEMETRY_PTR)?);
+        let values = u64::from(self.arc_word(arc_tile, arc::TELEMETRY_DATA)?);
+        if !arc::is_within_csm(table, 8) || !arc::is_within_csm(values, 4) {
+            let _ = (table, values);
+            return Err(ttStatus::TT_ERROR_TELEMETRY);
+        }
+        let version = self.arc_word(arc_tile, table)?;
+        let entries = self.arc_word(arc_tile, table + 4)?;
+        if ((version >> 16) & 0xFF) > arc::TELEMETRY_MAX_MAJOR_VERSION
+            || entries > arc::TELEMETRY_MAX_ENTRIES
+            || !arc::is_within_csm(table, 8 + 4 * u64::from(entries))
+        {
+            let _ = (version, entries);
+            return Err(ttStatus::TT_ERROR_TELEMETRY);
+        }
+        let mut found = None;
+        for i in 0..u64::from(entries) {
+            let entry = self.arc_word(arc_tile, table + 8 + 4 * i)?;
+            if entry & 0xFFFF != u32::from(tag) {
+                continue;
+            }
+            let at = values + 4 * u64::from(entry >> 16);
+            if !arc::is_within_csm(at, 4) {
+                let _ = at;
+                return Err(ttStatus::TT_ERROR_TELEMETRY);
+            }
+            found = Some(self.arc_word(arc_tile, at)?);
+        }
+        Ok(found)
+    }
+
+    /// One message on the ARC's application queue, exactly as tt-metal sends
+    /// one (`BlackholeArcMessageQueue::send_message`,
+    /// `blackhole_arc_message_queue.cpp:101-142`), and its exit code.
+    ///
+    /// The queue control block is the address SCRATCH_RAM[11] publishes; its
+    /// first word is the first queue's ARC address and bits 32-39 are the entries
+    /// in each queue, with queue [`ARC_APPLICATION_QUEUE`] at
+    /// `base + index * (32 + 2 * entries * 32)` bytes
+    /// (`get_blackhole_arc_message_queue`, `blackhole_arc_message_queue.cpp:144-167`).
+    /// A queue is an eight-word header of double-wrapping read/write pointers
+    /// followed by a request ring and a response ring of eight-word entries. The
+    /// request is written at the write pointer, the pointer is bumped, and the
+    /// ARC is rung with the APB doorbell; the response is taken from the response
+    /// ring once its write pointer moves, and its read pointer is bumped.
+    fn arc_msg(&mut self, code: u32) -> Result<u32, ttStatus> {
+        use tt_isa::arc;
+        let arc_tile = arc::arc_tile();
+        let qcb = u64::from(self.arc_word(arc_tile, arc::reset_scratch(11))?);
+        if !arc::is_within_csm(qcb, 8) {
+            eprintln!(
+                "libskamandros: the ARC's message-queue control block is at {qcb:#x}, outside \
+                 its CSM"
+            );
+            return Err(ttStatus::TT_ERROR_TELEMETRY);
+        }
+        let mut block = [0u8; 8];
+        self.window_read(arc_tile, qcb, &mut block)?;
+        let base = u64::from(u32::from_le_bytes(
+            block[0..4].try_into().expect("four bytes"),
+        ));
+        let entries =
+            u64::from(u32::from_le_bytes(block[4..8].try_into().expect("four bytes")) & 0xFF);
+        if base == 0 || entries == 0 {
+            eprintln!(
+                "libskamandros: the ARC published no message queue (base {base:#x}, {entries} \
+                 entries)"
+            );
+            return Err(ttStatus::TT_ERROR_TELEMETRY);
+        }
+        let queue_bytes = ARC_QUEUE_HEADER_BYTES + 2 * entries * ARC_QUEUE_ENTRY_BYTES;
+        let queue = base + ARC_APPLICATION_QUEUE * queue_bytes;
+        if !arc::is_within_csm(queue, queue_bytes) {
+            eprintln!(
+                "libskamandros: the ARC's application queue at {queue:#x} is outside its CSM"
+            );
+            return Err(ttStatus::TT_ERROR_TELEMETRY);
+        }
+        let ring = 2 * entries;
+        let started = std::time::Instant::now();
+
+        // Room in the request ring: it is full when the read pointer is one ring
+        // behind the write pointer (`push_request`,
+        // `blackhole_arc_message_queue.cpp:53-70`).
+        let write_at = queue + 4 * ARC_REQUEST_WPTR;
+        let mut wptr = u64::from(self.arc_word(arc_tile, write_at)?);
+        loop {
+            let rptr = u64::from(self.arc_word(arc_tile, queue + 4 * ARC_REQUEST_RPTR)?);
+            if (rptr as i64 - wptr as i64).unsigned_abs() != entries {
+                break;
+            }
+            if started.elapsed() >= ARC_MESSAGE_TIMEOUT {
+                eprintln!("libskamandros: the ARC's request queue is full");
+                return Err(ttStatus::TT_ERROR_DEVICE);
+            }
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        let mut request = [0u8; ARC_QUEUE_ENTRY_BYTES as usize];
+        request[0..4].copy_from_slice(&code.to_le_bytes());
+        let entry = queue + ARC_QUEUE_HEADER_BYTES + (wptr % entries) * ARC_QUEUE_ENTRY_BYTES;
+        self.window_write(arc_tile, entry, &request)?;
+        wptr = (wptr + 1) % ring;
+        self.window_write(arc_tile, write_at, &(wptr as u32).to_le_bytes())?;
+
+        // Ring the doorbell: tt-metal writes `ARC_FW_INT_VAL` to `ARC_FW_INT_ADDR`
+        // through the APB, which is BAR0 when the PCIe tile is at X 11 and the
+        // ARC's NoC aperture otherwise (`write_to_arc_apb`,
+        // `blackhole_tt_device.cpp:237-257`).
+        let mut niu = [0u8; 4];
+        self.link.mem_read(BAR0_BASE + NIU_CFG_0, &mut niu);
+        if u32::from_le_bytes(niu) & 0x3F == 11 {
+            self.bar_write32(ARC_APB_BAR0 + ARC_FW_INT_ADDR, ARC_FW_INT_VAL)?;
+        } else {
+            self.window_write(
+                arc_tile,
+                ARC_APB_NOC + ARC_FW_INT_ADDR,
+                &ARC_FW_INT_VAL.to_le_bytes(),
+            )?;
+        }
+
+        // The response: its ring's write pointer moves off the read pointer
+        // (`pop_response`, `blackhole_arc_message_queue.cpp:72-99`).
+        let read_at = queue + 4 * ARC_RESPONSE_RPTR;
+        let mut rptr = u64::from(self.arc_word(arc_tile, read_at)?);
+        loop {
+            let wptr = u64::from(self.arc_word(arc_tile, queue + 4 * ARC_RESPONSE_WPTR)?);
+            if wptr != rptr {
+                break;
+            }
+            if started.elapsed() >= ARC_MESSAGE_TIMEOUT {
+                eprintln!("libskamandros: no ARC response to message {code:#04x}");
+                return Err(ttStatus::TT_ERROR_DEVICE);
+            }
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        let mut response = [0u8; ARC_QUEUE_ENTRY_BYTES as usize];
+        let at =
+            queue + ARC_QUEUE_HEADER_BYTES + (entries + rptr % entries) * ARC_QUEUE_ENTRY_BYTES;
+        self.window_read(arc_tile, at, &mut response)?;
+        rptr = (rptr + 1) % ring;
+        self.window_write(arc_tile, read_at, &(rptr as u32).to_le_bytes())?;
+
+        let word = u32::from_le_bytes(response[0..4].try_into().expect("four bytes"));
+        let status = word & 0xFF;
+        if status >= ARC_RESPONSE_OK_LIMIT {
+            eprintln!("libskamandros: the ARC refused message {code:#04x}: status {status:#04x}");
+            return Err(ttStatus::TT_ERROR_DEVICE);
+        }
+        Ok(word >> 16)
+    }
+
+    /// Put the chip at its busy or idle operating point, and wait for telemetry
+    /// to show it: tt-metal's `Chip::set_power_state` (`chip.cpp:216-238`) and
+    /// `wait_for_aiclk_value` (`chip.cpp:240-296`).
+    ///
+    /// The message is `AICLK_GO_BUSY` or `AICLK_GO_LONG_IDLE`; the target is
+    /// telemetry's `AICLK_LIMIT_MAX` (`get_max_clock_freq`,
+    /// `firmware_info_provider.cpp:197`) or `AICLK_IDLE`. A message the ARC
+    /// refuses is an error. A clock that does not settle within `AICLK_TIMEOUT`
+    /// is reported and not fatal, as tt-metal's warning is -- but the consequence
+    /// is printed, because at the idle point the Matrix Unit's `Src` reads are
+    /// unreliable on silicon.
+    ///
+    /// Nothing here resets the board: no `RESET_DEVICE` ioctl, no ARC reset
+    /// message, no backend pulse. It only moves the clock.
+    pub fn set_power_state(&mut self, busy: bool) -> Result<(), ttStatus> {
+        if self.link.is_simulated() {
+            return Ok(());
+        }
+        // tt-metal skips the idle message when the chip is already there
+        // (`LocalChip::close_device`, `local_chip.cpp:195-211`).
+        if !busy && self.arc_tag(tt_isa::arc::tag::AICLK)? == Some(AICLK_IDLE) {
+            return Ok(());
+        }
+        let target = if busy {
+            self.arc_tag(tt_isa::arc::tag::AICLK_LIMIT_MAX)?
+        } else {
+            Some(AICLK_IDLE)
+        };
+        let code = if busy {
+            AICLK_GO_BUSY
+        } else {
+            AICLK_GO_LONG_IDLE
+        };
+        let exit = self.arc_msg(code)?;
+        if exit != 0 {
+            eprintln!(
+                "libskamandros: the ARC returned exit code {exit} for AICLK message {code:#04x}"
+            );
+            return Err(ttStatus::TT_ERROR_DEVICE);
+        }
+        let Some(target) = target else {
+            eprintln!(
+                "libskamandros: telemetry carries no AICLK limit; the operating point cannot be \
+                 confirmed"
+            );
+            return Ok(());
+        };
+        let started = std::time::Instant::now();
+        loop {
+            let aiclk = self.arc_tag(tt_isa::arc::tag::AICLK)?;
+            if aiclk == Some(target) {
+                return Ok(());
+            }
+            if started.elapsed() >= AICLK_TIMEOUT {
+                eprintln!(
+                    "libskamandros: AICLK reads {aiclk:?} after {AICLK_TIMEOUT:?}, not {target}; \
+                     at the idle operating point the Matrix Unit's Src reads are unreliable on \
+                     silicon"
+                );
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
     }
 
     /// Target `tile` for the low-level accessors (`l1_write`, `read32`, the
@@ -697,11 +1014,17 @@ impl Device {
         Ok(self.tiles[y as usize * self.columns + x as usize])
     }
 
-    /// A GDDR channel that can hold data.
+    /// A GDDR channel that can hold data: the chip's first, in the logical
+    /// numbering of [`Dram`].
     pub fn dram_channel(&self) -> DramChannel {
         self.dram
             .channel(0)
-            .expect("channel 0 is usable on a full chip")
+            .expect("a chip the probe accepted has a first channel")
+    }
+
+    /// The chip's `ENABLED_GDDR` word, for the data mover's `USABLE` mailbox.
+    pub fn dram_mask(&self) -> u32 {
+        u32::from(self.dram.enabled_mask())
     }
 
     /// Reserve `bytes` of DRAM, 64-byte aligned, and return its channel-0
@@ -722,10 +1045,10 @@ impl Device {
         Ok(at)
     }
 
-    /// The endpoint high word a program names for DRAM on channel 0.
+    /// The endpoint high word a program names for DRAM on the first channel.
     pub fn dram_hi_for(&self, niu: tt_isa::noc::niu::Niu) -> u32 {
         let channel = self.dram_channel();
-        let ep = self.channel_endpoint(channel, niu);
+        let ep = channel.preferred(niu);
         Endpoint {
             x: ep.x(),
             y: ep.y(),
@@ -741,18 +1064,14 @@ impl Device {
             let _ = (bytes.len(), offset);
             ttStatus::TT_ERROR_DRAM_RANGE
         })?;
-        let ep = self.channel_endpoint(channel, tt_isa::noc::niu::Niu::Noc0);
+        let ep = channel.preferred(tt_isa::noc::niu::Niu::Noc0);
         self.window_write(ep, range.offset(), bytes)?;
-        // A write is visible through the port it went out of; a reader may use
-        // any endpoint NoC #0 owns, so read the last word back through each.
+        // A write is visible through the endpoint it went out of: read the last
+        // word back through it.
         if bytes.len() >= 4 {
             let last = range.offset() + bytes.len() as u64 - 4;
             let mut word = [0u8; 4];
-            for port in 0..tt_isa::dram::PORTS {
-                if let Some(via) = channel.endpoint(tt_isa::noc::niu::Niu::Noc0, port) {
-                    self.window_read(via, last, &mut word)?;
-                }
-            }
+            self.window_read(ep, last, &mut word)?;
         }
         Ok(())
     }
@@ -764,7 +1083,7 @@ impl Device {
             let _ = out.len();
             ttStatus::TT_ERROR_DRAM_RANGE
         })?;
-        let ep = self.channel_endpoint(channel, tt_isa::noc::niu::Niu::Noc0);
+        let ep = channel.preferred(tt_isa::noc::niu::Niu::Noc0);
         self.window_read(ep, offset, out)
     }
 
@@ -1144,8 +1463,15 @@ impl Device {
         if self.shadow == Some(words) {
             return Ok(());
         }
+        // The configuration array is 12 bytes per window on Blackhole
+        // (`blackhole.c:153-154`, `TLB_REG_SIZE`; UMD `pci_device.cpp:884-890`
+        // with `TLB_CFG_REG_SIZE_BYTES`), so *this* session's window is
+        // configured at `12 * window`. Writing window 0's register while
+        // addressing window `n` would retarget another process's window and
+        // leave ours unconfigured.
+        let base = TLB_CONFIG_BASE + 12 * u64::from(self.link.window());
         for (i, word) in words.iter().enumerate() {
-            self.bar_write32(TLB_CONFIG_BASE + 4 * i as u64, *word)?;
+            self.bar_write32(base + 4 * i as u64, *word)?;
         }
         self.shadow = Some(words);
         Ok(())
@@ -1197,12 +1523,6 @@ impl Device {
         Ok(())
     }
 
-    fn channel_endpoint(&self, channel: DramChannel, niu: tt_isa::noc::niu::Niu) -> NocCoord {
-        channel
-            .endpoint(niu, channel.port_for(niu, 0))
-            .expect("the NIU's first endpoint")
-    }
-
     fn check_l1(&self, address: u64, len: usize) -> Result<(), ttStatus> {
         let end = address
             .checked_add(len as u64)
@@ -1246,7 +1566,10 @@ fn check_bar0(offset: u64, len: usize) -> Result<(), ttStatus> {
         .ok_or(ttStatus::TT_ERROR_BAR0_OVERFLOW)?;
     let in_aperture = end <= 202 * WINDOW_SIZE;
     let in_config = offset >= TLB_CONFIG_BASE && end <= TLB_CONFIG_BASE + 210 * 12;
-    if !in_aperture && !in_config {
+    // The ARC's APB window, the last MiB of BAR0: `ARC_APB_BAR0_XBAR_OFFSET_START`
+    // (`blackhole_implementation.hpp:222`), where the message-queue doorbell is.
+    let in_arc_apb = offset >= ARC_APB_BAR0 && end <= crate::kmd::BAR0_BYTES;
+    if !in_aperture && !in_config && !in_arc_apb {
         let _ = (offset, end);
         return Err(ttStatus::TT_ERROR_BAR0_NOT_DECODED);
     }

@@ -49,6 +49,15 @@ pub struct Module {
     pub writer: Vec<u32>,
     /// The three compute programs, T0/T1/T2, words.
     pub cores: [Vec<u32>; 3],
+    /// The same three programs as the card needs them: the unpacker's
+    /// tile-descriptor tail (words 2 and 3, both zero for an uncompressed
+    /// tile) is written, which `ttsim` refuses to model. tt-metal writes the
+    /// whole four-word descriptor every configure (`unpack_tile_descriptor_u`,
+    /// `tt_llk_blackhole/common/inc/cunpack_common.h:812-828`), and `Config`
+    /// outlives the program that wrote it, so the tail must not be left at
+    /// whatever an earlier kernel put there. The launch picks this set on the
+    /// card and [`Module::cores`] on the simulator.
+    pub silicon_cores: [Vec<u32>; 3],
     /// The setup program thread 0 runs before the three roles are released: the
     /// semaphore initialisation, sized to the `Dst` slots this kernel uses.
     pub setup: Vec<u32>,

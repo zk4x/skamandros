@@ -46,7 +46,11 @@ pub fn compile(k: &Kernel) -> Result<Module, ttStatus> {
 /// `render` is read-only: everything that had to be decided (the rings' places,
 /// the registers, the grid and the parameters) was decided before it.
 pub fn render(m: &MachineKernel) -> Result<Module, ttStatus> {
-    let words = encode::encode(m)?.words()?;
+    let words = encode::encode(m, false)?.words()?;
+    // The card's variant: the unpacker's tile-descriptor tail written. Only
+    // the unpack program (T0) can differ; the other two are encoded anyway and
+    // discarded so the two sets are produced by one function.
+    let silicon = encode::encode(m, true)?.words()?;
     let setup = encode::setup(&m.sems)?;
     let mut cbs: Vec<CbInfo> = m.cbs.iter().map(|(_, info)| *info).collect();
     cbs.sort_by_key(|info| info.base);
@@ -62,6 +66,7 @@ pub fn render(m: &MachineKernel) -> Result<Module, ttStatus> {
         reader: words[0].clone(),
         writer: words[4].clone(),
         cores: [words[1].clone(), words[2].clone(), words[3].clone()],
+        silicon_cores: [silicon[1].clone(), silicon[2].clone(), silicon[3].clone()],
         setup,
         iface,
         cbs,

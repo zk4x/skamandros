@@ -316,7 +316,12 @@ impl Words {
 }
 
 /// Encode all five programs.
-pub fn encode(m: &MachineKernel) -> Result<Words, ttStatus> {
+///
+/// `tail` decides whether the unpacker's tile-descriptor words 2 and 3 are
+/// written. They are zero for a tile this compiler stages (no blobs, no
+/// explicit `W` dimension), and `ttsim` refuses a write of the all-zero tail,
+/// so the card's variant is emitted separately ([`crate::module::Module::silicon_cores`]).
+pub fn encode(m: &MachineKernel, tail: bool) -> Result<Words, ttStatus> {
     let mut out = Words::default();
     encode_mover(m, Core::Reader, false, &mut out.reader)?;
     encode_mover(m, Core::Writer, true, &mut out.writer)?;
@@ -324,6 +329,7 @@ pub fn encode(m: &MachineKernel) -> Result<Words, ttStatus> {
         &m.stream(Core::Unpack).collect::<Vec<_>>(),
         &mut out.t0,
         m.dst_is_16_bit,
+        tail,
     )?;
     encode_math(
         &m.stream(Core::Math).collect::<Vec<_>>(),
@@ -525,7 +531,12 @@ struct UnpackState {
     override_set: Option<bool>,
 }
 
-fn encode_unpack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(), ttStatus> {
+fn encode_unpack(
+    ops: &[MirOp],
+    out: &mut Stream,
+    dst_is_16_bit: bool,
+    tail: bool,
+) -> Result<(), ttStatus> {
     if ops.is_empty() {
         return Ok(());
     }
@@ -622,10 +633,10 @@ fn encode_unpack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result
                 let mut words = ConfigWords::new();
                 match cfg {
                     UnpackCfg::Src { dtype, haloize } => {
-                        src_unpack_config(&mut words, unit, dtype, haloize)?
+                        src_unpack_config(&mut words, unit, dtype, haloize, tail)?
                     }
                     UnpackCfg::Dst { datums, row, .. } => {
-                        unpack_config(&mut words, datums, row, dtype, dst_is_16_bit)?
+                        unpack_config(&mut words, datums, row, dtype, dst_is_16_bit, tail)?
                     }
                 }
                 out.extend(config_program(&words)?);
@@ -989,6 +1000,7 @@ fn unpack_config(
     dst_row: u32,
     dtype: DType,
     dst_is_16_bit: bool,
+    tail: bool,
 ) -> Result<(), ttStatus> {
     // `In_data_format` is the L1 datum's own format; the `Dst` side is the
     // kernel's one width. The lane's format (`SFPLOAD`/`SFPSTORE`) is the third
@@ -1016,10 +1028,13 @@ fn unpack_config(
     config_set(words, unpack1::UNP0_ADDR_CTRL_XY_REG_1_Ystride, 0)?;
     config_set(words, unpack1::UNP0_ADDR_CTRL_ZW_REG_1_Zstride, 0)?;
     let descriptor = tile_descriptor(fmt, datums as u16, 1, 0);
-    // Words 0 and 1 always; 2 and 3 only when they carry something (ttsim
-    // refuses a write of the all-zero tail).
+    // Words 0 and 1 always; 2 and 3 only when they carry something — or when
+    // `tail` says the card is the target, which needs the whole four-word
+    // descriptor written because `Config` survives the program that wrote it.
+    // ttsim refuses a write of the all-zero tail, which is why the two
+    // variants exist.
     for (i, word) in descriptor.iter().enumerate() {
-        if i < 2 || *word != 0 {
+        if i < 2 || *word != 0 || tail {
             config_seed(
                 words,
                 thcon::THCON_SEC0_REG0_TileDescriptor.addr32() + i as u16,
@@ -1043,6 +1058,7 @@ fn src_unpack_config(
     unit: u8,
     dtype: DType,
     haloize: bool,
+    tail: bool,
 ) -> Result<(), ttStatus> {
     let out = match dtype {
         DType::Bf16 => DATA_FORMAT_BF16,
@@ -1074,8 +1090,10 @@ fn src_unpack_config(
             thcon::THCON_SEC1_REG0_TileDescriptor
         }
     };
+    // As `unpack_config`: the card needs words 2 and 3 written even when they
+    // are zero, because `Config` outlives the program; ttsim refuses that write.
     for (i, word) in descriptor.iter().enumerate() {
-        if *word != 0 {
+        if *word != 0 || tail {
             config_seed(words, span.addr32() + i as u16, *word)?;
         }
     }
@@ -2104,7 +2122,7 @@ mod tests {
     }
 
     fn pack_words(count: u8) -> usize {
-        let words = encode(&packs(count))
+        let words = encode(&packs(count), false)
             .expect("the packer program encodes")
             .words()
             .expect("the words are inline");
@@ -2137,5 +2155,41 @@ mod tests {
         let mut words = ConfigWords::new();
         pack_config(&mut words, DType::F32, false, PackMask::None);
         words.program_len()
+    }
+
+    /// The one thing the two target variants differ in: the unpacker's tile
+    /// descriptor. Words 2 and 3 are zero for a tile this compiler stages, so
+    /// the simulator's program omits them (`ttsim` refuses the write) and the
+    /// card's writes them (`Config` outlives the program that wrote it). Both
+    /// config paths — `Dst` and `Src` — must agree.
+    #[test]
+    fn the_tile_descriptor_tail_is_written_only_for_the_card() {
+        let base = thcon::THCON_SEC0_REG0_TileDescriptor.addr32();
+        for tail in [false, true] {
+            let mut dst = ConfigWords::new();
+            unpack_config(&mut dst, 1024, 0, DType::F32, false, tail).unwrap();
+            let mut src = ConfigWords::new();
+            src_unpack_config(&mut src, 0, DType::F32, false, tail).unwrap();
+            for (name, words) in [("dst", &dst), ("src", &src)] {
+                let tail_words: Vec<(u16, u32)> = words
+                    .words()
+                    .iter()
+                    .copied()
+                    .filter(|&(at, _)| at == base + 2 || at == base + 3)
+                    .collect();
+                if tail {
+                    assert_eq!(
+                        tail_words,
+                        [(base + 2, 0), (base + 3, 0)],
+                        "{name}: the card needs the whole descriptor"
+                    );
+                } else {
+                    assert!(
+                        tail_words.is_empty(),
+                        "{name}: the simulator's variant omits the all-zero tail"
+                    );
+                }
+            }
+        }
     }
 }
