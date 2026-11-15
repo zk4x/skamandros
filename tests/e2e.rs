@@ -4986,7 +4986,7 @@ copy 32,32 %out [0] = %bo [0]
 ";
 
 #[test]
-#[ignore = "the bf16 row fold over-accumulates by 13 % over 96 tiles; see TODO.md"]
+#[ignore = "the bf16 row fold over-accumulates by 13 % over 96 tiles; see zyx2's TODO.md"]
 fn bf16_sum_row_over_many_tiles() {
     const HIDDEN: usize = 3072;
     const COLS: usize = HIDDEN / 32;
@@ -5434,7 +5434,7 @@ fn probe_bf16_row_fold() {
 /// so the reference is the f32 rule on the widened inputs and the tolerance
 /// covers the truncations (the 96-tile fold included).
 #[test]
-#[ignore = "the bf16 fold quantises to the Dst ulp (+13.2 % over 96 tiles) and the accurate `acc f32` form packs through 0x105, which ttsim does not model by decision; silicon only — see TODO.md"]
+#[ignore = "the bf16 fold quantises to the Dst ulp (+13.2 % over 96 tiles) and the accurate `acc f32` form packs through 0x105, which ttsim does not model; silicon only — see zyx2's TODO.md"]
 fn bf16_rms_norm_runs_on_the_simulator() {
     const HIDDEN: usize = 3072;
     const COLS: usize = HIDDEN / 32;

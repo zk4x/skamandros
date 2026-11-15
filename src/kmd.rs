@@ -16,8 +16,8 @@
 //! are the header's; `KMd` never passes an address the driver has not reported.
 //!
 //! What is deliberately absent: `TENSTORRENT_IOCTL_RESET_DEVICE`. Resets are the
-//! owner's, always (`TODO.md`), and a reset here would be an unsupervised ASIC
-//! power cycle — the same event that has tripped a host PSU.
+//! owner's, always, and a reset here would be an unsupervised ASIC power cycle —
+//! the same event that has tripped a host PSU.
 //!
 //! What the driver does for us that the simulator does not need:
 //!

@@ -1019,9 +1019,9 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     crate::ir::DType::F32 | crate::ir::DType::Bf16 => storage(left.dtype),
                     // The bit and shift ops are raw 32-bit words, and the
                     // comparisons order sign-magnitude, which an `i32` lane is
-                    // only where its datum is non-negative (TODO.md's recorded
-                    // integer-comparison gap). The unfold's `!= 0` tests a
-                    // masked 0/1, so that is exact.
+                    // only where its datum is non-negative (the integer-
+                    // comparison gap zyx2's `TODO.md` records). The unfold's
+                    // `!= 0` tests a masked 0/1, so that is exact.
                     crate::ir::DType::I32
                         if matches!(
                             op,

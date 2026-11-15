@@ -125,7 +125,7 @@ const POLL_BUSY_WINDOW: std::time::Duration = std::time::Duration::from_millis(1
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_micros(10);
 
 /// How long the ARC is given to come up: tt-kmd's `ARC_MSG_READY_MS`
-/// (`blackhole.c:69`), user decision 2026-11-15.
+/// (`blackhole.c:69`).
 ///
 /// tt-metal waits up to `ARC_STARTUP_TIMEOUT` = 300 s for the same status
 /// (`timeouts.hpp:14`). Half a second is longer than tt-kmd's own bound allows
@@ -284,9 +284,7 @@ unsafe extern "C" fn dma_read_unexpected(paddr: u64, _dst: *mut c_void, size: u3
 ///
 /// The two differ in four calls — configuration read, window read, window write
 /// and a clock step — and in nothing else, so the choice is one field rather
-/// than two device types. The driver variant is the `tt-kmd` port recorded in
-/// `TODO.md`; until that lands it cannot be constructed, and the four arms say
-/// so.
+/// than two device types. Each variant is constructed by its own `open`.
 enum Link {
     /// The simulator: `dlopen`ed `libttsim_bh.so`, entry points resolved once.
     Sim(&'static Lib),
@@ -621,14 +619,14 @@ impl Device {
     /// through tt-kmd, one window the driver arbitrated, and the card's telemetry
     /// consulted before any Tensix tile is named.
     ///
-    /// Device 0 only (user decision 2026-11-15): on a multi-card host the node is
-    /// not chosen, so a second card is simply not reached. Opening it also requires
-    /// `TT_HARDWARE=1` for now — a bring-up gate that is dropped once a kernel has
-    /// run on the card — so nothing reaches silicon by accident.
+    /// Device 0 only: on a multi-card host the node is not chosen, so a second
+    /// card is not reached. Opening the card also requires `TT_HARDWARE=1` — a
+    /// bring-up gate that is dropped once a kernel has run on it — so nothing
+    /// reaches silicon by accident.
     pub fn open_hardware() -> Result<Device, ttStatus> {
         if std::env::var_os("TT_HARDWARE").as_deref() != Some(OsStr::new("1")) {
             eprintln!(
-                "libskamandros: refusing to open the card: TT_HARDWARE=1 is required for now \
+                "libskamandros: refusing to open the card: TT_HARDWARE=1 is required \
                  (and TT_METAL_SIMULATOR is unset)"
             );
             return Err(ttStatus::TT_ERROR_DEVICE);
@@ -678,8 +676,8 @@ impl Device {
         // (`firmware_info_provider.cpp:470-488`). A channel that failed is
         // refused rather than retrained: tt-metal's recovery is
         // `TOGGLE_GDDR_RESET`, an ARC message that disturbs the card's DRAM, and
-        // this driver sends no reset (user decision 2026-11-15). tt-metal ends
-        // its wait when the tag is absent, and so does this.
+        // this driver sends no reset. tt-metal ends its wait when the tag is
+        // absent, and so does this.
         let enabled = device.dram.enabled_mask();
         let started = std::time::Instant::now();
         loop {
@@ -1441,9 +1439,9 @@ impl Device {
     /// wrote, so a failed launch leaves nothing polling the L1 that the next
     /// launch rewrites.
     ///
-    /// The failure path has no `ttReset` (user decision): this is the driver's
-    /// own cleanup. Every step is attempted even if one fails, and the first
-    /// failure is returned, so a wedged tile is reported rather than hidden.
+    /// The failure path has no `ttReset`: this is the driver's own cleanup.
+    /// Every step is attempted even if one fails, and the first failure is
+    /// returned, so a wedged tile is reported rather than hidden.
     pub fn quiesce(&mut self) -> Result<(), ttStatus> {
         let mut first: Result<(), ttStatus> = Ok(());
         for i in 0..self.tiles.len() {

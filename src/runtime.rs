@@ -161,8 +161,8 @@ fn run(
     if result.is_err() {
         // A failed launch is a status, not a wedged tile: stop the cores this
         // launch started and clear the mailboxes it wrote before returning, so
-        // the next launch starts from a known state (user requirement). No
-        // `ttReset` exists; this is the driver's own cleanup.
+        // the next launch starts from a known state. No `ttReset` exists; this
+        // is the driver's own cleanup.
         device.quiesce()?;
     }
     result
