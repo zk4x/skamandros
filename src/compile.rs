@@ -25,6 +25,9 @@ pub fn compile(k: &Kernel) -> Result<Module, ttStatus> {
     // leave a program this accepts, so a pass cannot hand a broken kernel to
     // the lowering.
     k.verify()?;
+    if std::env::var_os("SKAM_IR").is_some() {
+        eprintln!("--- virtual kernel ---\n{k}");
+    }
     let mut machine = k.lower()?;
     // The row bodies are fused before the hand-offs are derived: a value that
     // stays in a lane register has no `Dst` for a seam to carry.
@@ -46,11 +49,22 @@ pub fn compile(k: &Kernel) -> Result<Module, ttStatus> {
 /// `render` is read-only: everything that had to be decided (the rings' places,
 /// the registers, the grid and the parameters) was decided before it.
 pub fn render(m: &MachineKernel) -> Result<Module, ttStatus> {
+    if std::env::var_os("SKAM_IR").is_some() {
+        eprintln!("--- machine kernel ---\n{m}");
+    }
     let words = encode::encode(m, false)?.words()?;
     // The card's variant: the unpacker's tile-descriptor tail written. Only
     // the unpack program (T0) can differ; the other two are encoded anyway and
     // discarded so the two sets are produced by one function.
     let silicon = encode::encode(m, true)?.words()?;
+    if std::env::var_os("SKAM_IR").is_some() {
+        for core in 0..3 {
+            eprintln!("core {core} sim:  {:08x?}", words[core + 1]);
+            eprintln!("core {core} card: {:08x?}", silicon[core + 1]);
+        }
+        eprintln!("reader sim:  {:08x?}", words[0]);
+        eprintln!("writer sim:  {:08x?}", words[4]);
+    }
     let setup = encode::setup(&m.sems)?;
     let mut cbs: Vec<CbInfo> = m.cbs.iter().map(|(_, info)| *info).collect();
     cbs.sort_by_key(|info| info.base);

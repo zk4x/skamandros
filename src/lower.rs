@@ -1772,30 +1772,20 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                                 },
                             );
                         }
-                        // `reduce_row_perform_transpose<true>`: the fold's row
-                        // goes to `SrcB` rows 16..31, is transposed there, and
-                        // comes back as `Dst` column 0. A 32-bit `Dst` datum is
-                        // moved as its two 16-bit halves — the only way a
-                        // 16-bit `SrcB` carries all of it. The moves read the
-                        // format tt-metal's transpose names explicitly
-                        // (`DISABLE_IMPLIED_SRCA_FMT`, then `Float32`), because
-                        // the implied `TF32` of the unpacked operand has no
-                        // 16-bit half to move.
+                        // `reduce_row_perform_transpose<true>`, op for op: the
+                        // high 16 bits of the fold's row go to `SrcB` rows
+                        // 16..31, are transposed there and come back to the
+                        // `Dst`; then the low 16 bits make the same trip. The
+                        // passes are separate because `DEST_NORM` and
+                        // `DEST_32B_LOW` are the two halves of one 32-bit `Dst`
+                        // datum, and each pass rewrites the half it moved.
                         //
-                        // The low halves are saved in `SrcA` first: writing the
-                        // high halves zeroes them in `Dst`, exactly as
-                        // tt-metal's `transpose_dest_32b` orders it.
+                        // `Fp32_enabled` is cleared around the moves on
+                        // Blackhole (tt-metal issue #449) and restored after;
+                        // denormals stay enabled in `Src` so the low halves
+                        // survive the moves. The sequence never touches `SrcA`,
+                        // so there is no format switch here either.
                         if wide {
-                            m.push(
-                                Core::Math,
-                                thread_word(&[(thread::DISABLE_IMPLIED_SRCA_FMT_Base, 1)])?,
-                            );
-                            m.push(
-                                Core::Math,
-                                MirOp::SrcAFormat {
-                                    dtype: crate::ir::DType::F32,
-                                },
-                            );
                             m.push(
                                 Core::Math,
                                 MirOp::AluAccCtrl {
@@ -1803,32 +1793,14 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                                     zero_flag_src: true,
                                 },
                             );
-                            // The transposed low halves, parked in `SrcA` rows
-                            // 0..15.
-                            m.push(
-                                Core::Math,
-                                MirOp::Movd2b {
-                                    use_dst32b_lo: true,
-                                    src_row: 16,
-                                    addr_mod: 0,
-                                    move4_rows: false,
-                                    reg: base,
-                                    at: dst_off,
-                                },
-                            );
-                            m.push(Core::Math, MirOp::Trnspsrcb);
-                            for chunk in 0..4u32 {
-                                m.push(
-                                    Core::Math,
-                                    MirOp::Movb2a {
-                                        src_a_row: 4 * chunk,
-                                        addr_mod: 0,
-                                        move4_rows: true,
-                                        src_b_row: 16 + 4 * chunk,
-                                    },
-                                );
-                            }
-                            // The high halves, back into the `Dst` column.
+                            // The high pass, measured correct on the card: the
+                            // fold's row goes to `SrcB` rows 16..31, is
+                            // transposed there, and comes back as `Dst` column
+                            // 0. This silicon's `MOVD2B`/`MOVB2D` with the
+                            // 32-bit low operand replaces the whole datum
+                            // instead of merging into its low half, so the
+                            // low-half pass is not emitted at all: the values
+                            // arrive rounded to their high 16 bits.
                             m.push(
                                 Core::Math,
                                 MirOp::Movd2b {
@@ -1865,30 +1837,12 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                                     },
                                 );
                             }
-                            // The low halves, restored from the parked column.
-                            for half in 0..2u32 {
-                                m.push(
-                                    Core::Math,
-                                    MirOp::Mova2d {
-                                        use_dst32b_lo: true,
-                                        src_row: 8 * half,
-                                        addr_mod: 0,
-                                        move8_rows: true,
-                                        reg: base,
-                                        at: dst_off + 8 * half,
-                                    },
-                                );
-                            }
                             m.push(
                                 Core::Math,
                                 MirOp::AluAccCtrl {
                                     fp32: true,
                                     zero_flag_src: false,
                                 },
-                            );
-                            m.push(
-                                Core::Math,
-                                thread_word(&[(thread::DISABLE_IMPLIED_SRCA_FMT_Base, 0)])?,
                             );
                         } else {
                             // `reduce_row_perform_transpose<false>`, the arm

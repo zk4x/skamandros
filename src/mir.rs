@@ -397,6 +397,13 @@ pub enum MirOp {
         at: u32,
     },
     /// `MOVB2A`: `SrcB` rows into `SrcA` rows.
+    ///
+    /// Nothing emits this since the 32-bit row reduce stopped parking its low
+    /// halves in `SrcA`: this silicon's `MOVB2D`/`MOVA2D` with the 32-bit low
+    /// operand replaces a whole datum rather than merging into its low half, so
+    /// the wide arm transposes the high halves only (`lower.rs`). The op stays
+    /// for the exact low-half path when that gets a merge of its own.
+    #[allow(dead_code)]
     Movb2a {
         src_a_row: u32,
         addr_mod: u32,
@@ -429,6 +436,11 @@ pub enum MirOp {
     /// `ALU_ACC_CTRL`: the `Dst` width the Matrix Unit and the moves address.
     AluAccCtrl { fp32: bool, zero_flag_src: bool },
     /// `ALU_FORMAT_SPEC_REG0_SrcA`, through the override bit.
+    ///
+    /// Nothing emits this since the 32-bit row reduce stopped switching the
+    /// `SrcA` format: the high-half transpose runs with the format the unpacker
+    /// left, which this silicon accepts.
+    #[allow(dead_code)]
     SrcAFormat { dtype: DType },
     /// `SETRWC`: the `SrcA`/`SrcB`/`Dst` row counters and the fidelity phase.
     Setrwc {
