@@ -264,6 +264,14 @@ pub mod cb {
     }
 
     /// `cb_reserve_back(cb, n)`: poll until `num_pages - (received - acked) >= n`.
+    ///
+    /// Every poll flushes the L0 data cache first, as tt-metal's does:
+    /// `cb_reserve_back` calls `invalidate_l1_cache` at the top of its loop
+    /// (`dataflow_api.h:404-421`), which is `fence` on Blackhole
+    /// (`tt-1xx/risc_common.h:153-157`). The counter is written by another
+    /// core, and a load of L1 can be served stale from the L0 cache
+    /// (`MemoryOrdering.md:59-60`); the `0x0ff0_000f` below is `fence`, the
+    /// word a RISC-V assembler emits for it.
     pub fn reserve_back(
         a: &mut Asm,
         base: u8,
@@ -275,6 +283,7 @@ pub mod cb {
         base_of(a, base, cb, p)?;
         let top = a.fresh_label();
         a.label(top.clone());
+        a.word(0x0ff0_000f);
         a.word(lhu(u, p, COUNTERS + 2));
         a.word(lhu(t, p, COUNTERS));
         a.word(sub(u, u, t));
@@ -286,6 +295,10 @@ pub mod cb {
     }
 
     /// `cb_wait_front(cb, n)`: poll until `received - acked >= n`.
+    ///
+    /// No cache flush in the loop: this copies tt-metal's asymmetry, whose
+    /// `cb_wait_front` polls without `invalidate_l1_cache`
+    /// (`dataflow_api.h:474-484`) where `cb_reserve_back` polls with it.
     pub fn wait_front(a: &mut Asm, base: u8, cb: u32, n: u32, s: [u8; 3]) -> Result<(), ttStatus> {
         let [p, t, u] = s;
         base_of(a, base, cb, p)?;
@@ -524,5 +537,16 @@ mod tests {
         assert!(words.len() > 16);
         // The first instruction addresses entry 3 of the table: 3 * 32 = 96.
         assert_eq!(words[0], addi(reg::T0, reg::A6, 96));
+
+        // `reserve_back` flushes the L0 data cache at the top of every poll;
+        // `wait_front` does not, which is tt-metal's asymmetry.
+        let mut r = Asm::default();
+        cb::reserve_back(&mut r, reg::A6, 3, 1, [reg::T0, reg::T1, reg::T2]);
+        let r = r.finish().expect("reserve_back assembles");
+        assert_eq!(r[1], 0x0ff0_000f);
+        let mut w = Asm::default();
+        cb::wait_front(&mut w, reg::A6, 3, 1, [reg::T0, reg::T1, reg::T2]);
+        let w = w.finish().expect("wait_front assembles");
+        assert_ne!(w[1], 0x0ff0_000f);
     }
 }

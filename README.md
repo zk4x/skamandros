@@ -77,16 +77,21 @@ cargo test           # unit tests, then the end-to-end suite
 ```
 
 The end-to-end suite (`tests/e2e.rs`) `dlopen`s the built library and drives the
-C ABI exactly as a consumer would; it builds the `cdylib` itself first. It needs
-Tenstorrent's functional simulator, which is not part of this repository: put
-`libttsim_bh.so` in `vendor/` (git-ignored) or name it in `$TT_METAL_SIMULATOR`,
-with the Blackhole descriptor beside it:
+C ABI exactly as a consumer would; it builds the `cdylib` itself first. It sets no
+environment of its own: the transport comes from the environment, as `ttInit`
+reads it. A simulator run needs Tenstorrent's functional simulator, which is not
+part of this repository, named in `$TT_METAL_SIMULATOR` (a copy in `vendor/`,
+git-ignored, works well), with the Blackhole descriptor beside it:
 
 ```bash
 mkdir -p vendor && curl -L -o vendor/libttsim_bh.so \
   https://github.com/tenstorrent/ttsim/releases/latest/download/libttsim_bh.so
 cp $TT_METAL_HOME/tt_metal/soc_descriptors/blackhole_140_arch.yaml vendor/soc_descriptor.yaml
+TT_METAL_SIMULATOR=$PWD/vendor/libttsim_bh.so cargo test
 ```
+
+A card run exports `TT_HARDWARE=1` and leaves `$TT_METAL_SIMULATOR` unset. With
+neither set, `ttInit` refuses instead of guessing which target was meant.
 
 `ttsim` 1.16.0 or newer is what this tree is measured on. Unit tests are not the
 measure; the end-to-end suite is.

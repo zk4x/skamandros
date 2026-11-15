@@ -490,7 +490,8 @@ pub const EXEC_SUBORDINATES: [Image; 4] = [
 #[cfg(test)]
 pub const DM_NC: &[u8] = include_bytes!(env!("FIRMWARE_DM_NC"));
 
-/// RISCV B's data mover (`tt_isa::dm`), loaded at L1 offset 0.
+/// RISCV B's data mover (`tt_isa::dm`), loaded at [`tt_isa::dm::IMAGE_BASE`]
+/// and reached through the jump the loader writes at its hardwired reset PC.
 #[cfg(test)]
 pub const DM_B: &[u8] = include_bytes!(env!("FIRMWARE_DM_B"));
 
@@ -1336,6 +1337,10 @@ impl Device {
     /// Everything [`Device::load_and_start`] does except the release: the image,
     /// the reset PC and a cleared status word are in place, so one later write to
     /// `SOFT_RESET_0` starts this core and every other held one at once.
+    ///
+    /// A core with no reset-PC register is hardwired to its reset PC and is
+    /// started by one `jal x0, at` written there, which is how tt-metal starts
+    /// BRISC (`generate_risc_startup_addr`, `llrt/hal.cpp:126-149`).
     fn load_held(&mut self, core: Core, image: &[u8], at: u64) -> Result<(), ttStatus> {
         self.set_core_reset(core, true)?;
         self.l1_write(at, image)?;
@@ -1352,8 +1357,13 @@ impl Device {
             }
             None if at == u64::from(core.default_reset_pc()) => {}
             None => {
-                let _ = (core, at);
-                return Err(ttStatus::TT_ERROR_RESET_PC);
+                let entry = i32::try_from(at).ok().filter(|n| *n < 0x8_0000);
+                let Some(entry) = entry else {
+                    let _ = at;
+                    return Err(ttStatus::TT_ERROR_RESET_PC);
+                };
+                let jump = crate::riscv::jal(0, entry);
+                self.l1_write(u64::from(core.default_reset_pc()), &jump.to_le_bytes())?;
             }
         }
         Ok(())
@@ -1490,7 +1500,7 @@ impl Device {
                 self.load_held(core, image, at)?;
             }
         }
-        self.load_and_start(Core::B, EXEC_B, u64::from(Core::B.default_reset_pc()))?;
+        self.load_and_start(Core::B, EXEC_B, tt_isa::dm::IMAGE_BASE)?;
         let mb = mailbox::launch::Mailbox::b();
         self.wait_for(mb.status(), |s| s == status::RUNNING)?;
         // A previous process leaves programs named and generations set; a new

@@ -327,29 +327,9 @@ load 32,32 %x = %in [0]
 store 32,32 %out [0] = %y
 ";
 
-/// Where the simulator is. The library only reads `TT_METAL_SIMULATOR`, so the
-/// test supplies it: the simulator is not part of this repository's sources, but
-/// a copy downloaded from the ttsim releases may sit in `vendor/` (git-ignored)
-/// for convenience.
-fn simulator_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("TT_METAL_SIMULATOR") {
-        return PathBuf::from(p);
-    }
-    let local = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/libttsim_bh.so");
-    if local.exists() {
-        return local;
-    }
-    panic!("no libttsim_bh.so: set TT_METAL_SIMULATOR to the simulator's shared object");
-}
-
 #[test]
 fn a_copy_kernel_runs_on_the_simulator() {
     let _device = device();
-    let sim = simulator_path();
-    // SAFETY: no other thread reads the environment concurrently; the library
-    // reads it when it opens the device.
-    unsafe { std::env::set_var("TT_METAL_SIMULATOR", &sim) };
-
     let lib = library();
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
     let unload: Symbol<ModuleUnload> =
@@ -442,11 +422,6 @@ fn a_copy_kernel_runs_on_the_simulator() {
 #[test]
 fn an_elementwise_kernel_runs_on_the_simulator() {
     let _device = device();
-    let sim = simulator_path();
-    // SAFETY: no other thread reads the environment concurrently; the library
-    // reads it when it opens the device.
-    unsafe { std::env::set_var("TT_METAL_SIMULATOR", &sim) };
-
     let lib = library();
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
     let unload: Symbol<ModuleUnload> =
@@ -546,11 +521,6 @@ fn an_elementwise_kernel_runs_on_the_simulator() {
 #[test]
 fn two_live_values_pack_from_their_own_dst_rows() {
     let _device = device();
-    let sim = simulator_path();
-    // SAFETY: no other thread reads the environment concurrently; the library
-    // reads it when it opens the device.
-    unsafe { std::env::set_var("TT_METAL_SIMULATOR", &sim) };
-
     let lib = library();
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
     let unload: Symbol<ModuleUnload> =
@@ -645,11 +615,6 @@ fn two_live_values_pack_from_their_own_dst_rows() {
 #[test]
 fn a_direct_parameter_kernel_runs_on_the_simulator() {
     let _device = device();
-    let sim = simulator_path();
-    // SAFETY: no other thread reads the environment concurrently; the library
-    // reads it when it opens the device.
-    unsafe { std::env::set_var("TT_METAL_SIMULATOR", &sim) };
-
     let lib = library();
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
     let unload: Symbol<ModuleUnload> =
@@ -738,11 +703,6 @@ fn a_direct_parameter_kernel_runs_on_the_simulator() {
 #[test]
 fn a_constant_loop_runs_on_the_simulator() {
     let _device = device();
-    let sim = simulator_path();
-    // SAFETY: no other thread reads the environment concurrently; the library
-    // reads it when it opens the device.
-    unsafe { std::env::set_var("TT_METAL_SIMULATOR", &sim) };
-
     let lib = library();
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
     let unload: Symbol<ModuleUnload> =
@@ -872,11 +832,6 @@ copy 32,32 %out [0] = %bo [0]
 ";
 
     let _device = device();
-    let sim = simulator_path();
-    // SAFETY: no other thread reads the environment concurrently; the library
-    // reads it when it opens the device.
-    unsafe { std::env::set_var("TT_METAL_SIMULATOR", &sim) };
-
     let lib = library();
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
     let unload: Symbol<ModuleUnload> =
@@ -1027,11 +982,6 @@ copy 32,32 %out [0] = %bo [0]
 ";
 
     let _device = device();
-    let sim = simulator_path();
-    // SAFETY: no other thread reads the environment concurrently; the library
-    // reads it when it opens the device.
-    unsafe { std::env::set_var("TT_METAL_SIMULATOR", &sim) };
-
     let lib = library();
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
     let unload: Symbol<ModuleUnload> =
@@ -1174,11 +1124,6 @@ copy 32,32 %out [0] = %bo [0]
 ";
 
     let _device = device();
-    let sim = simulator_path();
-    // SAFETY: no other thread reads the environment concurrently; the library
-    // reads it when it opens the device.
-    unsafe { std::env::set_var("TT_METAL_SIMULATOR", &sim) };
-
     let lib = library();
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
     let unload: Symbol<ModuleUnload> =
@@ -1309,11 +1254,6 @@ endloop
 #[test]
 fn a_symbolic_loop_bound_runs_on_the_simulator() {
     let _device = device();
-    let sim = simulator_path();
-    // SAFETY: no other thread reads the environment concurrently; the library
-    // reads it when it opens the device.
-    unsafe { std::env::set_var("TT_METAL_SIMULATOR", &sim) };
-
     let lib = library();
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
     let unload: Symbol<ModuleUnload> =
@@ -1430,11 +1370,6 @@ grid %nx,%ny
 #[test]
 fn a_symbolic_grid_runs_each_tiles_own_slice() {
     let _device = device();
-    let sim = simulator_path();
-    // SAFETY: no other thread reads the environment concurrently; the library
-    // reads it when it opens the device.
-    unsafe { std::env::set_var("TT_METAL_SIMULATOR", &sim) };
-
     let lib = library();
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
     let unload: Symbol<ModuleUnload> =
@@ -1613,11 +1548,6 @@ fn run_kernel_scalars(
     out_bytes: usize,
 ) -> Vec<u8> {
     let _device = device();
-    let sim = simulator_path();
-    // SAFETY: no other thread reads the environment concurrently; the library
-    // reads it when it opens the device.
-    unsafe { std::env::set_var("TT_METAL_SIMULATOR", &sim) };
-
     let lib = library();
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
     let unload: Symbol<ModuleUnload> =
@@ -1887,11 +1817,6 @@ copy 32,32 %out [0] = %bo [0]
 #[test]
 fn bf16_arithmetic_runs_on_the_simulator() {
     let _device = device();
-    let sim = simulator_path();
-    // SAFETY: no other thread reads the environment concurrently; the library
-    // reads it when it opens the device.
-    unsafe { std::env::set_var("TT_METAL_SIMULATOR", &sim) };
-
     let lib = library();
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
     let unload: Symbol<ModuleUnload> =

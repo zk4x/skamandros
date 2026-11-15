@@ -88,17 +88,6 @@ fn build_library(path: &Path) {
     );
 }
 
-fn simulator_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("TT_METAL_SIMULATOR") {
-        return PathBuf::from(p);
-    }
-    let local = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/libttsim_bh.so");
-    if local.exists() {
-        return local;
-    }
-    panic!("no libttsim_bh.so: set TT_METAL_SIMULATOR to the simulator's shared object");
-}
-
 fn take_error(free: &Symbol<Free>, err: *mut c_char) -> String {
     if err.is_null() {
         return String::from("<no message>");
@@ -119,11 +108,6 @@ fn run_kernel_scalars(
     out_bytes: usize,
 ) -> Vec<u8> {
     let _device = device();
-    let sim = simulator_path();
-    // SAFETY: no other thread reads the environment concurrently; the library
-    // reads it when it opens the device.
-    unsafe { std::env::set_var("TT_METAL_SIMULATOR", &sim) };
-
     let lib = library();
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
     let unload: Symbol<ModuleUnload> =
