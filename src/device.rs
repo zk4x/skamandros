@@ -620,9 +620,8 @@ impl Device {
     /// consulted before any Tensix tile is named.
     ///
     /// Device 0 only: on a multi-card host the node is not chosen, so a second
-    /// card is not reached. Opening the card also requires `TT_HARDWARE=1` — a
-    /// bring-up gate that is dropped once a kernel has run on it — so nothing
-    /// reaches silicon by accident.
+    /// card is not reached. Opening the card also requires `TT_HARDWARE=1`, so
+    /// nothing reaches silicon by accident.
     pub fn open_hardware() -> Result<Device, ttStatus> {
         if std::env::var_os("TT_HARDWARE").as_deref() != Some(OsStr::new("1")) {
             eprintln!(

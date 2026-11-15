@@ -2,8 +2,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * The smallest useful kernel: one 32x32 tile from DRAM, through L1 and the
- * cores, and back to DRAM. A consumer, not a test: it uploads its input,
- * launches, and says so.
+ * cores, and back to DRAM.
  *
  *   export LD_LIBRARY_PATH="$PWD/target/release:$LD_LIBRARY_PATH"
  *   export CPATH="$PWD/target/release:$CPATH"
