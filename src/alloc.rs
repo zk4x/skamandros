@@ -1069,6 +1069,21 @@ copy 32,32 %out [0] = %bo [0]
 %t1 = add %t %one
 %r = mul %xh %t1";
 
+    /// `elu = max(x, 0) - alpha * max(1 - exp2(x * log2(e)), 0)`: the shape
+    /// `Tensor::elu` composes, written with the exponent the SFPU has.
+    const ELU_CHAIN: &str = "\
+%z = const f32 0
+%pos = max %x %z
+%l2e = const f32 1.442695
+%p = mul %x %l2e
+%e = exp2 %p
+%one = const f32 1
+%d = sub %one %e
+%neg = max %d %z
+%alpha = const f32 1
+%t = mul %neg %alpha
+%r = sub %pos %t";
+
     /// One program through the same machine passes `compile` runs.
     fn lowered(text: &str) -> MachineKernel {
         let k = crate::ir::Kernel::parse(text).expect("the program parses");
@@ -1108,6 +1123,7 @@ copy 32,32 %out [0] = %bo [0]
             ("silu", SILU_CHAIN),
             ("tanh", TANH_CHAIN),
             ("gelu", GELU_CHAIN),
+            ("elu", ELU_CHAIN),
         ] {
             let m = lowered(&activation(chain));
             assert_eq!(

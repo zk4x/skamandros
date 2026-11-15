@@ -197,3 +197,7 @@ environment: `TT_HARDWARE=1` for the card, or `$TT_METAL_SIMULATOR` for the simu
 ## License
 
 Apache-2.0. Copyright (C) 2026 zk4x.
+
+
+Skamandros was enabled by the amazing work by Knight-Ops https://github.com/Knight-Ops/metalium-rs without
+whom I wouldn't have dreamed about doing the the whole driver myself.
