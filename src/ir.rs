@@ -1500,6 +1500,12 @@ impl Parser {
     fn run(&mut self, text: &str) -> Result<Kernel, ttStatus> {
         let mut version = false;
         for line in text.lines() {
+            // `#` starts a comment wherever it appears and runs to the end of
+            // the line, so a statement can be annotated after it. Cutting it
+            // off here, before the line is tokenised, keeps the rule out of
+            // every op's parser and makes a `#` inside a word a comment too,
+            // never a token.
+            let line = line.split_once('#').map_or(line, |(before, _)| before);
             let line = line.trim();
             if line.is_empty() || line.starts_with(';') || line.starts_with("//") {
                 continue;

@@ -16,16 +16,76 @@ use libloading::{Library, Symbol};
 
 /// One device at a time.
 ///
-/// `libttsim` is a process-wide singleton and `ttInit` hands out DRAM and L1
-/// addresses from a fresh base, so two device tests running in parallel would
-/// free each other's allocations and stage into each other's L1. Every test that
-/// opens the device holds this for its whole body.
+/// The device is opened once for the whole process — the first `ttInit`, which
+/// is idempotent — and the one matching `ttRelease` runs at process exit (see
+/// [`close_at_exit`]), so a later test launches on the device the earlier one
+/// opened. `libttsim` is a process-wide singleton and every launch stages
+/// programs into L1 and reads DRAM, so two tests launching in parallel would
+/// stage into each other's L1. Every test that launches holds this for its whole
+/// body.
 fn device() -> MutexGuard<'static, ()> {
     static DEVICE: OnceLock<Mutex<()>> = OnceLock::new();
     DEVICE
-        .get_or_init(|| Mutex::new(()))
+        .get_or_init(|| {
+            close_at_exit();
+            Mutex::new(())
+        })
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The `ttRelease` and `ttFree` the exit handler calls, and the handler itself.
+///
+/// A C `atexit` callback takes no arguments, so the two functions are kept
+/// here: they are set once, before the handler is registered, from a library
+/// that is never `dlclose`d.
+static RELEASE: OnceLock<Release> = OnceLock::new();
+static FREE: OnceLock<Free> = OnceLock::new();
+
+/// The one `ttRelease` of the process, on the way out.
+///
+/// `runtime::release` is what puts the chip back to its idle operating point, so
+/// leaving it out would leave the card at the busy clock the first launch set.
+/// It cannot be a `Drop` on a static (Rust never drops one) and it cannot be the
+/// end of the last test (no test knows it is last), so it is `atexit`: the
+/// handler runs after the tests and while the `dlopen`ed library is still
+/// mapped. A failure is printed, never panicked on: a panic here would abort the
+/// process after the tests have already reported.
+extern "C" fn release_at_exit() {
+    let (Some(release), Some(free)) = (RELEASE.get(), FREE.get()) else {
+        return;
+    };
+    let mut err: *mut c_char = std::ptr::null_mut();
+    // SAFETY: the tests are over and every test released the device lock, so no
+    // launch is in flight; the library stays loaded until after `atexit` runs.
+    if unsafe { release(&mut err) } == TT_OK {
+        return;
+    }
+    let message = if err.is_null() {
+        "<no message>".to_string()
+    } else {
+        let message = unsafe { CStr::from_ptr(err) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { free(err.cast()) };
+        message
+    };
+    eprintln!("ttRelease at exit: {message}");
+}
+
+/// Register [`release_at_exit`], once per process.
+fn close_at_exit() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let lib = library();
+        let release: Symbol<Release> = unsafe { lib.get(b"ttRelease\0") }.expect("ttRelease");
+        let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
+        let _ = RELEASE.set(*release);
+        let _ = FREE.set(*free);
+        // SAFETY: the handler reads the two statics set just above and calls
+        // functions of a library that outlives `atexit`.
+        unsafe { libc::atexit(release_at_exit) };
+    });
 }
 
 type AbiVersion = unsafe extern "C" fn() -> u32;
@@ -336,7 +396,6 @@ fn a_copy_kernel_runs_on_the_simulator() {
         unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
     let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
-    let release: Symbol<Release> = unsafe { lib.get(b"ttRelease\0") }.expect("ttRelease");
     let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
     let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
     let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
@@ -409,12 +468,27 @@ fn a_copy_kernel_runs_on_the_simulator() {
         "unload: {}",
         take_error(&free, err)
     );
-    assert_eq!(
-        unsafe { release(&mut err) },
-        TT_OK,
-        "ttRelease: {}",
-        take_error(&free, err)
-    );
+}
+
+/// `#` starts a comment wherever it appears and runs to the end of the line:
+/// the block the README shows annotates its statements that way, so the file a
+/// reader copies is the program the compiler reads.
+#[test]
+fn a_hash_comment_runs_to_the_end_of_its_line() {
+    const ANNOTATED: &str = "\
+version 9           # the only version this build reads
+grid 1,1            # one tile, one core
+%in = param f32 1024
+%out = param f32 1024
+%b0 = buffer f32 32,32
+copy 32,32 %b0 [0] = %in [0]    # L1 <- DRAM
+copy 32,32 %out [0] = %b0 [0]   # DRAM <- L1
+# a line that is nothing but a comment
+";
+    let host: Vec<f32> = (0..1024).map(|i| (i as f32 - 512.0) * 0.25).collect();
+    let host_bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel(ANNOTATED, &host_bytes, host_bytes.len());
+    assert_eq!(out, host_bytes, "the copy moved every byte unchanged");
 }
 
 /// An elementwise kernel runs the whole datapath: the inbound mover, the three
@@ -428,7 +502,6 @@ fn an_elementwise_kernel_runs_on_the_simulator() {
         unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
     let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
-    let release: Symbol<Release> = unsafe { lib.get(b"ttRelease\0") }.expect("ttRelease");
     let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
     let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
     let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
@@ -508,12 +581,6 @@ fn an_elementwise_kernel_runs_on_the_simulator() {
         "unload: {}",
         take_error(&free, err)
     );
-    assert_eq!(
-        unsafe { release(&mut err) },
-        TT_OK,
-        "ttRelease: {}",
-        take_error(&free, err)
-    );
 }
 
 /// Each store packs the value in its own `Dst` rows: the second page is not the
@@ -527,7 +594,6 @@ fn two_live_values_pack_from_their_own_dst_rows() {
         unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
     let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
-    let release: Symbol<Release> = unsafe { lib.get(b"ttRelease\0") }.expect("ttRelease");
     let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
     let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
     let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
@@ -602,12 +668,6 @@ fn two_live_values_pack_from_their_own_dst_rows() {
         "unload: {}",
         take_error(&free, err)
     );
-    assert_eq!(
-        unsafe { release(&mut err) },
-        TT_OK,
-        "ttRelease: {}",
-        take_error(&free, err)
-    );
 }
 
 /// The direct form: no buffer and no `copy_to` in the program, and the tile
@@ -621,7 +681,6 @@ fn a_direct_parameter_kernel_runs_on_the_simulator() {
         unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
     let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
-    let release: Symbol<Release> = unsafe { lib.get(b"ttRelease\0") }.expect("ttRelease");
     let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
     let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
     let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
@@ -690,12 +749,6 @@ fn a_direct_parameter_kernel_runs_on_the_simulator() {
         "unload: {}",
         take_error(&free, err)
     );
-    assert_eq!(
-        unsafe { release(&mut err) },
-        TT_OK,
-        "ttRelease: {}",
-        take_error(&free, err)
-    );
 }
 
 /// The loop form of the elementwise kernel runs too: the constant loop is a
@@ -709,7 +762,6 @@ fn a_constant_loop_runs_on_the_simulator() {
         unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
     let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
-    let release: Symbol<Release> = unsafe { lib.get(b"ttRelease\0") }.expect("ttRelease");
     let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
     let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
     let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
@@ -790,12 +842,6 @@ fn a_constant_loop_runs_on_the_simulator() {
         "unload: {}",
         take_error(&free, err)
     );
-    assert_eq!(
-        unsafe { release(&mut err) },
-        TT_OK,
-        "ttRelease: {}",
-        take_error(&free, err)
-    );
 }
 
 /// The unary and binary ops the SFPU has an encoding for, run through the C ABI:
@@ -838,7 +884,6 @@ copy 32,32 %out [0] = %bo [0]
         unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
     let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
-    let release: Symbol<Release> = unsafe { lib.get(b"ttRelease\0") }.expect("ttRelease");
     let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
     let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
     let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
@@ -952,13 +997,6 @@ copy 32,32 %out [0] = %bo [0]
         let program = TWO_LOAD.replace("OP", op);
         run(&program, f, 4096);
     }
-
-    assert_eq!(
-        unsafe { release(&mut err) },
-        TT_OK,
-        "ttRelease: {}",
-        take_error(&free, err)
-    );
 }
 
 /// Comparisons produce a `bool` in `Dst`, `sel` consumes one, and `max` goes
@@ -988,7 +1026,6 @@ copy 32,32 %out [0] = %bo [0]
         unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
     let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
-    let release: Symbol<Release> = unsafe { lib.get(b"ttRelease\0") }.expect("ttRelease");
     let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
     let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
     let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
@@ -1081,13 +1118,6 @@ copy 32,32 %out [0] = %bo [0]
         "%lt = cmplt %x %y\n%ge = cmpge %x %y\n%c = and %lt %ge\n%r = sel %c %x %y",
         &|_, b| b,
     );
-
-    assert_eq!(
-        unsafe { release(&mut err) },
-        TT_OK,
-        "ttRelease: {}",
-        take_error(&free, err)
-    );
 }
 
 /// The bitwise ops that are one SFPU instruction, on `i32` tiles: `bitand`,
@@ -1130,7 +1160,6 @@ copy 32,32 %out [0] = %bo [0]
         unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
     let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
-    let release: Symbol<Release> = unsafe { lib.get(b"ttRelease\0") }.expect("ttRelease");
     let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
     let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
     let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
@@ -1220,13 +1249,6 @@ copy 32,32 %out [0] = %bo [0]
         run(&TWO_LOAD.replace("OP", op), f, true);
     }
     run(&ONE_LOAD, &|a: i32, _| !a, false);
-
-    assert_eq!(
-        unsafe { release(&mut err) },
-        TT_OK,
-        "ttRelease: {}",
-        take_error(&free, err)
-    );
 }
 
 /// The loop form of the elementwise kernel with a launch-bound trip count: the
@@ -1260,7 +1282,6 @@ fn a_symbolic_loop_bound_runs_on_the_simulator() {
         unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
     let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
-    let release: Symbol<Release> = unsafe { lib.get(b"ttRelease\0") }.expect("ttRelease");
     let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
     let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
     let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
@@ -1335,12 +1356,6 @@ fn a_symbolic_loop_bound_runs_on_the_simulator() {
         "unload: {}",
         take_error(&free, err)
     );
-    assert_eq!(
-        unsafe { release(&mut err) },
-        TT_OK,
-        "ttRelease: {}",
-        take_error(&free, err)
-    );
 }
 
 /// A symbolic `2,2` grid: each of the four tiles negates its own slice, selected
@@ -1376,7 +1391,6 @@ fn a_symbolic_grid_runs_each_tiles_own_slice() {
         unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
     let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
-    let release: Symbol<Release> = unsafe { lib.get(b"ttRelease\0") }.expect("ttRelease");
     let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
     let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
     let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
@@ -1449,12 +1463,6 @@ fn a_symbolic_grid_runs_each_tiles_own_slice() {
         unsafe { unload(module, &mut err) },
         TT_OK,
         "unload: {}",
-        take_error(&free, err)
-    );
-    assert_eq!(
-        unsafe { release(&mut err) },
-        TT_OK,
-        "ttRelease: {}",
         take_error(&free, err)
     );
 }
@@ -1554,7 +1562,6 @@ fn run_kernel_scalars(
         unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
     let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
-    let release: Symbol<Release> = unsafe { lib.get(b"ttRelease\0") }.expect("ttRelease");
     let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
     let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
     let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
@@ -1619,12 +1626,6 @@ fn run_kernel_scalars(
         unsafe { unload(module, &mut err) },
         TT_OK,
         "unload: {}",
-        take_error(&free, err)
-    );
-    assert_eq!(
-        unsafe { release(&mut err) },
-        TT_OK,
-        "ttRelease: {}",
         take_error(&free, err)
     );
     back
@@ -1823,7 +1824,6 @@ fn bf16_arithmetic_runs_on_the_simulator() {
         unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
     let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
-    let release: Symbol<Release> = unsafe { lib.get(b"ttRelease\0") }.expect("ttRelease");
     let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
     let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
     let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
@@ -1941,13 +1941,6 @@ fn bf16_arithmetic_runs_on_the_simulator() {
         let program = BF16_TWO_LOAD.replace("OP", op);
         run(&program, f);
     }
-
-    assert_eq!(
-        unsafe { release(&mut err) },
-        TT_OK,
-        "ttRelease: {}",
-        take_error(&free, err)
-    );
 }
 
 /// The 32-bit `Dst` kernel's bf16 output: the packer narrows as it writes.

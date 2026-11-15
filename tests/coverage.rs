@@ -17,13 +17,65 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use libloading::{Library, Symbol};
 
-/// One device at a time: `libttsim` is a process-wide singleton.
+/// One device at a time: the device is opened once per process and `libttsim`
+/// is a process-wide singleton.
 fn device() -> MutexGuard<'static, ()> {
     static DEVICE: OnceLock<Mutex<()>> = OnceLock::new();
     DEVICE
-        .get_or_init(|| Mutex::new(()))
+        .get_or_init(|| {
+            close_at_exit();
+            Mutex::new(())
+        })
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The `ttRelease` and `ttFree` the exit handler calls.
+///
+/// A C `atexit` callback takes no arguments, so the two functions are kept here:
+/// they are set once, before the handler is registered, from a library that is
+/// never `dlclose`d.
+static RELEASE: OnceLock<Release> = OnceLock::new();
+static FREE: OnceLock<Free> = OnceLock::new();
+
+/// The one `ttRelease` of the process, on the way out: it puts the chip back to
+/// its idle operating point. Not a `Drop` on a static (Rust never drops one),
+/// and not the end of the last test (no test knows it is last), so `atexit`.
+extern "C" fn release_at_exit() {
+    let (Some(release), Some(free)) = (RELEASE.get(), FREE.get()) else {
+        return;
+    };
+    let mut err: *mut c_char = std::ptr::null_mut();
+    // SAFETY: the tests are over and no launch is in flight; the library stays
+    // loaded until after `atexit` runs.
+    if unsafe { release(&mut err) } == TT_OK {
+        return;
+    }
+    let message = if err.is_null() {
+        "<no message>".to_string()
+    } else {
+        let message = unsafe { CStr::from_ptr(err) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { free(err.cast()) };
+        message
+    };
+    eprintln!("ttRelease at exit: {message}");
+}
+
+/// Register [`release_at_exit`], once per process.
+fn close_at_exit() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let lib = library();
+        let release: Symbol<Release> = unsafe { lib.get(b"ttRelease\0") }.expect("ttRelease");
+        let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
+        let _ = RELEASE.set(*release);
+        let _ = FREE.set(*free);
+        // SAFETY: the handler reads the two statics set just above and calls
+        // functions of a library that outlives `atexit`.
+        unsafe { libc::atexit(release_at_exit) };
+    });
 }
 
 type Compile =
@@ -114,7 +166,6 @@ fn run_kernel_scalars(
         unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
     let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
-    let release: Symbol<Release> = unsafe { lib.get(b"ttRelease\0") }.expect("ttRelease");
     let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
     let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
     let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
@@ -179,12 +230,6 @@ fn run_kernel_scalars(
         unsafe { unload(module, &mut err) },
         TT_OK,
         "unload: {}",
-        take_error(&free, err)
-    );
-    assert_eq!(
-        unsafe { release(&mut err) },
-        TT_OK,
-        "ttRelease: {}",
         take_error(&free, err)
     );
     back
