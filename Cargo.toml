@@ -9,15 +9,24 @@ repository = "https://github.com/zk4x/skamandros"
 homepage = "https://github.com/zk4x/skamandros"
 description = "Tenstorrent kernel IR, allocator and driver. Builds libskamandros.so."
 
+# docs.rs has neither the RISC-V target nor llvm-tools, so it documents the
+# compiler-only build; the default `firmware` feature needs both. The crate is
+# Linux-only (`/dev/tenstorrent` through `tt-kmd`), so the tier-one targets the
+# service would otherwise try -- Windows and macOS among them -- cannot build it.
+[package.metadata.docs.rs]
+no-default-features = true
+targets = []
+
 [lib]
 name = "skamandros"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# The backend is the crate: on by default. The name is kept because the
-# firmware build script (copied from zyx) gates on it.
-default = ["tenstorrent"]
-tenstorrent = []
+# The device firmware: build the RISC-V images and embed them in the library.
+# This is what needs the `riscv32im-unknown-none-elf` target and `llvm-tools`;
+# the crate is the Tenstorrent backend whether or not they are built.
+default = ["firmware"]
+firmware = []
 
 [dependencies]
 tt-isa = "0.2.0"

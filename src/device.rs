@@ -413,6 +413,7 @@ unsafe extern "C" fn dma_write_unexpected(paddr: u64, _src: *const c_void, size:
 /// anything runs it. That is what makes `libskamandros.so` self-contained: the consumer's
 /// build needs neither the RISC-V target nor `llvm-objcopy`, only this crate's
 /// build did.
+#[cfg(feature = "firmware")]
 pub type Image = (Core, &'static [u8], u64);
 
 /// Where `link.x` places an image: RISCV T0's default reset PC, which every image
@@ -423,7 +424,7 @@ pub const LOAD_ADDRESS: u64 = Core::T0.default_reset_pc() as u64;
 /// The three role images -- unpack on T0, math on T1, pack on T2 -- each linked
 /// at its own slot (`tt_isa::l1::roles`), so all three fit in one tile's L1 at
 /// once and each starts through its reset-PC override.
-#[cfg(test)]
+#[cfg(all(test, feature = "firmware"))]
 pub const ROLES: [Image; 3] = [
     (
         Core::T0,
@@ -444,12 +445,14 @@ pub const ROLES: [Image; 3] = [
 
 /// The program executor: reads a staged program's address, length and arguments
 /// from the mailbox, invalidates the I-cache and calls it.
+#[cfg(feature = "firmware")]
 pub const EXEC_B: &[u8] = include_bytes!(env!("FIRMWARE_EXEC_B"));
 
 /// The three role executors -- unpack on T0, math on T1, pack on T2 -- each
 /// linked at its role slot. They read their own role mailbox and call the
 /// program with `a0` at its arguments, the way tt-metal's firmware calls a
 /// kernel; nothing is pushed.
+#[cfg(feature = "firmware")]
 pub const EXEC_ROLES: [Image; 3] = [
     (
         Core::T0,
@@ -472,10 +475,12 @@ pub const EXEC_ROLES: [Image; 3] = [
 /// theirs. NC cannot invalidate its own cache, so `exec_b` invalidates it before
 /// each launch; the image runs from `dm_nc`'s slot behind a jump at NC's reset
 /// PC.
+#[cfg(feature = "firmware")]
 pub const EXEC_NC: &[u8] = include_bytes!(env!("FIRMWARE_EXEC_NC"));
 
 /// The four subordinate executors, loaded held and released together after
 /// RISCV B has invalidated every instruction cache.
+#[cfg(feature = "firmware")]
 pub const EXEC_SUBORDINATES: [Image; 4] = [
     EXEC_ROLES[0],
     EXEC_ROLES[1],
@@ -485,19 +490,19 @@ pub const EXEC_SUBORDINATES: [Image; 4] = [
 
 /// RISCV NC's mover image (`tt_isa::dm::nc`), reached through the stub at NC's
 /// reset PC.
-#[cfg(test)]
+#[cfg(all(test, feature = "firmware"))]
 pub const DM_NC: &[u8] = include_bytes!(env!("FIRMWARE_DM_NC"));
 
 /// RISCV B's data mover (`tt_isa::dm`), loaded at [`tt_isa::dm::IMAGE_BASE`]
 /// and reached through the jump the loader writes at its hardwired reset PC.
-#[cfg(test)]
+#[cfg(all(test, feature = "firmware"))]
 pub const DM_B: &[u8] = include_bytes!(env!("FIRMWARE_DM_B"));
 
 /// Every image this build produced, by name, with its load address.
 ///
 /// The list exists so a test can name every image the build gate judged, rather
 /// than trusting that the one it embeds was among them.
-#[cfg(test)]
+#[cfg(all(test, feature = "firmware"))]
 pub fn all_images() -> Vec<(&'static str, &'static [u8])> {
     vec![
         ("exec_b", EXEC_B),
@@ -1341,6 +1346,7 @@ impl Device {
     }
 
     /// Load `image` into L1 and start `core` on it.
+    #[cfg(feature = "firmware")]
     pub fn load_and_start(&mut self, core: Core, image: &[u8], at: u64) -> Result<(), ttStatus> {
         self.load_held(core, image, at)?;
         self.set_core_reset(core, false)
@@ -1355,6 +1361,7 @@ impl Device {
     /// A core with no reset-PC register is hardwired to its reset PC and is
     /// started by one `jal x0, at` written there, which is how tt-metal starts
     /// BRISC (`generate_risc_startup_addr`, `llrt/hal.cpp:126-149`).
+    #[cfg(feature = "firmware")]
     fn load_held(&mut self, core: Core, image: &[u8], at: u64) -> Result<(), ttStatus> {
         self.set_core_reset(core, true)?;
         self.l1_write(at, image)?;
@@ -1396,6 +1403,7 @@ impl Device {
     /// is simulated cycles. On silicon time passes by itself and the same number
     /// is a wall-clock deadline, floored at [`SILICON_MIN_WAIT`] (`tt-device`
     /// `core_control.rs:489-521`).
+    #[cfg(feature = "firmware")]
     pub fn wait_for(
         &mut self,
         address: u64,
@@ -1497,40 +1505,48 @@ impl Device {
     /// then releases the other four (tt-metal: BRISC's mask store, then
     /// `deassert_all_reset`).
     pub fn start_executors(&mut self) -> Result<(), ttStatus> {
-        if self
-            .exec_started
-            .iter()
-            .any(|t| t.x() == self.tile.x() && t.y() == self.tile.y())
+        // A build without the `firmware` feature carries no images to start,
+        // so a launch in it is refused instead of leaving held cores behind.
+        #[cfg(not(feature = "firmware"))]
+        return Err(ttStatus::TT_ERROR_UNSUPPORTED);
+        #[cfg(feature = "firmware")]
         {
-            return Ok(());
-        }
-        // NC cannot take a reset-PC override (ttsim refuses it), so its image
-        // starts through a two-word jump at its reset PC, as every NC image
-        // has since the mover.
-        for &(core, image, at) in &EXEC_SUBORDINATES {
-            if core == Core::NC {
-                self.load_held_nc(image, at)?;
-            } else {
-                self.load_held(core, image, at)?;
+            if self
+                .exec_started
+                .iter()
+                .any(|t| t.x() == self.tile.x() && t.y() == self.tile.y())
+            {
+                return Ok(());
             }
+            // NC cannot take a reset-PC override (ttsim refuses it), so its image
+            // starts through a two-word jump at its reset PC, as every NC image
+            // has since the mover.
+            for &(core, image, at) in &EXEC_SUBORDINATES {
+                if core == Core::NC {
+                    self.load_held_nc(image, at)?;
+                } else {
+                    self.load_held(core, image, at)?;
+                }
+            }
+            self.load_and_start(Core::B, EXEC_B, tt_isa::dm::IMAGE_BASE)?;
+            let mb = mailbox::launch::Mailbox::b();
+            self.wait_for(mb.status(), |s| s == status::RUNNING)?;
+            // A previous process leaves programs named and generations set; a new
+            // executor must not replay them.
+            for mb in Self::launch_mailboxes() {
+                self.clear_launch(mb)?;
+            }
+            for &(core, _, _) in &EXEC_SUBORDINATES {
+                self.set_core_reset(core, false)?;
+            }
+            self.exec_started.push(self.tile);
+            Ok(())
         }
-        self.load_and_start(Core::B, EXEC_B, tt_isa::dm::IMAGE_BASE)?;
-        let mb = mailbox::launch::Mailbox::b();
-        self.wait_for(mb.status(), |s| s == status::RUNNING)?;
-        // A previous process leaves programs named and generations set; a new
-        // executor must not replay them.
-        for mb in Self::launch_mailboxes() {
-            self.clear_launch(mb)?;
-        }
-        for &(core, _, _) in &EXEC_SUBORDINATES {
-            self.set_core_reset(core, false)?;
-        }
-        self.exec_started.push(self.tile);
-        Ok(())
     }
 
     /// Load NC's image at `at` and leave NC held, with the jump that starts it
     /// at its reset PC.
+    #[cfg(feature = "firmware")]
     fn load_held_nc(&mut self, image: &[u8], at: u64) -> Result<(), ttStatus> {
         self.set_core_reset(Core::NC, true)?;
         self.l1_write(at, image)?;
@@ -1542,6 +1558,7 @@ impl Device {
 
     /// Clear one launch message: the generation first, then the program and
     /// control words.
+    #[cfg(feature = "firmware")]
     fn clear_launch(&mut self, mb: mailbox::launch::Mailbox) -> Result<(), ttStatus> {
         self.write32(mb.generation(), 0)?;
         for at in [
@@ -1886,6 +1903,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "firmware")]
     fn every_image_is_present_and_linked_where_it_is_loaded() {
         for (name, bytes) in all_images() {
             assert!(!bytes.is_empty(), "{name} is empty");
@@ -1910,6 +1928,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "firmware")]
     fn the_executor_is_the_image_the_mailbox_starts() {
         // The executor is linked at T0's reset PC, which `link.x` also uses for the
         // images loaded through a plain reset.

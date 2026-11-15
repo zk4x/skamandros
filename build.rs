@@ -9,10 +9,10 @@
 //! `CARGO_*` environment is stripped from the child so the nested invocation does
 //! not inherit the parent's target directory or profile.
 
-#[cfg(feature = "tenstorrent")]
+#[cfg(feature = "firmware")]
 use std::path::Path;
 use std::path::PathBuf;
-#[cfg(feature = "tenstorrent")]
+#[cfg(feature = "firmware")]
 use std::process::Command;
 
 /// The C spelling of every entry point: `(name, return type, parameters)`.
@@ -54,7 +54,7 @@ const DECLARATIONS: &[(&str, &str, &str)] = &[
 ];
 
 /// Binaries in `firmware/src/bin` to build and expose.
-#[cfg(feature = "tenstorrent")]
+#[cfg(feature = "firmware")]
 const BINARIES: &[&str] = &[
     "heartbeat",
     "sfpu_mul",
@@ -83,14 +83,14 @@ const BINARIES: &[&str] = &[
     "exec_nc",
 ];
 
-#[cfg(feature = "tenstorrent")]
+#[cfg(feature = "firmware")]
 const TARGET: &str = "riscv32im-unknown-none-elf";
 
 fn main() {
     write_c_header();
     // The firmware belongs to the Tenstorrent backend, so a build without that
     // feature compiles none of it (and does not need the RISC-V target).
-    #[cfg(feature = "tenstorrent")]
+    #[cfg(feature = "firmware")]
     {
         let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
         let firmware_dir = manifest.join("firmware");
@@ -201,7 +201,7 @@ fn main() {
 
 /// Emit `rerun-if-changed` for every source file under `dir`, skipping build
 /// output.
-#[cfg(feature = "tenstorrent")]
+#[cfg(feature = "firmware")]
 fn track_sources(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -221,7 +221,7 @@ fn track_sources(dir: &Path) {
 }
 
 /// Copy the firmware source tree (no `target/`, no `.git/`) into `dst`.
-#[cfg(feature = "tenstorrent")]
+#[cfg(feature = "firmware")]
 fn copy_tree(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).expect("could not create the firmware build directory");
     for entry in std::fs::read_dir(src)
@@ -243,7 +243,7 @@ fn copy_tree(src: &Path, dst: &Path) {
 }
 
 /// Locate one of the `llvm-tools` binaries shipped with the active toolchain.
-#[cfg(feature = "tenstorrent")]
+#[cfg(feature = "firmware")]
 fn tool(name: &str) -> PathBuf {
     let sysroot = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
         .arg("--print")
@@ -271,7 +271,7 @@ fn tool(name: &str) -> PathBuf {
 /// the baby RISC-V implementation, and executing an unimplemented instruction is
 /// `UndefinedBehavior` — which, per the glossary, includes possible physical
 /// damage. There is no illegal-instruction trap to fall back on.
-#[cfg(feature = "tenstorrent")]
+#[cfg(feature = "firmware")]
 fn check_instruction_set(objdump: &Path, elf: &Path, name: &str) {
     // Every image is disassembled whole and judged. No image contains a
     // `.ttinsn` word: the compiler emits them as RISC-V stores into the
@@ -289,7 +289,7 @@ fn check_instruction_set(objdump: &Path, elf: &Path, name: &str) {
 }
 
 /// The disassembly of `elf`, or of `range` of it.
-#[cfg(feature = "tenstorrent")]
+#[cfg(feature = "firmware")]
 fn disassemble(objdump: &Path, elf: &Path, name: &str, range: Option<(u64, u64)>) -> String {
     let mut cmd = Command::new(objdump);
     // `F` on top of the image's own attributes (rv32im): firmware reaches
@@ -308,7 +308,7 @@ fn disassemble(objdump: &Path, elf: &Path, name: &str, range: Option<(u64, u64)>
 }
 
 /// Judge every instruction line of `text`, and say how many there were.
-#[cfg(feature = "tenstorrent")]
+#[cfg(feature = "firmware")]
 fn judge(text: &str, name: &str) -> usize {
     let mut checked = 0usize;
     for line in text.lines() {
@@ -360,7 +360,7 @@ fn judge(text: &str, name: &str) -> usize {
 ///
 /// The permitted forms are the ordering fences the specification's own recipes
 /// use. Anything else is flagged rather than assumed safe.
-#[cfg(feature = "tenstorrent")]
+#[cfg(feature = "firmware")]
 fn fence_reason(mnemonic: &str, operands: &str) -> Option<&'static str> {
     if mnemonic != "fence" {
         return None;
@@ -386,7 +386,7 @@ fn fence_reason(mnemonic: &str, operands: &str) -> Option<&'static str> {
 /// unimplemented instruction is `UndefinedBehavior` — which per `Glossary.md`
 /// includes possible physical damage. There is no illegal-instruction trap to
 /// fall back on, so this is a correctness gate rather than hygiene.
-#[cfg(feature = "tenstorrent")]
+#[cfg(feature = "firmware")]
 fn forbidden_reason(mnemonic: &str) -> Option<&'static str> {
     // Strip the ordering suffixes AMOs may carry, so `lr.w.aq` is caught too.
     let base = mnemonic.trim_end_matches(".aq").trim_end_matches(".rl");
@@ -433,7 +433,7 @@ fn forbidden_reason(mnemonic: &str) -> Option<&'static str> {
 }
 
 /// `e_entry` of a 32-bit little-endian ELF.
-#[cfg(feature = "tenstorrent")]
+#[cfg(feature = "firmware")]
 fn elf_entry(elf: &Path) -> u32 {
     let bytes = std::fs::read(elf).expect("could not read the firmware ELF");
     assert!(

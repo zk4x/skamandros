@@ -106,7 +106,8 @@ as their last step of the lowering.
 
 ## Install
 
-The build compiles the device firmware into the library, so two toolchain pieces come first:
+The `firmware` feature — on by default — compiles the device's RISC-V images into the library, so two
+toolchain pieces come first:
 
 ```bash
 rustup target add riscv32im-unknown-none-elf   # the firmware's cores

@@ -25,10 +25,10 @@ fast-reads = []
 encoded-guard = ["fast-reads"]
 
 [dependencies]
-tt-isa = { path = "/home/x/Dev/rust/tt-isa" }
+tt-isa = "0.2.0"
 
 [build-dependencies]
-tt-isa = { path = "/home/x/Dev/rust/tt-isa" }
+tt-isa = "0.2.0"
 
 [profile.release]
 # Code size, not speed: every role image is linked into a 10 KiB L1 slot, and
