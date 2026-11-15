@@ -1,5 +1,7 @@
 # skamandros
 
+[![crates.io](https://img.shields.io/crates/v/skamandros.svg)](https://crates.io/crates/skamandros)
+
 A kernel compiler and driver for Tenstorrent Blackhole, shipped as
 `libskamandros.so` and `skamandros.h`.
 
@@ -8,7 +10,7 @@ A kernel compiler and driver for Tenstorrent Blackhole, shipped as
 
 ## Why?
 
-Tenstorrent has amazing and powerful hardware, but the software is a bit unwieldy. This library was produced
+Tenstorrent has amazing and powerful hardware, but the software is a bit unwieldy. This library grew
 over ~5 months of working on the zyx Tenstorrent backend and my failures to utilize tt-metal.
 
 ## How?
@@ -115,6 +117,13 @@ cargo build --release
 This writes `libskamandros.so` and `skamandros.h` into `target/release`; copy both to your path.
 For usage, look at examples and tests.
 
+## Requirements
+
+- Linux, with the card reached through `tt-kmd` (`/dev/tenstorrent/0`).
+- A Tenstorrent Blackhole p100a, or Tenstorrent's functional simulator (`ttsim` 1.16.0 or newer) named in
+  `$TT_METAL_SIMULATOR`.
+- Rust 1.85 or newer to build, with the `riscv32im-unknown-none-elf` target and `llvm-tools` (see Install).
+
 ## The C ABI
 
 The build generates `skamandros.h` next to `libskamandros.so`, from the code that declares it:
@@ -137,7 +146,7 @@ Every call but `ttAbiVersion` and `ttFree` returns a `ttStatus`, and on failure 
 
 ```bash
 cargo build          # target/debug/libskamandros.so
-cargo test           # unit tests, then the end-to-end suite
+cargo test           # unit tests, then the end-to-end suite (TT_HARDWARE=1 for the card)
 ```
 
 The end-to-end suite (`tests/e2e.rs`) `dlopen`s the built library and drives the C ABI exactly as a consumer would;
@@ -204,6 +213,5 @@ environment: `TT_HARDWARE=1` for the card, or `$TT_METAL_SIMULATOR` for the simu
 
 Apache-2.0. Copyright (C) 2026 zk4x.
 
-
 Skamandros was enabled by the amazing work by Knight-Ops https://github.com/Knight-Ops/metalium-rs without
-whom I wouldn't have dreamed about doing the the whole driver myself.
+whom I wouldn't have dreamed about doing the whole driver myself.
