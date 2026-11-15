@@ -744,6 +744,23 @@ impl Device {
         // At the idle point the Matrix Unit's `Src` reads are unreliable on
         // silicon, so this belongs to bringing the device up.
         device.set_power_state(true)?;
+        // Which target this is: the same C ABI drives ttsim, which prints
+        // nothing, so this line is what tells a run it reached silicon.
+        let clock = device
+            .arc_tag(tt_isa::arc::tag::AICLK)?
+            .map_or_else(|| "unknown".to_string(), |mhz| format!("{mhz} MHz"));
+        let limit = device
+            .arc_tag(tt_isa::arc::tag::AICLK_LIMIT_MAX)?
+            .map_or_else(|| "unknown".to_string(), |mhz| format!("{mhz} MHz"));
+        eprintln!(
+            "libskamandros: running on hardware: {}/{}, {} Tensix columns, {} tiles, \
+             DRAM mask {:#04x}, AICLK {clock} (limit {limit})",
+            crate::kmd::DEV_DIR,
+            0,
+            device.columns,
+            device.tiles.len(),
+            device.dram.enabled_mask(),
+        );
         Ok(device)
     }
 
