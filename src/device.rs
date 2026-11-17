@@ -156,6 +156,31 @@ const L1_BARRIER_POLLS: u32 = 1000;
 /// dispatch would touch.
 const DRAM_FIRST: u64 = 0x10_0080;
 
+/// The most one PCIe DMA transfer moves: UMD's "512KB is the empirical sweet
+/// spot for per-chunk DMA throughput" (`pci_device.cpp:1045-1050`).
+const DMA_CHUNK: usize = 512 * 1024;
+
+/// Transfers at or above this many bytes go through the DMA engine. Below it
+/// the fixed cost of a doorbell and a completion poll is more than the window
+/// copy it replaces.
+const DMA_MIN: usize = 4096;
+
+/// Whether host transfers use the PCIe DMA engine.
+///
+/// The transcription of `BlackholeDmaTransfer::h2d_start` is in
+/// [`crate::kmd::Kmd::dma_h2d`], but the destination address it is given is the
+/// window's AXI address, and a 2 MiB window is a BAR0 aperture: the engine,
+/// which reaches the card through BAR4, does not complete a transfer aimed
+/// there (measured: the completion marker never lands). UMD's DMA path
+/// allocates its own 4 GiB BAR4 window for exactly this reason
+/// (`get_dma_tlb_size`, `pcie_protocol.cpp:548-560`), and this driver does not
+/// map or configure that class yet.
+const DMA_ENABLED: bool = false;
+
+/// How many times a DMA window's configuration is read back before the card is
+/// declared not to have taken it.
+const CONFIG_POLLS: u32 = 1000;
+
 /// Simulated cycles one core may take to answer before it is declared stuck.
 ///
 /// On silicon there are no simulated cycles, so the same number is read as
@@ -538,8 +563,13 @@ pub struct Device {
     columns: usize,
     /// DRAM channels that can hold data.
     dram: Dram,
-    /// First byte of DRAM this device has not handed out.
-    dram_used: u64,
+    /// First byte of each channel this device has not handed out, in logical
+    /// channel order.
+    dram_used: Vec<u64>,
+    /// The pinned host buffer the PCIe DMA engine reads, once a bulk transfer
+    /// has needed one. `None` on the simulator, whose transfers go through the
+    /// window like a register access.
+    dma: Option<crate::kmd::DmaBuffer>,
     /// Is `exec_b` resident and looping on the tile?
     exec_started: Vec<NocCoord>,
     /// The last generation handed to any core. Device-wide, so a value a core
@@ -588,7 +618,8 @@ impl Device {
             tiles: Vec::new(),
             columns: 0,
             dram: Dram::FULL,
-            dram_used: DRAM_FIRST,
+            dram_used: vec![DRAM_FIRST; usize::from(Dram::FULL.channels().count())],
+            dma: None,
             exec_started: Vec::new(),
             launch_seq: 0,
             placed: Vec::new(),
@@ -648,7 +679,8 @@ impl Device {
             tiles: Vec::new(),
             columns: 0,
             dram: Dram::FULL,
-            dram_used: DRAM_FIRST,
+            dram_used: vec![DRAM_FIRST; usize::from(Dram::FULL.channels().count())],
+            dma: None,
             exec_started: Vec::new(),
             launch_seq: 0,
             placed: Vec::new(),
@@ -672,6 +704,7 @@ impl Device {
             .first()
             .ok_or(ttStatus::TT_ERROR_NO_TENSIX_TILE)?;
         device.dram = device.probe_dram()?;
+        device.dram_used = vec![DRAM_FIRST; usize::from(device.dram.channels().count())];
 
         // Firmware trains each GDDR channel after power-up, and tt-metal waits
         // for every enabled channel before it touches DRAM (`LocalChip`'s
@@ -1212,57 +1245,104 @@ impl Device {
         Ok(self.tiles[y as usize * self.columns + x as usize])
     }
 
-    /// A GDDR channel that can hold data: the chip's first, in the logical
-    /// numbering of [`Dram`].
-    pub fn dram_channel(&self) -> DramChannel {
-        self.dram
-            .channel(0)
-            .expect("a chip the probe accepted has a first channel")
-    }
-
     /// The chip's `ENABLED_GDDR` word, for the data mover's `USABLE` mailbox.
     pub fn dram_mask(&self) -> u32 {
         u32::from(self.dram.enabled_mask())
     }
 
-    /// Reserve `bytes` of DRAM, 64-byte aligned, and return its channel-0
-    /// offset. This is what a caller passes back to `ttMemcpy` and `ttLaunch`.
+    /// Every channel, in logical order.
+    pub fn dram_channels(&self) -> Vec<DramChannel> {
+        self.dram.channels().collect()
+    }
+
+    /// The channel a flat DRAM address lives on, and its offset inside that
+    /// channel.
+    ///
+    /// An address is `channel * CHANNEL_BYTES + offset`, the same shape
+    /// tt-metal gives a bank: `bank_id * bank_size + offset`, with the bank's
+    /// NoC endpoint resolved from the bank id (`get_noc_addr_from_bank_id`,
+    /// `dataflow_api_addrgen.h:516-533`). Splitting it needs no table: the
+    /// channel is the quotient and the offset the remainder.
+    fn dram_at(&self, address: u64) -> Result<(DramChannel, u64), ttStatus> {
+        let channel = address / CHANNEL_BYTES;
+        let offset = address % CHANNEL_BYTES;
+        let channel = u8::try_from(channel)
+            .ok()
+            .and_then(|index| self.dram.channel(index))
+            .ok_or(ttStatus::TT_ERROR_DRAM_RANGE)?;
+        Ok((channel, offset))
+    }
+
+    /// Reserve `bytes` of DRAM, 64-byte aligned, and return its flat address
+    /// (`channel * CHANNEL_BYTES + offset`). This is what a caller passes back
+    /// to `ttMemcpy` and `ttLaunch`.
+    ///
+    /// The channel is the one with the most free space, as tt-metal's
+    /// `ChannelAllocator` picks a bank — `free_size` per bank and the largest
+    /// first (`allocator.cpp:57-100`, `bank_manager.cpp:417-446`). No range is
+    /// ever freed here, so "most free" is "least used".
     pub fn alloc_dram(&mut self, bytes: usize) -> Result<u64, ttStatus> {
         if bytes == 0 {
             return Err(ttStatus::TT_ERROR_ALLOC_ZERO);
         }
-        let at = self.dram_used.next_multiple_of(64);
-        let end = at
-            .checked_add(bytes as u64)
-            .ok_or(ttStatus::TT_ERROR_DRAM_ADDRESS_OVERFLOW)?;
-        if end > CHANNEL_BYTES {
-            let _ = (bytes, at);
-            return Err(ttStatus::TT_ERROR_DRAM_FULL);
+        let bytes = bytes as u64;
+        let mut best: Option<(u8, u64)> = None;
+        for channel in self.dram.channels() {
+            let used = self.dram_used[usize::from(channel.index())];
+            let at = used.next_multiple_of(64);
+            let fits = at
+                .checked_add(bytes)
+                .is_some_and(|end| end <= CHANNEL_BYTES);
+            if fits && best.is_none_or(|(_, free)| used < free) {
+                best = Some((channel.index(), used));
+            }
         }
-        self.dram_used = end;
-        Ok(at)
+        let Some((index, used)) = best else {
+            let _ = bytes;
+            return Err(ttStatus::TT_ERROR_DRAM_FULL);
+        };
+        let at = used.next_multiple_of(64);
+        self.dram_used[usize::from(index)] = at + bytes;
+        Ok(u64::from(index) * CHANNEL_BYTES + at)
     }
 
-    /// The endpoint high word a program names for DRAM on the first channel.
-    pub fn dram_hi_for(&self, niu: tt_isa::noc::niu::Niu) -> u32 {
-        let channel = self.dram_channel();
+    /// The endpoint high word a program names for the channel `address` lives
+    /// on.
+    ///
+    /// A DRAM address is a bank id and an offset; the NoC endpoint is the
+    /// bank's, resolved per NIU (`get_noc_addr_from_bank_id` adds
+    /// `bank_to_dram_offset[bank_id]` to the offset and the packed endpoint to
+    /// the high word, `dataflow_api_addrgen.h:516-533`). The reader and the
+    /// writer use opposite NoCs, and the endpoints differ between them.
+    pub fn dram_hi(&self, address: u64, niu: tt_isa::noc::niu::Niu) -> Result<u32, ttStatus> {
+        let (channel, _) = self.dram_at(address)?;
         let ep = channel.preferred(niu);
-        Endpoint {
+        Ok(Endpoint {
             x: ep.x(),
             y: ep.y(),
             addr: 0,
         }
-        .hi()
+        .hi())
     }
 
-    /// Write `bytes` to DRAM at a channel-0 offset.
-    pub fn dram_write(&mut self, offset: u64, bytes: &[u8]) -> Result<(), ttStatus> {
-        let channel = self.dram_channel();
+    /// Write `bytes` to DRAM at a flat address.
+    pub fn dram_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), ttStatus> {
+        let (channel, offset) = self.dram_at(address)?;
         let range = channel.range(offset, bytes.len() as u64).ok_or_else(|| {
-            let _ = (bytes.len(), offset);
+            let _ = (bytes.len(), address);
             ttStatus::TT_ERROR_DRAM_RANGE
         })?;
         let ep = channel.preferred(tt_isa::noc::niu::Niu::Noc0);
+        if DMA_ENABLED && bytes.len() >= DMA_MIN && self.dma_write(ep, range.offset(), bytes)? {
+            // The engine's completion flag is the transfer's witness; the window
+            // read is a second one, from the endpoint the data went out of.
+            if bytes.len() >= 4 {
+                let last = range.offset() + bytes.len() as u64 - 4;
+                let mut word = [0u8; 4];
+                self.window_read(ep, last, &mut word)?;
+            }
+            return Ok(());
+        }
         self.window_write(ep, range.offset(), bytes)?;
         // A write is visible through the endpoint it went out of: read the last
         // word back through it.
@@ -1274,11 +1354,11 @@ impl Device {
         Ok(())
     }
 
-    /// Read DRAM at a channel-0 offset.
-    pub fn dram_read(&mut self, offset: u64, out: &mut [u8]) -> Result<(), ttStatus> {
-        let channel = self.dram_channel();
+    /// Read DRAM at a flat address.
+    pub fn dram_read(&mut self, address: u64, out: &mut [u8]) -> Result<(), ttStatus> {
+        let (channel, offset) = self.dram_at(address)?;
         channel.range(offset, out.len() as u64).ok_or_else(|| {
-            let _ = out.len();
+            let _ = (out.len(), address);
             ttStatus::TT_ERROR_DRAM_RANGE
         })?;
         let ep = channel.preferred(tt_isa::noc::niu::Niu::Noc0);
@@ -1323,6 +1403,9 @@ impl Device {
     pub fn l1_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), ttStatus> {
         self.check_l1(address, bytes.len())?;
         let tile = self.tile;
+        if DMA_ENABLED && bytes.len() >= DMA_MIN && self.dma_write(tile, address, bytes)? {
+            return Ok(());
+        }
         self.window_write(tile, address, bytes)
     }
 
@@ -1722,8 +1805,8 @@ impl Device {
     }
 
     /// Point the window at `address` in `tile`, unless it already is.
-    fn retarget(&mut self, tile: NocCoord, address: u64) -> Result<(), ttStatus> {
-        let words = tlb_words(address, tile)?;
+    fn retarget(&mut self, tile: NocCoord, address: u64, write: bool) -> Result<(), ttStatus> {
+        let words = tlb_words(address, tile, write)?;
         if self.shadow == Some(words) {
             return Ok(());
         }
@@ -1748,7 +1831,7 @@ impl Device {
             let base = at & !(WINDOW_SIZE - 1);
             let offset = at - base;
             let here = (bytes.len() - done).min((WINDOW_SIZE - offset) as usize);
-            self.retarget(tile, base)?;
+            self.retarget(tile, base, true)?;
             let bar = self.window_bar_offset() + offset;
             check_bar0(bar, here)?;
             self.link
@@ -1770,7 +1853,7 @@ impl Device {
             let base = at & !(WINDOW_SIZE - 1);
             let offset = at - base;
             let here = (out.len() - done).min((WINDOW_SIZE - offset) as usize);
-            self.retarget(tile, base)?;
+            self.retarget(tile, base, false)?;
             let bar = self.window_bar_offset() + offset;
             check_bar0(bar, here)?;
             self.link
@@ -1784,6 +1867,96 @@ impl Device {
         check_bar0(offset, 4)?;
         self.link
             .mem_write(BAR0_BASE + offset, &value.to_le_bytes());
+        Ok(())
+    }
+
+    fn bar_read32(&self, offset: u64) -> Result<u32, ttStatus> {
+        check_bar0(offset, 4)?;
+        let mut word = [0u8; 4];
+        self.link.mem_read(BAR0_BASE + offset, &mut word);
+        Ok(u32::from_le_bytes(word))
+    }
+
+    /// Point the window at `base` and confirm the card took it.
+    ///
+    /// A host store through the window is ordered by the CPU's own fence, but a
+    /// DMA transfer is read by the *engine*, which is not behind this core's
+    /// stores. UMD allocates its DMA window with `verify_config=true` for this
+    /// reason (`pcie_protocol.cpp:548-560`): every configure reads the words
+    /// back before the engine is started.
+    fn retarget_verified(
+        &mut self,
+        tile: NocCoord,
+        base: u64,
+        write: bool,
+    ) -> Result<(), ttStatus> {
+        self.retarget(tile, base, write)?;
+        let words = tlb_words(base, tile, write)?;
+        let at = TLB_CONFIG_BASE + 12 * u64::from(self.link.window());
+        for attempt in 0..CONFIG_POLLS {
+            let landed =
+                (0..3).all(|i| self.bar_read32(at + 4 * i).ok() == Some(words[i as usize]));
+            if landed {
+                return Ok(());
+            }
+            if attempt + 1 == CONFIG_POLLS {
+                break;
+            }
+        }
+        Err(ttStatus::TT_ERROR_DEVICE)
+    }
+
+    /// The pinned DMA buffer, allocated on first use.
+    fn ensure_dma(&mut self) -> Result<(), ttStatus> {
+        if self.dma.is_some() {
+            return Ok(());
+        }
+        let Link::Driver(kmd) = &self.link else {
+            return Ok(());
+        };
+        self.dma = Some(kmd.allocate_dma(DMA_CHUNK)?);
+        Ok(())
+    }
+
+    /// Copy `bytes` to `address` on `tile` through the PCIe DMA engine.
+    ///
+    /// Returns `Ok(false)` when there is no engine (the simulator), so the
+    /// caller falls back to the window.
+    fn dma_write(&mut self, tile: NocCoord, address: u64, bytes: &[u8]) -> Result<bool, ttStatus> {
+        self.ensure_dma()?;
+        let Some(mut dma) = self.dma.take() else {
+            return Ok(false);
+        };
+        let result = self.dma_write_chunks(tile, address, bytes, &mut dma);
+        self.dma = Some(dma);
+        result.map(|()| true)
+    }
+
+    fn dma_write_chunks(
+        &mut self,
+        tile: NocCoord,
+        address: u64,
+        bytes: &[u8],
+        dma: &mut crate::kmd::DmaBuffer,
+    ) -> Result<(), ttStatus> {
+        let mut done = 0usize;
+        while done < bytes.len() {
+            let at = address + done as u64;
+            let base = at & !(WINDOW_SIZE - 1);
+            let offset = at - base;
+            let room = (WINDOW_SIZE - offset) as usize;
+            let here = (bytes.len() - done).min(room).min(dma.size);
+            self.retarget_verified(tile, base, true)?;
+            // The engine reads the window at its AXI address, which is the
+            // window's offset in BAR0 (`architecture_tlbs.cpp:22-36`).
+            let window_axi = self.window_bar_offset() + offset;
+            let axi = u32::try_from(window_axi).map_err(|_| ttStatus::TT_ERROR_ARGUMENT)?;
+            let Link::Driver(kmd) = &self.link else {
+                return Err(ttStatus::TT_ERROR_UNSUPPORTED);
+            };
+            kmd.dma_h2d(axi, &bytes[done..done + here], dma)?;
+            done += here;
+        }
         Ok(())
     }
 
@@ -1840,20 +2013,33 @@ fn check_bar0(offset: u64, len: usize) -> Result<(), ttStatus> {
     Ok(())
 }
 
-/// Encode the three dwords of a 2 MiB unicast window on NoC #0, strict ordering.
-fn tlb_words(base_address: u64, tile: NocCoord) -> Result<[u32; 3], ttStatus> {
+/// Encode the three dwords of a 2 MiB unicast window on NoC #0.
+///
+/// This is UMD's `tlb_data` for Blackhole (`blackhole_implementation.hpp:24-43`,
+/// `tlb.hpp`) plus the two settings a *transfer* window gets:
+/// `TlbWindow::make_tlb_config` (`tlb_window.cpp:43-61`) fills the static
+/// virtual channel from `ArchitectureTlbs::get_static_vc(flags)`
+/// (`architecture_tlbs.cpp:42-57`: `static_vc = 1`, and the buddy is 1 for a
+/// read window and 0 for a write), and `configure` defaults to
+/// `IoOrdering::Strict`. A window without a static VC is arbitrated per
+/// transaction, which is what made every host store wait for its own round
+/// trip.
+fn tlb_words(base_address: u64, tile: NocCoord, write: bool) -> Result<[u32; 3], ttStatus> {
     if base_address % WINDOW_SIZE != 0 {
         let _ = base_address;
         return Err(ttStatus::TT_ERROR_WINDOW_ALIGNMENT);
     }
     // Field positions, `HostToDeviceTLBs.md`: local offset 43 bits, then the
-    // unicast end coordinate, NoC index and ordering.
+    // unicast end coordinate, NoC index, ordering and the static channel.
     const OFFSET_BITS: u32 = 43;
     const X_END: u32 = 43;
     const Y_END: u32 = 49;
     const NOC: u32 = 67;
     const ORDERING: u32 = 70;
-    /// Strict AXI response ordering.
+    const STATIC_VC: u32 = 73;
+    const STATIC_VC_BUDDY: u32 = 75;
+    const STATIC_VC_CLASS: u32 = 76;
+    /// Strict AXI response ordering (`IoOrdering::Strict`).
     const STRICT_AXI: u64 = 1;
 
     let mut words = [0u32; 3];
@@ -1868,6 +2054,9 @@ fn tlb_words(base_address: u64, tile: NocCoord) -> Result<[u32; 3], ttStatus> {
     // NoC #0: the only NoC libttsim decodes.
     place(&mut words, NOC, 1, 0);
     place(&mut words, ORDERING, 2, STRICT_AXI);
+    place(&mut words, STATIC_VC, 1, 1);
+    place(&mut words, STATIC_VC_BUDDY, 1, u64::from(!write));
+    place(&mut words, STATIC_VC_CLASS, 2, 0);
     Ok(words)
 }
 

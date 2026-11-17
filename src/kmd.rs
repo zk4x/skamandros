@@ -89,6 +89,7 @@ pub mod abi {
     // `ioctl.h:14-31`, in numeric order.
     pub const GET_DEVICE_INFO: u64 = io(0);
     pub const QUERY_MAPPINGS: u64 = io(2);
+    pub const ALLOCATE_DMA_BUF: u64 = io(3);
     pub const GET_DRIVER_INFO: u64 = io(5);
     pub const LOCK_CTL: u64 = io(8);
     pub const ALLOCATE_TLB: u64 = io(11);
@@ -97,13 +98,13 @@ pub mod abi {
 
     /// `tenstorrent_mapping.mapping_id` (`ioctl.h:35-40`). Resource numbers are
     /// PCI BARs 0, 2 and 4 — not array indices — and each BAR has an uncached
-    /// and a write-combining mapping. Only BAR0's uncached view is mapped: it
-    /// carries every 2 MiB window and the configuration array, and it is the view
-    /// the configuration registers must go through (a write-combining store may be
-    /// merged or reordered).
+    /// and a write-combining mapping. BAR0 carries every 2 MiB window and the
+    /// configuration array; BAR2 carries the PCIe DMA engine's registers, which
+    /// UMD maps uncached (`pci_device_->bar2_uc`) and no other way.
     pub mod mapping_id {
         pub const RESOURCE0_UC: u32 = 1;
         pub const RESOURCE0_WC: u32 = 2;
+        pub const RESOURCE2_UC: u32 = 5;
     }
 
     /// `TENSTORRENT_LOCK_CTL_*` at the value this module uses (`ioctl.h:212-215`).
@@ -211,6 +212,40 @@ pub mod abi {
         pub addr: u64,
         pub data: u64,
     }
+
+    /// `tenstorrent_allocate_dma_buf_in` (`ioctl.h:93-100`).
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct AllocateDmaBufIn {
+        pub requested_size: u32,
+        pub buf_index: u8,
+        /// `TENSTORRENT_ALLOCATE_DMA_BUF_NOC_DMA` (2) asks for a NoC address.
+        pub flags: u8,
+        pub reserved0: [u8; 2],
+        pub reserved1: [u64; 2],
+    }
+
+    /// `tenstorrent_allocate_dma_buf_out` (`ioctl.h:102-111`): the physical
+    /// address the card reads from, the mmap key for the host's view, and (with
+    /// the NoC flag) the address the NoC can DMA from.
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct AllocateDmaBufOut {
+        pub physical_address: u64,
+        pub mapping_offset: u64,
+        pub size: u32,
+        pub reserved0: u32,
+        pub noc_address: u64,
+        pub reserved1: u64,
+    }
+
+    /// `tenstorrent_allocate_dma_buf` (`ioctl.h:113-116`).
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct AllocateDmaBuf {
+        pub input: AllocateDmaBufIn,
+        pub output: AllocateDmaBufOut,
+    }
 }
 
 /// `ioctl`'s request argument, as libc declares it: `c_ulong` in glibc,
@@ -309,6 +344,98 @@ impl Bar {
         }
     }
 
+    /// Copy `dst.len()` bytes out of a TLB window at `offset`.
+    ///
+    /// A window maps L1 or DRAM, not a register: no dword ordering applies and
+    /// no access may be elided, but a dword-at-a-time loop throws the bus away
+    /// (measured at 18 MB/s against this card). This is tt-metal's
+    /// `umd::memcpy_from_device` (`device_memcpy.cpp:355-420`): byte loads
+    /// until the device pointer is 4-byte aligned, then 256-byte blocks of
+    /// eight 32-byte AVX2 loads, then a dword tail. A short read — a register
+    /// or one mailbox word — stays the dword path, because several regions
+    /// behind this aperture decode dwords only ([`Bar::read`]).
+    fn read_window(&self, offset: usize, dst: &mut [u8]) {
+        assert!(offset + dst.len() <= self.len);
+        if dst.len() < 32 {
+            self.read(offset, dst);
+            return;
+        }
+        let src = unsafe { self.ptr.add(offset) };
+        let mut done = 0;
+        while done < dst.len() && (src as usize + done) % 4 != 0 {
+            // SAFETY: bounds checked above.
+            dst[done] = unsafe { std::ptr::read_volatile(src.add(done)) };
+            done += 1;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") {
+            let body = (dst.len() - done) & !31;
+            // SAFETY: `body` bytes of the mapping are in bounds, and the
+            // destination is a caller slice of at least that many.
+            unsafe { avx2_load(src.add(done), dst.as_mut_ptr().add(done), body) };
+            done += body;
+        }
+        let at = offset + done;
+        let four = (dst.len() - done) & !3;
+        for i in (0..four).step_by(4) {
+            // SAFETY: `at + i + 4` is inside the mapping.
+            let v = unsafe { std::ptr::read_volatile(self.ptr.add(at + i).cast::<u32>()) };
+            dst[done + i..done + i + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        done += four;
+        while done < dst.len() {
+            // SAFETY: bounds checked above.
+            dst[done] = unsafe { std::ptr::read_volatile(src.add(done)) };
+            done += 1;
+        }
+        flush_writes();
+    }
+
+    /// Copy `src` into a TLB window at `offset`. See [`Bar::read_window`].
+    ///
+    /// tt-metal's `umd::memcpy_to_device` (`device_memcpy.cpp:106-180`): a
+    /// 4-byte-aligned head of byte stores, 256-byte blocks of eight 32-byte
+    /// AVX2 stores, then a dword tail. The stores are not reordered across the
+    /// blocks (a compiler fence), and the `SFENCE` before returning is what
+    /// makes them visible to the card. A short write stays the dword path, as
+    /// in [`Bar::read_window`].
+    fn write_window(&self, offset: usize, src: &[u8]) {
+        assert!(offset + src.len() <= self.len);
+        if src.len() < 32 {
+            self.write(offset, src);
+            return;
+        }
+        let dst = unsafe { self.ptr.add(offset) };
+        let mut done = 0;
+        while done < src.len() && (dst as usize + done) % 4 != 0 {
+            // SAFETY: bounds checked above.
+            unsafe { std::ptr::write_volatile(dst.add(done), src[done]) };
+            done += 1;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") {
+            let body = (src.len() - done) & !31;
+            // SAFETY: `body` bytes of the mapping are in bounds, and the source
+            // is a caller slice of at least that many.
+            unsafe { avx2_store(dst.add(done), src.as_ptr().add(done), body) };
+            done += body;
+        }
+        let at = offset + done;
+        let four = (src.len() - done) & !3;
+        for i in (0..four).step_by(4) {
+            let v = u32::from_le_bytes(src[done + i..done + i + 4].try_into().unwrap());
+            // SAFETY: `at + i + 4` is inside the mapping.
+            unsafe { std::ptr::write_volatile(self.ptr.add(at + i).cast::<u32>(), v) };
+        }
+        done += four;
+        while done < src.len() {
+            // SAFETY: bounds checked above.
+            unsafe { std::ptr::write_volatile(dst.add(done), src[done]) };
+            done += 1;
+        }
+        flush_writes();
+    }
+
     /// Copy `src` into the aperture at `offset`. See [`Bar::read`].
     fn write(&self, offset: usize, src: &[u8]) {
         assert!(offset + src.len() <= self.len);
@@ -337,8 +464,51 @@ impl Drop for Bar {
     }
 }
 
+/// The PCIe DMA engine's `RDCH_0` register bank, from
+/// `BlackholeDmaTransfer` (`blackhole_dma_transfer.cpp:18-32`). Offsets into
+/// BAR2.
+const DMA_EN: u32 = 0x100;
+const DMA_DOORBELL: u32 = 0x104;
+const DMA_XFERSIZE: u32 = 0x11C;
+const DMA_SAR_LOW: u32 = 0x120;
+const DMA_SAR_HIGH: u32 = 0x124;
+const DMA_DAR_LOW: u32 = 0x128;
+const DMA_DAR_HIGH: u32 = 0x12C;
+const DMA_INT_SETUP: u32 = 0x188;
+const DMA_MSI_STOP_LOW: u32 = 0x190;
+const DMA_MSI_STOP_HIGH: u32 = 0x194;
+const DMA_MSI_ABORT_LOW: u32 = 0x1A0;
+const DMA_MSI_ABORT_HIGH: u32 = 0x1A4;
+const DMA_MSI_MSGD: u32 = 0x1A8;
+
+/// The marker the engine writes into the completion word when a transfer
+/// finishes (`DMA_COMPLETION_VALUE`, `dma_completion.hpp`).
+const DMA_COMPLETION_VALUE: u32 = 0xfaca;
+
+/// A pinned host buffer for the PCIe DMA engine: the data area, and the one
+/// page after it that holds the completion marker.
+pub struct DmaBuffer {
+    buffer: *mut u8,
+    buffer_pa: u64,
+    /// Bytes of data area (the completion page follows it).
+    pub size: usize,
+    completion: *mut u32,
+    completion_pa: u64,
+    len: usize,
+}
+
+// The mapping is host memory owned by this descriptor, not shared state.
+unsafe impl Send for DmaBuffer {}
+
+impl Drop for DmaBuffer {
+    fn drop(&mut self) {
+        // SAFETY: the region was mapped in `Kmd::allocate_dma` with this base
+        // and length, and nothing borrows it after `drop` begins.
+        unsafe { libc::munmap(self.buffer.cast(), self.len) };
+    }
+}
+
 /// One Blackhole reached through one `/dev/tenstorrent/N`.
-///
 /// Holds the file descriptor the driver ties the session lock and the cleanup
 /// write to, BAR0 in both of the driver's views, and the 2 MiB window the driver
 /// allocated for this session. tt-kmd exposes no configuration-space ioctl —
@@ -355,6 +525,9 @@ pub struct Kmd {
     /// passes `TlbMapping::WC`, `tlb_manager.cpp:44`) and its registers through
     /// the uncached view (`pci_device.cpp:531-536`).
     bar0_wc: Bar,
+    /// BAR2 uncached: the PCIe DMA engine's registers (`bar2_uc`,
+    /// `pci_device.cpp`).
+    bar2: Bar,
     fd: File,
     window: u32,
 }
@@ -421,7 +594,13 @@ impl Kmd {
             query_mappings(fd.as_fd(), 8).map_err(|e| failed("querying the BAR mappings", e))?;
         let bar0 = Bar::new(
             fd.as_fd(),
-            bar0_mapping(&mappings, abi::mapping_id::RESOURCE0_UC, &path, "uncached")?,
+            bar0_mapping(
+                &mappings,
+                abi::mapping_id::RESOURCE0_UC,
+                &path,
+                "BAR0 uncached",
+                BAR0_BYTES,
+            )?,
             BAR0_BYTES as usize,
         )
         .map_err(|e| failed("mapping BAR0 uncached", e))?;
@@ -431,11 +610,31 @@ impl Kmd {
                 &mappings,
                 abi::mapping_id::RESOURCE0_WC,
                 &path,
-                "write-combined",
+                "BAR0 write-combined",
+                BAR0_BYTES,
             )?,
             BAR0_BYTES as usize,
         )
         .map_err(|e| failed("mapping BAR0 write-combined", e))?;
+        // BAR2: the PCIe DMA engine. UMD maps it uncached (`bar2_uc`) and
+        // programs it there (`blackhole_dma_transfer.cpp:44-96`).
+        let bar2_size = mappings
+            .iter()
+            .find(|m| m.mapping_id == abi::mapping_id::RESOURCE2_UC)
+            .map(|m| m.mapping_size)
+            .ok_or(ttStatus::TT_ERROR_DEVICE)?;
+        let bar2 = Bar::new(
+            fd.as_fd(),
+            bar0_mapping(
+                &mappings,
+                abi::mapping_id::RESOURCE2_UC,
+                &path,
+                "BAR2 uncached",
+                bar2_size,
+            )?,
+            bar2_size as usize,
+        )
+        .map_err(|e| failed("mapping BAR2 uncached", e))?;
 
         // Claim the card. The lock is advisory — it cannot stop `tt-smi` — but it
         // does stop a second `libskamandros`, which is the case a session can
@@ -471,6 +670,7 @@ impl Kmd {
         Ok(Kmd {
             bar0,
             bar0_wc,
+            bar2,
             fd,
             window: tlb.out_id,
         })
@@ -479,6 +679,134 @@ impl Kmd {
     /// The window index the driver allocated.
     pub fn window(&self) -> u32 {
         self.window
+    }
+
+    /// Allocate a pinned host buffer the PCIe DMA engine can read.
+    ///
+    /// tt-metal/UMD's `PCIDevice::allocate_pcie_dma_buffer` (`pci_device.cpp:1010-1050`):
+    /// one `ALLOCATE_DMA_BUF` ioctl, then the host view mmapped at the key it
+    /// returns. The engine reads the *physical* address it reports, and the
+    /// last page of the buffer is the completion flag (the engine writes a
+    /// marker there when the transfer lands).
+    pub fn allocate_dma(&self, size: usize) -> Result<DmaBuffer, ttStatus> {
+        let page = 4096usize;
+        let total = size
+            .checked_add(page)
+            .ok_or(ttStatus::TT_ERROR_ALLOC_ZERO)?;
+        let mut arg = abi::AllocateDmaBuf {
+            input: abi::AllocateDmaBufIn {
+                requested_size: u32::try_from(total).map_err(|_| ttStatus::TT_ERROR_ALLOC_ZERO)?,
+                buf_index: 0,
+                flags: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        call(self.fd.as_fd(), abi::ALLOCATE_DMA_BUF, &mut arg)
+            .map_err(|e| failed("allocating a DMA buffer", e))?;
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                self.fd.as_raw_fd(),
+                arg.output.mapping_offset as libc::off_t,
+            )
+        };
+        if mapping == libc::MAP_FAILED {
+            return Err(failed(
+                "mapping a DMA buffer",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(DmaBuffer {
+            buffer: mapping.cast(),
+            buffer_pa: arg.output.physical_address,
+            size,
+            completion: unsafe { mapping.cast::<u8>().add(size) }.cast(),
+            completion_pa: arg.output.physical_address + size as u64,
+            len: total,
+        })
+    }
+
+    /// Run one PCIe DMA read channel transfer: host `src` to device address
+    /// `dst`.
+    ///
+    /// `BlackholeDmaTransfer::h2d_start` (`blackhole_dma_transfer.cpp:44-96`),
+    /// transcribed: the engine is told where to write its completion marker,
+    /// enabled, given the source (host physical) and destination (card AXI)
+    /// addresses, and started by the doorbell. `h2d_is_complete` polls the
+    /// marker for `0xfaca` (`dma_completion.hpp`). Blackhole's read channel has
+    /// no device-to-host direction, which is why UMD throws there and reads
+    /// stay on the MMIO window.
+    pub fn dma_h2d(&self, dst: u32, src: &[u8], dma: &DmaBuffer) -> Result<(), ttStatus> {
+        if src.len() > dma.size {
+            return Err(ttStatus::TT_ERROR_ARGUMENT);
+        }
+        // SAFETY: `src.len() <= dma.size`, and the mapping is at least that big.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), dma.buffer, src.len());
+        }
+        // SAFETY: the completion word is inside the mapping.
+        unsafe { std::ptr::write_volatile(dma.completion, 0) };
+
+        let reg = |offset: u32, value: u32| self.bar2_write32(offset, value);
+        reg(DMA_INT_SETUP, 0x28);
+        reg(DMA_MSI_STOP_LOW, dma.completion_pa as u32);
+        reg(DMA_MSI_STOP_HIGH, (dma.completion_pa >> 32) as u32);
+        reg(DMA_MSI_ABORT_LOW, (dma.completion_pa + 4) as u32);
+        reg(DMA_MSI_ABORT_HIGH, ((dma.completion_pa + 4) >> 32) as u32);
+        reg(DMA_MSI_MSGD, DMA_COMPLETION_VALUE);
+        reg(DMA_EN, 0x1);
+        reg(DMA_SAR_LOW, dma.buffer_pa as u32);
+        reg(DMA_SAR_HIGH, (dma.buffer_pa >> 32) as u32);
+        reg(DMA_DAR_LOW, dst);
+        reg(DMA_DAR_HIGH, 0);
+        reg(DMA_XFERSIZE, src.len() as u32);
+        reg(DMA_DOORBELL, 0x1);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            // SAFETY: as above; the engine writes this word.
+            if unsafe { std::ptr::read_volatile(dma.completion) } == DMA_COMPLETION_VALUE {
+                return Ok(());
+            }
+            if std::time::Instant::now() > deadline {
+                eprintln!(
+                    "libskamandros: DMA h2d timeout: dst={dst:#x} size={} sar={:#x} completion_pa={:#x} \
+                     flag={:#x} en={:#x}",
+                    src.len(),
+                    dma.buffer_pa,
+                    dma.completion_pa,
+                    unsafe { std::ptr::read_volatile(dma.completion) },
+                    self.bar2_read32(DMA_EN)
+                );
+                return Err(ttStatus::TT_ERROR_FIRMWARE_TIMEOUT);
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// One dword of the PCIe DMA engine's register bank (BAR2, uncached).
+    fn bar2_write32(&self, offset: u32, value: u32) {
+        let at = u64::from(offset);
+        if at + 4 <= self.bar2.len as u64 {
+            // SAFETY: the offset is inside the mapped BAR2 aperture.
+            unsafe {
+                std::ptr::write_volatile(self.bar2.ptr.add(at as usize).cast::<u32>(), value)
+            };
+        }
+    }
+
+    fn bar2_read32(&self, offset: u32) -> u32 {
+        let at = u64::from(offset);
+        if at + 4 <= self.bar2.len as u64 {
+            // SAFETY: the offset is inside the mapped BAR2 aperture.
+            unsafe { std::ptr::read_volatile(self.bar2.ptr.add(at as usize).cast::<u32>()) }
+        } else {
+            0xdead_beef
+        }
     }
 
     /// Write `bytes` into BAR0 at `offset`, uncached.
@@ -520,7 +848,7 @@ impl Kmd {
         if end > BAR0_BYTES {
             return Err(ttStatus::TT_ERROR_BAR0_NOT_DECODED);
         }
-        self.bar0_wc.write(offset as usize, bytes);
+        self.bar0_wc.write_window(offset as usize, bytes);
         flush_writes();
         Ok(())
     }
@@ -534,7 +862,7 @@ impl Kmd {
         if end > BAR0_BYTES {
             return Err(ttStatus::TT_ERROR_BAR0_NOT_DECODED);
         }
-        self.bar0_wc.read(offset as usize, out);
+        self.bar0_wc.read_window(offset as usize, out);
         Ok(())
     }
 
@@ -606,14 +934,15 @@ fn bar0_mapping(
     id: u32,
     path: &Path,
     what: &str,
+    size: u64,
 ) -> Result<u64, ttStatus> {
     let Some(mapping) = mappings.iter().find(|m| m.mapping_id == id).copied() else {
-        eprintln!("libskamandros: {path:?} reports no {what} BAR0 mapping");
+        eprintln!("libskamandros: {path:?} reports no {what} mapping");
         return Err(ttStatus::TT_ERROR_DEVICE);
     };
-    if mapping.mapping_size != BAR0_BYTES {
+    if mapping.mapping_size != size {
         eprintln!(
-            "libskamandros: {path:?} reports BAR0 {what} as {} bytes, not {BAR0_BYTES}",
+            "libskamandros: {path:?} reports {what} as {} bytes, not {size}",
             mapping.mapping_size
         );
         return Err(ttStatus::TT_ERROR_DEVICE);
@@ -661,6 +990,94 @@ fn query_mappings(fd: BorrowedFd<'_>, count: u32) -> std::io::Result<Vec<abi::Ma
         });
     }
     Ok(out)
+}
+
+/// Eight 32-byte AVX2 loads per 256-byte block, tt-metal's
+/// `umd::memcpy_from_device` (`device_memcpy.cpp:355-420`): the block is read
+/// into registers first, so the non-posted loads of one block are in flight
+/// together, then written to host memory. A compiler fence closes the block,
+/// which is what keeps the next block's loads from moving above this one's
+/// stores.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_load(src: *const u8, dst: *mut u8, len: usize) {
+    use core::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
+    use core::sync::atomic::{Ordering, compiler_fence};
+    let mut i = 0;
+    while i + 256 <= len {
+        // SAFETY: the caller checked `len` bytes are readable in the mapping
+        // and writable in `dst`.
+        let v: [__m256i; 8] = unsafe {
+            [
+                _mm256_loadu_si256(src.add(i).cast()),
+                _mm256_loadu_si256(src.add(i + 32).cast()),
+                _mm256_loadu_si256(src.add(i + 64).cast()),
+                _mm256_loadu_si256(src.add(i + 96).cast()),
+                _mm256_loadu_si256(src.add(i + 128).cast()),
+                _mm256_loadu_si256(src.add(i + 160).cast()),
+                _mm256_loadu_si256(src.add(i + 192).cast()),
+                _mm256_loadu_si256(src.add(i + 224).cast()),
+            ]
+        };
+        for (k, value) in v.iter().enumerate() {
+            // SAFETY: as above; each store is 32 bytes inside the block.
+            unsafe { _mm256_storeu_si256(dst.add(i + 32 * k).cast(), *value) };
+        }
+        compiler_fence(Ordering::SeqCst);
+        i += 256;
+    }
+    while i + 32 <= len {
+        // SAFETY: as above.
+        unsafe {
+            let value = _mm256_loadu_si256(src.add(i).cast());
+            _mm256_storeu_si256(dst.add(i).cast(), value);
+        }
+        i += 32;
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// Eight 32-byte AVX2 stores per 256-byte block, tt-metal's
+/// `umd::memcpy_to_device` (`device_memcpy.cpp:106-180`): the whole block is
+/// loaded from host memory before any store, and a compiler fence closes the
+/// block so the store pipeline is not broken per store.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_store(dst: *mut u8, src: *const u8, len: usize) {
+    use core::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
+    use core::sync::atomic::{Ordering, compiler_fence};
+    let mut i = 0;
+    while i + 256 <= len {
+        // SAFETY: the caller checked `len` bytes are writable in the mapping
+        // and readable in `src`.
+        let v: [__m256i; 8] = unsafe {
+            [
+                _mm256_loadu_si256(src.add(i).cast()),
+                _mm256_loadu_si256(src.add(i + 32).cast()),
+                _mm256_loadu_si256(src.add(i + 64).cast()),
+                _mm256_loadu_si256(src.add(i + 96).cast()),
+                _mm256_loadu_si256(src.add(i + 128).cast()),
+                _mm256_loadu_si256(src.add(i + 160).cast()),
+                _mm256_loadu_si256(src.add(i + 192).cast()),
+                _mm256_loadu_si256(src.add(i + 224).cast()),
+            ]
+        };
+        for (k, value) in v.iter().enumerate() {
+            // SAFETY: as above; each store is 32 bytes inside the block.
+            unsafe { _mm256_storeu_si256(dst.add(i + 32 * k).cast(), *value) };
+        }
+        compiler_fence(Ordering::SeqCst);
+        i += 256;
+    }
+    while i + 32 <= len {
+        // SAFETY: as above.
+        unsafe {
+            let value = _mm256_loadu_si256(src.add(i).cast());
+            _mm256_storeu_si256(dst.add(i).cast(), value);
+        }
+        i += 32;
+    }
+    compiler_fence(Ordering::SeqCst);
 }
 
 /// Take or release one of the driver's 64 arbitrated locks.

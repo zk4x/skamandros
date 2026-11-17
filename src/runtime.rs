@@ -24,6 +24,7 @@ use std::sync::Mutex;
 use crate::compile::Module;
 use crate::device::Device;
 use crate::status::ttStatus;
+use tt_isa::dram::CHANNEL_BYTES;
 use tt_isa::mailbox;
 use tt_isa::noc::NocCoord;
 use tt_isa::noc::niu::Niu;
@@ -255,15 +256,20 @@ fn args_for(
     let mut arrays = [(Niu::Noc0, Vec::new()), (Niu::Noc1, Vec::new())];
     for (niu, args) in arrays.iter_mut() {
         *args = vec![grid[0], grid[1], module.iface, me_hi(tile)];
-        let hi = device.dram_hi_for(*niu);
         for (index, kind) in module.params.iter().enumerate() {
             let word = params[index];
             let (low, high) = match kind {
                 crate::compile::ParamKind::Scalar => (word as u32, 0),
-                crate::compile::ParamKind::Tensor => (
-                    u32::try_from(word).map_err(|_| ttStatus::TT_ERROR_PARAMETER_ADDRESS)?,
-                    hi,
-                ),
+                // A tensor names its channel's endpoint in the high word and
+                // the offset inside that channel in the low one, as tt-metal's
+                // `get_noc_addr_from_bank_id` does: the endpoint comes from the
+                // bank, the address is the bank-local offset
+                // (`dataflow_api_addrgen.h:516-533`).
+                crate::compile::ParamKind::Tensor => {
+                    let hi = device.dram_hi(word, *niu)?;
+                    let channel_bytes = tt_isa::dram::CHANNEL_BYTES;
+                    ((word % channel_bytes) as u32, hi)
+                }
             };
             args.push(low);
             args.push(high);
@@ -291,27 +297,34 @@ fn launch_steps(
     // (`LocalChip::insert_host_to_device_barrier` -> `set_membar_flag`,
     // `local_chip.cpp:472-508`).
     //
-    // Channel 0 only: every allocation this driver hands out is an offset in
-    // channel 0 (`Device::alloc_dram`), so one channel's barrier covers every
-    // byte a launch can read. A chip-wide barrier would have to visit all
-    // seven survivors.
+    // Every channel, as tt-metal's `dram_barrier` does: it collects all DRAM
+    // channels and inserts the barrier on each channel's DRAM core
+    // (`tt_cluster.cpp:1201-1208` -> `LocalChip::dram_membar`,
+    // `local_chip.cpp:446-476`), because a host write is posted and may land on
+    // any bank after the launch reads it. An address is `channel *
+    // CHANNEL_BYTES`, so the same word is written on each channel in turn.
     for flag in [BARRIER_SET, BARRIER_RESET] {
-        device.dram_write(DRAM_BARRIER, &flag.to_le_bytes())?;
-        let mut back = [0u8; 4];
-        let mut polls = 0u32;
-        loop {
-            device.dram_read(DRAM_BARRIER, &mut back)?;
-            if u32::from_le_bytes(back) == flag {
-                break;
-            }
-            polls += 1;
-            if polls == BARRIER_POLLS {
-                eprintln!(
-                    "libskamandros: the DRAM barrier word at offset {DRAM_BARRIER:#x} of channel 0 \
-                     still reads {:#010x}, not {flag:#010x}: the host's writes are not reaching DRAM",
-                    u32::from_le_bytes(back)
-                );
-                return Err(ttStatus::TT_ERROR_DEVICE);
+        for channel in device.dram_channels() {
+            let at = u64::from(channel.index()) * CHANNEL_BYTES + DRAM_BARRIER;
+            device.dram_write(at, &flag.to_le_bytes())?;
+            let mut back = [0u8; 4];
+            let mut polls = 0u32;
+            loop {
+                device.dram_read(at, &mut back)?;
+                if u32::from_le_bytes(back) == flag {
+                    break;
+                }
+                polls += 1;
+                if polls == BARRIER_POLLS {
+                    eprintln!(
+                        "libskamandros: the DRAM barrier word at offset {DRAM_BARRIER:#x} of \
+                         channel {} still reads {:#010x}, not {flag:#010x}: the host's writes are \
+                         not reaching that channel",
+                        channel.index(),
+                        u32::from_le_bytes(back)
+                    );
+                    return Err(ttStatus::TT_ERROR_DEVICE);
+                }
             }
         }
     }
