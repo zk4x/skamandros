@@ -76,7 +76,7 @@ or an `i32` value; a scalar parameter is the shape `0`, and a buffer is two cons
 Every `load`, `store` and `copy` names its unit — `32,32` a tile, `1,32` a row, `32,1` a column, `1,1` one
 datum — and its index counts those units. There is no implicit dtype conversion: `cast` converts with the C type's rounding,
 `bitcast` renames the same bits, and the dtypes are `f32`, `bf16`, `i32` and `bool`. The ops are [zyx's](https://github.com/zk4x/zyx) `UOp` and
-`BOp` plus `matmul`, `sum` and `max`; there is no `relu`/`elu`/`sigmoid` - these can be written manually using other
+`BOp` plus `matmul`, `sum`, `max` and `transpose`; there is no `relu`/`elu`/`sigmoid` - these can be written manually using other
 primitive ops and *skamandros automatically optimizes memory allocation around them* (that is automatic **fusion**, no llks,
 [you are welcome](https://github.com/geohot/tt-tiny)).
 
@@ -181,7 +181,9 @@ Working end to end through the C ABI:
   stays 16-bit,
 - [x] both reduces,
 - [x] `matmul`,
-- [ ] `rms_norm` over two tokens and the real hidden size — it is red on the card, green on sim
+- [x] `transpose` of a bf16 tile, including `q @ kᵀ` (the first GEMM of attention); an `f32` tile is
+  `TT_TODO_TRANSPOSE`,
+- [x] `rms_norm` over two tokens and the real hidden size,
 - [x] a symbolic loop bound,
 - [x] a symbolic grid,
 - [x] a gather,

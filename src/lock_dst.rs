@@ -36,6 +36,7 @@ fn is_math(k: &Kernel, op: &Op) -> bool {
         | Op::Unary { .. }
         | Op::Binary { .. }
         | Op::Select { .. }
+        | Op::Transpose { .. }
         | Op::Matmul { .. }
         | Op::Sum { .. }
         | Op::Max { .. } => true,

@@ -837,7 +837,7 @@ copy 32,32 %ba [0] = %pa [0]
 copy 32,32 %bb [0] = %pa [0]
 copy 32,32 %bf [0] = %pf [0]
 %m = acc bf16 32,32
-%zero = const f32 0
+%zero = const bf16 0
 store 32,32 %m = %zero
 load 32,32 %a = %ba [0]
 load 32,32 %b = %bb [0]
@@ -867,7 +867,7 @@ grid 1,1
 copy 32,32 %ba [0] = %pa [0]
 copy 32,32 %bb [0] = %pa [0]
 %m = acc bf16 32,32
-%zero = const f32 0
+%zero = const bf16 0
 store 32,32 %m = %zero
 load 32,32 %a = %ba [0]
 load 32,32 %b = %bb [0]
@@ -1141,7 +1141,7 @@ grid 1,1
 copy 32,32 %bx [0] = %px [0]
 copy 32,32 %bs [0] = %ps [0]
 %m = acc bf16 1,32
-%zero = const f32 0
+%zero = const bf16 0
 store 32,32 %m = %zero
 load 32,32 %x = %bx [0]
 load 32,32 %s = %bs [0]
@@ -1158,6 +1158,68 @@ copy 32,32 %out [0] = %bo [0]
         &reduce_program("1,1", "sum %m %x %s", true),
         S::TT_TODO_REDUCE,
     );
+}
+
+/// `transpose` is one 32x32 register tile. It compiles for a bf16 value (the
+/// 16-bit arm `transpose_tile` uses), and the text form round-trips.
+#[test]
+fn a_transpose_is_one_tile() {
+    const PROGRAM: &str = "\
+version 9
+grid 1,1
+%pin = param bf16 1024
+%pout = param f32 1024
+%bin = buffer bf16 32,32
+%bout = buffer f32 32,32
+copy 32,32 %bin [0] = %pin [0]
+load 32,32 %x = %bin [0]
+%y = transpose %x
+%z = cast %y to f32
+store 32,32 %bout [0] = %z
+copy 32,32 %pout [0] = %bout [0]
+";
+    let k = Kernel::parse(PROGRAM).expect("a bf16 transpose parses");
+    let text = k.to_string();
+    assert!(text.contains("transpose %x"), "the op round-trips: {text}");
+    compile::compile(&k).expect("the bf16 transpose lowers");
+
+    // The 32-bit arm is not lowered: ttsim refuses tt-metal's first half move.
+    const F32: &str = "\
+version 9
+grid 1,1
+%pin = param f32 1024
+%pout = param f32 1024
+%bin = buffer f32 32,32
+%bout = buffer f32 32,32
+copy 32,32 %bin [0] = %pin [0]
+load 32,32 %x = %bin [0]
+%y = transpose %x
+store 32,32 %bout [0] = %y
+copy 32,32 %pout [0] = %bout [0]
+";
+    let k = Kernel::parse(F32).expect("an f32 transpose parses");
+    assert_eq!(
+        compile::compile(&k).expect_err("the f32 arm is a TODO"),
+        ttStatus::TT_TODO_TRANSPOSE
+    );
+
+    // A row is not a square: the op names one whole tile.
+    const ROW: &str = "\
+version 9
+grid 1,1
+%pin = param bf16 32
+%pout = param f32 32
+%bin = buffer bf16 1,32
+%bout = buffer f32 1,32
+copy 1,32 %bin [0] = %pin [0]
+load 1,32 %x = %bin [0]
+%y = transpose %x
+%z = cast %y to f32
+store 1,32 %bout [0] = %z
+copy 1,32 %pout [0] = %bout [0]
+";
+    let err = Kernel::parse(ROW).expect_err("a row has no transpose");
+    assert_eq!(err, ttStatus::TT_ERROR_TRANSPOSE_OPERAND);
 }
 
 /// A ring written under one symbolic bound and read under another: nothing

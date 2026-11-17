@@ -486,6 +486,13 @@ pub enum ttStatus {
     /// and a ring may end holding up to its own depth (a producer one page
     /// ahead of its consumer is a pipeline, not a leak).
     TT_ERROR_RING_UNBALANCED = 189,
+    /// `transpose` in a 16-bit `Dst` module: the lowering transcribed is
+    /// tt-metal's 32-bit `transpose_dest_32b`, whose format switching has no
+    /// 16-bit counterpart here yet.
+    TT_TODO_TRANSPOSE = 190,
+    /// A `transpose` operand is not a 32x32 register tile: the op is one whole
+    /// tile, and a row, a column or a scalar has no square to transpose.
+    TT_ERROR_TRANSPOSE_OPERAND = 191,
 }
 
 impl ttStatus {
@@ -676,6 +683,8 @@ impl ttStatus {
             ttStatus::TT_INTERNAL_BUG => "TT_INTERNAL_BUG",
             ttStatus::TT_ERROR_DST_ROW_ODD => "TT_ERROR_DST_ROW_ODD",
             ttStatus::TT_ERROR_RING_UNBALANCED => "TT_ERROR_RING_UNBALANCED",
+            ttStatus::TT_TODO_TRANSPOSE => "TT_TODO_TRANSPOSE",
+            ttStatus::TT_ERROR_TRANSPOSE_OPERAND => "TT_ERROR_TRANSPOSE_OPERAND",
         }
     }
 }

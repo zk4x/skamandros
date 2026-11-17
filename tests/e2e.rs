@@ -2563,7 +2563,7 @@ grid 1,1
 copy 32,32 %ba [0] = %pa [0]
 copy 32,32 %bb [0] = %pb [0]
 %m = acc bf16 32,32
-%zero = const f32 0
+%zero = const bf16 0
 store 32,32 %m = %zero
 load 32,32 %a = %ba [0]
 load 32,32 %b = %bb [0]
@@ -3117,7 +3117,7 @@ grid 1,1
 copy 32,32 %bx [0] = %px [0]
 copy 32,32 %bs [0] = %ps [0]
 %acc = acc bf16 32,1
-%zero = const f32 0
+%zero = const bf16 0
 store 32,32 %acc = %zero
 load 32,32 %x = %bx [0]
 load 32,32 %s = %bs [0]
@@ -3138,7 +3138,7 @@ grid 1,1
 copy 32,32 %bx [0] = %px [0]
 copy 32,32 %bs [0] = %ps [0]
 %acc = acc bf16 1,32
-%zero = const f32 0
+%zero = const bf16 0
 store 32,32 %acc = %zero
 load 32,32 %x = %bx [0]
 load 32,32 %s = %bs [0]
@@ -3156,7 +3156,7 @@ grid 1,1
 %bo = buffer bf16 32,32
 copy 32,32 %bx [0] = %px [0]
 %acc = acc bf16 1,32
-%low = const f32 -1000
+%low = const bf16 -1000
 store 32,32 %acc = %low
 load 32,32 %x = %bx [0]
 max %acc %x
@@ -3176,7 +3176,7 @@ grid 1,1
 %bo = buffer bf16 32,32
 copy 32,32 %bx [0] = %px [0]
 %acc = acc bf16 32,1
-%low = const f32 -1000
+%low = const bf16 -1000
 store 32,32 %acc = %low
 load 32,32 %x = %bx [0]
 max %acc %x
@@ -4915,7 +4915,7 @@ grid 1,1
 %br = buffer bf16 32,32
 %bo = buffer bf16 32,32
 %acc = acc bf16 32,1
-%zero = const f32 0
+%zero = const bf16 0
 %one = const i32 1
 %n = const i32 96
 copy 32,32 %bones [0] = %pone [0]
@@ -4965,7 +4965,7 @@ grid 1,1
 %bacc = buffer bf16 32,32
 %bo = buffer bf16 32,32
 %acc = acc bf16 32,1
-%zero = const f32 0
+%zero = const bf16 0
 %one = const i32 1
 %n = const i32 96
 copy 32,32 %bones [0] = %pone [0]
@@ -5050,7 +5050,7 @@ grid 1,1
 %bacc = buffer {out} 32,32
 %bo = buffer {out} 32,32
 %acc = acc {acc} 32,1
-%zero = const f32 0
+%zero = const {acc} 0
 %one = const i32 1
 %n = const i32 {n}
 copy 32,32 %bones [0] = %pone [0]
@@ -5088,7 +5088,7 @@ grid 1,1
 %bacc = buffer {out} 32,32
 %bo = buffer {out} 32,32
 %acc = acc {acc} 32,1
-%zero = const f32 0
+%zero = const {acc} 0
 %one = const i32 1
 %n = const i32 {n}
 copy 32,32 %bones [0] = %pone [0]
@@ -5551,7 +5551,7 @@ grid 1,1
 copy 32,32 %bx [0] = %px [0]
 copy 32,32 %bs [0] = %ps [0]
 %m = acc bf16 1,32
-%low = const f32 -1000
+%low = const bf16 -1000
 store 32,32 %m = %low
 load 32,32 %x = %bx [0]
 max %m %x
@@ -5560,7 +5560,7 @@ max %m %x
 %p = mul %d %k
 %e = exp2 %p
 %s = acc bf16 1,32
-%zero = const f32 0
+%zero = const bf16 0
 store 32,32 %s = %zero
 load 32,32 %ones = %bs [0]
 sum %s %e %ones
@@ -5678,10 +5678,125 @@ fn a_gather_is_pure_data_movement() {
     }
 }
 
+/// `%y = transpose %x`: datum `(row, column)` of the result is datum
+/// `(column, row)` of the source, and the four 16x16 faces move with the
+/// elements (face `(fr, fc)` becomes face `(fc, fr)`). This is tt-metal's
+/// `transpose_tile` for a 16-bit source: the unpacker does the whole transpose
+/// while it fills `SrcA`, and the datacopy into `Dst` widens the bf16 datum
+/// exactly. The transpose is a bit move, so every datum must match exactly.
+#[test]
+fn transpose_runs_on_the_simulator() {
+    const TRANSPOSE: &str = "\
+version 9
+grid 1,1
+%pin = param bf16 1024
+%pout = param bf16 1024
+%bin = buffer bf16 32,32
+%bout = buffer bf16 32,32
+copy 32,32 %bin [0] = %pin [0]
+load 32,32 %x = %bin [0]
+%y = transpose %x
+store 32,32 %bout [0] = %y
+copy 32,32 %pout [0] = %bout [0]
+";
+    // Distinct bf16-representable values, with signs and a wide range.
+    let x: Vec<u16> = (0..1024)
+        .map(|i| {
+            let (row, column) = tile_rc(i);
+            truncate_to_bf16((row as f32 * 32.0 + column as f32) * 0.5 - 1000.25)
+        })
+        .collect();
+    let bytes: Vec<u8> = x.iter().flat_map(|h| h.to_le_bytes()).collect();
+    let out = run_kernel_tensors(TRANSPOSE, &[&bytes], 1024 * 2);
+    let got: Vec<u16> = out
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for row in 0..32 {
+        for column in 0..32 {
+            assert_eq!(
+                got[tile_index(row, column)],
+                x[tile_index(column, row)],
+                "datum ({row}, {column})"
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
-// The llama forward's assemblies, minus the ones that need a transposed operand
-// (`q @ kᵀ` has no path yet: `Op::Matmul` carries no transpose).
+// The llama forward's assemblies.
 // ---------------------------------------------------------------------------
+
+/// The transpose composed with the Matrix Unit: `scores = q @ kᵀ`, the first
+/// GEMM of attention. `q`, `k` and the accumulator are bf16, so the kernel is
+/// one 16-bit `Dst` and the transpose takes the unpacker path.
+#[test]
+fn q_times_k_transposed_runs_on_the_simulator() {
+    const QK_TRANSPOSED: &str = "\
+version 9
+grid 1,1
+%pq = param bf16 1024
+%pk = param bf16 1024
+%pout = param bf16 1024
+%bq = buffer bf16 32,32
+%bk = buffer bf16 32,32
+%bo = buffer bf16 32,32
+%acc = acc bf16 32,32
+%zero = const bf16 0
+copy 32,32 %bq [0] = %pq [0]
+copy 32,32 %bk [0] = %pk [0]
+load 32,32 %q = %bq [0]
+load 32,32 %k = %bk [0]
+%kt = transpose %k
+store 32,32 %acc = %zero
+matmul %acc %q %kt
+store 32,32 %bo [0] = %acc
+copy 32,32 %pout [0] = %bo [0]
+";
+    // Small integers: exact in bf16, and the product and its bf16 sum are exact
+    // (a sum stays inside 128, well inside bf16's eight-bit significand).
+    let q_vals: Vec<f32> = (0..1024)
+        .map(|i| {
+            let (row, column) = tile_rc(i);
+            ((row as i32 * 3 + column as i32 * 5) % 3 - 1) as f32
+        })
+        .collect();
+    let k_vals: Vec<f32> = (0..1024)
+        .map(|i| {
+            let (row, column) = tile_rc(i);
+            ((row as i32 * 11 + column as i32 * 2) % 2) as f32
+        })
+        .collect();
+    // `%q` is a bf16 tile, so the host reads the same bf16 image the kernel does.
+    let to_bf16 = |v: &[f32]| -> Vec<u16> { v.iter().map(|x| truncate_to_bf16(*x)).collect() };
+    let q = to_bf16(&q_vals);
+    let k = to_bf16(&k_vals);
+    let q_w: Vec<f32> = q.iter().map(|h| widen_bf16(*h)).collect();
+    let k_w: Vec<f32> = k.iter().map(|h| widen_bf16(*h)).collect();
+    let mut kt = vec![0.0f32; 1024];
+    for row in 0..32 {
+        for column in 0..32 {
+            kt[tile_index(row, column)] = k_w[tile_index(column, row)];
+        }
+    }
+    let want = tile_matmul(&q_w, &kt);
+    let q_bytes: Vec<u8> = q.iter().flat_map(|h| h.to_le_bytes()).collect();
+    let k_bytes: Vec<u8> = k.iter().flat_map(|h| h.to_le_bytes()).collect();
+    let out = run_kernel_tensors(QK_TRANSPOSED, &[&q_bytes, &k_bytes], 1024 * 2);
+    let got: Vec<u16> = out
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for row in 0..32 {
+        for column in 0..32 {
+            assert_eq!(
+                got[tile_index(row, column)],
+                truncate_to_bf16(want[tile_index(row, column)]),
+                "score ({row}, {column})"
+            );
+        }
+    }
+}
 
 /// The causal mask of attention in the kernel that consumes it: a mask page
 /// added to the scores before `exp2`, `0` where a key is visible and a large

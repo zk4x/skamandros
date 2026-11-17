@@ -154,6 +154,7 @@ fn prepare(k: &Kernel) -> Result<(Plan, MachineKernel, Alloc), ttStatus> {
                 | Op::Unary { .. }
                 | Op::Binary { .. }
                 | Op::Select { .. }
+                | Op::Transpose { .. }
         );
         if !homes {
             continue;
@@ -241,6 +242,7 @@ fn page_operands(k: &Kernel, op: &Op) -> Vec<OpId> {
         Op::Matmul { a, b, .. } => vec![a, b],
         Op::Sum { x, s, .. } => vec![x, s],
         Op::Max { x, .. } => vec![x],
+        Op::Transpose { src } => vec![src],
         _ => Vec::new(),
     }
 }
@@ -645,7 +647,15 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     if wide && dtype == crate::ir::DType::Bf16 {
                         // The whole page at once: one `Z` plane per face, the
                         // descriptor's four faces, 64 `SrcA` rows.
-                        m.push(Core::Unpack, MirOp::Setadczw { unit: 0, face: 0 });
+                        m.push(
+                            Core::Unpack,
+                            MirOp::Setadczw {
+                                u0: true,
+                                u1: false,
+                                z0: Some(0),
+                                z1: None,
+                            },
+                        );
                         m.push(
                             Core::Unpack,
                             MirOp::UnpackConfig {
@@ -653,6 +663,8 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                                 to_src: true,
                                 dtype,
                                 haloize: false,
+                                add_dest_cntr: false,
+                                ch1_z_stride: 0,
                             },
                         );
                         m.push(Core::Unpack, MirOp::SetUnpackBase { cb, unit: 0 });
@@ -714,7 +726,15 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                         // The page's wait and release are the `wait`/`pop` ops
                         // `add_movers` placed around this load.
                         m.push(Core::Unpack, MirOp::Setdst { reg });
-                        m.push(Core::Unpack, MirOp::Setadczw { unit: 0, face: 0 });
+                        m.push(
+                            Core::Unpack,
+                            MirOp::Setadczw {
+                                u0: true,
+                                u1: false,
+                                z0: Some(0),
+                                z1: None,
+                            },
+                        );
                         m.push(
                             Core::Unpack,
                             MirOp::Setadcx {
@@ -730,6 +750,8 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                                 to_src: false,
                                 dtype,
                                 haloize: false,
+                                add_dest_cntr: false,
+                                ch1_z_stride: 0,
                             },
                         );
                         m.push(Core::Unpack, MirOp::SetUnpackBase { cb, unit: 0 });
@@ -756,17 +778,24 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                 shape: access,
             } => {
                 // An accumulator is written in place in `Dst`, not packed: the
-                // only form the verifier admits is a fill from an f32 constant,
-                // and the SFPU writes it row by row.
+                // only form the verifier admits is a fill from a constant of
+                // the accumulator's own dtype, and the SFPU writes it row by
+                // row.
                 if types.of(buffer).kind == crate::ir::ValueKind::Acc {
-                    let bits = match k.at(src) {
-                        Op::Const { bits, .. } => *bits,
+                    let (bits, from) = match *k.at(src) {
+                        Op::Const { bits, dtype, .. } => (bits, dtype),
                         _ => {
                             let _ = src;
                             return Err(ttStatus::TT_TODO_ACC_STORE);
                         }
                     };
                     let acc_dtype = types.of(buffer).dtype;
+                    if from != acc_dtype {
+                        let _ = (from, acc_dtype);
+                        return Err(ttStatus::TT_TODO_ACC_STORE);
+                    }
+                    // The lane is one 32-bit image: a bf16 datum widens to it.
+                    let bits = lane_image(from, bits);
                     let (unit_shape, _, _) = unit_of([32, 32], acc_dtype)?;
                     let rows = rows_of(unit_shape, at)?;
                     let reg = dst_reg(alloc, buffer)?;
@@ -1295,6 +1324,124 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     );
                 }
             }
+            // `%y = transpose %x`: tt-metal's `transpose_dest_32b<true>`. The
+            // tile is first moved into the destination `Dst` slot (the transpose
+            // works in place), then the math thread runs tt-metal's hi/lo
+            // half sequence: each 16-bit half is moved from `Dst` into `SrcB`,
+            // transposed there by `TRNSPSRCB`, and written back into its
+            // transposed face. The SrcA format/FP32 switches are the ones
+            // tt-metal uses to keep the two halves apart (Blackhole issue #449).
+            Op::Transpose { src } => {
+                let shape = types.of(src).shape;
+                if shape != RegShape::Tile {
+                    let _ = (at, shape);
+                    return Err(ttStatus::TT_ERROR_TRANSPOSE_OPERAND);
+                }
+                let dtype = types.of(src).dtype;
+                let out = dst_reg(alloc, owner(k, value))?;
+                // The page the tile comes from: a `load`'s own, or the
+                // compiler's staged copy of a computed value.
+                let (cb, staged) =
+                    fpu_page(k, &plan, src, at, ttStatus::TT_ERROR_TRANSPOSE_OPERAND)?;
+                if staged {
+                    stage(&mut m, k, &types, alloc, &acc_mask, src, cb)?;
+                    m.push(Core::Unpack, MirOp::CbWait { cb, n: 1 });
+                }
+                // tt-metal's `transpose_tile` has two paths. A 32-bit `Dst`
+                // unpacks the page face-transposed into `Dst` and runs
+                // `transpose_dest_32b<false>` on the math thread; a 16-bit
+                // source (`bf16` here, which skamandros's unpacker cannot
+                // convert to a 32-bit `Dst`) does the whole transpose on the
+                // unpacker with `transpose_of_faces` and
+                // `within_face_16x16_transpose`, then datacopies the result.
+                if dtype != crate::ir::DType::Bf16 {
+                    // tt-metal's 32-bit arm is `unpack_to_dest` with
+                    // `transpose_of_faces`, then `transpose_dest_32b<false>`.
+                    // ttsim refuses that sequence at its first `MOVD2B`
+                    // (`tf32 use_dst32b=1 dest_32b_lo=1`, the Blackhole erratum
+                    // TEN-4245), so the fp32 path is not lowered yet.
+                    let _ = (at, out);
+                    return Err(ttStatus::TT_TODO_TRANSPOSE);
+                }
+                {
+                    // A bf16 page cannot enter a 32-bit `Dst` through the
+                    // unpacker; the load arm's `SrcA` widening is the way in.
+                    // `transpose_of_faces` + `within_face_16x16_transpose`:
+                    // source faces 0,2,1,3 land in SrcA faces 0..3.
+                    for (i, (src_face, dst_face)) in [(0u32, 0u32), (2, 1), (1, 2), (3, 3)]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        m.push(
+                            Core::Unpack,
+                            MirOp::Setadczw {
+                                u0: true,
+                                u1: false,
+                                z0: Some(src_face),
+                                z1: Some(dst_face),
+                            },
+                        );
+                        m.push(
+                            Core::Unpack,
+                            MirOp::UnpackConfig {
+                                unit: 0,
+                                to_src: true,
+                                dtype,
+                                haloize: true,
+                                add_dest_cntr: true,
+                                ch1_z_stride: dtype.bytes() * 256,
+                            },
+                        );
+                        m.push(Core::Unpack, MirOp::SetUnpackBase { cb, unit: 0 });
+                        m.push(
+                            Core::Unpack,
+                            MirOp::Unpacr {
+                                unit: 0,
+                                count: 256,
+                                flip: i == 3,
+                            },
+                        );
+                    }
+                    m.push(
+                        Core::Math,
+                        MirOp::Setrwc {
+                            src_a: 0,
+                            src_b: 0,
+                            dst: 0,
+                            flip_src_a: false,
+                            flip_src_b: false,
+                            dst_cr: false,
+                        },
+                    );
+                    for band in 0..(DST_ROWS / 8) {
+                        m.push(
+                            Core::Math,
+                            MirOp::Mova2d {
+                                use_dst32b_lo: false,
+                                src_row: 8 * band,
+                                addr_mod: 0,
+                                move8_rows: true,
+                                reg: out,
+                                at: 8 * band,
+                            },
+                        );
+                    }
+                    m.push(
+                        Core::Math,
+                        MirOp::Setrwc {
+                            src_a: 0,
+                            src_b: 0,
+                            dst: 0,
+                            flip_src_a: true,
+                            flip_src_b: false,
+                            dst_cr: false,
+                        },
+                    );
+                }
+                if staged {
+                    m.push(Core::Unpack, MirOp::CbPop { cb, n: 1 });
+                }
+            }
             Op::Select {
                 cond,
                 if_true,
@@ -1490,8 +1637,10 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                         m.push(
                             Core::Unpack,
                             MirOp::Setadczw {
-                                unit: 1,
-                                face: 2 * fi + kk,
+                                u0: false,
+                                u1: true,
+                                z0: Some(2 * fi + kk),
+                                z1: None,
                             },
                         );
                         m.push(
@@ -1501,6 +1650,8 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                                 to_src: true,
                                 dtype: dt_a,
                                 haloize: false,
+                                add_dest_cntr: false,
+                                ch1_z_stride: 0,
                             },
                         );
                         m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_a, unit: 1 });
@@ -1515,8 +1666,10 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                         m.push(
                             Core::Unpack,
                             MirOp::Setadczw {
-                                unit: 0,
-                                face: 2 * kk,
+                                u0: true,
+                                u1: false,
+                                z0: Some(2 * kk),
+                                z1: None,
                             },
                         );
                         m.push(
@@ -1526,6 +1679,8 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                                 to_src: true,
                                 dtype: dt_b,
                                 haloize: false,
+                                add_dest_cntr: false,
+                                ch1_z_stride: 0,
                             },
                         );
                         m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 0 });
@@ -1554,8 +1709,10 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                         m.push(
                             Core::Unpack,
                             MirOp::Setadczw {
-                                unit: 0,
-                                face: 2 * kk + 1,
+                                u0: true,
+                                u1: false,
+                                z0: Some(2 * kk + 1),
+                                z1: None,
                             },
                         );
                         m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 0 });
@@ -1746,6 +1903,8 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                             to_src: true,
                             dtype: dt_x,
                             haloize: true,
+                            add_dest_cntr: false,
+                            ch1_z_stride: 0,
                         },
                     );
                     m.push(
@@ -1755,6 +1914,8 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                             to_src: true,
                             dtype: dt_b,
                             haloize: false,
+                            add_dest_cntr: false,
+                            ch1_z_stride: 0,
                         },
                     );
                     for group in 0..2u32 {
@@ -1764,7 +1925,15 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                             // One face into `SrcA` and one row of the scaler
                             // into `SrcB` (16 datums): tt-metal's AB-reduce
                             // unpack.
-                            m.push(Core::Unpack, MirOp::Setadczw { unit: 0, face });
+                            m.push(
+                                Core::Unpack,
+                                MirOp::Setadczw {
+                                    u0: true,
+                                    u1: false,
+                                    z0: Some(face),
+                                    z1: None,
+                                },
+                            );
                             m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_x, unit: 0 });
                             m.push(
                                 Core::Unpack,
@@ -1774,7 +1943,15 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                                     flip: true,
                                 },
                             );
-                            m.push(Core::Unpack, MirOp::Setadczw { unit: 1, face });
+                            m.push(
+                                Core::Unpack,
+                                MirOp::Setadczw {
+                                    u0: false,
+                                    u1: true,
+                                    z0: Some(face),
+                                    z1: None,
+                                },
+                            );
                             m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 1 });
                             m.push(
                                 Core::Unpack,
@@ -2005,7 +2182,15 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     for face in 0..4u32 {
                         // One face into `SrcA` and one row of the scaler into
                         // `SrcB` (16 datums): tt-metal's AB-reduce unpack.
-                        m.push(Core::Unpack, MirOp::Setadczw { unit: 0, face });
+                        m.push(
+                            Core::Unpack,
+                            MirOp::Setadczw {
+                                u0: true,
+                                u1: false,
+                                z0: Some(face),
+                                z1: None,
+                            },
+                        );
                         m.push(
                             Core::Unpack,
                             MirOp::UnpackConfig {
@@ -2013,6 +2198,8 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                                 to_src: true,
                                 dtype: dt_x,
                                 haloize: false,
+                                add_dest_cntr: false,
+                                ch1_z_stride: 0,
                             },
                         );
                         m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_x, unit: 0 });
@@ -2024,7 +2211,15 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                                 flip: true,
                             },
                         );
-                        m.push(Core::Unpack, MirOp::Setadczw { unit: 1, face });
+                        m.push(
+                            Core::Unpack,
+                            MirOp::Setadczw {
+                                u0: false,
+                                u1: true,
+                                z0: Some(face),
+                                z1: None,
+                            },
+                        );
                         m.push(
                             Core::Unpack,
                             MirOp::UnpackConfig {
@@ -2032,6 +2227,8 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                                 to_src: true,
                                 dtype: dt_b,
                                 haloize: false,
+                                add_dest_cntr: false,
+                                ch1_z_stride: 0,
                             },
                         );
                         m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 1 });
@@ -2223,6 +2420,189 @@ fn mvmul_group(role: &mut Vec<MirOp>, reg: Dst, at: u32) {
             });
         }
     }
+}
+
+/// tt-metal's `transpose_dest_32b<false>`: transpose `reg`'s four 16x16 faces
+/// within themselves, in place. The face arrangement is the unpacker's job
+/// (`transpose_of_faces`), which is why `transpose_tile` calls this arm for a
+/// 32-bit `Dst`.
+///
+/// Not called yet: the fp32 `Op::Transpose` arm is `TT_TODO_TRANSPOSE` because
+/// ttsim refuses the sequence's first `MOVD2B` (`tf32 use_dst32b=1
+/// dest_32b_lo=1`, Blackhole erratum TEN-4245), so it has not been run here.
+/// The transcription is kept for the card-side arm.
+#[allow(dead_code)]
+fn transpose_dst(m: &mut MachineKernel, reg: Dst) -> Result<(), ttStatus> {
+    // `ADDR_MOD_1`: nothing moves. Both `Config` words go out whole, because
+    // `Config` outlives the program that wrote it.
+    m.push(
+        Core::Math,
+        MirOp::ThreadWord {
+            addr: thread::ADDR_MOD_AB_SEC0_SrcAIncr.addr32() + 1,
+            value: 0,
+        },
+    );
+    m.push(
+        Core::Math,
+        MirOp::ThreadWord {
+            addr: thread::ADDR_MOD_DST_SEC0_DestIncr.addr32() + 1,
+            value: 0,
+        },
+    );
+    // `DISABLE_IMPLIED_SRCA_FMT`: the manual `SrcA` format switches below only
+    // take effect with the inferred format off.
+    m.push(
+        Core::Math,
+        MirOp::ThreadWord {
+            addr: thread::DISABLE_IMPLIED_SRCA_FMT_Base.addr32(),
+            value: 1,
+        },
+    );
+    // PRESERVE source denormals: the halves are raw 16-bit images, not numbers.
+    m.push(
+        Core::Math,
+        MirOp::AluAccCtrl {
+            fp32: true,
+            zero_flag_src: true,
+        },
+    );
+    // The counters this thread inherits are whatever the previous op left;
+    // every row below is absolute.
+    m.push(
+        Core::Math,
+        MirOp::Setrwc {
+            src_a: 0,
+            src_b: 0,
+            dst: 0,
+            flip_src_a: false,
+            flip_src_b: false,
+            dst_cr: false,
+        },
+    );
+    let hold = 1u32;
+    // The low 16 bits of every face go to `SrcA`, transposed. tt-metal's
+    // `ckernel_template::run()` walks the four faces; the `srca` operand steps
+    // by sixteen per face.
+    m.push(Core::Math, MirOp::SrcAFormat { format: 5 });
+    for face in 0..4u32 {
+        for (i, src) in [16u32, 20, 24, 28].into_iter().enumerate() {
+            m.push(
+                Core::Math,
+                MirOp::Movd2b {
+                    use_dst32b_lo: true,
+                    src_row: src,
+                    addr_mod: hold,
+                    move4_rows: true,
+                    reg,
+                    at: face * 16 + 4 * i as u32,
+                },
+            );
+        }
+        m.push(Core::Math, MirOp::Trnspsrcb);
+        for (i, src) in [16u32, 20, 24, 28].into_iter().enumerate() {
+            m.push(
+                Core::Math,
+                MirOp::Movb2a {
+                    src_a_row: face * 16 + 4 * i as u32,
+                    addr_mod: hold,
+                    move4_rows: true,
+                    src_b_row: src,
+                },
+            );
+        }
+    }
+    // tt-metal's `!transpose_of_faces` arm: the unpacker has already swapped
+    // the faces, so each face is only transposed within itself. `SrcAFormat`
+    // is Tf32 for the half moves, as in `transpose_dest_32b<false>`.
+    m.push(Core::Math, MirOp::SrcAFormat { format: 4 });
+    for face in 0..4u32 {
+        for (i, src) in [16u32, 20, 24, 28].into_iter().enumerate() {
+            m.push(
+                Core::Math,
+                MirOp::Movd2b {
+                    use_dst32b_lo: true,
+                    src_row: src,
+                    addr_mod: hold,
+                    move4_rows: true,
+                    reg,
+                    at: face * 16 + 4 * i as u32,
+                },
+            );
+        }
+        m.push(Core::Math, MirOp::Trnspsrcb);
+        for (i, src) in [16u32, 20, 24].into_iter().enumerate() {
+            m.push(
+                Core::Math,
+                MirOp::Movb2a {
+                    src_a_row: 4 * i as u32,
+                    addr_mod: hold,
+                    move4_rows: true,
+                    src_b_row: src,
+                },
+            );
+        }
+        m.push(
+            Core::Math,
+            MirOp::Movb2d {
+                use_dst32b_lo: false,
+                src_row: 28,
+                addr_mod: hold,
+                move4_rows: true,
+                reg,
+                at: face * 16 + 12,
+            },
+        );
+    }
+    // All the high halves are back; write the low halves from `SrcA`.
+    m.push(
+        Core::Math,
+        MirOp::AluAccCtrl {
+            fp32: false,
+            zero_flag_src: true,
+        },
+    );
+    m.push(Core::Math, MirOp::SrcAFormat { format: 0 });
+    for band in 0..8u32 {
+        m.push(
+            Core::Math,
+            MirOp::Mova2d {
+                use_dst32b_lo: true,
+                src_row: 8 * band,
+                addr_mod: hold,
+                move8_rows: true,
+                reg,
+                at: 8 * band,
+            },
+        );
+    }
+    // Restore the state the rest of the program expects.
+    m.push(
+        Core::Math,
+        MirOp::ThreadWord {
+            addr: thread::DISABLE_IMPLIED_SRCA_FMT_Base.addr32(),
+            value: 0,
+        },
+    );
+    m.push(
+        Core::Math,
+        MirOp::AluAccCtrl {
+            fp32: true,
+            zero_flag_src: false,
+        },
+    );
+    // `SETRWC(CLR_AB, SET_ABD)`: hand both source banks back.
+    m.push(
+        Core::Math,
+        MirOp::Setrwc {
+            src_a: 0,
+            src_b: 0,
+            dst: 0,
+            flip_src_a: true,
+            flip_src_b: true,
+            dst_cr: false,
+        },
+    );
+    Ok(())
 }
 
 /// One whole `SETC16` `ThreadConfig` word composed from `fields`.
@@ -2419,7 +2799,15 @@ fn fpu_broadcast(
         }
     }
     for face in 0..4u32 {
-        m.push(Core::Unpack, MirOp::Setadczw { unit: 0, face });
+        m.push(
+            Core::Unpack,
+            MirOp::Setadczw {
+                u0: true,
+                u1: false,
+                z0: Some(face),
+                z1: None,
+            },
+        );
         m.push(
             Core::Unpack,
             MirOp::UnpackConfig {
@@ -2427,6 +2815,8 @@ fn fpu_broadcast(
                 to_src: true,
                 dtype: dt_a,
                 haloize: false,
+                add_dest_cntr: false,
+                ch1_z_stride: 0,
             },
         );
         m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_a, unit: 0 });
@@ -2456,8 +2846,10 @@ fn fpu_broadcast(
         m.push(
             Core::Unpack,
             MirOp::Setadczw {
-                unit: 1,
-                face: b_face,
+                u0: false,
+                u1: true,
+                z0: Some(b_face),
+                z1: None,
             },
         );
         m.push(
@@ -2467,6 +2859,8 @@ fn fpu_broadcast(
                 to_src: true,
                 dtype: dt_b,
                 haloize: false,
+                add_dest_cntr: false,
+                ch1_z_stride: 0,
             },
         );
         m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 1 });

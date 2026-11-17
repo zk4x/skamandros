@@ -405,6 +405,10 @@ pub enum Op {
     Cast { dtype: DType, src: OpId },
     /// The same bits under another name, between dtypes of equal width.
     Bitcast { dtype: DType, src: OpId },
+    /// A 32x32 tile's transpose: `%y = transpose %x`. Datum `(r, c)` of the
+    /// result is datum `(c, r)` of the source, in the same page layout, and the
+    /// dtype is unchanged.
+    Transpose { src: OpId },
     /// One unary register op.
     Unary { op: UOp, a: OpId },
     /// One binary register op, with implicit broadcast.
@@ -500,6 +504,7 @@ impl Op {
             Op::Cast { src, .. } | Op::Bitcast { src, .. } | Op::Unary { a: src, .. } => {
                 [src].get(idx).copied()
             }
+            Op::Transpose { src } => [src].get(idx).copied(),
             Op::Binary { a, b, .. } => [a, b].get(idx).copied(),
             Op::Select {
                 cond,
@@ -558,6 +563,7 @@ impl Op {
             Op::Cast { src, .. } | Op::Bitcast { src, .. } | Op::Unary { a: src, .. } => {
                 ParamsMut::One(Some(src))
             }
+            Op::Transpose { src } => ParamsMut::One(Some(src)),
             Op::Binary { a, b, .. } => ParamsMut::Two(Some(a), Some(b)),
             Op::Select {
                 cond,
@@ -923,6 +929,7 @@ impl Kernel {
                     (ValueKind::Register, dtype, of(self.cast_source(id)).shape)
                 }
                 Unary { a, .. } => (ValueKind::Register, of(a).dtype, of(a).shape),
+                Transpose { src } => (ValueKind::Register, of(src).dtype, of(src).shape),
                 Binary { op, a, b } => {
                     let dtype = if op.returns_bool() {
                         DType::Bool
@@ -1205,7 +1212,7 @@ impl Kernel {
                         if self.const_i32(offset) != Some(0) {
                             return Err(ttStatus::TT_ERROR_ACC_OFFSET);
                         }
-                        if v.kind != ValueKind::Const || v.dtype != DType::F32 {
+                        if v.kind != ValueKind::Const || v.dtype != b.dtype {
                             return Err(ttStatus::TT_TODO_ACC_STORE);
                         }
                         continue;
@@ -1257,6 +1264,13 @@ impl Kernel {
                     if self.dtype(src).bytes() != dtype.bytes() {
                         let _ = (src, dtype);
                         return Err(ttStatus::TT_ERROR_BITCAST_WIDTH);
+                    }
+                }
+                Op::Transpose { src } => {
+                    let s = self.info(src);
+                    if !is_value(&s) || s.shape != RegShape::Tile {
+                        let _ = src;
+                        return Err(ttStatus::TT_ERROR_TRANSPOSE_OPERAND);
                     }
                 }
                 Op::Unary { a, .. } => {
@@ -1875,6 +1889,13 @@ impl Parser {
                     if_false,
                 });
             }
+            "transpose" => {
+                let src = t.value(&self.symbols)?;
+                t.end()?;
+                let id = self.ops.len();
+                self.define(name, id)?;
+                self.push(Op::Transpose { src });
+            }
             other => {
                 let id = self.ops.len();
                 if let Some(op) = UOp::from_name(other) {
@@ -2053,6 +2074,9 @@ impl Printer<'_, '_> {
                 unary_name(op),
                 self.name(a)
             ),
+            Op::Transpose { src } => {
+                writeln!(self.f, "{} = transpose {}", self.name(id), self.name(src))
+            }
             Op::Binary { op, a, b } => writeln!(
                 self.f,
                 "{} = {} {} {}",

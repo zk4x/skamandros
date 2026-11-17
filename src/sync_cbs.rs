@@ -535,6 +535,7 @@ fn reads_source(op: &Op, value: OpId) -> bool {
         Op::Matmul { a, b, .. } => a == value || b == value,
         Op::Sum { x, s, .. } => x == value || s == value,
         Op::Max { x, .. } => x == value,
+        Op::Transpose { src } => src == value,
         _ => false,
     }
 }

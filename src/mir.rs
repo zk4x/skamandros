@@ -337,12 +337,24 @@ pub enum MirOp {
         to_src: bool,
         dtype: DType,
         haloize: bool,
+        /// `UNPn_ADD_DEST_ADDR_CNTR`: the destination address is the context
+        /// base *plus* the `ch1` counter (the face `Setadczw`'s `z1` names)
+        /// instead of the context base alone.
+        add_dest_cntr: bool,
+        /// `UNPn_ADDR_CTRL_ZW_REG_1_Zstride`: the byte step the `ch1` counter
+        /// adds per destination face.
+        ch1_z_stride: u32,
     },
     /// `UNPACR`: the page [`MirOp::SetUnpackBase`] names into `unit`'s
     /// configured destination.
     Unpacr { unit: u8, count: u32, flip: bool },
     /// `SETADCZW`: which face the unpacker reads next.
-    Setadczw { unit: u8, face: u32 },
+    Setadczw {
+        u0: bool,
+        u1: bool,
+        z0: Option<u32>,
+        z1: Option<u32>,
+    },
     /// `SETADCX`: the datum run the unpacker walks.
     Setadcx { unit: u8, first: u32, count: u32 },
     /// `MVMUL`: `Dst` rows starting at `at` accumulate `SrcA * SrcB`.
@@ -437,11 +449,10 @@ pub enum MirOp {
     AluAccCtrl { fp32: bool, zero_flag_src: bool },
     /// `ALU_FORMAT_SPEC_REG0_SrcA`, through the override bit.
     ///
-    /// Nothing emits this since the 32-bit row reduce stopped switching the
-    /// `SrcA` format: the high-half transpose runs with the format the unpacker
-    /// left, which this silicon accepts.
-    #[allow(dead_code)]
-    SrcAFormat { dtype: DType },
+    /// `format` is the ISA's `DataFormat` number: `0` fp32, `4` tf32, `5`
+    /// bf16. The transpose switches between them because a 32-bit `Dst` datum
+    /// is transposed as two 16-bit halves.
+    SrcAFormat { format: u32 },
     /// `SETRWC`: the `SrcA`/`SrcB`/`Dst` row counters and the fidelity phase.
     Setrwc {
         src_a: u32,
@@ -901,11 +912,14 @@ fn write_op(f: &mut dyn fmt::Write, op: &MirOp) -> fmt::Result {
             to_src,
             dtype,
             haloize,
+            add_dest_cntr,
+            ch1_z_stride,
         } => write!(
             f,
-            "unpack_config u{unit} {}{}{}",
+            "unpack_config u{unit} {}{}{} z1stride {ch1_z_stride}{}",
             if to_src { "src" } else { "dst" },
             if haloize { " haloize" } else { "" },
+            if add_dest_cntr { " add-dest" } else { "" },
             format_args!(" {}", dtype.name())
         ),
         MirOp::Unpacr { unit, count, flip } => write!(
@@ -913,7 +927,19 @@ fn write_op(f: &mut dyn fmt::Write, op: &MirOp) -> fmt::Result {
             "unpacr u{unit} {count}{}",
             if flip { " flip" } else { "" }
         ),
-        MirOp::Setadczw { unit, face } => write!(f, "setadczw u{unit} face {face}"),
+        MirOp::Setadczw { u0, u1, z0, z1 } => write!(
+            f,
+            "setadczw{} z0 {:?} z1 {:?}",
+            if u0 {
+                " u0"
+            } else if u1 {
+                " u1"
+            } else {
+                ""
+            },
+            z0,
+            z1
+        ),
         MirOp::Setadcx { unit, first, count } => {
             write!(f, "setadcx u{unit} {first}..{}", first + count)
         }
@@ -1047,7 +1073,7 @@ fn write_op(f: &mut dyn fmt::Write, op: &MirOp) -> fmt::Result {
             if fp32 { "fp32" } else { "16b" },
             if zero_flag_src { " keep_denorm" } else { "" }
         ),
-        MirOp::SrcAFormat { dtype } => write!(f, "srca_format {}", dtype.name()),
+        MirOp::SrcAFormat { format } => write!(f, "srca_format {format}"),
         MirOp::Setrwc {
             src_a,
             src_b,

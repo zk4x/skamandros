@@ -22,7 +22,7 @@ use crate::status::ttStatus;
 use tt_isa::backend::{
     self, Before, ConfigWords, ThreadConfigEntry, block, cond, wait_for_packer, wait_for_unpacker0,
 };
-use tt_isa::cfg::generated::{alu, global, pack0, thcon, thread, unpack1};
+use tt_isa::cfg::generated::{alu, global, pack0, thcon, thread, unpack0, unpack1};
 use tt_isa::isa::Instruction;
 use tt_isa::isa::generated::{defs, encode};
 use tt_isa::noc::niu::Niu;
@@ -509,6 +509,8 @@ enum UnpackCfg {
     Src {
         dtype: DType,
         haloize: bool,
+        add_dest_cntr: bool,
+        ch1_z_stride: u32,
     },
     Dst {
         dtype: DType,
@@ -591,16 +593,44 @@ fn encode_unpack(
                 state.x0[u] = first;
                 state.x1[u] = first + count - 1;
             }
-            MirOp::Setadczw { unit, face } => state.face[usize::from(unit)] = face,
+            MirOp::Setadczw { u0, u1, z0, z1 } => {
+                let mut entry = encode::Setadczw::ZERO;
+                if u0 {
+                    entry = entry.u0(1);
+                }
+                if u1 {
+                    entry = entry.u1(1);
+                }
+                if let Some(face) = z0 {
+                    entry = entry.z0(1).z0_val(face);
+                    if u0 {
+                        state.face[0] = face;
+                    }
+                    if u1 {
+                        state.face[1] = face;
+                    }
+                }
+                if let Some(face) = z1 {
+                    entry = entry.z1(1).z1_val(face);
+                }
+                out.push(entry.encode().map_err(|_| ttStatus::TT_ERROR_SETADCZW)?);
+            }
             MirOp::UnpackConfig {
                 unit,
                 to_src,
                 dtype,
                 haloize,
+                add_dest_cntr,
+                ch1_z_stride,
             } => {
                 let u = usize::from(unit);
                 let cfg = if to_src {
-                    UnpackCfg::Src { dtype, haloize }
+                    UnpackCfg::Src {
+                        dtype,
+                        haloize,
+                        add_dest_cntr,
+                        ch1_z_stride,
+                    }
                 } else {
                     // A `Dst` config bakes the page's datum count and landing
                     // row into the descriptor, so both come from the `SETADCX`
@@ -640,9 +670,20 @@ fn encode_unpack(
                 }
                 let mut words = ConfigWords::new();
                 match cfg {
-                    UnpackCfg::Src { dtype, haloize } => {
-                        src_unpack_config(&mut words, unit, dtype, haloize, tail)?
-                    }
+                    UnpackCfg::Src {
+                        dtype,
+                        haloize,
+                        add_dest_cntr,
+                        ch1_z_stride,
+                    } => src_unpack_config(
+                        &mut words,
+                        unit,
+                        dtype,
+                        haloize,
+                        add_dest_cntr,
+                        ch1_z_stride,
+                        tail,
+                    )?,
                     UnpackCfg::Dst { datums, row, .. } => {
                         unpack_config(&mut words, datums, row, dtype, dst_is_16_bit, tail)?
                     }
@@ -1070,6 +1111,8 @@ fn src_unpack_config(
     unit: u8,
     dtype: DType,
     haloize: bool,
+    add_dest_cntr: bool,
+    ch1_z_stride: u32,
     tail: bool,
 ) -> Result<(), ttStatus> {
     let out = match dtype {
@@ -1077,6 +1120,7 @@ fn src_unpack_config(
         _ => DATA_FORMAT_TF32,
     };
     let haloize = u32::from(haloize);
+    let add_dest_cntr = u32::from(add_dest_cntr);
     let descriptor = tile_descriptor(l1_format(dtype), 16, 16, 4);
     let span = match unit {
         0 => {
@@ -1087,8 +1131,17 @@ fn src_unpack_config(
             config_set(words, thcon::THCON_SEC0_REG2_Disable_zero_compress_cntx0, 1)?;
             config_set(words, thcon::THCON_SEC0_REG2_Haloize_mode, haloize)?;
             config_set(words, thcon::THCON_SEC0_REG5_Dest_cntx0_address, 64)?;
+            config_set(
+                words,
+                unpack0::UNP0_ADD_DEST_ADDR_CNTR_add_dest_addr_cntr,
+                add_dest_cntr,
+            )?;
             config_set(words, unpack1::UNP0_ADDR_CTRL_XY_REG_1_Ystride, 0)?;
-            config_set(words, unpack1::UNP0_ADDR_CTRL_ZW_REG_1_Zstride, 0)?;
+            config_set(
+                words,
+                unpack1::UNP0_ADDR_CTRL_ZW_REG_1_Zstride,
+                ch1_z_stride,
+            )?;
             thcon::THCON_SEC0_REG0_TileDescriptor
         }
         _ => {
@@ -1098,7 +1151,18 @@ fn src_unpack_config(
             config_set(words, thcon::THCON_SEC1_REG2_Out_data_format, out)?;
             config_set(words, thcon::THCON_SEC1_REG2_Disable_zero_compress_cntx0, 1)?;
             config_set(words, thcon::THCON_SEC1_REG2_Haloize_mode, haloize)?;
-            config_set(words, unpack1::UNP1_ADDR_CTRL_ZW_REG_1_Zstride, 0)?;
+            if add_dest_cntr != 0 {
+                config_set(
+                    words,
+                    unpack1::UNP1_ADD_DEST_ADDR_CNTR_add_dest_addr_cntr,
+                    add_dest_cntr,
+                )?;
+            }
+            config_set(
+                words,
+                unpack1::UNP1_ADDR_CTRL_ZW_REG_1_Zstride,
+                ch1_z_stride,
+            )?;
             thcon::THCON_SEC1_REG0_TileDescriptor
         }
     };
@@ -1684,18 +1748,10 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), tt
             )?;
             out.extend(config_program(&words)?);
         }
-        MirOp::SrcAFormat { dtype } => {
+        MirOp::SrcAFormat { format } => {
             // The moves take `SrcA`'s format while
             // `DISABLE_IMPLIED_SRCA_FMT` is set; the override pair is the
             // field the format switch writes.
-            let format = match dtype {
-                DType::F32 => DATA_FORMAT_FP32,
-                DType::Bf16 => DATA_FORMAT_BF16,
-                other => {
-                    let _ = other;
-                    return Err(ttStatus::TT_ERROR_ENCODE);
-                }
-            };
             let mut words = ConfigWords::new();
             config_set(&mut words, alu::ALU_FORMAT_SPEC_REG_SrcA_override, 1)?;
             config_set(&mut words, alu::ALU_FORMAT_SPEC_REG_SrcA_val, format)?;
@@ -2189,7 +2245,7 @@ mod tests {
             let mut dst = ConfigWords::new();
             unpack_config(&mut dst, 1024, 0, DType::F32, false, tail).unwrap();
             let mut src = ConfigWords::new();
-            src_unpack_config(&mut src, 0, DType::F32, false, tail).unwrap();
+            src_unpack_config(&mut src, 0, DType::F32, false, false, 0, tail).unwrap();
             for (name, words) in [("dst", &dst), ("src", &src)] {
                 let tail_words: Vec<(u16, u32)> = words
                     .words()
