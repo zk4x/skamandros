@@ -460,7 +460,15 @@ fn semaphore_init(sems: &[(u8, u8)]) -> Result<Vec<Instruction>, ttStatus> {
     let mut out = Vec::new();
     for &(index, value) in sems {
         let sem = semaphore(index)?;
-        out.push(sync::init(sem, value, sync::MAX_VALUE).map_err(|_| {
+        // The `Dst` lock is a one-token semaphore: `MathLock` waits until it is
+        // below its maximum, and the packer's release is the get that takes it
+        // back to zero. Every other seam is only a counter.
+        let max = if index == crate::lower::SEM_MATH_PACK {
+            1
+        } else {
+            sync::MAX_VALUE
+        };
+        out.push(sync::init(sem, value, max).map_err(|_| {
             let _ = (index, value);
             ttStatus::TT_ERROR_SEMINIT
         })?);
@@ -714,6 +722,10 @@ fn encode_unpack(
             MirOp::SemWait { sem, .. } => {
                 out.extend(sync::take(semaphore(sem)?, Before::EVERYTHING));
             }
+            MirOp::SemWaitNoGet { sem, .. } => {
+                out.push(sync::wait_nonzero(semaphore(sem)?, Before::EVERYTHING));
+            }
+            MirOp::SemGet { sem } => out.push(sync::get(semaphore(sem)?)),
             MirOp::SemWaitFree { sem } => {
                 out.push(sync::wait_below_max(semaphore(sem)?, Before::EVERYTHING));
             }
@@ -1750,6 +1762,10 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), tt
             let s = semaphore(sem)?;
             out.extend(sync::take(s, Before::EVERYTHING));
         }
+        MirOp::SemWaitNoGet { sem, .. } => {
+            out.push(sync::wait_nonzero(semaphore(sem)?, Before::EVERYTHING));
+        }
+        MirOp::SemGet { sem } => out.push(sync::get(semaphore(sem)?)),
         other => {
             let _ = other;
             return Err(ttStatus::TT_ERROR_NOT_MATH);
@@ -1794,6 +1810,10 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(
             MirOp::SemWait { sem, .. } => {
                 out.extend(sync::take(semaphore(sem)?, Before::EVERYTHING));
             }
+            MirOp::SemWaitNoGet { sem, .. } => {
+                out.push(sync::wait_nonzero(semaphore(sem)?, Before::EVERYTHING));
+            }
+            MirOp::SemGet { sem } => out.push(sync::get(semaphore(sem)?)),
             MirOp::SemPost { sem } => {
                 out.extend(sync::post_after(sync::Unit::Packer, semaphore(sem)?));
             }

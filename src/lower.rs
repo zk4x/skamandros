@@ -27,6 +27,11 @@ use crate::riscv::reg;
 use crate::status::ttStatus;
 use tt_isa::cfg::generated::thread;
 
+/// The `Dst` lock the math thread and the packer share: tt-metal's one
+/// `MATH_PACK` semaphore, starting at zero (the math thread's turn).
+pub const SEM_MATH_PACK: u8 = 6;
+pub const LOCK_SEMS: [(u8, u8); 1] = [(SEM_MATH_PACK, 0)];
+
 /// `Dst` rows one 32x32 F32 tile occupies (`tt_isa`'s SFPU row is 16 datums).
 pub const DST_ROWS: u32 = 64;
 /// Datums in one 32x32 tile.
@@ -324,7 +329,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
     for (at, op) in k.ops() {
         for v in op.parameters() {
             last_use.insert(v, at);
-            if matches!(*op, Op::CopyTo { dst, src, .. } if v != dst && v != src) {
+            if matches!(*op, Op::Copy { dst, src, .. } if v != dst && v != src) {
                 continue;
             }
             other_use.insert(v);
@@ -493,6 +498,29 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                 mover = None;
                 continue;
             }
+            // tt-metal's `tile_regs_acquire`: wait until `MATH_PACK` is below
+            // its maximum, without taking it. The packer's release takes it.
+            Op::MathLock => {
+                m.push(Core::Math, MirOp::SemWaitFree { sem: SEM_MATH_PACK });
+            }
+            // `tile_regs_commit`: math has filled its `Dst` section.
+            Op::MathUnlock => {
+                m.push(Core::Math, MirOp::SemPost { sem: SEM_MATH_PACK });
+            }
+            // `tile_regs_wait`: wait for math, but the get is the release.
+            Op::PackLock => {
+                m.push(
+                    Core::Pack,
+                    MirOp::SemWaitNoGet {
+                        sem: SEM_MATH_PACK,
+                        before: 0,
+                    },
+                );
+            }
+            // `tile_regs_release`: hand `Dst` back to math.
+            Op::PackUnlock => {
+                m.push(Core::Pack, MirOp::SemGet { sem: SEM_MATH_PACK });
+            }
             Op::EndCompute => {
                 mover = Some(Core::Writer);
                 continue;
@@ -540,7 +568,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                 m.push(core, op);
                 continue;
             }
-            Op::CopyTo {
+            Op::Copy {
                 dst,
                 src,
                 dst_offset,
@@ -721,7 +749,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                 let _ = rows;
                 let _ = offset;
             }
-            Op::StoreTo {
+            Op::Store {
                 src,
                 buffer,
                 offset,

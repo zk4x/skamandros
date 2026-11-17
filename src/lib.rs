@@ -17,6 +17,7 @@ mod device;
 mod encode;
 mod ir;
 mod kmd;
+mod lock_dst;
 mod lower;
 mod mir;
 mod module;

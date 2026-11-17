@@ -8,6 +8,8 @@ authors = ["zk4x"]
 repository = "https://github.com/zk4x/skamandros"
 homepage = "https://github.com/zk4x/skamandros"
 description = "Tenstorrent kernel IR, allocator and driver. Builds libskamandros.so."
+keywords = ["tenstorrent", "compiler", "gpu", "riscv", "tensix"]
+categories = ["hardware-support", "compilers"]
 
 # docs.rs has neither the RISC-V target nor llvm-tools, so it documents the
 # compiler-only build; the default `firmware` feature needs both. The crate is

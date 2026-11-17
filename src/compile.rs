@@ -20,6 +20,7 @@ pub fn compile(k: &Kernel) -> Result<Module, ttStatus> {
     let k = &k;
     let mut k = crate::mover::add_movers(k)?;
     crate::sync_cbs::sync_cbs(&mut k)?;
+    crate::lock_dst::lock_dst(&mut k)?;
     let k = &k;
     // The one check of the virtual program: everything above is required to
     // leave a program this accepts, so a pass cannot hand a broken kernel to
@@ -35,6 +36,10 @@ pub fn compile(k: &Kernel) -> Result<Module, ttStatus> {
     // The hand-offs are derived from the accesses, before fusion replaces the
     // cross-core order with the per-core streams.
     crate::optimize::reg_sync(&mut machine)?;
+    // The IR locks carry tt-metal's `Dst` section hand-off (a whole section at
+    // a time, which the per-slot seams cannot express across a loop). The
+    // seams above still order the unpacker's pages and pace `Src`/`Dst` reuse.
+    machine.sems.extend(crate::lower::LOCK_SEMS);
     crate::optimize::fuse(&mut machine);
     // The allocator is what brings the lane registers and `Dst` ids inside the
     // hardware's limits, so it runs before the check that enforces them.

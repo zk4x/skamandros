@@ -126,7 +126,7 @@ impl Mover<'_> {
                     self.compute.push((id, op.clone()));
                     self.loops.pop();
                 }
-                Op::CopyTo {
+                Op::Copy {
                     dst,
                     src,
                     dst_offset,
@@ -141,7 +141,7 @@ impl Mover<'_> {
                     }
                     self.copies.push(Copy {
                         path: self.loops.clone(),
-                        op: Op::CopyTo {
+                        op: Op::Copy {
                             dst,
                             src,
                             dst_offset,
@@ -160,7 +160,7 @@ impl Mover<'_> {
                     let zero = self.zero()?;
                     self.copies.push(Copy {
                         path: self.loops.clone(),
-                        op: Op::CopyTo {
+                        op: Op::Copy {
                             dst: ring,
                             src: buffer,
                             dst_offset: zero,
@@ -178,7 +178,7 @@ impl Mover<'_> {
                         },
                     ));
                 }
-                Op::StoreTo {
+                Op::Store {
                     src,
                     buffer,
                     offset,
@@ -188,7 +188,7 @@ impl Mover<'_> {
                     let zero = self.zero()?;
                     self.copies.push(Copy {
                         path: self.loops.clone(),
-                        op: Op::CopyTo {
+                        op: Op::Copy {
                             dst: buffer,
                             src: ring,
                             dst_offset: offset,
@@ -199,7 +199,7 @@ impl Mover<'_> {
                     });
                     self.compute.push((
                         id,
-                        Op::StoreTo {
+                        Op::Store {
                             src,
                             buffer: ring,
                             offset: zero,
@@ -353,7 +353,7 @@ impl Mover<'_> {
     /// Emit one group's copies.
     fn bodies(&mut self, into: &mut Kernel, group: &[Copy]) -> Result<(), ttStatus> {
         for copy in group {
-            let Op::CopyTo {
+            let Op::Copy {
                 dst,
                 src,
                 dst_offset,
@@ -375,7 +375,7 @@ impl Mover<'_> {
             // waits for a published page and releases it (tt-metal's
             // `writer_unary_1.cpp` is `cb_wait_front`/`cb_pop_front`). Those
             // hand-offs are `sync_cbs`'s: this pass only places the copy.
-            into.push(Op::CopyTo {
+            into.push(Op::Copy {
                 dst,
                 src,
                 dst_offset,

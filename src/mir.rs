@@ -488,6 +488,12 @@ pub enum MirOp {
     SemPost { sem: u8 },
     /// `SEMWAIT` on this core, holding `before`'s blocks.
     SemWait { sem: u8, before: u8 },
+    /// `SEMWAIT` for a non-zero value without the `SEMGET` (tt-metal's
+    /// `packer_wait_for_math_done`). The get belongs to the release.
+    SemWaitNoGet { sem: u8, before: u8 },
+    /// `SEMGET`: decrement a semaphore without waiting (tt-metal's
+    /// `pack_dest_section_done`).
+    SemGet { sem: u8 },
     /// `SEMWAIT` C1: hold this thread's blocks until `sem`'s value is below
     /// its maximum.
     SemWaitFree { sem: u8 },
@@ -1080,6 +1086,8 @@ fn write_op(f: &mut dyn fmt::Write, op: &MirOp) -> fmt::Result {
         MirOp::Semset { sem, value } => write!(f, "semset {sem} = {value}"),
         MirOp::SemPost { sem } => write!(f, "sempost {sem}"),
         MirOp::SemWait { sem, before } => write!(f, "semwait {sem} before {before}"),
+        MirOp::SemWaitNoGet { sem, before } => write!(f, "semwaitn {sem} before {before}"),
+        MirOp::SemGet { sem } => write!(f, "semget {sem}"),
         MirOp::SemWaitFree { sem } => write!(f, "semwaitfree {sem}"),
         MirOp::Repeat { len, count } => write!(f, "repeat {count} x {len}"),
         MirOp::Loop { count } => write!(f, "loop {count}"),

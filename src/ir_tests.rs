@@ -284,7 +284,7 @@ grid 1,1
         .count();
     let copies = staged
         .ops()
-        .filter(|(_, op)| matches!(op, Op::CopyTo { .. }))
+        .filter(|(_, op)| matches!(op, Op::Copy { .. }))
         .count();
     assert_eq!(buffers, 2, "one staged buffer per direct access");
     assert_eq!(copies, 2, "one inbound and one outbound copy");

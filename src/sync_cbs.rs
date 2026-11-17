@@ -111,7 +111,7 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
                 let opened = loops.pop().ok_or(ttStatus::TT_ERROR_ENDLOOP_WITHOUT_LOOP)?;
                 end_of.insert(opened, at);
             }
-            Op::CopyTo { dst, src, .. } => {
+            Op::Copy { dst, src, .. } => {
                 if rings.contains(&src) {
                     consumers.push(Consumer {
                         ring: src,
@@ -133,7 +133,7 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
                 });
                 pending.push((at, section));
             }
-            Op::StoreTo { buffer, .. } if rings.contains(&buffer) => {
+            Op::Store { buffer, .. } if rings.contains(&buffer) => {
                 producer_depths
                     .entry(buffer)
                     .or_default()
@@ -505,8 +505,8 @@ fn consumer_ring(consumers: &[Consumer], load: OpId) -> Result<OpId, ttStatus> {
 /// The ring an op writes, if it writes one.
 fn write_ring(op: &Op, rings: &BTreeSet<OpId>) -> Option<OpId> {
     match *op {
-        Op::StoreTo { buffer, .. } if rings.contains(&buffer) => Some(buffer),
-        Op::CopyTo { dst, .. } if rings.contains(&dst) => Some(dst),
+        Op::Store { buffer, .. } if rings.contains(&buffer) => Some(buffer),
+        Op::Copy { dst, .. } if rings.contains(&dst) => Some(dst),
         _ => None,
     }
 }

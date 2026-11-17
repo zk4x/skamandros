@@ -380,7 +380,7 @@ pub enum Op {
     /// or a row and nothing narrower. A vector index on the parameter side names
     /// one base per datum, and the lanes fill the buffer's page: a `1,32` copy
     /// with 32 bases is 32 rows, one `32,32` page.
-    CopyTo {
+    Copy {
         dst: OpId,
         src: OpId,
         dst_offset: OpId,
@@ -395,7 +395,7 @@ pub enum Op {
         shape: [Dim; 2],
     },
     /// A register value into an L1 buffer.
-    StoreTo {
+    Store {
         src: OpId,
         buffer: OpId,
         offset: OpId,
@@ -453,6 +453,14 @@ pub enum Op {
     Push { cb: OpId, n: Dim },
     /// `pop %cb`: the page just consumed is released.
     Pop { cb: OpId, n: Dim },
+    /// The math thread takes `Dst` back from the packer.
+    MathLock,
+    /// The math thread hands its `Dst` section to the packer.
+    MathUnlock,
+    /// The packer waits for the math thread's `Dst` section.
+    PackLock,
+    /// The packer hands `Dst` back to the math thread.
+    PackUnlock,
 }
 
 impl Op {
@@ -466,12 +474,16 @@ impl Op {
             | Op::EndLoop
             | Op::EndReader
             | Op::EndCompute
+            | Op::MathLock
+            | Op::MathUnlock
+            | Op::PackLock
+            | Op::PackUnlock
             | Op::GridCoord { .. } => None,
             Op::Shape(ref ops) => ops.get(idx).copied(),
             Op::Param { shape, .. } => [shape].get(idx).copied(),
             Op::Grid { x, y } => [x, y].get(idx).copied(),
             Op::Loop { bound } => [bound].get(idx).copied(),
-            Op::CopyTo {
+            Op::Copy {
                 dst,
                 src,
                 dst_offset,
@@ -479,7 +491,7 @@ impl Op {
                 ..
             } => [dst, src, dst_offset, src_offset].get(idx).copied(),
             Op::Load { buffer, offset, .. } => [buffer, offset].get(idx).copied(),
-            Op::StoreTo {
+            Op::Store {
                 src,
                 buffer,
                 offset,
@@ -520,12 +532,16 @@ impl Op {
             | Op::EndLoop
             | Op::EndReader
             | Op::EndCompute
+            | Op::MathLock
+            | Op::MathUnlock
+            | Op::PackLock
+            | Op::PackUnlock
             | Op::GridCoord { .. } => ParamsMut::Empty,
             Op::Shape(ops) => ParamsMut::Slice(ops.iter_mut()),
             Op::Param { shape, .. } => ParamsMut::One(Some(shape)),
             Op::Grid { x, y } => ParamsMut::Two(Some(x), Some(y)),
             Op::Loop { bound } => ParamsMut::One(Some(bound)),
-            Op::CopyTo {
+            Op::Copy {
                 dst,
                 src,
                 dst_offset,
@@ -533,7 +549,7 @@ impl Op {
                 ..
             } => ParamsMut::Four([dst, src, dst_offset, src_offset].into_iter()),
             Op::Load { buffer, offset, .. } => ParamsMut::Two(Some(buffer), Some(offset)),
-            Op::StoreTo {
+            Op::Store {
                 src,
                 buffer,
                 offset,
@@ -895,6 +911,9 @@ impl Kernel {
                 Cb { dtype, .. } => (ValueKind::Buffer, dtype, RegShape::Tile),
                 Acc { dtype, shape } => (ValueKind::Acc, dtype, acc_reg_shape(shape)),
                 GridCoord { .. } | Loop { .. } => (ValueKind::Induction, INDEX, RegShape::Scalar),
+                MathLock | MathUnlock | PackLock | PackUnlock => {
+                    (ValueKind::Const, INDEX, RegShape::Scalar)
+                }
                 Load { buffer, shape, .. } => (
                     ValueKind::Register,
                     of(buffer).dtype,
@@ -933,9 +952,9 @@ impl Kernel {
                 Matmul { acc, .. } | Sum { acc, .. } | Max { acc, .. } => {
                     (ValueKind::Acc, of(acc).dtype, of(acc).shape)
                 }
-                StoreTo { buffer, .. } => (ValueKind::Buffer, of(buffer).dtype, RegShape::Tile),
+                Store { buffer, .. } => (ValueKind::Buffer, of(buffer).dtype, RegShape::Tile),
                 Grid { .. } => (ValueKind::Shape, INDEX, RegShape::Scalar),
-                CopyTo { .. }
+                Copy { .. }
                 | EndLoop
                 | EndReader
                 | EndCompute
@@ -1097,7 +1116,7 @@ impl Kernel {
                         visible[slot] = false;
                     }
                 }
-                Op::CopyTo {
+                Op::Copy {
                     dst,
                     src,
                     dst_offset,
@@ -1166,7 +1185,7 @@ impl Kernel {
                         }
                     }
                 }
-                Op::StoreTo {
+                Op::Store {
                     src,
                     buffer,
                     offset,
@@ -1306,16 +1325,25 @@ impl Kernel {
                         return Err(ttStatus::TT_ERROR_NOT_A_BUFFER);
                     }
                 }
-                Op::EndReader | Op::EndCompute => {}
+                Op::EndReader
+                | Op::EndCompute
+                | Op::MathLock
+                | Op::MathUnlock
+                | Op::PackLock
+                | Op::PackUnlock => {}
             }
             if let Some(slot) = values.get_mut(at) {
                 if !matches!(
                     *op,
-                    Op::CopyTo { .. }
-                        | Op::StoreTo { .. }
+                    Op::Copy { .. }
+                        | Op::Store { .. }
                         | Op::EndLoop
                         | Op::EndReader
                         | Op::EndCompute
+                        | Op::MathLock
+                        | Op::MathUnlock
+                        | Op::PackLock
+                        | Op::PackUnlock
                         | Op::Grid { .. }
                         | Op::Matmul { .. }
                         | Op::Sum { .. }
@@ -1545,7 +1573,7 @@ impl Parser {
                             dst_offset
                         };
                         t.end()?;
-                        self.push(Op::CopyTo {
+                        self.push(Op::Copy {
                             dst,
                             src,
                             dst_offset,
@@ -1566,7 +1594,7 @@ impl Parser {
                         t.eq()?;
                         let src = self.value(&mut t)?;
                         t.end()?;
-                        self.push(Op::StoreTo {
+                        self.push(Op::Store {
                             src,
                             buffer,
                             offset,
@@ -1951,13 +1979,17 @@ impl Printer<'_, '_> {
             }
             Op::EndReader => writeln!(self.f, "endreader"),
             Op::EndCompute => writeln!(self.f, "endcompute"),
+            Op::MathLock => writeln!(self.f, "mathlock"),
+            Op::MathUnlock => writeln!(self.f, "mathunlock"),
+            Op::PackLock => writeln!(self.f, "packlock"),
+            Op::PackUnlock => writeln!(self.f, "packunlock"),
             Op::GridCoord { axis } => writeln!(
                 self.f,
                 "{} = grid.{}",
                 self.name(id),
                 if axis == 0 { "x" } else { "y" }
             ),
-            Op::CopyTo {
+            Op::Copy {
                 dst,
                 src,
                 dst_offset,
@@ -1986,7 +2018,7 @@ impl Printer<'_, '_> {
                 self.name(buffer),
                 self.name(offset)
             ),
-            Op::StoreTo {
+            Op::Store {
                 src,
                 buffer,
                 offset,
