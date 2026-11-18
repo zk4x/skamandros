@@ -8,7 +8,7 @@
 //! path here: a compiler emits the branches and addresses itself.
 
 use crate::{l1_write32, publish};
-use tt_isa::cfg::{generated::global::RISCV_IC_INVALIDATE_InvalidateAll, ConfigBank};
+use tt_isa::cfg::{blackhole::global::RISCV_IC_INVALIDATE_InvalidateAll, ConfigBank};
 
 const ZERO: u32 = 0;
 const A0: u32 = 10;

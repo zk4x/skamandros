@@ -68,13 +68,13 @@ pub struct Plan {
 
 const ALIGN: u32 = 64;
 
-/// Place every buffer in `tt_isa::l1::DATA`, in declaration order, and the CB
+/// Place every buffer in `tt_isa::arch::blackhole::l1::DATA`, in declaration order, and the CB
 /// interface table after them.
 pub fn place(k: &Kernel, types: &Types) -> Result<Plan, ttStatus> {
     let mut buf: BTreeMap<OpId, u32> = BTreeMap::new();
     let mut cb: BTreeMap<OpId, u32> = BTreeMap::new();
     let mut cbs: Vec<Cb> = Vec::new();
-    let mut at = tt_isa::l1::DATA.base as u32;
+    let mut at = tt_isa::arch::blackhole::l1::DATA.base as u32;
     for (op_at, op) in k.ops() {
         let Op::Cb {
             value,
@@ -98,7 +98,7 @@ pub fn place(k: &Kernel, types: &Types) -> Result<Plan, ttStatus> {
             let _ = (op_at, value);
             ttStatus::TT_ERROR_L1_OVERFLOW
         })?;
-        if u64::from(end) > tt_isa::l1::DATA.end {
+        if u64::from(end) > tt_isa::arch::blackhole::l1::DATA.end {
             let _ = (op_at, value, base, end);
             return Err(ttStatus::TT_ERROR_L1_ARENA);
         }
@@ -129,7 +129,7 @@ pub fn place(k: &Kernel, types: &Types) -> Result<Plan, ttStatus> {
             .ok_or(ttStatus::TT_ERROR_L1_OVERFLOW)?;
         let base = at.div_ceil(ALIGN) * ALIGN;
         let end = base.checked_add(bytes).ok_or(ttStatus::TT_ERROR_L1_OVERFLOW)?;
-        if u64::from(end) > tt_isa::l1::DATA.end {
+        if u64::from(end) > tt_isa::arch::blackhole::l1::DATA.end {
             let _ = (base, end);
             return Err(ttStatus::TT_ERROR_L1_ARENA);
         }
@@ -161,7 +161,7 @@ pub fn place(k: &Kernel, types: &Types) -> Result<Plan, ttStatus> {
                 .ok_or(ttStatus::TT_ERROR_L1_OVERFLOW)?;
             let base = at.div_ceil(ALIGN) * ALIGN;
             let end = base.checked_add(bytes).ok_or(ttStatus::TT_ERROR_L1_OVERFLOW)?;
-            if u64::from(end) > tt_isa::l1::DATA.end {
+            if u64::from(end) > tt_isa::arch::blackhole::l1::DATA.end {
                 let _ = (value, base, end);
                 return Err(ttStatus::TT_ERROR_L1_ARENA);
             }
@@ -184,7 +184,7 @@ pub fn place(k: &Kernel, types: &Types) -> Result<Plan, ttStatus> {
     let end = iface
         .checked_add(table)
         .ok_or(ttStatus::TT_ERROR_L1_OVERFLOW)?;
-    if u64::from(end) > tt_isa::l1::DATA.end {
+    if u64::from(end) > tt_isa::arch::blackhole::l1::DATA.end {
         let _ = (iface, end);
         return Err(ttStatus::TT_ERROR_L1_ARENA);
     }

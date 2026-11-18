@@ -324,11 +324,11 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
         }
     }
     edges.sort_unstable();
-    if edges.len() > tt_isa::sync::Semaphore::COUNT as usize {
+    if edges.len() > tt_isa::arch::blackhole::sync::Semaphore::COUNT as usize {
         return Err(crate::status::internal_bug(format_args!(
             "reg_sync: {} role hand-off edges need more than the {} semaphores of the Sync Unit",
             edges.len(),
-            tt_isa::sync::Semaphore::COUNT
+            tt_isa::arch::blackhole::sync::Semaphore::COUNT
         )));
     }
     let sem = |edge: Edge| -> Result<u8, ttStatus> {
@@ -499,10 +499,10 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
             .map(|(_, _, count)| *count)
             .max()
             .unwrap_or(0);
-        if value > tt_isa::sync::MAX_VALUE {
+        if value > tt_isa::arch::blackhole::sync::MAX_VALUE {
             return Err(crate::status::internal_bug(format_args!(
                 "reg_sync: edge {edge:?} performs {value} loop hand-offs per iteration, more than the {} a semaphore can start with",
-                tt_isa::sync::MAX_VALUE
+                tt_isa::arch::blackhole::sync::MAX_VALUE
             )));
         }
         inits.push((
@@ -662,7 +662,9 @@ pub fn verify(m: &MachineKernel) -> Result<(), ttStatus> {
     // every init names a semaphore the Sync Unit has.
     let sems = m.sems.clone();
     for (i, (sem, value)) in sems.iter().enumerate() {
-        if tt_isa::sync::Semaphore::new(*sem).is_none() || *value > tt_isa::sync::MAX_VALUE {
+        if tt_isa::arch::blackhole::sync::Semaphore::new(*sem).is_none()
+            || *value > tt_isa::arch::blackhole::sync::MAX_VALUE
+        {
             let _ = (sem, value);
             return Err(ttStatus::TT_ERROR_SEMAPHORE);
         }
@@ -730,7 +732,7 @@ pub fn verify(m: &MachineKernel) -> Result<(), ttStatus> {
                 | MirOp::SemWaitNoGet { sem, .. }
                 | MirOp::SemGet { sem }
                 | MirOp::SemWaitFree { sem } => {
-                    if tt_isa::sync::Semaphore::new(sem).is_none()
+                    if tt_isa::arch::blackhole::sync::Semaphore::new(sem).is_none()
                         || !sems.iter().any(|(s, _)| *s == sem)
                     {
                         let _ = (name, at, sem);

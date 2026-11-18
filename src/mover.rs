@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use crate::ir::{Kernel, Op, OpId, RegShape, ValueKind};
 use crate::module::ParamKind;
 use crate::status::ttStatus;
-use tt_isa::noc::niu::TxnId;
+use tt_isa::arch::blackhole::noc::niu::TxnId;
 
 /// Transaction ID every request uses. A mover issues in order and drains after
 /// each copy, so one ID is enough.
@@ -42,7 +42,7 @@ pub const ARG_IFACE: usize = 2;
 
 /// The most channels a parameter can be striped over: every channel a
 /// Blackhole can have.
-pub const MAX_BANKS: usize = tt_isa::dram::CHANNELS as usize;
+pub const MAX_BANKS: usize = tt_isa::arch::blackhole::dram::CHANNELS as usize;
 
 /// Words an interleaved parameter's block occupies: a pair per channel, then
 /// the channel count and the page size.

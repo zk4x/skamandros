@@ -25,7 +25,7 @@ use crate::mir::{
 };
 use crate::riscv::reg;
 use crate::status::ttStatus;
-use tt_isa::cfg::generated::thread;
+use tt_isa::cfg::blackhole::thread;
 
 /// The `Dst` lock the math thread and the packer share: tt-metal's one
 /// `MATH_PACK` semaphore, starting at zero (the math thread's turn).
@@ -2661,7 +2661,7 @@ fn thread_word(fields: &[(tt_isa::cfg::ThreadConfigField, u16)]) -> Result<MirOp
             "lower: a thread config has no fields",
         ));
     };
-    let mut entry = tt_isa::backend::ThreadConfigEntry::zeroed(first.0.addr32());
+    let mut entry = tt_isa::arch::blackhole::backend::ThreadConfigEntry::zeroed(first.0.addr32());
     for &(field, value) in fields {
         entry = match entry.set(field, value) {
             Ok(entry) => entry,
@@ -3383,7 +3383,7 @@ fn sfp_select(role: &mut Vec<MirOp>, cond: LReg, t: LReg, f: LReg, d: LReg) {
     role.push(MirOp::SfpGt {
         mod1: SFPSET_CC,
         vc: cond,
-        vd: LReg(tt_isa::sfpu::LREG_ZERO as u16),
+        vd: LReg(tt_isa::arch::blackhole::sfpu::LREG_ZERO as u16),
     });
     role.push(MirOp::SfpMov { a: t, d });
     role.push(SFPENCC_OFF);
@@ -4289,7 +4289,7 @@ fn sin_cos_body(
     ];
     let pio2_hi = f32::from_bits((std::f64::consts::FRAC_PI_2 as f32).to_bits() & !0xfff);
     let pio2_lo = (std::f64::consts::FRAC_PI_2 - f64::from(pio2_hi)) as f32;
-    let zero = LReg(tt_isa::sfpu::LREG_ZERO as u16);
+    let zero = LReg(tt_isa::arch::blackhole::sfpu::LREG_ZERO as u16);
     let (n, nf, s, r, rest, tmp) = (LReg(2), LReg(3), LReg(4), LReg(5), LReg(6), LReg(7));
     debug_assert!(la.0 < 2, "the body's scratch lanes start at 2");
     for &row in rows {
@@ -4550,7 +4550,7 @@ fn mod_body(role: &mut Vec<MirOp>) {
     /// `MantissaMode::FractionOnly` (`SFPEXMAN_MOD1_PAD9`).
     const EXMAN_FRACTION_ONLY: u32 = 1;
     const STOCHRND_FP32_TO_UINT16: u32 = 6;
-    let one = LReg(tt_isa::sfpu::LREG_ONE as u16);
+    let one = LReg(tt_isa::arch::blackhole::sfpu::LREG_ONE as u16);
     // The lanes the body names. `a` stays untouched to the end: the sign of
     // the dividend is the sign of the result.
     let a = LReg(0);
@@ -5413,8 +5413,10 @@ fn emit_request(
     interleaved: bool,
 ) -> Result<(), ttStatus> {
     use crate::riscv::cb::{RD_PTR, STRIDE, WR_PTR};
-    use tt_isa::noc::niu::{CMD_RD, CMD_WR, RESP_MARKED, STATIC_VC_1, initiator, reqs_outstanding};
-    if bytes == 0 || bytes > tt_isa::noc::niu::MAX_REQUEST_BYTES {
+    use tt_isa::arch::blackhole::noc::niu::{
+        CMD_RD, CMD_WR, RESP_MARKED, STATIC_VC_1, initiator, reqs_outstanding,
+    };
+    if bytes == 0 || bytes > tt_isa::arch::blackhole::noc::niu::MAX_REQUEST_BYTES {
         return Err(ttStatus::TT_ERROR_NOC_REQUEST_BYTES);
     }
     let (lo_arg, hi_arg) = (block, block + 4);
@@ -5629,7 +5631,7 @@ fn cast_lanes(from: DType, to: DType, a: LReg, d: LReg, t: LReg) -> Result<Vec<M
     const SETCC_NE0: u32 = 2;
     const ENCC_ALL: u32 = 0;
     const MASK_ON: u32 = 10;
-    let zero = LReg(tt_isa::sfpu::LREG_ZERO as u16);
+    let zero = LReg(tt_isa::arch::blackhole::sfpu::LREG_ZERO as u16);
     let mut out: Vec<MirOp> = Vec::new();
     match (from, to) {
         (DType::F32, DType::F32) | (DType::I32, DType::I32) | (DType::Bool, DType::Bool) => {

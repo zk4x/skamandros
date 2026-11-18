@@ -1,4 +1,4 @@
-//! L1 Cache Tag Search Accelerator probe on RISCV B (`tt_isa::tag_search`).
+//! L1 Cache Tag Search Accelerator probe on RISCV B (`tt_isa::arch::blackhole::tag_search`).
 //!
 //! Runs the script the host staged at `tag_search::probe::SCRIPT`. For each step
 //! it applies the step's masked `Config` read-modify-writes, fences, reads the
@@ -28,8 +28,8 @@
 #![no_main]
 
 use tt_firmware::{fail, finish, l1_read32, l1_write32, publish, spin};
-use tt_isa::mailbox::panic_code;
-use tt_isa::tag_search::{self as ts, probe, DISARM};
+use tt_isa::arch::blackhole::mailbox::panic_code;
+use tt_isa::arch::blackhole::tag_search::{self as ts, probe, DISARM};
 
 /// Masked read-modify-write of one `Config` word with plain `lw`/`sw`: RISC-V can
 /// write `Config` only with whole-word stores.

@@ -5,11 +5,11 @@
  * the image here, as tt-metal starts BRISC (`generate_risc_startup_addr`,
  * `llrt/hal.cpp:126-149`). The image is not at 0: the card's CMFW newer than
  * 19.3 writes its throttle state to L1 offset 0x10 on every Tensix
- * (`tt_isa::dm::IMAGE_BASE`). LENGTH stops at 0xA800, where the first role
- * image (T0's slot, `tt_isa::l1::roles`) begins, so the mover and the three
+ * (`tt_isa::arch::blackhole::dm::IMAGE_BASE`). LENGTH stops at 0xA800, where the first role
+ * image (T0's slot, `tt_isa::arch::blackhole::l1::roles`) begins, so the mover and the three
  * role images can all be resident in one tile at once -- a link error, not a
  * clobbered T0 entry point, if it ever grows past that
- * (`tt_isa::dm::IMAGE_MAX`).
+ * (`tt_isa::arch::blackhole::dm::IMAGE_MAX`).
  */
 MEMORY
 {

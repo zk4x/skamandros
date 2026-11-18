@@ -6,7 +6,7 @@
 //! `tt_metal/impl/dispatch/kernels/cq_dispatch.cpp:1187`) and each worker's
 //! launch message names the text, the length and its arguments. This is the
 //! same shape with unicast NoC writes per worker instead of the multicast
-//! rectangle -- the write path is `tt_isa::noc::niu::Command::Write`, an
+//! rectangle -- the write path is `tt_isa::arch::blackhole::noc::niu::Command::Write`, an
 //! L1-to-remote-L1 copy -- and the workers' completion is one NoC atomic
 //! increment each rather than tt-metal's completion queue.
 //!
@@ -35,12 +35,12 @@
 
 use crate::corpus::fail_in;
 use crate::{l1_read32, l1_write32, noc, publish};
-use tt_isa::mailbox::launch::Mailbox;
-use tt_isa::mailbox::{DUMP_ROW_WORDS, panic_code, status};
-use tt_isa::noc::niu::{Command, Endpoint, Niu, TxnId};
+use tt_isa::arch::blackhole::mailbox::launch::Mailbox;
+use tt_isa::arch::blackhole::mailbox::{DUMP_ROW_WORDS, panic_code, status};
+use tt_isa::arch::blackhole::noc::niu::{Command, Endpoint, Niu, TxnId};
 
-/// The fan-out's own transaction ID: B's mover uses [`tt_isa::dm::TXN_B`] and
-/// NC's [`tt_isa::dm::TXN_NC`], and no request of one ID can be mistaken for
+/// The fan-out's own transaction ID: B's mover uses [`tt_isa::arch::blackhole::dm::TXN_B`] and
+/// NC's [`tt_isa::arch::blackhole::dm::TXN_NC`], and no request of one ID can be mistaken for
 /// another's when the counters are drained.
 const TXN: TxnId = match TxnId::new(5) {
     Some(t) => t,

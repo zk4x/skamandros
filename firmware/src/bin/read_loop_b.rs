@@ -1,6 +1,6 @@
 //! A read loop on RISCV B with none of the mover's interpreter: the question of
 //! `silicon_probe_read_loop`, "how much of a 4 KiB read entry is decode and
-//! dispatch?" (`tt_isa::noc::read_loop`).
+//! dispatch?" (`tt_isa::arch::blackhole::noc::read_loop`).
 //!
 //! The host encodes the first request (`DramMove::words`) and this image issues
 //! `count` of them through the same `noc` calls the mover issues through, each
@@ -20,9 +20,9 @@
 #![no_main]
 
 use tt_firmware::{disable_gathering, finish, l1_read32, l1_write32, noc, publish, spin};
-use tt_isa::dm::Entry;
-use tt_isa::noc::niu::{DramMove, Niu, TxnId};
-use tt_isa::noc::read_loop::{self as rl, mode};
+use tt_isa::arch::blackhole::dm::Entry;
+use tt_isa::arch::blackhole::noc::niu::{DramMove, Niu, TxnId};
+use tt_isa::arch::blackhole::noc::read_loop::{self as rl, mode};
 
 fn rd(at: u64) -> u32 {
     // SAFETY: a fixed aligned word of the control block, table or request.
@@ -36,7 +36,7 @@ fn wr(at: u64, v: u32) {
 
 /// The tile counter's low word.
 fn wall_clock() -> u32 {
-    rd(tt_isa::tensix::timestamper::WALL_CLOCK_L)
+    rd(tt_firmware::hw::WALL_CLOCK_L)
 }
 
 /// The wrapping sum of the window's words.

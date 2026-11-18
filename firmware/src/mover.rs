@@ -1,13 +1,13 @@
 // The data mover, shared by RISCV B's image (`bin/dm_b.rs`) and RISCV NC's
-// (`bin/dm_nc.rs`): each binary defines `M`, its `tt_isa::dm::Mover` -- the
+// (`bin/dm_nc.rs`): each binary defines `M`, its `tt_isa::arch::blackhole::dm::Mover` -- the
 // mailbox, list ring, scratch and trace chunk it uses -- and includes this.
-// Protocol and layout are `tt_isa::dm`, which the host shares.
+// Protocol and layout are `tt_isa::arch::blackhole::dm`, which the host shares.
 
 use tt_firmware::{l1_read32, l1_write32, mailbox_word, noc, publish};
-use tt_isa::dm::{self, encoded, op, record, Descriptor, Entry, Transform};
-use tt_isa::mailbox::launch::Mailbox;
-use tt_isa::mailbox::{offset, status};
-use tt_isa::noc::niu::{Command, DramMove, Niu, TxnId};
+use tt_isa::arch::blackhole::dm::{self, encoded, op, record, Descriptor, Entry, Transform};
+use tt_isa::arch::blackhole::mailbox::launch::Mailbox;
+use tt_isa::arch::blackhole::mailbox::{offset, status};
+use tt_isa::arch::blackhole::noc::niu::{Command, DramMove, Niu, TxnId};
 
 const TXN: TxnId = match TxnId::new(if IS_NC { dm::TXN_NC } else { dm::TXN_B }) {
     Some(t) => t,
@@ -161,7 +161,7 @@ fn list_settings() {
 /// clock `noc` times waits for room under the in-flight cap with: read only
 /// when a request has to wait.
 fn wall_clock() -> u32 {
-    rd(tt_isa::tensix::timestamper::WALL_CLOCK_L)
+    rd(tt_firmware::hw::WALL_CLOCK_L)
 }
 
 /// After a list: if any of its requests waited for room under the in-flight
@@ -180,7 +180,7 @@ fn publish_stalls(seen: &mut noc::Stalls, traced: bool) {
 #[cold]
 #[inline(never)]
 fn stalled(seen: noc::Stalls, now: noc::Stalls, traced: bool) {
-    use tt_isa::mailbox::trace as ev;
+    use tt_isa::arch::blackhole::mailbox::trace as ev;
     let cycles = now.cycles.wrapping_sub(seen.cycles);
     wr(
         M.at(dm::THROTTLE_STALLS),
@@ -301,7 +301,7 @@ fn launch(generation: u32, programs: [(u32, u32); 3]) {
     publish();
     *launched() = generation;
     let traced = rd(M.at(dm::TRACE)) != 0;
-    trace(traced, tt_isa::mailbox::trace::KICK, generation);
+    trace(traced, tt_isa::arch::blackhole::mailbox::trace::KICK, generation);
 }
 
 /// Wait for each role to acknowledge `generation`, the last one launched
@@ -330,7 +330,7 @@ fn await_roles(generation: u32) -> Result<(), u32> {
         }
     }
     let traced = rd(M.at(dm::TRACE)) != 0;
-    trace(traced, tt_isa::mailbox::trace::ROLES_DONE, generation);
+    trace(traced, tt_isa::arch::blackhole::mailbox::trace::ROLES_DONE, generation);
     Ok(())
 }
 
@@ -338,8 +338,8 @@ fn await_roles(generation: u32) -> Result<(), u32> {
 /// (`M.at(dm::TRACE)`). One 128-bit event per store, so the mover's events and the
 /// role runners' share one stream without interleaving.
 fn trace(on: bool, event: u32, detail: u32) {
-    use tt_isa::mailbox::trace as ev;
-    use tt_isa::tensix::timestamper as ts;
+    use tt_isa::arch::blackhole::mailbox::trace as ev;
+    use tt_firmware::hw as ts;
     if on {
         wr(
             ts::TIMESTAMP,
@@ -355,7 +355,7 @@ fn trace(on: bool, event: u32, detail: u32) {
 /// (`publish`).
 #[inline(never)]
 fn barrier(me: (u8, u8), target: u32, x: u8, y: u8, arrive: bool) -> Result<(), u32> {
-    use tt_isa::noc::niu::Endpoint;
+    use tt_isa::arch::blackhole::noc::niu::Endpoint;
     let counter = Endpoint {
         x,
         y,
@@ -419,7 +419,7 @@ const CAPS: u32 = dm::caps::VALID
     | if ENCODED_GUARD { dm::caps::GUARD } else { 0 };
 
 /// `op::READ_ENCODED`: one GDDR read the host validated and encoded
-/// (`tt_isa::dm::encoded`). The card verifies the entry's checksum -- damage in
+/// (`tt_isa::arch::blackhole::dm::encoded`). The card verifies the entry's checksum -- damage in
 /// transit, an overwritten list, or an entry the encoder did not make -- and issues it
 /// as `issue_via` issues the words of a decoded one, with the tag and control word a B
 /// read always has. With `encoded-guard` it also runs the semantic guard first.
@@ -544,7 +544,7 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             action,
             capacity,
         } => {
-            use tt_isa::dataflow::{Action, Endpoint};
+            use tt_isa::arch::blackhole::dataflow::{Action, Endpoint};
             let (endpoint, actor) = if M == dm::Mover::B {
                 (Endpoint::Reader, 0)
             } else {
@@ -776,7 +776,7 @@ fn tile_layout(tilize: bool, block: u64, stride: usize, slot: u64, valid: u32) {
 #[cold]
 #[inline(never)]
 fn host_move(me: (u8, u8), write: bool, host_lo: u32, host_hi: u32, l1: u32, len: u32) {
-    let mv = tt_isa::noc::niu::HostMove {
+    let mv = tt_isa::arch::blackhole::noc::niu::HostMove {
         host_lo,
         host_hi,
         l1,
@@ -805,7 +805,7 @@ fn entry_at(at: u64) -> [u32; 8] {
 /// through `Entry::decode` and every refusal in it.
 ///
 /// With `M.at(dm::TRACE)` set, the list, and each entry or record in it, is
-/// bracketed by timestamper events (`tt_isa::mailbox::trace`); a record's
+/// bracketed by timestamper events (`tt_isa::arch::blackhole::mailbox::trace`); a record's
 /// expanded moves are not, so the events per list stay bounded by its length.
 fn run_list(me: (u8, u8), usable: u32, count: u32) -> Result<(), u32> {
     run_list_at(me, usable, 0, count)
@@ -824,7 +824,7 @@ fn run_list_at(me: (u8, u8), usable: u32, first: u32, count: u32) -> Result<(), 
     // (`silicon_perf::mover_read_shapes`).
     let head = entry_at(base);
     let result = if head[0] == op::PAIR {
-        if M != dm::Mover::B || tt_isa::dataflow::packet_length(head)? != count as usize {
+        if M != dm::Mover::B || tt_isa::arch::blackhole::dataflow::packet_length(head)? != count as usize {
             return Err(dm::error::LENGTH);
         }
         pair_shared(me, usable, base + dm::ENTRY_BYTES, head[1], head[2])?;
@@ -975,7 +975,7 @@ fn pair_call(
 #[link_section = ".text.hot"]
 #[inline(never)]
 fn run_entries(me: (u8, u8), usable: u32, base: u64, count: u32) -> Result<(), u32> {
-    use tt_isa::mailbox::trace as ev;
+    use tt_isa::arch::blackhole::mailbox::trace as ev;
     let mode = rd(M.at(dm::TRACE));
     let traced = mode != 0;
     let outer = traced && unsafe { TRACE_DEPTH == 0 };
@@ -1151,7 +1151,7 @@ fn call(
 ) -> Result<(), u32> {
     let mut done = 0u32;
     let chunk = if M == dm::Mover::B && !unsafe { PAIR_ACTIVE } {
-        tt_isa::dataflow::OUTER_CHUNK
+        tt_isa::arch::blackhole::dataflow::OUTER_CHUNK
     } else {
         M.trace_chunk
     };

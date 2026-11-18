@@ -2,7 +2,7 @@
 //! both NoCs.
 //!
 //! Keeps the heartbeat. Each time the host bumps `SEQ` in NC's mover mailbox
-//! (`tt_isa::dm::nc`), writes `LEN` bytes of L1 at `L1_ADDR` to channel
+//! (`tt_isa::arch::blackhole::dm::nc`), writes `LEN` bytes of L1 at `L1_ADDR` to channel
 //! `CHANNEL` at `DRAM_OFFSET` through NoC #1 (port 1, its own), then reads
 //! them back through NoC #0 (CMFW's port, NoC #0's) to `L1_ADDR + LEN`, and
 //! publishes `DONE = SEQ` with `ERROR`. Also publishes this tile's coordinate
@@ -18,10 +18,10 @@
 #![no_main]
 
 use tt_firmware::{l1_read32, l1_write32, mailbox_word, noc, publish};
-use tt_isa::dm::{self, nc};
-use tt_isa::dram::Dram;
-use tt_isa::mailbox::offset;
-use tt_isa::noc::niu::{Command, Niu, TxnId};
+use tt_isa::arch::blackhole::dm::{self, nc};
+use tt_isa::arch::blackhole::dram::Dram;
+use tt_isa::arch::blackhole::mailbox::offset;
+use tt_isa::arch::blackhole::noc::niu::{Command, Niu, TxnId};
 
 /// Which registers read back differently from what was written, a bit per
 /// register in `Command::registers`' order, for the NoC #1 and NoC #0
@@ -36,7 +36,7 @@ const CTRL_NOC0: u64 = dm::nc::MAILBOX_BASE + 0xF4;
 /// that differ from what `Command::registers` wrote, and `NOC_CTRL`.
 fn kept(niu: Niu, cmd: &Command, me: (u8, u8)) -> (u32, u32) {
     use core::ptr::read_volatile;
-    use tt_isa::noc::niu::initiator;
+    use tt_isa::arch::blackhole::noc::niu::initiator;
     let base = niu.base();
     // SAFETY: initiator 0's registers, MMIO in every Tensix tile.
     unsafe { while read_volatile((base + initiator::CMD_CTRL) as *const u32) & 1 != 0 {} }

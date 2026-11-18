@@ -25,10 +25,14 @@ fast-reads = []
 encoded-guard = ["fast-reads"]
 
 [dependencies]
-tt-isa = "0.2.0"
+# `build.rs` replaces `__TT_ISA_DEP__` with the host's tt-isa dependency: the
+# sibling path on a development tree, the registry version otherwise. The dotenv
+# cannot be a path here because this manifest is copied into `OUT_DIR` before it
+# is read.
+tt-isa = __TT_ISA_DEP__
 
 [build-dependencies]
-tt-isa = "0.2.0"
+tt-isa = __TT_ISA_DEP__
 
 [profile.release]
 # Code size, not speed: every role image is linked into a 10 KiB L1 slot, and

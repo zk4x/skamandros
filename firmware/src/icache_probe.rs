@@ -61,7 +61,7 @@ const PASSES: u32 = 16;
 fn clock() -> u32 {
     // SAFETY: the tile's wall clock, a read-only debug register every baby
     // core reaches (`BabyRISCV/README.md`, memory map).
-    unsafe { core::ptr::read_volatile(tt_isa::tensix::timestamper::WALL_CLOCK_L as *const u32) }
+    unsafe { core::ptr::read_volatile(tt_firmware::hw::WALL_CLOCK_L as *const u32) }
 }
 
 /// Cycles for `PASSES` runs of the last `size` bytes of the block ending at

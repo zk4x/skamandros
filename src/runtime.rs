@@ -24,10 +24,10 @@ use std::sync::Mutex;
 use crate::compile::Module;
 use crate::device::Device;
 use crate::status::ttStatus;
-use tt_isa::dram::CHANNEL_BYTES;
-use tt_isa::mailbox;
-use tt_isa::noc::NocCoord;
-use tt_isa::noc::niu::Niu;
+use tt_isa::arch::blackhole::dram::CHANNEL_BYTES;
+use tt_isa::arch::blackhole::mailbox;
+use tt_isa::arch::blackhole::noc::NocCoord;
+use tt_isa::arch::blackhole::noc::niu::Niu;
 
 /// The one open device, if [`init`] has been called.
 static DEVICE: Mutex<Option<Device>> = Mutex::new(None);
@@ -336,7 +336,7 @@ fn args_for(
         *args = vec![grid[0], grid[1], module.iface, me_hi(tile)];
         for (index, kind) in module.params.iter().enumerate() {
             let word = params[index];
-            let channel_bytes = tt_isa::dram::CHANNEL_BYTES;
+            let channel_bytes = tt_isa::arch::blackhole::dram::CHANNEL_BYTES;
             if *kind == crate::compile::ParamKind::Interleaved {
                 // A striped tensor: a pair per channel, then the count and the
                 // page, exactly what the mover's address arithmetic reads.
@@ -373,7 +373,9 @@ fn args_for(
             args.push(low);
             args.push(high);
         }
-        if (args_at(*niu) as u64) + 4 * args.len() as u64 > tt_isa::l1::PROGRAM_CACHE.end {
+        if (args_at(*niu) as u64) + 4 * args.len() as u64
+            > tt_isa::arch::blackhole::l1::PROGRAM_CACHE.end
+        {
             let _ = args.len();
             return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
         }
@@ -537,7 +539,7 @@ fn launch_steps(
         }
     }
     if u64::from(GROUPS_AT) + (lists.len() as u64) * u64::from(GROUPS_STRIDE)
-        > tt_isa::l1::PROGRAM_CACHE.end
+        > tt_isa::arch::blackhole::l1::PROGRAM_CACHE.end
     {
         return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
     }
@@ -572,10 +574,10 @@ fn launch_steps(
         device.stage_words(u64::from(crate::mir::CORE_INFO), &[*x, *y])?;
         // The mover's `USABLE` mailbox: the chip's `ENABLED_GDDR` word, in the
         // compacted logical channel numbering its decoder uses
-        // (`tt_isa::dm::Descriptor::decode`). The mover reads it once when it
+        // (`tt_isa::arch::blackhole::dm::Descriptor::decode`). The mover reads it once when it
         // starts, so it lands before the executor is released.
         let mask = device.dram_mask();
-        device.stage_words(tt_isa::dm::USABLE, &[mask])?;
+        device.stage_words(tt_isa::arch::blackhole::dm::USABLE, &[mask])?;
         if compute {
             device.release_tensix_backend()?;
         }

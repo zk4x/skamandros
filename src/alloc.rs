@@ -942,7 +942,7 @@ fn rewrite_lregs(op: &mut MirOp, rename: &BTreeMap<LReg, LReg>) {
 /// them. Every ring is `ALIGN`-aligned, so the two sides of a copy are
 /// congruent by construction.
 pub fn plan_cbs(m: &mut MachineKernel) -> Result<(), ttStatus> {
-    let mut at = tt_isa::l1::DATA.base as u32;
+    let mut at = tt_isa::arch::blackhole::l1::DATA.base as u32;
     let mut infos: Vec<(Cb, CbInfo)> = m.cbs.iter().map(|(id, info)| (id, *info)).collect();
     infos.sort_by_key(|(id, _)| *id);
     let count = infos.len() as u32;
@@ -955,7 +955,7 @@ pub fn plan_cbs(m: &mut MachineKernel) -> Result<(), ttStatus> {
         let end = base
             .checked_add(bytes)
             .ok_or(ttStatus::TT_ERROR_L1_OVERFLOW)?;
-        if u64::from(end) > tt_isa::l1::DATA.end {
+        if u64::from(end) > tt_isa::arch::blackhole::l1::DATA.end {
             let _ = (base, end);
             return Err(ttStatus::TT_ERROR_L1_ARENA);
         }
@@ -969,7 +969,7 @@ pub fn plan_cbs(m: &mut MachineKernel) -> Result<(), ttStatus> {
     let end = iface
         .checked_add(table)
         .ok_or(ttStatus::TT_ERROR_L1_OVERFLOW)?;
-    if u64::from(end) > tt_isa::l1::DATA.end {
+    if u64::from(end) > tt_isa::arch::blackhole::l1::DATA.end {
         let _ = (iface, end);
         return Err(ttStatus::TT_ERROR_L1_ARENA);
     }

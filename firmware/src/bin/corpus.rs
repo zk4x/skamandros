@@ -15,7 +15,8 @@
 #![no_main]
 
 use tt_firmware::corpus;
-use tt_isa::tensix::{RiscvT1, Thread1};
+use tt_firmware::tensix::RiscvT1;
+use tt_isa::tensix::Thread1;
 
 /// T1 because ttsim models the RISC-V view of `Dst` only for it (divergence row
 /// 12). `corpus_t0` is the silicon image; see `tt_firmware::corpus`.

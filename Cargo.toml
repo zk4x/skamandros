@@ -31,7 +31,10 @@ default = ["firmware"]
 firmware = []
 
 [dependencies]
-tt-isa = "0.2.0"
+# The architecture split (Blackhole under `arch::blackhole`, the `Arch` trait,
+# Quasar's tables) is not on crates.io yet; the sibling tree is the source of
+# truth until it is released.
+tt-isa = { path = "../tt-isa" }
 libloading = "0.8"
 libc = "0.2"
 # zyx's line: the slab's `SerBin`/`DeBin` impls are copied with the file.

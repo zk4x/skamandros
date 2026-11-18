@@ -1,6 +1,6 @@
 use crate::{l1_read32, l1_write32, publish};
-use tt_isa::dataflow::{self, Action, Channel, Endpoint, Release, Stream};
-use tt_isa::{dm, mailbox};
+use tt_isa::arch::blackhole::dataflow::{self, Action, Channel, Endpoint, Release, Stream};
+use tt_isa::arch::blackhole::{dm, mailbox};
 
 fn read(address: u64) -> u32 {
     unsafe { l1_read32(address) }

@@ -1,6 +1,6 @@
 //! The Ethernet-tile image, on RISCV E1: a data mover between chips.
 //!
-//! Protocol and layout are `tt_isa::eth::mover`, which the host shares. This
+//! Protocol and layout are `tt_isa::arch::blackhole::eth::mover`, which the host shares. This
 //! image is both ends of a link: it sends what the host asks it to, and forwards
 //! what its partner sends it. It also keeps the heartbeat, so the host can tell a
 //! stuck mover from a dead core.
@@ -9,9 +9,9 @@
 #![no_main]
 
 use tt_firmware::{cycles, l1_read32, l1_write32, mailbox_word, noc, publish};
-use tt_isa::eth::{self, mover, mover::event};
-use tt_isa::mailbox::offset;
-use tt_isa::noc::niu::{Command, Endpoint, Niu, TxnId, MAX_REQUEST_BYTES};
+use tt_isa::arch::blackhole::eth::{self, mover, mover::event};
+use tt_isa::arch::blackhole::mailbox::offset;
+use tt_isa::arch::blackhole::noc::niu::{Command, Endpoint, Niu, TxnId, MAX_REQUEST_BYTES};
 
 const TXN: TxnId = match TxnId::new(1) {
     Some(t) => t,

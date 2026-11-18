@@ -19,14 +19,16 @@ use crate::mir::{
 };
 use crate::riscv::{self as rv, Asm, reg};
 use crate::status::ttStatus;
-use tt_isa::backend::{
+use tt_isa::arch::Arch;
+use tt_isa::arch::blackhole::Blackhole;
+use tt_isa::arch::blackhole::backend::{
     self, Before, ConfigWords, ThreadConfigEntry, block, cond, wait_for_packer, wait_for_unpacker0,
 };
-use tt_isa::cfg::generated::{alu, global, pack0, thcon, thread, unpack0, unpack1};
+use tt_isa::arch::blackhole::noc::niu::Niu;
+use tt_isa::arch::blackhole::sync::{self, Semaphore};
+use tt_isa::cfg::blackhole::{alu, global, pack0, thcon, thread, unpack0, unpack1};
 use tt_isa::isa::Instruction;
-use tt_isa::isa::generated::{defs, encode};
-use tt_isa::noc::niu::Niu;
-use tt_isa::sync::{self, Semaphore};
+use tt_isa::isa::blackhole::{defs, encode};
 
 /// The GPR the configuration program stages each word through.
 pub const SCRATCH_GPR: u32 = 8;
@@ -729,7 +731,7 @@ fn encode_unpack(
                 // A page the Matrix Unit read is released only once its own
                 // unpacker has drained too.
                 out.push(
-                    tt_isa::backend::wait_for_unpacker1(Before::EVERYTHING)
+                    tt_isa::arch::blackhole::backend::wait_for_unpacker1(Before::EVERYTHING)
                         .map_err(|_| ttStatus::TT_ERROR_STALLWAIT)?,
                 );
                 out.asm(|a| {
@@ -791,7 +793,7 @@ const SETDMAREG: u32 = 0x4500_0000;
 /// `INSTRN_BUF_BASE`: the store target that pushes a Tensix instruction. RISC-V
 /// T0/T1/T2 all push their own thread through this address
 /// (`PushTensixInstruction.md`); a `.ttinsn` is the same store.
-const INSTRN_BUF: u32 = tt_isa::tensix::INSTRN_BUF_BASE as u32;
+const INSTRN_BUF: u32 = Blackhole::INSTRN_BUF_BASE as u32;
 
 /// The unpacker's read base: the ring's read pointer in 16-byte units, minus the
 /// header unit the unpacker adds (`UNPACR_Regular.md`: `InAddr = (Base_address +
@@ -800,7 +802,7 @@ fn cb_base_unpack(out: &mut Stream, cb: Cb, unit: u8) -> Result<(), ttStatus> {
     out.push(wait_for_unpacker0(Before::EVERYTHING).map_err(|_| ttStatus::TT_ERROR_STALLWAIT)?);
     if unit == 1 {
         out.push(
-            tt_isa::backend::wait_for_unpacker1(Before::EVERYTHING)
+            tt_isa::arch::blackhole::backend::wait_for_unpacker1(Before::EVERYTHING)
                 .map_err(|_| ttStatus::TT_ERROR_STALLWAIT)?,
         );
     }
@@ -959,7 +961,7 @@ fn config_seed(words: &mut ConfigWords, at: u16, value: u32) -> Result<(), ttSta
 
 /// The instructions that write `words` into `Config`, sized to fit.
 fn config_program(words: &ConfigWords) -> Result<Vec<Instruction>, ttStatus> {
-    let mut buf = vec![tt_isa::sfpu::nop(); words.program_len()];
+    let mut buf = vec![tt_isa::arch::blackhole::sfpu::nop(); words.program_len()];
     let n = match words.program(SCRATCH_GPR, &mut buf) {
         Ok(n) => n,
         Err(e) => {
@@ -983,9 +985,9 @@ fn stallwait(block_mask: u32, condition: u32) -> Result<Instruction, ttStatus> {
 /// makes on the way in or out.
 fn lane_format(dtype: DType) -> u32 {
     match dtype {
-        DType::F32 => tt_isa::sfpu::mod0_fmt::FP32,
-        DType::I32 | DType::Bool => tt_isa::sfpu::mod0_fmt::INT32,
-        DType::Bf16 => tt_isa::sfpu::mod0_fmt::BF16,
+        DType::F32 => tt_isa::arch::blackhole::sfpu::mod0_fmt::FP32,
+        DType::I32 | DType::Bool => tt_isa::arch::blackhole::sfpu::mod0_fmt::INT32,
+        DType::Bf16 => tt_isa::arch::blackhole::sfpu::mod0_fmt::BF16,
     }
 }
 
@@ -1320,7 +1322,8 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), tt
             out.push(i);
         }
         MirOp::LaneConst { lreg, bits } => {
-            let halves = tt_isa::sfpu::load_f32(u32::from(lreg), bits).map_err(|e| bad(e, op))?;
+            let halves = tt_isa::arch::blackhole::sfpu::load_f32(u32::from(lreg), bits)
+                .map_err(|e| bad(e, op))?;
             for i in halves {
                 out.push(i);
             }
@@ -1346,7 +1349,7 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), tt
             d,
         } => {
             out.push(
-                tt_isa::sfpu::add(u32::from(a), u32::from(b), u32::from(d))
+                tt_isa::arch::blackhole::sfpu::add(u32::from(a), u32::from(b), u32::from(d))
                     .map_err(|e| bad(e, op))?,
             );
         }
@@ -1357,7 +1360,7 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), tt
             d,
         } => {
             out.push(
-                tt_isa::sfpu::sub(u32::from(a), u32::from(b), u32::from(d))
+                tt_isa::arch::blackhole::sfpu::sub(u32::from(a), u32::from(b), u32::from(d))
                     .map_err(|e| bad(e, op))?,
             );
         }
@@ -1368,7 +1371,7 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), tt
             d,
         } => {
             out.push(
-                tt_isa::sfpu::mul(u32::from(a), u32::from(b), u32::from(d))
+                tt_isa::arch::blackhole::sfpu::mul(u32::from(a), u32::from(b), u32::from(d))
                     .map_err(|e| bad(e, op))?,
             );
         }
@@ -1427,7 +1430,8 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), tt
             // (`VC - VD`, with `VC` the integer zero), the same step zyx's
             // `tt_sfp_integer` takes.
             out.push(
-                encode::sfpiadd(0, tt_isa::sfpu::LREG_ZERO, u32::from(b), 6).map_err(bad_isa)?,
+                encode::sfpiadd(0, tt_isa::arch::blackhole::sfpu::LREG_ZERO, u32::from(b), 6)
+                    .map_err(bad_isa)?,
             );
             out.push(encode::sfpshft(0, u32::from(b), u32::from(d), 0).map_err(bad_isa)?);
         }
@@ -1520,7 +1524,7 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), tt
                 encode::Sfpmul24::ZERO
                     .va(u32::from(a))
                     .vb(u32::from(b))
-                    .vc(tt_isa::sfpu::LREG_ZERO)
+                    .vc(tt_isa::arch::blackhole::sfpu::LREG_ZERO)
                     .vd(u32::from(d))
                     .mod1(u32::from(upper))
                     .encode()
@@ -1529,8 +1533,14 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), tt
         }
         MirOp::SfpMad { mod1, a, b, c, d } => {
             out.push(
-                tt_isa::sfpu::mad(u32::from(a), u32::from(b), u32::from(c), u32::from(d), mod1)
-                    .map_err(|e| bad(e, op))?,
+                tt_isa::arch::blackhole::sfpu::mad(
+                    u32::from(a),
+                    u32::from(b),
+                    u32::from(c),
+                    u32::from(d),
+                    mod1,
+                )
+                .map_err(|e| bad(e, op))?,
             );
         }
         MirOp::SfpStochRnd { mod1, a, d } => {

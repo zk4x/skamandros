@@ -7,6 +7,9 @@
 //! are computed in registers. Values that fit `u32` are materialised with
 //! `lui`/`addi`; the assembler patches branch immediates at `finish`.
 
+use tt_isa::arch::blackhole::Blackhole;
+use tt_isa::arch::{Arch, Specials};
+
 /// Register numbers of the caller-saved set the programs use. A program is a
 /// leaf: no `sp`, `gp`, `tp`, `ra`, `s0..s11`.
 pub mod reg {
@@ -216,7 +219,11 @@ pub fn ret() -> u32 {
 /// dropped (`ManualTTSync.md`; no other load in the PC buffer range may start
 /// until this one finishes).
 pub fn coprocessor_done(a: &mut Asm) {
-    a.li(reg::T0, tt_isa::tensix::COPROCESSOR_DONE_CHECK as u32);
+    let check = match Blackhole::SPECIALS {
+        Specials::Blackhole(specials) => specials.coprocessor_done_check,
+        Specials::Quasar => unreachable!("skamandros lowers for Blackhole"),
+    };
+    a.li(reg::T0, check as u32);
     a.word(sw(reg::ZERO, reg::T0, 0));
     a.word(lw(reg::T1, reg::T0, 0));
     a.word(and(reg::T1, reg::T1, reg::ZERO));

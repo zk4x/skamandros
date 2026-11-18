@@ -1,4 +1,4 @@
-//! NoC atomic, multicast and completion probe on RISCV B (`tt_isa::noc::probe`).
+//! NoC atomic, multicast and completion probe on RISCV B (`tt_isa::arch::blackhole::noc::probe`).
 //!
 //! Replays the requests the host encoded with the typed encoders
 //! (`AtomicRequest::registers`, `MulticastWrite::registers`): this image holds no
@@ -39,8 +39,8 @@
 use core::ptr::{read_volatile, write_volatile};
 
 use tt_firmware::{finish, l1_read32, l1_write32, publish, spin};
-use tt_isa::noc::niu::{self, initiator, Niu, TxnId};
-use tt_isa::noc::probe::{self, flag, kind, phase, result, status, word};
+use tt_isa::arch::blackhole::noc::niu::{self, initiator, Niu, TxnId};
+use tt_isa::arch::blackhole::noc::probe::{self, flag, kind, phase, result, status, word};
 
 fn reg(niu: Niu, offset: u64) -> *mut u32 {
     (niu.base() + offset) as *mut u32
@@ -218,7 +218,7 @@ pub extern "Rust" fn firmware_main() -> ! {
             unsafe {
                 write_volatile(
                     reg(niu, niu::CLEAR_OUTSTANDING),
-                    tt_isa::noc::clear_outstanding(txn),
+                    tt_isa::arch::blackhole::noc::clear_outstanding(txn),
                 );
                 let _ = read_volatile(reg(niu, ini + initiator::CMD_CTRL));
             }

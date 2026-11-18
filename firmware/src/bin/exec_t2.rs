@@ -6,7 +6,7 @@
 #![no_main]
 
 use tt_firmware::corpus;
-use tt_isa::mailbox::launch::Mailbox;
+use tt_isa::arch::blackhole::mailbox::launch::Mailbox;
 
 #[no_mangle]
 pub extern "Rust" fn firmware_main() -> ! {

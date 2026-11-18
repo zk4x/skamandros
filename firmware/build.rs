@@ -2,7 +2,7 @@
 //!
 //! Every Tensix image uses `link.x` (T0's default reset PC) except the three role
 //! images, which live in their own slots (`link_role_t{0,1,2}.x`,
-//! `tt_isa::l1::roles`) so that one tile can hold all three role images and a
+//! `tt_isa::arch::blackhole::l1::roles`) so that one tile can hold all three role images and a
 //! mover of up to `dm::IMAGE_MAX` at once, and the per-core probes
 //! (`icache_t1`, `icache_t2`), which use their cores' default reset PCs. The
 //! Ethernet image uses `link_e1.x`.
@@ -26,18 +26,18 @@ fn main() {
         ("role_t2", "link_role_t2.x"),
     ];
     for (bin, script) in tensix {
-        link(bin, script, tt_isa::mailbox::MAILBOX_BASE);
+        link(bin, script, tt_isa::arch::blackhole::mailbox::MAILBOX_BASE);
     }
-    link("eth_e1", "link_e1.x", tt_isa::eth::MAILBOX_BASE);
-    link("dm_b", "link_b.x", tt_isa::dm::MAILBOX_BASE);
-    link("nc_probe", "link_nc.x", tt_isa::dm::nc::MAILBOX_BASE);
-    link("dm_nc", "link_nc.x", tt_isa::dm::nc::MAILBOX_BASE);
-    link("icache_b", "link_b.x", tt_isa::mailbox::MAILBOX_BASE);
-    link("tag_search_b", "link_b.x", tt_isa::mailbox::MAILBOX_BASE);
-    link("noc_probe_b", "link_b.x", tt_isa::mailbox::MAILBOX_BASE);
-    link("read_loop_b", "link_b.x", tt_isa::mailbox::MAILBOX_BASE);
-    link("exec_b", "link_b.x", tt_isa::mailbox::MAILBOX_BASE);
-    link("icache_nc", "link_nc.x", tt_isa::dm::nc::MAILBOX_BASE);
+    link("eth_e1", "link_e1.x", tt_isa::arch::blackhole::eth::MAILBOX_BASE);
+    link("dm_b", "link_b.x", tt_isa::arch::blackhole::dm::MAILBOX_BASE);
+    link("nc_probe", "link_nc.x", tt_isa::arch::blackhole::dm::nc::MAILBOX_BASE);
+    link("dm_nc", "link_nc.x", tt_isa::arch::blackhole::dm::nc::MAILBOX_BASE);
+    link("icache_b", "link_b.x", tt_isa::arch::blackhole::mailbox::MAILBOX_BASE);
+    link("tag_search_b", "link_b.x", tt_isa::arch::blackhole::mailbox::MAILBOX_BASE);
+    link("noc_probe_b", "link_b.x", tt_isa::arch::blackhole::mailbox::MAILBOX_BASE);
+    link("read_loop_b", "link_b.x", tt_isa::arch::blackhole::mailbox::MAILBOX_BASE);
+    link("exec_b", "link_b.x", tt_isa::arch::blackhole::mailbox::MAILBOX_BASE);
+    link("icache_nc", "link_nc.x", tt_isa::arch::blackhole::dm::nc::MAILBOX_BASE);
     for (bin, script, t) in [
         ("icache_t0", "link.x", 0),
         ("icache_t1", "link_t1.x", 1),
@@ -46,7 +46,7 @@ fn main() {
         link(
             bin,
             script,
-            tt_isa::mailbox::launch::BASE + t * tt_isa::mailbox::launch::STRIDE,
+            tt_isa::arch::blackhole::mailbox::launch::BASE + t * tt_isa::arch::blackhole::mailbox::launch::STRIDE,
         );
     }
     // The role executors (NOTES "Role programs are RISC-V code"): the same
@@ -59,7 +59,7 @@ fn main() {
         link(
             bin,
             script,
-            tt_isa::mailbox::launch::BASE + t * tt_isa::mailbox::launch::STRIDE,
+            tt_isa::arch::blackhole::mailbox::launch::BASE + t * tt_isa::arch::blackhole::mailbox::launch::STRIDE,
         );
     }
     // RISCV NC's executor: the writer's launch mailbox, in the image slot the
@@ -67,7 +67,7 @@ fn main() {
     link(
         "exec_nc",
         "link_nc.x",
-        tt_isa::mailbox::launch::BASE + 3 * tt_isa::mailbox::launch::STRIDE,
+        tt_isa::arch::blackhole::mailbox::launch::BASE + 3 * tt_isa::arch::blackhole::mailbox::launch::STRIDE,
     );
 
     for f in [

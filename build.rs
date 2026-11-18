@@ -114,9 +114,24 @@ fn main() {
         // published crate.
         let build_dir = out_dir.join("firmware-src");
         copy_tree(&firmware_dir, &build_dir);
-        std::fs::copy(
-            firmware_dir.join("Cargo.toml.in"),
+        // The firmware manifest is read from a copy, so a path dependency has to
+        // be absolute. On this tree the dependency is the sibling `../tt-isa`,
+        // whose split into architectures is not on crates.io yet; a packaged
+        // crate has no sibling and takes the registry version instead.
+        let sibling = manifest.join("../tt-isa");
+        let dependency = if sibling.join("Cargo.toml").exists() {
+            let path = sibling
+                .canonicalize()
+                .expect("could not resolve the sibling tt-isa");
+            format!("{{ path = {path:?} }}")
+        } else {
+            "\"0.2.0\"".to_string()
+        };
+        let manifest_in = std::fs::read_to_string(firmware_dir.join("Cargo.toml.in"))
+            .expect("could not read the firmware manifest");
+        std::fs::write(
             build_dir.join("Cargo.toml"),
+            manifest_in.replace("__TT_ISA_DEP__", &dependency),
         )
         .expect("could not write the firmware manifest");
         println!(

@@ -92,10 +92,10 @@ pub enum IOp {
 
 /// This core's `core_info`: the logical grid coordinate the host wrote before
 /// the launch. `x` is at this address, `y` four bytes after it.
-pub const CORE_INFO: u32 = tt_isa::mailbox::MAILBOX_BASE as u32 + 0x100;
+pub const CORE_INFO: u32 = tt_isa::arch::blackhole::mailbox::MAILBOX_BASE as u32 + 0x100;
 // The launch barrier's word must not land on it: both are host-written words in
 // the mailbox page, and a barrier there would be read as a grid coordinate.
-const _: () = assert!(CORE_INFO as u64 >= tt_isa::mailbox::BARRIER + 4);
+const _: () = assert!(CORE_INFO as u64 >= tt_isa::arch::blackhole::mailbox::BARRIER + 4);
 
 /// The edge mask a pack applies: which datums of each 32x32 tile survive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

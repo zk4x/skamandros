@@ -5,10 +5,13 @@
 use tt_firmware::cfg::write_config_field;
 use tt_firmware::tensix::{push_word, read_dst32, wait_for_coprocessor};
 use tt_firmware::{fail, finish, l1_read32, l1_write32, publish, spin};
-use tt_isa::cfg::{generated::global::PRNG_SEED_Seed_Val, ConfigBank};
-use tt_isa::mailbox::{self, panic_code};
-use tt_isa::sfpu::dst32_address;
-use tt_isa::tensix::{RiscvT1, TensixThread, Thread1};
+use tt_isa::cfg::{blackhole::global::PRNG_SEED_Seed_Val, ConfigBank};
+use tt_isa::arch::blackhole::mailbox::{self, panic_code};
+use tt_isa::arch::blackhole::sfpu::dst32_address;
+use tt_firmware::tensix::RiscvT1;
+use tt_isa::arch::Arch;
+use tt_isa::arch::blackhole::Blackhole;
+use tt_isa::tensix::{TensixThread, Thread1};
 
 #[no_mangle]
 pub extern "Rust" fn firmware_main() -> ! {
@@ -25,14 +28,19 @@ pub extern "Rust" fn firmware_main() -> ! {
         || len == 0
         || len > mailbox::MAX_WORDS
         || program == 0
-        || !tt_isa::l1::PROGRAM_CACHE.contains(u64::from(program), u64::from(len) * 4)
+        || !tt_isa::arch::blackhole::l1::PROGRAM_CACHE.contains(u64::from(program), u64::from(len) * 4)
     {
         fail(panic_code::EXPLICIT);
     }
     // SAFETY: the host released the backend; this image owns T1 and no
     // coprocessor work has been submitted yet. Each later seed store follows
-    // a complete drain, not just a scheduling bubble.
-    unsafe { write_config_field(Thread1::DST_ACCESS_FMT, ConfigBank::Bank0, 0) };
+    // a complete drain, not just a scheduling bubble. The field is the one
+    // `Arch::dst_access_fmt` names for thread 1, which this image checked above.
+    let dst_format = match Blackhole::dst_access_fmt(Thread1::INDEX) {
+        Ok(field) => field,
+        Err(_) => fail(panic_code::EXPLICIT),
+    };
+    unsafe { write_config_field(dst_format, ConfigBank::Bank0, 0) };
     for (phase, value) in [seed, seed, !seed, seed].into_iter().enumerate() {
         // SAFETY: the coprocessor is idle; only the generated full-width seed
         // field is written. Fence before pushing anything dependent on it.

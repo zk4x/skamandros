@@ -10,23 +10,23 @@ it by hand.
 
 | Binary | Core | Link script | Purpose |
 |---|---|---|---|
-| `role_t0`, `role_t1`, `role_t2` | T0, T1, T2 | `link_role_t0.x`, `link_role_t1.x`, `link_role_t2.x` | The unpack / math / pack role runners. Each in its 10 KiB slot (`tt_isa::l1::roles`), reached through its reset-PC override, so all three and B's mover sit in one tile's L1. Resident in a `Session`. |
-| `dm_b` | B | `link_b.x` | The reader (`tt_isa::dm`): GDDR to L1, list entries, reading op records expanded on the tile, padding fills, tilizes, PCIe moves, barriers, `KERNEL` entries that point the resident roles at their programs and run them, and the shared packets that start NC. It never writes GDDR. No arithmetic: the image gate refuses every F-extension instruction, in every image. |
+| `role_t0`, `role_t1`, `role_t2` | T0, T1, T2 | `link_role_t0.x`, `link_role_t1.x`, `link_role_t2.x` | The unpack / math / pack role runners. Each in its 10 KiB slot (`tt_isa::arch::blackhole::l1::roles`), reached through its reset-PC override, so all three and B's mover sit in one tile's L1. Resident in a `Session`. |
+| `dm_b` | B | `link_b.x` | The reader (`tt_isa::arch::blackhole::dm`): GDDR to L1, list entries, reading op records expanded on the tile, padding fills, tilizes, PCIe moves, barriers, `KERNEL` entries that point the resident roles at their programs and run them, and the shared packets that start NC. It never writes GDDR. No arithmetic: the image gate refuses every F-extension instruction, in every image. |
 | `dm_nc` | NC | `link_nc.x` | The writer, loaded above the data arena via NC's reset stub: L1 to GDDR on NoC1, writing op records expanded on the tile, and the CB operations that order them. It runs no read, kernel launch, barrier or PCIe move. |
-| `eth_e1` | E1 (Ethernet) | `link_e1.x` | The chip-to-chip data mover (`tt_isa::eth::mover`). |
+| `eth_e1` | E1 (Ethernet) | `link_e1.x` | The chip-to-chip data mover (`tt_isa::arch::blackhole::eth::mover`). |
 | `corpus` / `corpus_t0` | T1 / T0 | `link.x` | Generic single-thread program runner (T1 for ttsim, T0 for silicon). |
 | `heartbeat`, `sfpu_mul` | T0, or the corpus core | `link.x` | The step 3 and step 4 bring-up gates. |
 | `prng_seed` | T1 | `link.x` | Step91 diagnostic: direct configuration seed stores, settling interval and four lane snapshots. |
 
 `dm_b` and `dm_nc` are one source (`src/mover.rs`) compiled twice with a const `M`;
-`tt_isa::dm::Mover::permits` is the table of which entries each runs, refused with
+`tt_isa::arch::blackhole::dm::Mover::permits` is the table of which entries each runs, refused with
 `error::DIRECTION` by the host before a list is sent and by the tile if one gets
 there anyway. Each image's other direction is compiled out.
 
 The program runners push from their fixed program slot, or, when
 `mailbox::PROGRAM_ADDR` is non-zero, from that address, which must lie in the
 program cache region. The host writes a runner's whole descriptor
-(`tt_isa::mailbox::Descriptor`) before every run: L1 survives between processes on
+(`tt_isa::arch::blackhole::mailbox::Descriptor`) before every run: L1 survives between processes on
 silicon, so a field left unwritten is the previous process's.
 
 `src/lib.rs` is the runtime (entry, `.bss`, status/heartbeat/panic words in the L1
@@ -75,6 +75,6 @@ normal path.
 | Feature | What it does |
 |---|---|
 | (none) | The default "safe" images: the B mover decodes and checks every read itself and refuses `READ_ENCODED`. |
-| `fast-reads` | The B mover runs host-encoded reads (`tt_isa::dm::encoded`), verifying their checksum; the host validates them in full. Reported to the host in `dm::CAPS`. |
+| `fast-reads` | The B mover runs host-encoded reads (`tt_isa::arch::blackhole::dm::encoded`), verifying their checksum; the host validates them in full. Reported to the host in `dm::CAPS`. |
 | `encoded-guard` | With `fast-reads`: also `encoded::guard`, an independent semantic check of each encoded read (~40 cycles). |
 | `ttinsn-experiment` | The `.ttinsn` push-fusion experiment image (`docs/plans/ttinsn-push-experiment.md`). |

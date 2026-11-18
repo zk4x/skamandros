@@ -20,7 +20,7 @@
 use core::panic::PanicInfo;
 use core::ptr::{read_volatile, write_volatile};
 
-use tt_isa::mailbox::{self, panic_code, status};
+use tt_isa::arch::blackhole::mailbox::{self, panic_code, status};
 
 // Entry point.
 //
@@ -95,13 +95,13 @@ pub unsafe fn l1_read32(offset: u64) -> u32 {
 
 extern "C" {
     /// Where this image's mailbox is, set per binary by `build.rs` from
-    /// `tt_isa::mailbox::MAILBOX_BASE` (Tensix) or `tt_isa::eth::MAILBOX_BASE`
+    /// `tt_isa::arch::blackhole::mailbox::MAILBOX_BASE` (Tensix) or `tt_isa::arch::blackhole::eth::MAILBOX_BASE`
     /// (Ethernet) -- generated, so the host and the image cannot disagree. Only its
     /// address means anything.
     static __mailbox: u8;
 }
 
-/// The address of mailbox word `offset` (one of `tt_isa::mailbox::offset`).
+/// The address of mailbox word `offset` (one of `tt_isa::arch::blackhole::mailbox::offset`).
 #[inline]
 pub fn mailbox_word(offset: u64) -> u64 {
     // Taking the address of a linker-defined symbol reads nothing.
@@ -244,6 +244,7 @@ fn panic(info: &PanicInfo) -> ! {
 pub mod corpus;
 pub mod dispatch;
 pub mod dataflow;
+pub mod hw;
 /// Run-time translation of a staged program into looping `.ttinsn` code
 /// (`docs/plans/ttinsn-push-experiment.md`): the role runners call it when a
 /// program's block repeats make the exchange pay, so a loop becomes a branch
@@ -251,8 +252,88 @@ pub mod dataflow;
 pub mod ttinsn;
 
 pub mod tensix {
-    use tt_isa::sfpu::Instruction;
-    use tt_isa::tensix::{self, PushesTo, TensixThread};
+    use tt_isa::arch::blackhole::sfpu::Instruction;
+    use tt_isa::tensix::{Core, TensixThread};
+
+    /// The core this image runs on, as a type.
+    ///
+    /// `tt-isa` describes a core's identity as a value (`Core`), because a
+    /// harness can be handed either architecture; an image is linked for one
+    /// core and cannot know it at run time (`mhartid` reads zero everywhere).
+    /// The marker types below let a call site name that fact, and the
+    /// [`PushesTo`] implementations are the compile-time form of the push table.
+    pub trait PushCore {
+        /// The runtime spelling of the same fact.
+        const CORE: Core;
+    }
+
+    /// RISCV B. The only core that can reach all three Tensix threads.
+    pub struct RiscvB;
+    /// RISCV T0.
+    pub struct RiscvT0;
+    /// RISCV T1.
+    pub struct RiscvT1;
+    /// RISCV T2.
+    pub struct RiscvT2;
+    /// RISCV NC. Implements neither [`PushCore`] nor [`PushesTo`], by construction.
+    pub struct RiscvNc;
+
+    impl PushCore for RiscvB {
+        const CORE: Core = Core::B;
+    }
+    impl PushCore for RiscvT0 {
+        const CORE: Core = Core::T0;
+    }
+    impl PushCore for RiscvT1 {
+        const CORE: Core = Core::T1;
+    }
+    impl PushCore for RiscvT2 {
+        const CORE: Core = Core::T2;
+    }
+
+    /// Which buffer address reaches thread `Th` from this core.
+    ///
+    /// **This trait exists to make a hang unrepresentable.** The table in
+    /// `PushTensixInstruction.md:5-9` is:
+    ///
+    /// | Store address | B | T0 | T1 | T2 |
+    /// |---|---|---|---|---|
+    /// | `INSTRN_BUF_BASE` | thread 0 | thread 0 | thread 1 | thread 2 |
+    /// | `INSTRN1_BUF_BASE` | thread 1 | *hangs* | *hangs* | *hangs* |
+    /// | `INSTRN2_BUF_BASE` | thread 2 | *hangs* | *hangs* | *hangs* |
+    ///
+    /// "Hangs" is not a fault that can be caught: it is an unrecoverable lockup of
+    /// the RISC-V. The impls below are exactly the non-hanging cells, so the bad
+    /// combinations do not compile instead of being documented and hoped about.
+    /// The addresses themselves are [`BlackholeSpecials::pushed_to`], which
+    /// answers `(core, thread)` and refuses anything off this table.
+    ///
+    /// [`BlackholeSpecials::pushed_to`]: tt_isa::arch::BlackholeSpecials::pushed_to
+    pub trait PushesTo<Th: TensixThread>: PushCore {}
+
+    impl PushesTo<tt_isa::tensix::Thread0> for RiscvB {}
+    impl PushesTo<tt_isa::tensix::Thread1> for RiscvB {}
+    impl PushesTo<tt_isa::tensix::Thread2> for RiscvB {}
+    impl PushesTo<tt_isa::tensix::Thread0> for RiscvT0 {}
+    impl PushesTo<tt_isa::tensix::Thread1> for RiscvT1 {}
+    impl PushesTo<tt_isa::tensix::Thread2> for RiscvT2 {}
+
+    /// The store address that reaches thread `Th` from core `C`.
+    ///
+    /// The trait bound admits only the six legal pairs, so the refusal is
+    /// unreachable; it is [`crate::fail`] rather than a panic because formatting
+    /// the error does not fit a role image.
+    #[inline]
+    fn instrn_buf<C, Th>() -> u64
+    where
+        Th: TensixThread,
+        C: PushesTo<Th>,
+    {
+        match crate::hw::SPECIALS.pushed_to(C::CORE, Th::INDEX) {
+            Ok(address) => address,
+            Err(_) => crate::fail(tt_isa::arch::blackhole::mailbox::panic_code::EXPLICIT),
+        }
+    }
 
     /// Push one Tensix instruction into this core's Tensix thread.
     ///
@@ -269,7 +350,7 @@ pub mod tensix {
     /// words live in the compressed-instruction encoding space, so they disassemble
     /// as garbage, and the instruction-set gate in `crates/tt-tests/build.rs` would
     /// have to stop rejecting undecodable instructions to let them through. The
-    /// encoding is implemented and tested in `tt_isa::sfpu`; using it belongs with
+    /// encoding is implemented and tested in `tt_isa::arch::blackhole::sfpu`; using it belongs with
     /// the rest of the performance work, when there is a measurement to justify it.
     ///
     /// # Which core, and which thread
@@ -277,11 +358,10 @@ pub mod tensix {
     /// `C` is the core this image runs on and `Th` is the Tensix thread to reach.
     /// Both are type parameters rather than arguments because the buffer address
     /// depends on the *pair*, and two of the nine combinations hang the RISC-V
-    /// unrecoverably (`PushTensixInstruction.md:5-9`). `tt_isa::tensix::PushesTo`
-    /// is implemented for exactly the six that do not, so a hanging push is a
-    /// compile error rather than a lockup. `C` cannot be inferred -- core identity
-    /// is not discoverable at run time -- so every call site names it, which is the
-    /// point.
+    /// unrecoverably (`PushTensixInstruction.md:5-9`). [`PushesTo`] is implemented
+    /// for exactly the six that do not, so a hanging push is a compile error rather
+    /// than a lockup. `C` cannot be inferred -- core identity is not discoverable
+    /// at run time -- so every call site names it, which is the point.
     ///
     /// # Safety
     ///
@@ -296,12 +376,7 @@ pub mod tensix {
         Th: TensixThread,
         C: PushesTo<Th>,
     {
-        unsafe {
-            core::ptr::write_volatile(
-                <C as PushesTo<Th>>::INSTRN_BUF as *mut u32,
-                instruction.word(),
-            )
-        }
+        unsafe { core::ptr::write_volatile(instrn_buf::<C, Th>() as *mut u32, instruction.word()) }
     }
 
     /// Push a raw instruction word.
@@ -320,7 +395,7 @@ pub mod tensix {
         Th: TensixThread,
         C: PushesTo<Th>,
     {
-        unsafe { core::ptr::write_volatile(<C as PushesTo<Th>>::INSTRN_BUF as *mut u32, word) }
+        unsafe { core::ptr::write_volatile(instrn_buf::<C, Th>() as *mut u32, word) }
     }
 
     /// Block until the Tensix coprocessor has retired every instruction this
@@ -359,7 +434,7 @@ pub mod tensix {
                 "sw   zero, 0({addr})",
                 "lw   {tmp}, 0({addr})",
                 "andi {tmp}, {tmp}, 0",
-                addr = in(reg) tensix::COPROCESSOR_DONE_CHECK as u32,
+                addr = in(reg) crate::hw::COPROCESSOR_DONE_CHECK as u32,
                 tmp = out(reg) _,
                 options(nostack),
             )
@@ -378,14 +453,14 @@ pub mod tensix {
                 "sw   zero, 0({addr})",
                 "lw   {tmp}, 0({addr})",
                 "andi {tmp}, {tmp}, 0",
-                addr = in(reg) tensix::MOP_EXPANDER_DONE_CHECK as u32,
+                addr = in(reg) crate::hw::MOP_EXPANDER_DONE_CHECK as u32,
                 tmp = out(reg) _,
                 options(nostack),
             )
         }
     }
 
-    /// Load this thread's `MopCfg` (`tt_isa::frontend::mop`): wait for the
+    /// Load this thread's `MopCfg` (`Blackhole::MOP_CFG_BASE`): wait for the
     /// expander to be idle, write the nine words, and fence so they land before
     /// any later push reaches it.
     pub fn load_mop_config(words: &[u32; 9]) {
@@ -394,7 +469,10 @@ pub mod tensix {
             // SAFETY: the write-only `MopCfg` window of this core's thread;
             // the expander is idle (above).
             unsafe {
-                core::ptr::write_volatile((tensix::MOP_CFG_BASE + 4 * k as u64) as *mut u32, w)
+                core::ptr::write_volatile(
+                    (crate::hw::MOP_CFG_BASE + 4 * k as u64) as *mut u32,
+                    w,
+                )
             };
         }
         crate::publish();
@@ -408,7 +486,7 @@ pub mod tensix {
     ///
     /// # Safety
     ///
-    /// `address` must come from [`tt_isa::sfpu::dst32_address`], and the
+    /// `address` must come from [`tt_isa::arch::blackhole::sfpu::dst32_address`], and the
     /// coprocessor must have retired the instruction that wrote it — see
     /// [`wait_for_coprocessor`].
     #[inline]
@@ -494,7 +572,7 @@ pub mod cfg {
     /// As [`read_thread_config`].
     #[inline]
     pub unsafe fn active_bank(thread: u32) -> ConfigBank {
-        use tt_isa::cfg::generated::thread::CFG_STATE_ID_StateID;
+        use tt_isa::cfg::blackhole::thread::CFG_STATE_ID_StateID;
         // SAFETY: delegated to the caller.
         if unsafe { read_thread_config(CFG_STATE_ID_StateID, thread) } == 0 {
             ConfigBank::Bank0
@@ -508,7 +586,7 @@ pub mod cfg {
 /// NIU: NoC #0's or NoC #1's, named per request.
 pub mod noc {
     use core::ptr::{read_volatile, write_volatile};
-    use tt_isa::noc::niu::{
+    use tt_isa::arch::blackhole::noc::niu::{
         self, initiator, Batch, Command, InFlight, Niu, RequestError, TxnId,
     };
 
@@ -520,7 +598,7 @@ pub mod noc {
 
     /// Each NIU's and transaction ID's requests in flight, kept under its cap
     /// so the 8-bit counter `wait` reads cannot wrap
-    /// (`tt_isa::noc::niu::InFlight`), and what the cap has cost. Each NIU
+    /// (`tt_isa::arch::blackhole::noc::niu::InFlight`), and what the cap has cost. Each NIU
     /// counts its own requests. In local data RAM (`sections.x`, `.local`):
     /// touched on every issue and every wait, and a load there is 2 cycles
     /// (`BabyRISCV/README.md:147`). Written by `reset` before `firmware_main`,
@@ -648,7 +726,7 @@ pub mod noc {
         Ok(())
     }
 
-    /// [`issue_on`] for one request of a `tt_isa::noc::niu::DramMove`, its
+    /// [`issue_on`] for one request of a `tt_isa::arch::blackhole::noc::niu::DramMove`, its
     /// values as arguments -- registers, on RISC-V -- written straight to the
     /// initiator: no register array built and read back per request. The two
     /// address-middle words and `AT_DATA` are written zero, as
@@ -766,7 +844,7 @@ pub mod noc {
     /// target coordinate and length only when either differs from the last
     /// request's, `NOC_CTRL`, and the command. The return coordinate and tag
     /// are the same in every read of a move and of a list (`DramMove`), which
-    /// `tt_isa::noc::niu` gates. The accounting is [`issue_dram_on`]'s, except
+    /// `tt_isa::arch::blackhole::noc::niu` gates. The accounting is [`issue_dram_on`]'s, except
     /// that the caller makes room under `txn`'s cap first ([`room_for_read`]),
     /// so that this stays a leaf with no frame to save the request in: the
     /// issue is counted after, and `CMD_CTRL` read back.
@@ -813,7 +891,7 @@ pub mod noc {
 
     /// A run of GDDR reads through the fast path, [`issue_read`] without its per-request costs: the in-flight
     /// room and the initiator's last key live in registers for the run, and `CMD_CTRL` is read back once, when
-    /// the run ends or must read a counter (`tt_isa::noc::niu::Batch`), not after each request. The next
+    /// the run ends or must read a counter (`tt_isa::arch::blackhole::noc::niu::Batch`), not after each request. The next
     /// request's wait for the initiator to be free reads the same register behind the same store, so it
     /// already orders one request's writes before the next; only the counter reads need the fence.
     /// Every exit from a run calls [`ReadBatch::end`], or the requests it issued are not counted and the
@@ -915,12 +993,12 @@ pub mod noc {
         }
     }
 
-    /// One request of a `tt_isa::noc::niu::HostMove` through NoC #0, under
+    /// One request of a `tt_isa::arch::blackhole::noc::niu::HostMove` through NoC #0, under
     /// `txn`: [`issue_dram_on`] with the high address words a host address
     /// needs. Cold: host moves are not the per-tile path.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
-    pub fn issue_host(r: tt_isa::noc::niu::HostRequest, txn: TxnId) {
+    pub fn issue_host(r: tt_isa::arch::blackhole::noc::niu::HostRequest, txn: TxnId) {
         use initiator::*;
         let niu = Niu::Noc0;
         if in_flight(niu, txn).at_cap() {
@@ -946,7 +1024,7 @@ pub mod noc {
     }
 
     /// Issue one request already encoded -- by `Command::registers`, or by a
-    /// `tt_isa::noc::niu::DramMove`, which checks a whole move once (the
+    /// `tt_isa::arch::blackhole::noc::niu::DramMove`, which checks a whole move once (the
     /// mover's per-entry path) -- under `txn`, through NoC #1 (`NOC1`) or
     /// NoC #0, fixed at compile time: the move path's copy for NoC #0 has a
     /// constant base and in-flight slot and none of NoC #1's bookkeeping.

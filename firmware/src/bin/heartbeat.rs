@@ -9,7 +9,7 @@
 #![no_main]
 
 use tt_firmware::{l1_write32, publish};
-use tt_isa::mailbox;
+use tt_isa::arch::blackhole::mailbox;
 
 #[no_mangle]
 pub extern "Rust" fn firmware_main() -> ! {

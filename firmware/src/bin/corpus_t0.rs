@@ -17,7 +17,8 @@
 #![no_main]
 
 use tt_firmware::corpus;
-use tt_isa::tensix::{RiscvT0, Thread0};
+use tt_firmware::tensix::RiscvT0;
+use tt_isa::tensix::Thread0;
 
 #[no_mangle]
 pub extern "Rust" fn firmware_main() -> ! {

@@ -16,11 +16,11 @@
 #![no_main]
 
 use tt_firmware::corpus;
-use tt_isa::mailbox::launch::Mailbox;
+use tt_isa::arch::blackhole::mailbox::launch::Mailbox;
 
 #[no_mangle]
 pub extern "Rust" fn firmware_main() -> ! {
     // Every cache, as tt-metal's BRISC invalidates BRISC, NC and all three
     // TRISCs before it starts them.
-    corpus::run_exec(Mailbox::b(), tt_isa::mailbox::launch::ENABLE_ALL)
+    corpus::run_exec(Mailbox::b(), tt_isa::arch::blackhole::mailbox::launch::ENABLE_ALL)
 }

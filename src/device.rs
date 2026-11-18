@@ -8,7 +8,7 @@
 //! violation terminates the process (`_Exit`), so nothing here hands it an
 //! address it does not decode: the window geometry is checked before each call,
 //! the TLB configuration is the one the library accepts, and L1 access is
-//! bounded by [`tt_isa::tensix::L1_SIZE`].
+//! bounded by [`tt_isa::arch::blackhole::Blackhole::L1_SIZE`].
 //!
 //! The simulator is loaded from `$TT_METAL_SIMULATOR` — the name tt-metal's own
 //! runtime and the ttsim project use — or `libttsim_bh.so` in the current
@@ -23,12 +23,29 @@ use libloading::{Library, Symbol};
 
 use crate::kmd::{DEVICE_ID_BLACKHOLE, Kmd, VENDOR_ID_TENSTORRENT};
 use crate::status::ttStatus;
-use tt_isa::dram::{CHANNEL_BYTES, Dram, DramChannel};
-use tt_isa::l1;
-use tt_isa::mailbox::{self, status};
-use tt_isa::noc::NocCoord;
-use tt_isa::noc::niu::Endpoint;
-use tt_isa::tensix::{self, Core};
+use tt_isa::arch::Arch;
+use tt_isa::arch::blackhole::Blackhole;
+use tt_isa::arch::blackhole::dram::{CHANNEL_BYTES, Dram, DramChannel};
+use tt_isa::arch::blackhole::l1;
+use tt_isa::arch::blackhole::mailbox::{self, status};
+use tt_isa::arch::blackhole::noc::NocCoord;
+use tt_isa::arch::blackhole::noc::niu::Endpoint;
+use tt_isa::tensix::Core;
+
+/// `RISC_SOFT_RESET_0`: the one register every Blackhole core and the backend
+/// share. The crate names it only through [`Arch::reset`], which also holds the
+/// bit of each core, so the two are looked up together.
+fn soft_reset_register() -> u64 {
+    Blackhole::reset(Core::B)
+        .expect("Blackhole has a reset bit for B")
+        .0
+}
+
+/// The reset bit of `core`. Every core this driver names is Blackhole's, so the
+/// architecture's refusal is unreachable here.
+fn soft_reset_mask(core: Core) -> u32 {
+    Blackhole::soft_reset_mask(core).expect("Blackhole's core set is the driver's")
+}
 
 /// The environment variable that names the simulator's shared object:
 /// tt-metal's own (`TT_METAL_SIMULATOR`, `TTSIM.md`).
@@ -138,7 +155,7 @@ const ARC_READY_POLL: std::time::Duration = std::time::Duration::from_micros(100
 /// The two values a host-to-device L1 barrier alternates through, tt-metal's
 /// `MemBarFlag { SET = 0xaa, RESET = 0xbb }`
 /// (`umd/device/types/cluster_types.hpp:106-109`) written to
-/// [`tt_isa::mailbox::BARRIER`].
+/// [`tt_isa::arch::blackhole::mailbox::BARRIER`].
 const L1_BARRIER_SET: u32 = 0xAA;
 const L1_BARRIER_RESET: u32 = 0xBB;
 /// How many times the L1 barrier word is read before the tile is declared not to
@@ -457,28 +474,31 @@ pub type Image = (Core, &'static [u8], u64);
 
 /// Where `link.x` places an image: RISCV T0's default reset PC, which every image
 /// but the role images and the per-core probes uses.
+///
+/// A literal because `Arch::default_reset_pc` is not a `const fn`; the test
+/// below pins it to the architecture's answer.
 #[cfg(test)]
-pub const LOAD_ADDRESS: u64 = Core::T0.default_reset_pc() as u64;
+pub const LOAD_ADDRESS: u64 = 0x0_6000;
 
 /// The three role images -- unpack on T0, math on T1, pack on T2 -- each linked
-/// at its own slot (`tt_isa::l1::roles`), so all three fit in one tile's L1 at
+/// at its own slot (`tt_isa::arch::blackhole::l1::roles`), so all three fit in one tile's L1 at
 /// once and each starts through its reset-PC override.
 #[cfg(all(test, feature = "firmware"))]
 pub const ROLES: [Image; 3] = [
     (
         Core::T0,
         include_bytes!(env!("FIRMWARE_ROLE_T0")),
-        tt_isa::l1::roles::BASE[0],
+        tt_isa::arch::blackhole::l1::roles::BASE[0],
     ),
     (
         Core::T1,
         include_bytes!(env!("FIRMWARE_ROLE_T1")),
-        tt_isa::l1::roles::BASE[1],
+        tt_isa::arch::blackhole::l1::roles::BASE[1],
     ),
     (
         Core::T2,
         include_bytes!(env!("FIRMWARE_ROLE_T2")),
-        tt_isa::l1::roles::BASE[2],
+        tt_isa::arch::blackhole::l1::roles::BASE[2],
     ),
 ];
 
@@ -496,17 +516,17 @@ pub const EXEC_ROLES: [Image; 3] = [
     (
         Core::T0,
         include_bytes!(env!("FIRMWARE_EXEC_T0")),
-        tt_isa::l1::roles::BASE[0],
+        tt_isa::arch::blackhole::l1::roles::BASE[0],
     ),
     (
         Core::T1,
         include_bytes!(env!("FIRMWARE_EXEC_T1")),
-        tt_isa::l1::roles::BASE[1],
+        tt_isa::arch::blackhole::l1::roles::BASE[1],
     ),
     (
         Core::T2,
         include_bytes!(env!("FIRMWARE_EXEC_T2")),
-        tt_isa::l1::roles::BASE[2],
+        tt_isa::arch::blackhole::l1::roles::BASE[2],
     ),
 ];
 
@@ -524,15 +544,19 @@ pub const EXEC_SUBORDINATES: [Image; 4] = [
     EXEC_ROLES[0],
     EXEC_ROLES[1],
     EXEC_ROLES[2],
-    (Core::NC, EXEC_NC, tt_isa::dm::nc::IMAGE_BASE),
+    (
+        Core::NC,
+        EXEC_NC,
+        tt_isa::arch::blackhole::dm::nc::IMAGE_BASE,
+    ),
 ];
 
-/// RISCV NC's mover image (`tt_isa::dm::nc`), reached through the stub at NC's
+/// RISCV NC's mover image (`tt_isa::arch::blackhole::dm::nc`), reached through the stub at NC's
 /// reset PC.
 #[cfg(all(test, feature = "firmware"))]
 pub const DM_NC: &[u8] = include_bytes!(env!("FIRMWARE_DM_NC"));
 
-/// RISCV B's data mover (`tt_isa::dm`), loaded at [`tt_isa::dm::IMAGE_BASE`]
+/// RISCV B's data mover (`tt_isa::arch::blackhole::dm`), loaded at [`tt_isa::arch::blackhole::dm::IMAGE_BASE`]
 /// and reached through the jump the loader writes at its hardwired reset PC.
 #[cfg(all(test, feature = "firmware"))]
 pub const DM_B: &[u8] = include_bytes!(env!("FIRMWARE_DM_B"));
@@ -665,7 +689,7 @@ impl Device {
         let mut device = Device {
             link,
             shadow: None,
-            tile: tt_isa::arc::arc_tile(),
+            tile: tt_isa::arch::blackhole::arc::arc_tile(),
             tiles: Vec::new(),
             columns: 0,
             dram: Dram::FULL,
@@ -732,7 +756,7 @@ impl Device {
         let mut device = Device {
             link,
             shadow: None,
-            tile: tt_isa::arc::arc_tile(),
+            tile: tt_isa::arch::blackhole::arc::arc_tile(),
             tiles: Vec::new(),
             columns: 0,
             dram: Dram::FULL,
@@ -781,7 +805,8 @@ impl Device {
         let enabled = device.dram.enabled_mask();
         let started = std::time::Instant::now();
         loop {
-            let Some(status) = device.arc_tag(tt_isa::arc::tag::GDDR_STATUS)? else {
+            let Some(status) = device.arc_tag(tt_isa::arch::blackhole::arc::tag::GDDR_STATUS)?
+            else {
                 eprintln!(
                     "libskamandros: telemetry carries no GDDR training status; not waiting for \
                      training"
@@ -790,7 +815,7 @@ impl Device {
             };
             let mut failed = None;
             let mut trained = true;
-            for bank in 0..u32::from(tt_isa::dram::CHANNELS) {
+            for bank in 0..u32::from(tt_isa::arch::blackhole::dram::CHANNELS) {
                 if enabled & (1 << bank) == 0 {
                     continue;
                 }
@@ -828,14 +853,14 @@ impl Device {
         // performs that write when the descriptor closes, whatever closed it
         // (`tt_cdev_release_noc_cleanup`, `chardev.c:1021-1030`).
         device.quiesce()?;
-        let held = Core::B.soft_reset_mask()
-            | Core::T0.soft_reset_mask()
-            | Core::T1.soft_reset_mask()
-            | Core::T2.soft_reset_mask()
-            | Core::NC.soft_reset_mask();
+        let held = soft_reset_mask(Core::B)
+            | soft_reset_mask(Core::T0)
+            | soft_reset_mask(Core::T1)
+            | soft_reset_mask(Core::T2)
+            | soft_reset_mask(Core::NC);
         let first = device.tile;
         if let Link::Driver(kmd) = &device.link {
-            kmd.hold_on_close(first.x(), first.y(), tensix::SOFT_RESET_0, held)?;
+            kmd.hold_on_close(first.x(), first.y(), soft_reset_register(), held)?;
         }
         // tt-metal puts the chip at its busy operating point once the device is
         // up (`Cluster::deassert_resets_and_set_power_state`, `cluster.cpp:1080-1099`).
@@ -845,10 +870,10 @@ impl Device {
         // Which target this is: the same C ABI drives ttsim, which prints
         // nothing, so this line is what tells a run it reached silicon.
         let clock = device
-            .arc_tag(tt_isa::arc::tag::AICLK)?
+            .arc_tag(tt_isa::arch::blackhole::arc::tag::AICLK)?
             .map_or_else(|| "unknown".to_string(), |mhz| format!("{mhz} MHz"));
         let limit = device
-            .arc_tag(tt_isa::arc::tag::AICLK_LIMIT_MAX)?
+            .arc_tag(tt_isa::arch::blackhole::arc::tag::AICLK_LIMIT_MAX)?
             .map_or_else(|| "unknown".to_string(), |mhz| format!("{mhz} MHz"));
         eprintln!(
             "libskamandros: running on hardware: {}/{}, {} Tensix columns, {} tiles, \
@@ -877,7 +902,7 @@ impl Device {
     /// All ones is the NoC not answering, the state tt-kmd turns into `-EIO`
     /// (`blackhole.c:543-545`); it is reported rather than polled.
     fn wait_arc_ready(&mut self) -> Result<(), ttStatus> {
-        use tt_isa::arc;
+        use tt_isa::arch::blackhole::arc;
         let arc_tile = arc::arc_tile();
         let started = std::time::Instant::now();
         loop {
@@ -909,7 +934,7 @@ impl Device {
     /// Every Tensix tile this driver names is a *logical* coordinate: with
     /// translation on, the NIU maps it onto a surviving physical column, which is
     /// why the first `n` columns of the grid are the right ones on a harvested chip
-    /// ([`tt_isa::noc::grid::Tensix`]). With translation off those numbers are
+    /// ([`tt_isa::arch::blackhole::noc::grid::Tensix`]). With translation off those numbers are
     /// physical and the first `n` are the wrong set — a write to a fused-off tile,
     /// which is a hung NoC.
     ///
@@ -944,7 +969,7 @@ impl Device {
     /// that back an attribute. The tag itself is the enabled mask, so this walk
     /// must not invert it again.
     fn probe_dram(&mut self) -> Result<Dram, ttStatus> {
-        use tt_isa::arc;
+        use tt_isa::arch::blackhole::arc;
         let arc_tile = arc::arc_tile();
         let table = u64::from(self.arc_word(arc_tile, arc::TELEMETRY_PTR)?);
         let values = u64::from(self.arc_word(arc_tile, arc::TELEMETRY_DATA)?);
@@ -997,13 +1022,13 @@ impl Device {
     /// `tag | offset << 16` and whose values live in the value block at that
     /// offset. The tag this driver needs is `ENABLED_TENSIX_COL`, whose bits
     /// index the harvesting order rather than physical columns. It is read the
-    /// way tt-metal reads it ([`tt_isa::noc::grid::Tensix::from_enabled_column_mask`]),
+    /// way tt-metal reads it ([`tt_isa::arch::blackhole::noc::grid::Tensix::from_enabled_column_mask`]),
     /// and the survivors are a prefix of the translated columns whatever the bit
     /// order (`NoC/Coordinates.md:54`). A chip that will not name its columns,
     /// or names none at all, is refused: assuming a full part writes to a
     /// fused-off tile, which ttsim v1.16 treats as undefined.
-    fn probe_tensix(&mut self) -> Result<tt_isa::noc::grid::Tensix, ttStatus> {
-        use tt_isa::arc;
+    fn probe_tensix(&mut self) -> Result<tt_isa::arch::blackhole::noc::grid::Tensix, ttStatus> {
+        use tt_isa::arch::blackhole::arc;
         let arc_tile = arc::arc_tile();
         let table = u64::from(self.arc_word(arc_tile, arc::TELEMETRY_PTR)?);
         let values = u64::from(self.arc_word(arc_tile, arc::TELEMETRY_DATA)?);
@@ -1046,7 +1071,7 @@ impl Device {
         // the count), which is also where bits above the fourteen columns are
         // masked off.
         let mask = enabled.ok_or(ttStatus::TT_ERROR_TELEMETRY)?;
-        tt_isa::noc::grid::Tensix::from_enabled_column_mask(mask)
+        tt_isa::arch::blackhole::noc::grid::Tensix::from_enabled_column_mask(mask)
             .ok_or(ttStatus::TT_ERROR_TELEMETRY)
     }
 
@@ -1066,7 +1091,7 @@ impl Device {
     /// Every address firmware supplied is bounded by the CSM first, because a
     /// CSM read is a NoC read and an unmapped ARC address hangs the host.
     fn arc_tag(&mut self, tag: u16) -> Result<Option<u32>, ttStatus> {
-        use tt_isa::arc;
+        use tt_isa::arch::blackhole::arc;
         let arc_tile = arc::arc_tile();
         let table = u64::from(self.arc_word(arc_tile, arc::TELEMETRY_PTR)?);
         let values = u64::from(self.arc_word(arc_tile, arc::TELEMETRY_DATA)?);
@@ -1114,7 +1139,7 @@ impl Device {
     /// ARC is rung with the APB doorbell; the response is taken from the response
     /// ring once its write pointer moves, and its read pointer is bumped.
     fn arc_msg(&mut self, code: u32) -> Result<u32, ttStatus> {
-        use tt_isa::arc;
+        use tt_isa::arch::blackhole::arc;
         let arc_tile = arc::arc_tile();
         let qcb = u64::from(self.arc_word(arc_tile, arc::reset_scratch(11))?);
         if !arc::is_within_csm(qcb, 8) {
@@ -1240,11 +1265,11 @@ impl Device {
         }
         // tt-metal skips the idle message when the chip is already there
         // (`LocalChip::close_device`, `local_chip.cpp:195-211`).
-        if !busy && self.arc_tag(tt_isa::arc::tag::AICLK)? == Some(AICLK_IDLE) {
+        if !busy && self.arc_tag(tt_isa::arch::blackhole::arc::tag::AICLK)? == Some(AICLK_IDLE) {
             return Ok(());
         }
         let target = if busy {
-            self.arc_tag(tt_isa::arc::tag::AICLK_LIMIT_MAX)?
+            self.arc_tag(tt_isa::arch::blackhole::arc::tag::AICLK_LIMIT_MAX)?
         } else {
             Some(AICLK_IDLE)
         };
@@ -1269,7 +1294,7 @@ impl Device {
         };
         let started = std::time::Instant::now();
         loop {
-            let aiclk = self.arc_tag(tt_isa::arc::tag::AICLK)?;
+            let aiclk = self.arc_tag(tt_isa::arch::blackhole::arc::tag::AICLK)?;
             if aiclk == Some(target) {
                 return Ok(());
             }
@@ -1471,7 +1496,11 @@ impl Device {
     /// `bank_to_dram_offset[bank_id]` to the offset and the packed endpoint to
     /// the high word, `dataflow_api_addrgen.h:516-533`). The reader and the
     /// writer use opposite NoCs, and the endpoints differ between them.
-    pub fn dram_hi(&self, address: u64, niu: tt_isa::noc::niu::Niu) -> Result<u32, ttStatus> {
+    pub fn dram_hi(
+        &self,
+        address: u64,
+        niu: tt_isa::arch::blackhole::noc::niu::Niu,
+    ) -> Result<u32, ttStatus> {
         let (channel, _) = self.dram_at(address)?;
         let ep = channel.preferred(niu);
         Ok(Endpoint {
@@ -1493,7 +1522,7 @@ impl Device {
             let _ = (bytes.len(), address);
             ttStatus::TT_ERROR_DRAM_RANGE
         })?;
-        let ep = channel.preferred(tt_isa::noc::niu::Niu::Noc0);
+        let ep = channel.preferred(tt_isa::arch::blackhole::noc::niu::Niu::Noc0);
         if DMA_ENABLED && bytes.len() >= DMA_MIN && self.dma_write(ep, range.offset(), bytes)? {
             // The engine's completion flag is the transfer's witness; the window
             // read is a second one, from the endpoint the data went out of.
@@ -1536,7 +1565,7 @@ impl Device {
             let _ = (out.len(), address);
             ttStatus::TT_ERROR_DRAM_RANGE
         })?;
-        let ep = channel.preferred(tt_isa::noc::niu::Niu::Noc0);
+        let ep = channel.preferred(tt_isa::arch::blackhole::noc::niu::Niu::Noc0);
         self.window_read(ep, offset, out)
     }
 
@@ -1551,7 +1580,7 @@ impl Device {
     /// never already holds the one being written, so a read-back of it is proof
     /// the write landed and, behind it, every earlier L1 write.
     ///
-    /// The word is [`tt_isa::mailbox::BARRIER`], which no core reads: tt-metal's
+    /// The word is [`tt_isa::arch::blackhole::mailbox::BARRIER`], which no core reads: tt-metal's
     /// own `MEM_L1_BARRIER` would land inside this driver's B image.
     pub fn l1_barrier(&mut self) -> Result<(), ttStatus> {
         let flag = self.barrier_flag;
@@ -1728,16 +1757,22 @@ impl Device {
         self.l1_write(at, image)?;
         // A stale status word would satisfy the wait before the image runs.
         self.write32(mailbox::STATUS, 0)?;
-        match core.reset_pc_register() {
+        let reset_pc =
+            Blackhole::reset_pc_register(core).map_err(|_| ttStatus::TT_ERROR_RESET_PC)?;
+        match reset_pc {
             Some(pc) => {
                 self.write32(pc, at as u32)?;
-                let (reg, bit) = core
-                    .reset_pc_override()
+                let override_ = Blackhole::reset_pc_override(core)
+                    .map_err(|_| ttStatus::TT_ERROR_RESET_PC)?
                     .expect("a core with a reset PC has an override");
+                let (reg, bit) = override_;
                 let current = self.read32(reg)?;
                 self.write32(reg, current | bit)?;
             }
-            None if at == u64::from(core.default_reset_pc()) => {}
+            None if at
+                == u64::from(
+                    Blackhole::default_reset_pc(core).map_err(|_| ttStatus::TT_ERROR_RESET_PC)?,
+                ) => {}
             None => {
                 let entry = i32::try_from(at).ok().filter(|n| *n < 0x8_0000);
                 let Some(entry) = entry else {
@@ -1745,7 +1780,9 @@ impl Device {
                     return Err(ttStatus::TT_ERROR_RESET_PC);
                 };
                 let jump = crate::riscv::jal(0, entry);
-                self.l1_write(u64::from(core.default_reset_pc()), &jump.to_le_bytes())?;
+                let entry_pc =
+                    Blackhole::default_reset_pc(core).map_err(|_| ttStatus::TT_ERROR_RESET_PC)?;
+                self.l1_write(u64::from(entry_pc), &jump.to_le_bytes())?;
             }
         }
         Ok(())
@@ -1760,8 +1797,11 @@ impl Device {
         if self.backend_released.contains(&self.tile) {
             return Ok(());
         }
-        let current = self.read32(tensix::SOFT_RESET_0)?;
-        self.write32(tensix::SOFT_RESET_0, current & !tensix::BACKEND_RESET_MASK)?;
+        let current = self.read32(soft_reset_register())?;
+        self.write32(
+            soft_reset_register(),
+            current & !Blackhole::BACKEND_RESET_MASK,
+        )?;
         self.backend_released.push(self.tile);
         Ok(())
     }
@@ -1901,7 +1941,7 @@ impl Device {
                     self.load_held(core, image, at)?;
                 }
             }
-            self.load_and_start(Core::B, EXEC_B, tt_isa::dm::IMAGE_BASE)?;
+            self.load_and_start(Core::B, EXEC_B, tt_isa::arch::blackhole::dm::IMAGE_BASE)?;
             let mb = mailbox::launch::Mailbox::b();
             self.wait_for(mb.status(), |s| s == status::RUNNING)?;
             // A previous process leaves programs named and generations set; a new
@@ -1930,9 +1970,9 @@ impl Device {
     fn load_held_nc(&mut self, image: &[u8], at: u64) -> Result<(), ttStatus> {
         self.set_core_reset(Core::NC, true)?;
         self.l1_write(at, image)?;
-        let stub = tt_isa::dm::nc::stub(at);
+        let stub = tt_isa::arch::blackhole::dm::nc::stub(at);
         let words: Vec<u8> = stub.iter().flat_map(|w| w.to_le_bytes()).collect();
-        self.l1_write(tt_isa::dm::nc::STUB_AT, &words)?;
+        self.l1_write(tt_isa::arch::blackhole::dm::nc::STUB_AT, &words)?;
         Ok(())
     }
 
@@ -2293,7 +2333,7 @@ impl Device {
         let end = address
             .checked_add(len as u64)
             .ok_or(ttStatus::TT_ERROR_L1_ADDRESS_OVERFLOW)?;
-        if end > tensix::L1_SIZE {
+        if end > Blackhole::L1_SIZE {
             let _ = (address, end);
             return Err(ttStatus::TT_ERROR_L1_ACCESS);
         }
@@ -2301,14 +2341,14 @@ impl Device {
     }
 
     fn set_core_reset(&mut self, core: Core, held: bool) -> Result<(), ttStatus> {
-        let current = self.read32(tensix::SOFT_RESET_0)?;
+        let current = self.read32(soft_reset_register())?;
         let updated = if held {
-            current | core.soft_reset_mask()
+            current | soft_reset_mask(core)
         } else {
-            current & !core.soft_reset_mask()
+            current & !soft_reset_mask(core)
         };
         if updated != current {
-            self.write32(tensix::SOFT_RESET_0, updated)?;
+            self.write32(soft_reset_register(), updated)?;
         }
         Ok(())
     }
@@ -2433,14 +2473,14 @@ mod tests {
         for (i, (_, bytes, at)) in ROLES.iter().enumerate() {
             assert_eq!(
                 *at,
-                tt_isa::l1::roles::BASE[i],
+                tt_isa::arch::blackhole::l1::roles::BASE[i],
                 "role {i} is loaded at its slot"
             );
             assert!(
-                bytes.len() as u64 <= tt_isa::l1::roles::SLOT,
+                bytes.len() as u64 <= tt_isa::arch::blackhole::l1::roles::SLOT,
                 "role {i} is {} bytes for a {} byte slot",
                 bytes.len(),
-                tt_isa::l1::roles::SLOT
+                tt_isa::arch::blackhole::l1::roles::SLOT
             );
         }
     }
@@ -2450,7 +2490,10 @@ mod tests {
     fn the_executor_is_the_image_the_mailbox_starts() {
         // The executor is linked at T0's reset PC, which `link.x` also uses for the
         // images loaded through a plain reset.
-        assert_eq!(LOAD_ADDRESS, u64::from(Core::T0.default_reset_pc()));
+        assert_eq!(
+            LOAD_ADDRESS,
+            u64::from(Blackhole::default_reset_pc(Core::T0).unwrap())
+        );
         assert!(!EXEC_B.is_empty());
     }
 }
