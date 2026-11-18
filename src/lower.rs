@@ -3975,10 +3975,16 @@ const SFPENCC_OFF: MirOp = MirOp::SfpEncc {
 /// `d = a < b` as `-1`/`0` lanes. `SFPGT` compares its `VD` lane against `VC`
 /// and writes the result into `VD`, so the right-hand value moves into the
 /// destination first.
+///
+/// On Quasar the value-writing form has no encoding the simulator implements
+/// (`tensix_sfpgt: instr_mod1=8`), so the encoder expands it into the flag
+/// sequence (`encode::quasar_math_op`); the lowering stays the same for both
+/// chips.
 fn sfp_lt(role: &mut Vec<MirOp>, a: LReg, b: LReg, d: LReg) {
     role.push(MirOp::SfpMov { a: b, d });
     role.push(MirOp::SfpGt {
         mod1: SFPSET_VD,
+        fp32: true,
         vc: a,
         vd: d,
     });
@@ -3989,6 +3995,7 @@ fn sfp_gt(role: &mut Vec<MirOp>, a: LReg, b: LReg, d: LReg) {
     role.push(MirOp::SfpMov { a, d });
     role.push(MirOp::SfpGt {
         mod1: SFPSET_VD,
+        fp32: true,
         vc: b,
         vd: d,
     });
@@ -3999,6 +4006,7 @@ fn sfp_ge(role: &mut Vec<MirOp>, a: LReg, b: LReg, d: LReg) {
     role.push(MirOp::SfpMov { a: b, d });
     role.push(MirOp::SfpLe {
         mod1: SFPSET_VD,
+        fp32: true,
         vc: a,
         vd: d,
     });
@@ -4012,6 +4020,8 @@ fn sfp_select(role: &mut Vec<MirOp>, cond: LReg, t: LReg, f: LReg, d: LReg) {
     role.push(SFPENCC_ON);
     role.push(MirOp::SfpGt {
         mod1: SFPSET_CC,
+        // A bool lane is `-1`/`0`, and this test is on its bits.
+        fp32: false,
         vc: cond,
         vd: LReg(tt_isa::arch::blackhole::sfpu::LREG_ZERO as u16),
     });
@@ -4026,6 +4036,7 @@ fn sfp_max(role: &mut Vec<MirOp>, a: LReg, b: LReg, d: LReg) {
     role.push(SFPENCC_ON);
     role.push(MirOp::SfpGt {
         mod1: SFPSET_CC,
+        fp32: true,
         vc: b,
         vd: a,
     });
@@ -4040,6 +4051,7 @@ fn sfp_min(role: &mut Vec<MirOp>, a: LReg, b: LReg, d: LReg) {
     role.push(SFPENCC_ON);
     role.push(MirOp::SfpGt {
         mod1: SFPSET_CC,
+        fp32: true,
         vc: a,
         vd: b,
     });

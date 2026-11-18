@@ -1497,10 +1497,10 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), tt
             out.push(encode::sfpmov(u32::from(b), u32::from(d), 0).map_err(bad_isa)?);
             out.push(encode::sfpsetexp(0, u32::from(a), u32::from(d), 0).map_err(bad_isa)?);
         }
-        MirOp::SfpGt { mod1, vc, vd } => {
+        MirOp::SfpGt { mod1, vc, vd, .. } => {
             out.push(encode::sfpgt(u32::from(vc), u32::from(vd), mod1).map_err(bad_isa)?);
         }
-        MirOp::SfpLe { mod1, vc, vd } => {
+        MirOp::SfpLe { mod1, vc, vd, .. } => {
             out.push(encode::sfple(u32::from(vc), u32::from(vd), mod1).map_err(bad_isa)?);
         }
         MirOp::SfpMov { a, d } => {
@@ -3010,6 +3010,44 @@ fn quasar_dst_row(
     Ok(at + row_delta)
 }
 
+/// `SFPGT`/`SFPLE`'s value-writing form on Quasar, built from the flag form.
+///
+/// `vd` ends up `-1` where `vd <op> vc` holds and `0` elsewhere — the bits
+/// Blackhole's `SET_VD` modifier writes. The four instructions that are not the
+/// comparison itself come from `p_sfpu`: `LCONST_neg1`, `LCONST_0`, and the
+/// `SFPCOMPC` that flips the lane flags (`ckernel_instr_params.h:378-388`,
+/// `assembly.yaml#SFPCOMPC`).
+fn quasar_compare_value(
+    out: &mut Stream,
+    greater: bool,
+    fp32: bool,
+    mod1: u32,
+    vc: crate::mir::LReg,
+    vd: crate::mir::LReg,
+) -> Result<(), ttStatus> {
+    // The flag-setting form: `SET_CC` (bit 0) and nothing else, which is what
+    // the lowering's other comparisons use (`SFPSET_CC`).
+    let _ = mod1;
+    let set_cc = 1;
+    let mask_on = qencode::sfpencc(3, 10).map_err(quasar_unusable)?;
+    let compare = if greater {
+        qencode::sfpgt(u32::from(fp32), u32::from(vc), u32::from(vd), set_cc)
+    } else {
+        qencode::sfple(u32::from(fp32), u32::from(vc), u32::from(vd), set_cc)
+    }
+    .map_err(quasar_unusable)?;
+    let fill = qencode::sfpmov(qsfpu::LREG_NEG_ONE, u32::from(vd), 0).map_err(quasar_unusable)?;
+    let complement =
+        tt_isa::isa::Instruction::with_operands(&tt_isa::isa::quasar::defs::SFPCOMPC, &[])
+            .map_err(quasar_unusable)?;
+    let clear = qencode::sfpmov(qsfpu::LREG_ZERO, u32::from(vd), 0).map_err(quasar_unusable)?;
+    let mask_off = qencode::sfpencc(2, 10).map_err(quasar_unusable)?;
+    for instruction in [mask_on, compare, fill, complement, clear, mask_off] {
+        out.push(instruction);
+    }
+    Ok(())
+}
+
 fn quasar_math_op(
     op: &MirOp,
     row_delta: u32,
@@ -3196,12 +3234,44 @@ fn quasar_math_op(
                     .map_err(quasar_unusable)?,
             );
         }
-        MirOp::SfpGt { mod1, vc, vd } => {
+        // Blackhole's value-writing comparison form, `SFPGT`/`SFPLE` with
+        // `SET_VD` (modifier bit 3). Quasar's simulator has no encoding for it
+        // (`tensix_sfpgt: instr_mod1=8`), so the same answer is built from the
+        // flag form: the comparison sets the lane flags, the constant `-1` lane
+        // fills the lanes it holds, `SFPCOMPC` takes the complement, and the
+        // constant zero lane fills the rest. Every lane is written exactly once
+        // and both writes follow the comparison, so no operand scratch is
+        // needed — which matters, because the lowering's `SFPGT` destination is
+        // one of the comparison's operands.
+        MirOp::SfpGt {
+            mod1: mod1 @ 8..=15,
+            fp32,
+            vc,
+            vd,
+        } => {
+            quasar_compare_value(out, true, fp32, mod1, vc, vd)?;
+        }
+        MirOp::SfpLe {
+            mod1: mod1 @ 8..=15,
+            fp32,
+            vc,
+            vd,
+        } => {
+            quasar_compare_value(out, false, fp32, mod1, vc, vd)?;
+        }
+        MirOp::SfpGt { mod1, fp32, vc, vd } => {
             // Quasar's `SFPGT` names the `imm12_math` operand Blackhole's does
-            // not; the lowering's comparison uses the register form, so it is
-            // zero.
+            // not, and its low bit selects the comparison mode: fp32 or
+            // two's-complement `int32` (`assembly.yaml#SFPGT`).
             out.push(
-                qencode::sfpgt(0, u32::from(vc), u32::from(vd), mod1).map_err(quasar_unusable)?,
+                qencode::sfpgt(u32::from(fp32), u32::from(vc), u32::from(vd), mod1)
+                    .map_err(quasar_unusable)?,
+            );
+        }
+        MirOp::SfpLe { mod1, fp32, vc, vd } => {
+            out.push(
+                qencode::sfple(u32::from(fp32), u32::from(vc), u32::from(vd), mod1)
+                    .map_err(quasar_unusable)?,
             );
         }
         MirOp::SfpExexp { mod1, a, d } => {

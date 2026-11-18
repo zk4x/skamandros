@@ -328,9 +328,24 @@ pub enum MirOp {
     /// `SFPGT`: compare the lane `vd` against `vc`, writing `-1`/`0` into
     /// `vd` (`mod1` bit 3, `SET_VD`) or setting the lane flags (`mod1` bit 0,
     /// `SET_CC`). `vd` is both an operand and the destination.
-    SfpGt { mod1: u32, vc: LReg, vd: LReg },
+    /// `SFPGT`: set the flags (or, with `SET_VD`, write `-1`/`0`) from
+    /// `vd > vc`. `fp32` is the instruction's comparison mode: `true` compares
+    /// the operands as fp32 values, `false` as two's-complement `int32` (the
+    /// mode a raw `-1`/`0` bool is tested in).
+    SfpGt {
+        mod1: u32,
+        fp32: bool,
+        vc: LReg,
+        vd: LReg,
+    },
     /// `SFPLE`: `vd <= vc`, the same two ways.
-    SfpLe { mod1: u32, vc: LReg, vd: LReg },
+    /// `SFPLE`: the same for `vd <= vc`.
+    SfpLe {
+        mod1: u32,
+        fp32: bool,
+        vc: LReg,
+        vd: LReg,
+    },
     /// The unpacker's `Config` bank for `unit`.
     UnpackConfig {
         unit: u8,
@@ -616,7 +631,7 @@ impl MirOp {
             }
             // The comparison reads its right-hand lane; with `SET_VD` it writes
             // the result back into it, and with `SET_CC` it only sets the flags.
-            MirOp::SfpGt { vc, vd, mod1 } | MirOp::SfpLe { vc, vd, mod1 } => {
+            MirOp::SfpGt { vc, vd, mod1, .. } | MirOp::SfpLe { vc, vd, mod1, .. } => {
                 let use_ = if mod1 & 8 != 0 { ReadWrite } else { Read };
                 vec![(vc, Read), (vd, use_)]
             }
@@ -925,19 +940,21 @@ fn write_op(f: &mut dyn fmt::Write, op: &MirOp) -> fmt::Result {
             lane(c),
             lane(d)
         ),
-        MirOp::SfpGt { mod1, vc, vd } => {
+        MirOp::SfpGt { mod1, fp32, vc, vd } => {
             write!(
                 f,
-                "sfpgt {mod1}, {} > {} -> {}",
+                "sfpgt {mod1}{}, {} > {} -> {}",
+                if fp32 { " fp32" } else { "" },
                 lane(vd),
                 lane(vc),
                 lane(vd)
             )
         }
-        MirOp::SfpLe { mod1, vc, vd } => {
+        MirOp::SfpLe { mod1, fp32, vc, vd } => {
             write!(
                 f,
-                "sfple {mod1}, {} <= {} -> {}",
+                "sfple {mod1}{}, {} <= {} -> {}",
+                if fp32 { " fp32" } else { "" },
                 lane(vd),
                 lane(vc),
                 lane(vd)
