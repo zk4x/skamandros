@@ -242,6 +242,7 @@ fn panic(info: &PanicInfo) -> ! {
 
 /// Pushing Tensix instructions from a baby RISC-V core.
 pub mod corpus;
+pub mod dispatch;
 pub mod dataflow;
 /// Run-time translation of a staged program into looping `.ttinsn` code
 /// (`docs/plans/ttinsn-push-experiment.md`): the role runners call it when a

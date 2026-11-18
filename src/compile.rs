@@ -79,7 +79,17 @@ pub fn render(m: &MachineKernel) -> Result<Module, ttStatus> {
         .map(|(_, info)| info.iface_entry)
         .min()
         .unwrap_or(0);
-    let module = Module {
+    let mut iface_words = Vec::with_capacity(cbs.len() * 8);
+    for ring in &cbs {
+        iface_words.extend_from_slice(&crate::riscv::cb::interface(
+            ring.base,
+            ring.page_bytes.checked_mul(ring.len).unwrap_or(0),
+            ring.page_bytes,
+            ring.len,
+        )?);
+    }
+    let args_words = 4 + module_params_words(&m.params);
+    let mut module = Module {
         grid: m.grid.clone(),
         params: m.params.clone(),
         reader: words[0].clone(),
@@ -89,7 +99,11 @@ pub fn render(m: &MachineKernel) -> Result<Module, ttStatus> {
         setup,
         iface,
         cbs,
+        iface_words,
+        args_words,
+        hash: 0,
     };
+    module.hash = module_hash(&module);
     if module.reader.is_empty()
         && module.writer.is_empty()
         && module.cores.iter().all(Vec::is_empty)
@@ -97,6 +111,41 @@ pub fn render(m: &MachineKernel) -> Result<Module, ttStatus> {
         return Err(ttStatus::TT_ERROR_EMPTY_MODULE);
     }
     Ok(module)
+}
+
+/// Words one argument block holds for `params` (`Module::args_words`).
+fn module_params_words(params: &[ParamKind]) -> u32 {
+    // A striped tensor names every channel's page base, then the count and the
+    // page: the shape `args_for` writes.
+    let interleaved = 2 * crate::mover::MAX_BANKS as u32 + 2;
+    params
+        .iter()
+        .map(|kind| match kind {
+            ParamKind::Interleaved => interleaved,
+            _ => 2,
+        })
+        .sum()
+}
+
+/// A hash of everything a launch stages on a tile, apart from the resolved
+/// grid (`Module::hash`).
+fn module_hash(module: &Module) -> u64 {
+    let mut words: Vec<u32> = vec![module.iface, module.params.len() as u32];
+    for program in [&module.reader, &module.writer, &module.setup] {
+        words.push(program.len() as u32);
+        words.extend_from_slice(program);
+    }
+    for cores in [&module.cores, &module.silicon_cores] {
+        words.push(cores.len() as u32);
+        for program in cores {
+            words.push(program.len() as u32);
+            words.extend_from_slice(program);
+        }
+    }
+    for ring in &module.cbs {
+        words.extend_from_slice(&[ring.base, ring.page_bytes, ring.len]);
+    }
+    crate::device::hash_words(&words)
 }
 
 /// The launch's parameter kinds, in program order.

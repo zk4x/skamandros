@@ -71,4 +71,17 @@ pub struct Module {
     pub iface: u32,
     /// The rings the table describes, in base-address order.
     pub cbs: Vec<crate::mir::CbInfo>,
+    /// The CB interface words every tile's B installs from its own L1
+    /// (`riscv::cb::interface` of `cbs`), computed once because they are the
+    /// same for every tile of every launch of this module.
+    pub iface_words: Vec<u32>,
+    /// Words in one argument block: the four the launch always passes, then two
+    /// per parameter (eighteen for a striped tensor, which carries its per-bank
+    /// page bases).
+    pub args_words: u32,
+    /// A hash of everything a launch stages on a tile -- the programs, the
+    /// rings, the interface, the parameters -- without the resolved grid, which
+    /// a launch adds. Two launches with the same fingerprint can reuse the
+    /// installation on every tile.
+    pub hash: u64,
 }

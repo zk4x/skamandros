@@ -559,7 +559,7 @@ pub fn all_images() -> Vec<(&'static str, &'static [u8])> {
 
 /// FNV-1a over words: enough to skip rewriting an unchanged program or setup,
 /// not a correctness check on the words.
-fn hash_words(words: &[u32]) -> u64 {
+pub(crate) fn hash_words(words: &[u32]) -> u64 {
     words.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, word| {
         (h ^ u64::from(*word)).wrapping_mul(0x0000_0100_0000_01b3)
     })
@@ -624,6 +624,13 @@ pub struct Device {
     /// writes visible to the device, and a launch after no host write has
     /// nothing to flush.
     dram_dirty: bool,
+    /// The module whose programs, arguments, CB interface template and
+    /// dispatcher descriptor are staged on every tile of its grid
+    /// (`Module::hash` with the resolved grid). A launch of that same module
+    /// again can be fanned out on the card from one tile instead of staged from
+    /// the host. Cleared whenever the tiles are reset or their executors
+    /// restart.
+    installed: Option<u64>,
 }
 
 impl Device {
@@ -672,6 +679,7 @@ impl Device {
             barrier_flag: L1_BARRIER_SET,
             backend_released: Vec::new(),
             dram_dirty: false,
+            installed: None,
         };
         // Before any tile is named: with translation off, a logical column number
         // is a physical one, and the first n of them are the wrong set.
@@ -738,6 +746,7 @@ impl Device {
             barrier_flag: L1_BARRIER_SET,
             backend_released: Vec::new(),
             dram_dirty: false,
+            installed: None,
         };
         // The ARC publishes every address the rest of this reads, so it is
         // waited for first, as tt-metal waits before it creates its messenger or
@@ -1574,13 +1583,22 @@ impl Device {
 
     /// Write into this tile's L1.
     pub fn l1_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), ttStatus> {
-        // A direct write invalidates what `stage_words` remembered at this
-        // address: the cache may only claim what is actually in L1. Staging
-        // ranges are disjoint, so the exact key is the only one that can be
-        // touched.
-        let tile = self.tile;
-        self.staged.remove(&(tile.x(), tile.y(), address));
+        // A direct write invalidates what `stage_words` remembered over this
+        // range: the cache may only claim what is actually in L1. A staging
+        // range and a later partial write of the same words overlap, so every
+        // entry the write touches goes, not just one at the same address.
+        self.forget_overlapping(address, bytes.len() as u64);
         self.l1_write_uncached(address, bytes)
+    }
+
+    /// Drop every staging-memory entry of this tile whose bytes overlap
+    /// `[at, at + len)`.
+    fn forget_overlapping(&mut self, at: u64, len: u64) {
+        let tile = self.tile;
+        self.staged.retain(|&(x, y, address), words| {
+            let end = address + 4 * words.len() as u64;
+            (x, y) != (tile.x(), tile.y()) || end <= at || at + len <= address
+        });
     }
 
     fn l1_write_uncached(&mut self, address: u64, bytes: &[u8]) -> Result<(), ttStatus> {
@@ -1630,6 +1648,8 @@ impl Device {
             return Ok(());
         }
         self.staged.remove(&key);
+        // A partial write leaves the rest of an overlapping range unknown.
+        self.forget_overlapping(at, 4 * words.len() as u64);
         for (start, end) in runs {
             let bytes: Vec<u8> = words[start..end]
                 .iter()
@@ -1639,6 +1659,32 @@ impl Device {
         }
         self.staged.insert(key, words.to_vec());
         Ok(())
+    }
+
+    /// The module whose staging is complete on every tile of its grid, if any
+    /// (`Module::hash` with the resolved grid).
+    pub fn installed(&self) -> Option<u64> {
+        self.installed
+    }
+
+    /// Record that `fingerprint`'s module is staged on every tile of its grid,
+    /// so its next launch can be fanned out on the card.
+    pub fn note_installed(&mut self, fingerprint: u64) {
+        self.installed = Some(fingerprint);
+    }
+
+    /// The tiles no longer hold a complete installation: the next launch has to
+    /// stage it from the host again.
+    pub fn forget_installed(&mut self) {
+        self.installed = None;
+    }
+
+    /// Forget what `stage_words` remembered about every tile but `tile`: the
+    /// on-card dispatcher writes the workers' argument blocks over the NoC,
+    /// while this tile's are the ones the host wrote here.
+    pub fn forget_staged_except(&mut self, tile: NocCoord) {
+        self.staged
+            .retain(|&(x, y, _), _| (x, y) == (tile.x(), tile.y()));
     }
 
     /// Read one dword from the tile (an L1 word or a core register).
@@ -1808,6 +1854,7 @@ impl Device {
         // What was staged is only valid until the cores are reset, and the
         // semaphores are no longer known to hold the setup program's values.
         self.staged.clear();
+        self.installed = None;
         first
     }
 
@@ -1870,6 +1917,8 @@ impl Device {
             let tile = self.tile;
             self.staged
                 .retain(|&(x, y, _), _| (x, y) != (tile.x(), tile.y()));
+            // The tile booted again, so nothing of a module is staged on it.
+            self.installed = None;
             self.exec_started.push(self.tile);
             Ok(())
         }
@@ -1995,11 +2044,21 @@ impl Device {
         let mut waited = 0u64;
         let started = std::time::Instant::now();
         let limit = std::time::Duration::from_nanos(BUDGET).max(SILICON_MIN_WAIT);
+        // Asked once: the loop runs per poll and must stay two reads.
+        let debug = crate::runtime::debug_enabled();
         loop {
             if self.read32(mb.ack())? == generation {
                 return Ok(());
             }
             if self.read32(mb.status())? == status::PANICKED {
+                if debug {
+                    eprintln!(
+                        "libskamandros: tile ({}, {}) panicked with code {}",
+                        self.tile.x(),
+                        self.tile.y(),
+                        self.read32(mb.panic_code())?
+                    );
+                }
                 return Err(ttStatus::TT_ERROR_PROGRAM_REFUSED);
             }
             let expired = if self.link.is_simulated() {
@@ -2013,6 +2072,28 @@ impl Device {
                 elapsed >= limit
             };
             if expired {
+                if debug {
+                    eprintln!(
+                        "libskamandros: tile ({}, {}) launch timeout: gen {} ack {} status {} \
+                         program {:#x} len {} args {:#x} enables {:#x} desc {:#x?}",
+                        self.tile.x(),
+                        self.tile.y(),
+                        self.read32(mb.generation())?,
+                        self.read32(mb.ack())?,
+                        self.read32(mb.status())?,
+                        self.read32(mb.program_addr())?,
+                        self.read32(mb.program_len())?,
+                        self.read32(mb.args())?,
+                        self.read32(mb.enables())?,
+                        {
+                            let mut d = [0u32; 4];
+                            for (k, w) in d.iter_mut().enumerate() {
+                                *w = self.read32(mb.dump_offset(0, k as u32))?;
+                            }
+                            d
+                        }
+                    );
+                }
                 return Err(ttStatus::TT_ERROR_FIRMWARE_TIMEOUT);
             }
             self.clock(CYCLES_PER_POLL);

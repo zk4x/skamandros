@@ -91,13 +91,22 @@ pub fn run_exec(mb: Mailbox, icache_mask: u32) -> ! {
                     fail_in(mb, mailbox::panic_code::EXPLICIT);
                 }
             }
+            let mut workers = 0u32;
             // Every cache is invalidated before any core is told to run, so the
             // programs the host has just placed are fetched, not old ones
             // (tt-metal's `run_triscs` follows the same mask store).
             if dispatch {
+                // Fan out first: the workers' launches run while this tile
+                // installs its own interface and runs its own setup. Then the
+                // interface (tt-metal's worker firmware installs it from its own
+                // copy, so a launch does not carry it) and the semaphore setup,
+                // both before any subordinate starts.
+                workers = crate::dispatch::fan_out(mb);
+                crate::dispatch::install_iface(mb);
                 // SAFETY: as above; the mask covers every core, so the program
                 // the host placed is what each one fetches.
                 unsafe { crate::ttinsn::invalidate_icache(mb.status(), icache_mask) };
+                crate::dispatch::run_setup(mb, generation);
                 for (enable, subordinate) in SUBORDINATES {
                     if enables & enable != 0 {
                         // SAFETY: a fixed aligned mailbox word of another core
@@ -127,7 +136,15 @@ pub fn run_exec(mb: Mailbox, icache_mask: u32) -> ! {
             }
             if dispatch {
                 join(mb, generation, enables);
+                // The workers this launch started over the NoC, each of which
+                // reports one increment when its own join is done.
+                crate::dispatch::join_workers(mb, workers);
             }
+            // Tell the dispatcher this tile is done, if one is waiting. Before
+            // the ACK, not after: a report still in flight when the host sees
+            // the ACK would be an increment counted against the *next* launch,
+            // whose dispatcher resets the counter before it fans out.
+            crate::dispatch::report(mb);
             // SAFETY: fixed aligned mailbox words inside L1.
             unsafe {
                 l1_write32(mb.status(), status::DONE);
@@ -186,7 +203,7 @@ fn join(mb: Mailbox, generation: u32, enables: u32) {
 
 /// Stop, having said why in `mb` as well as in the single-core mailbox the
 /// panic path always uses.
-fn fail_in(mb: Mailbox, code: u32) -> ! {
+pub(crate) fn fail_in(mb: Mailbox, code: u32) -> ! {
     // SAFETY: fixed aligned mailbox locations inside L1.
     unsafe {
         l1_write32(mb.panic_code(), code);

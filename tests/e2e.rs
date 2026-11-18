@@ -1468,6 +1468,231 @@ fn a_symbolic_grid_runs_each_tiles_own_slice() {
     );
 }
 
+/// A second launch of the same module runs from the card: the host writes one
+/// generation to the dispatcher tile's B, which starts the rest of the grid over
+/// the NoC (`firmware/src/dispatch.rs`).
+///
+/// Each launch gets different tensors, so the argument blocks the dispatcher
+/// fans out have to be the new ones -- the tile word it patches is the only word
+/// that may stay the same.
+#[test]
+fn a_repeat_launch_is_fanned_out_on_the_card() {
+    let _device = device();
+    let lib = library();
+    let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
+    let unload: Symbol<ModuleUnload> =
+        unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
+    let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
+    let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
+    let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
+    let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
+    let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
+    let launch: Symbol<Launch> = unsafe { lib.get(b"ttLaunch\0") }.expect("ttLaunch");
+
+    let mut err: *mut c_char = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { init(&mut err) },
+        TT_OK,
+        "ttInit: {}",
+        take_error(&free, err)
+    );
+
+    let count = 4096;
+    let bytes = count * 4;
+    let mut module: *mut c_void = std::ptr::null_mut();
+    let code = unsafe {
+        compile(
+            NEG_GRID.as_ptr().cast(),
+            NEG_GRID.len(),
+            &mut module,
+            &mut err,
+        )
+    };
+    assert_eq!(code, TT_OK, "compile: {}", take_error(&free, err));
+
+    // Two launches, each with its own tensors: the second one's arguments are
+    // not the ones the first staged on the workers.
+    for round in 0..2u32 {
+        let (mut input, mut output) = (0u64, 0u64);
+        assert_eq!(
+            unsafe { alloc(bytes, &mut input, &mut err) },
+            TT_OK,
+            "input: {}",
+            take_error(&free, err)
+        );
+        assert_eq!(
+            unsafe { alloc(bytes, &mut output, &mut err) },
+            TT_OK,
+            "output: {}",
+            take_error(&free, err)
+        );
+        let host: Vec<f32> = (0..count)
+            .map(|i| (i as f32 - 2048.0) * 0.0625 + round as f32)
+            .collect();
+        let host_bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(
+            unsafe { h2d(input, host_bytes.as_ptr(), host_bytes.len(), &mut err) },
+            TT_OK,
+            "upload: {}",
+            take_error(&free, err)
+        );
+        let params = [2u64, 2, input, output];
+        let code = unsafe { launch(module, params.as_ptr(), params.len(), &mut err) };
+        assert_eq!(
+            code,
+            TT_OK,
+            "round {round}: ttLaunch: {}",
+            take_error(&free, err)
+        );
+        let mut back = vec![0u8; bytes];
+        assert_eq!(
+            unsafe { d2h(back.as_mut_ptr(), output, back.len(), &mut err) },
+            TT_OK,
+            "download: {}",
+            take_error(&free, err)
+        );
+        let got: Vec<f32> = back
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        for (i, (x, y)) in host.iter().zip(&got).enumerate() {
+            assert_eq!(*y, -*x, "round {round}, datum {i}: {x} negated is {}", -*x);
+        }
+    }
+
+    assert_eq!(
+        unsafe { unload(module, &mut err) },
+        TT_OK,
+        "unload: {}",
+        take_error(&free, err)
+    );
+}
+
+/// [`NEG_GRID`] over the whole part: twelve columns, ten rows, one page a tile.
+const NEG_FULL_GRID: &str = "\
+version 9
+%nx = param i32 0
+%ny = param i32 0
+%in = param f32 122880
+%out = param f32 122880
+%x = grid.x
+%y = grid.y
+%row = mul %y %nx
+%idx = add %row %x
+%bi = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %bi [0] = %in [%idx]
+load 32,32 %v = %bi [0]
+%n = neg %v
+store 32,32 %bo [0] = %n
+copy 32,32 %out [%idx] = %bo [0]
+grid %nx,%ny
+";
+
+/// The whole part, launched twice: the first launch is staged from the host,
+/// the second is fanned out from the root tile over the NoC. Every tile's page
+/// must come back negated in both, which is what fails if a leader's list is
+/// truncated or a worker is started twice.
+#[test]
+fn a_full_grid_repeat_launch_is_fanned_out_on_the_card() {
+    let _device = device();
+    let lib = library();
+    let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
+    let unload: Symbol<ModuleUnload> =
+        unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
+    let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
+    let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
+    let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
+    let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
+    let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
+    let launch: Symbol<Launch> = unsafe { lib.get(b"ttLaunch\0") }.expect("ttLaunch");
+
+    let mut err: *mut c_char = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { init(&mut err) },
+        TT_OK,
+        "ttInit: {}",
+        take_error(&free, err)
+    );
+
+    const NX: u64 = 12;
+    const NY: u64 = 10;
+    let pages = (NX * NY) as usize;
+    let count = pages * 1024;
+    let bytes = count * 4;
+    let mut module: *mut c_void = std::ptr::null_mut();
+    let code = unsafe {
+        compile(
+            NEG_FULL_GRID.as_ptr().cast(),
+            NEG_FULL_GRID.len(),
+            &mut module,
+            &mut err,
+        )
+    };
+    assert_eq!(code, TT_OK, "compile: {}", take_error(&free, err));
+
+    for round in 0..2u32 {
+        let (mut input, mut output) = (0u64, 0u64);
+        assert_eq!(
+            unsafe { alloc(bytes, &mut input, &mut err) },
+            TT_OK,
+            "input: {}",
+            take_error(&free, err)
+        );
+        assert_eq!(
+            unsafe { alloc(bytes, &mut output, &mut err) },
+            TT_OK,
+            "output: {}",
+            take_error(&free, err)
+        );
+        let host: Vec<f32> = (0..count)
+            .map(|i| (i as f32 - 4096.0) * 0.03125 + round as f32)
+            .collect();
+        let host_bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(
+            unsafe { h2d(input, host_bytes.as_ptr(), host_bytes.len(), &mut err) },
+            TT_OK,
+            "upload: {}",
+            take_error(&free, err)
+        );
+        let params = [NX, NY, input, output];
+        let code = unsafe { launch(module, params.as_ptr(), params.len(), &mut err) };
+        assert_eq!(
+            code,
+            TT_OK,
+            "round {round}: ttLaunch: {}",
+            take_error(&free, err)
+        );
+        let mut back = vec![0u8; bytes];
+        assert_eq!(
+            unsafe { d2h(back.as_mut_ptr(), output, back.len(), &mut err) },
+            TT_OK,
+            "download: {}",
+            take_error(&free, err)
+        );
+        let got: Vec<f32> = back
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        for (i, (x, y)) in host.iter().zip(&got).enumerate() {
+            assert_eq!(
+                *y,
+                -*x,
+                "round {round}, datum {i} (page {}): {x} negated is {}",
+                i / 1024,
+                -*x
+            );
+        }
+    }
+
+    assert_eq!(
+        unsafe { unload(module, &mut err) },
+        TT_OK,
+        "unload: {}",
+        take_error(&free, err)
+    );
+}
+
 /// The tail of a grid's work: `ntiles` need not divide the number of sites.
 /// Each site computes its own length — `base = ntiles / nsites`, plus one for
 /// the first `ntiles % nsites` sites — and its own starting tile, so no site

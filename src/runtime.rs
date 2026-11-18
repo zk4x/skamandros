@@ -32,6 +32,20 @@ use tt_isa::noc::niu::Niu;
 /// The one open device, if [`init`] has been called.
 static DEVICE: Mutex<Option<Device>> = Mutex::new(None);
 
+/// Is the debug output enabled (`SKAM_DEBUG`)? Read once: the launch path must
+/// not scan the environment per launch.
+pub fn debug_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SKAM_DEBUG").is_some())
+}
+
+/// Has the on-card dispatcher been turned off (`SKAM_NO_DISPATCH`), keeping
+/// every launch on the host path? Read once, as [`debug_enabled`].
+fn dispatch_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("SKAM_NO_DISPATCH").is_some())
+}
+
 /// First byte of `l1::PROGRAM_CACHE`, where every program is placed once.
 const PROGRAM_AREA: u32 = crate::device::PROGRAM_AREA as u32;
 /// Bytes in one program-cache slot: `mailbox::MAX_WORDS` words.
@@ -68,6 +82,62 @@ const ARGS_AT: u32 = PROGRAM_AREA + 6 * SLOT_BYTES;
 /// The writer's array, one kilobyte after the reader's: its DRAM endpoints are
 /// NoC #1's.
 const ARGS_WRITER: u32 = ARGS_AT + 0x400;
+
+/// The fan-out lists, which the tree in `launch_steps` stages: the root's
+/// (every other column leader, then its own column's workers) and one per
+/// column leader (its column's other tiles). One packed endpoint per word
+/// (`endpoint_of`), `GROUPS_STRIDE` bytes apart.
+const GROUPS_AT: u32 = ARGS_WRITER + 0x400;
+/// Bytes per fan-out list: sixty-four endpoints of room. The root's is the
+/// widest (every other column leader plus its own column), and the slots must
+/// not overlap: an 0x40 stride truncated the root's list and started the wrong
+/// tiles.
+const GROUPS_STRIDE: u32 = 0x100;
+
+// The dispatcher's descriptor, in RISCV B's dump block -- which that core's
+// executor never writes, because it has no `Dst` to dump. `firmware/src/
+// dispatch.rs` holds the same field numbers and the regions of the block; the
+// two must be changed together.
+/// L1 address of this tile's fan-out list ([`GROUPS_AT`]).
+const DESC_WORKERS: u32 = 0;
+/// Words in this tile's fan-out list.
+const DESC_COUNT: u32 = 1;
+/// Words in each argument block.
+const DESC_ARGS_WORDS: u32 = 2;
+/// The writer's block, as a byte offset from [`ARGS_AT`].
+const DESC_WRITER_OFFSET: u32 = 3;
+/// Words in the CB interface template.
+const DESC_IFACE_WORDS: u32 = 4;
+/// The semaphore setup program's address; zero for none.
+const DESC_SETUP_ADDR: u32 = 5;
+/// Words in the setup program.
+const DESC_SETUP_WORDS: u32 = 6;
+/// This tile's packed endpoint.
+const DESC_SELF: u32 = 7;
+/// The dispatcher's packed endpoint; zero on the dispatcher itself.
+const DESC_DISPATCHER: u32 = 8;
+/// How many argument blocks the module has: the reader's, plus the writer's
+/// when it has one.
+const DESC_BLOCKS: u32 = 9;
+/// Words in the descriptor itself, before the interface template.
+const DESC_FIELDS: u32 = 16;
+/// The CB interface template's first word in the same block.
+const DESC_IFACE_AT: u32 = 16;
+/// Words the template may hold (sixteen rings of eight words).
+const DESC_IFACE_CAPACITY: u32 = 128;
+/// Words an argument block may hold for the dispatcher path.
+const DESC_SCRATCH_CAPACITY: u32 = 64;
+
+/// Word `k` of RISCV B's descriptor, in its mailbox's dump block.
+fn descriptor_at(k: u32) -> u64 {
+    mailbox::launch::Mailbox::b().dump_offset(k / 16, k % 16)
+}
+
+/// A tile's NoC endpoint, packed into one word: the coordinate a NoC request
+/// names, not the logical grid coordinate a module sees.
+fn endpoint_of(tile: NocCoord) -> u32 {
+    u32::from(tile.x()) | (u32::from(tile.y()) << 8)
+}
 
 /// `index`'s slot in the program cache.
 const fn slot(index: u32) -> u32 {
@@ -391,34 +461,112 @@ fn launch_steps(
         &module.silicon_cores
     };
     let compute = cores.iter().any(|words| !words.is_empty());
-
-    // Every tile is staged, then all of them are started and joined, so the
-    // grid runs concurrently rather than one core at a time.
-    let mut launched: Vec<(NocCoord, u32)> = Vec::new();
-    for ((x, y), tile) in &tiles {
-        device.select(*tile);
-        // The CB interface is host state: tt-metal's
-        // `setup_local_cb_read_write_interfaces` writes each
-        // `LocalCBInterface` before the roles start, and every mover and
-        // compute role reads its ring pointers from there. Bytes, not
-        // tt-metal's 16-byte units (`riscv::cb`).
-        if !module.cbs.is_empty() {
-            let mut words = Vec::with_capacity(module.cbs.len() * 8);
-            for ring in &module.cbs {
-                words.extend_from_slice(&crate::riscv::cb::interface(
-                    ring.base,
-                    ring.page_bytes.checked_mul(ring.len).unwrap_or(0),
-                    ring.page_bytes,
-                    ring.len,
-                )?);
-            }
-            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-            // Not staged: the cores advance the ring's read and write pointers
-            // in this table, so each launch starts them from the base again —
-            // tt-metal's `setup_local_cb_read_write_interfaces` runs per launch
-            // for the same reason.
-            device.l1_write(u64::from(module.iface), &bytes)?;
+    // Which processors the launch starts. Only RISCV B reads it: it starts the
+    // reader's and the writer's cores and the three Tensors threads itself.
+    let mut enables = 0u32;
+    if !module.reader.is_empty() {
+        enables |= mailbox::launch::ENABLE_B;
+    }
+    if !module.writer.is_empty() {
+        enables |= mailbox::launch::ENABLE_NC;
+    }
+    for (thread, words) in cores.iter().enumerate() {
+        if !words.is_empty() {
+            enables |= ROLE_ENABLE[thread];
         }
+    }
+
+    // The CB interface is host state: tt-metal's
+    // `setup_local_cb_read_write_interfaces` writes each `LocalCBInterface`
+    // before the roles start, and every mover and compute role reads its ring
+    // pointers from there. Bytes, not tt-metal's 16-byte units (`riscv::cb`).
+    // The words are identical on every tile, and each tile's B installs them
+    // from its own copy before it starts the roles (`firmware/src/dispatch.rs`,
+    // tt-metal's worker firmware does the same): a launch carries the template
+    // once per module instead of the table per tile per launch, because a role
+    // advances the ring pointers in it.
+    let interface = &module.iface_words;
+    let args_words = module.args_words as usize;
+    if 4 * args_words as u64 > u64::from(ARGS_WRITER - ARGS_AT) {
+        return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
+    }
+    // The fan-out tree. One core issuing 120 workers' blocks and generations
+    // is ~40 us of NoC issues on card 0; two levels are ~10. Each physical
+    // column of the grid has a leader, the grid's first tile is the root, and
+    // the root starts the other leaders *and* its own column's workers. A tile
+    // reports to its parent when its own join is done, so the root's `ACK`
+    // still means the whole grid has finished.
+    //
+    // The lists are packed NoC endpoints (`endpoint_of`): physical coordinates,
+    // which is what a NoC request names, not the logical grid a module sees.
+    let mut columns: Vec<Vec<u32>> = Vec::new();
+    for (_, tile) in &tiles {
+        let endpoint = endpoint_of(*tile);
+        match columns.iter_mut().find(|column| {
+            // Same physical column: both endpoints decode to the same x.
+            (column[0] & 0xff) == (endpoint & 0xff)
+        }) {
+            Some(column) => column.push(endpoint),
+            None => columns.push(vec![endpoint]),
+        }
+    }
+    let root = columns[0][0];
+    // The root's list: every other leader, then its own column's workers.
+    let mut root_list: Vec<u32> = columns.iter().skip(1).map(|column| column[0]).collect();
+    root_list.extend(columns[0].iter().copied().filter(|tile| *tile != root));
+    let mut lists: Vec<Vec<u32>> = vec![root_list];
+    for column in columns.iter().skip(1) {
+        lists.push(column[1..].to_vec());
+    }
+    // Each list's slot, and the parent of every tile, in `tiles` order.
+    let mut plan: Vec<(usize, u32)> = Vec::with_capacity(tiles.len());
+    for (_, tile) in &tiles {
+        let endpoint = endpoint_of(*tile);
+        let column = columns
+            .iter()
+            .position(|column| (column[0] & 0xff) == (endpoint & 0xff))
+            .ok_or(ttStatus::TT_ERROR_GRID)?;
+        if endpoint == root {
+            plan.push((0, 0));
+        } else if columns[column][0] == endpoint {
+            // A leader: it starts its column and reports to the root.
+            plan.push((column, root));
+        } else {
+            // A worker: started by its column's leader, reports to it.
+            plan.push((usize::MAX, columns[column][0]));
+        }
+    }
+    if u64::from(GROUPS_AT) + (lists.len() as u64) * u64::from(GROUPS_STRIDE)
+        > tt_isa::l1::PROGRAM_CACHE.end
+    {
+        return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
+    }
+    // The tile whose B fans the next launch out from: the grid's first tile,
+    // whose B is resident like every other tile's. It costs no tile of the
+    // grid, which is the point -- tt-metal's dispatcher takes a whole column,
+    // because its dispatch core is a full-time ring processor and cannot also
+    // compute.
+    let dispatcher = tiles[0].1;
+    // The installation is only reusable while the programs, the rings, the
+    // parameters and the resolved grid are all the same.
+    let fingerprint = module.hash.rotate_left(17) ^ (u64::from(grid[1]) << 32) ^ u64::from(grid[0]);
+    let dispatchable =
+        interface.len() as u32 <= DESC_IFACE_CAPACITY && args_words as u32 <= DESC_SCRATCH_CAPACITY;
+    // A launch of a module this device has already staged on every tile runs
+    // from the dispatcher: the host writes one generation and waits for one
+    // `ACK` (`firmware/src/dispatch.rs`). `SKAM_NO_DISPATCH` keeps every launch
+    // on the host path, for measuring the two against each other.
+    if dispatchable && device.installed() == Some(fingerprint) && !dispatch_disabled() {
+        return dispatch_launch(device, module, params, grid, dispatcher);
+    }
+
+    // Every tile is staged. Then the grid is started from one tile, which fans
+    // the launch out over the NoC to the rest (`firmware/src/dispatch.rs`);
+    // a module too wide for the descriptor's block scratch is started on every
+    // tile by the host instead.
+    let mut launched: Vec<(NocCoord, u32)> = Vec::new();
+    for (index, ((x, y), tile)) in tiles.iter().enumerate() {
+        device.select(*tile);
         // This core's logical coordinate, host-written like tt-metal's
         // `core_info`: `%x = grid.x` and `%y = grid.y` read it.
         device.stage_words(u64::from(crate::mir::CORE_INFO), &[*x, *y])?;
@@ -437,30 +585,66 @@ fn launch_steps(
         // a mover run. Staged: a repeat launch writes only the words that differ.
         device.stage_words(u64::from(ARGS_AT), &args)?;
         device.stage_words(u64::from(ARGS_WRITER), &writer_args)?;
-        // The semaphore setup runs on T0 first and to completion, as BRISC
+        // The semaphore setup is placed here but not run: the descriptor names
+        // it, and B runs it on T0 before it starts the roles, as BRISC
         // initialises the semaphores before it releases the TRISCs. It runs on
         // every launch, not once per tile: a launch does not necessarily leave
         // every semaphore at the value the setup wrote, and re-initialising is
         // what puts the next launch's pacing back (skipping it measured a
         // kernel ~20% slower, as well as relying on an end state no code
-        // guarantees). It has its own program slot so it does not evict T0's
-        // role program.
+        // guarantees).
         if compute && !module.setup.is_empty() {
-            stage_at(device, 0, SLOT_SETUP, &module.setup, ARGS_AT)?;
-            // The arguments and the setup program are in L1; the generation that
-            // starts T0 on them is a store to a different address, so the tile
-            // is made to show every earlier write first (tt-metal's `l1_membar`
-            // before a launch).
-            device.l1_barrier()?;
-            let mb = mailbox::launch::Mailbox::of(0);
-            let generation = device.start(mb)?;
-            device.await_launch(mb, generation)?;
+            device.place(slot(SLOT_SETUP), &module.setup)?;
+        }
+
+        // The descriptor: the tiles this one fans out to, the width of the
+        // argument blocks, the setup program, and the CB interface template it
+        // installs from its own L1. It lives in B's dump block, which its
+        // executor never writes (`firmware/src/dispatch.rs` has the same field
+        // numbers).
+        let (list_slot, parent) = plan[index];
+        let list = if list_slot == usize::MAX {
+            None
+        } else {
+            Some(&lists[list_slot])
+        };
+        let setup = if compute && !module.setup.is_empty() {
+            (slot(SLOT_SETUP), module.setup.len() as u32)
+        } else {
+            (0, 0)
+        };
+        let mut desc = vec![0u32; DESC_FIELDS as usize];
+        desc[DESC_WORKERS as usize] =
+            list.map_or(0, |_| GROUPS_AT + list_slot as u32 * GROUPS_STRIDE);
+        // Zero when the host starts every tile itself: then no tile fans out,
+        // and a launch the host has not finished staging is never started.
+        desc[DESC_COUNT as usize] = if dispatchable {
+            list.map_or(0, |list| list.len() as u32)
+        } else {
+            0
+        };
+        desc[DESC_ARGS_WORDS as usize] = args_words as u32;
+        desc[DESC_WRITER_OFFSET as usize] = ARGS_WRITER - ARGS_AT;
+        desc[DESC_IFACE_WORDS as usize] = interface.len() as u32;
+        desc[DESC_SETUP_ADDR as usize] = setup.0;
+        desc[DESC_SETUP_WORDS as usize] = setup.1;
+        desc[DESC_BLOCKS as usize] = 1 + u32::from(!module.writer.is_empty());
+        desc[DESC_SELF as usize] = endpoint_of(*tile);
+        // Zero on the root: it reports to nobody, and a tile that reports
+        // increments its parent's completion counter.
+        desc[DESC_DISPATCHER as usize] = parent;
+        device.stage_words(descriptor_at(0), &desc)?;
+        device.stage_words(descriptor_at(DESC_IFACE_AT), interface)?;
+        if let Some(list) = list {
+            device.stage_words(
+                u64::from(GROUPS_AT + list_slot as u32 * GROUPS_STRIDE),
+                list,
+            )?;
         }
 
         // Name every program of the launch. B is dispatched once and starts
         // the enabled cores itself; the reader on B and the writer on NC
         // therefore run with the compute cores, not before or after them.
-        let mut enables = 0u32;
         if !module.reader.is_empty() {
             device.place(slot(SLOT_READER), &module.reader)?;
             device.prepare(
@@ -469,7 +653,6 @@ fn launch_steps(
                 module.reader.len() as u32,
                 ARGS_AT,
             )?;
-            enables |= mailbox::launch::ENABLE_B;
         }
         if !module.writer.is_empty() {
             device.place(slot(SLOT_WRITER), &module.writer)?;
@@ -479,34 +662,109 @@ fn launch_steps(
                 module.writer.len() as u32,
                 ARGS_WRITER,
             )?;
-            enables |= mailbox::launch::ENABLE_NC;
         }
         for (thread, words) in cores.iter().enumerate() {
             if words.is_empty() {
                 continue;
             }
             stage_role(device, thread, words, ARGS_AT)?;
-            enables |= ROLE_ENABLE[thread];
         }
+        // B's launch message, on every tile: the host names the reader here,
+        // and the generation below is the only word a launch writes. The
+        // dispatcher never rewrites it, so a tile started over the NoC runs the
+        // same message the host staged.
         let mb = mailbox::launch::Mailbox::b();
-        // Every program and launch word of this tile is staged; the generation
-        // below is the store that lets a core read them, so the tile is made to
-        // show them first (`l1_membar`, as before the setup run).
-        device.l1_barrier()?;
         let (text, words) = if module.reader.is_empty() {
             (0, 0)
         } else {
             (slot(SLOT_READER), module.reader.len() as u32)
         };
-        let generation = device.launch(mb, text, words, ARGS_AT, enables)?;
-        launched.push((*tile, generation));
+        device.prepare(mb, text, words, ARGS_AT)?;
+        device.stage_words(mb.enables(), &[enables])?;
+        if !dispatchable {
+            // Every program and launch word of this tile is staged; the
+            // generation below is the store that lets a core read them, so the
+            // tile is made to show them first (`l1_membar`, as before the setup
+            // run).
+            device.l1_barrier()?;
+            let generation = device.start(mb)?;
+            launched.push((*tile, generation));
+        }
     }
-    // Every tile is running; join them all.
+    // Every tile is staged: start the grid from the root, or from every tile
+    // when the module does not fit the dispatcher's descriptor, then join it.
     let mb = mailbox::launch::Mailbox::b();
-    for (tile, generation) in launched {
-        device.select(tile);
+    if dispatchable {
+        device.select(dispatcher);
+        if debug_enabled() {
+            eprintln!(
+                "libskamandros: staging launch from root ({}, {}): {} lists, dispatchable {}",
+                dispatcher.x(),
+                dispatcher.y(),
+                lists.len(),
+                dispatchable
+            );
+        }
+        // Every program, argument word and descriptor of every tile is staged;
+        // the generation is the store that lets B read this tile's, so the tile
+        // is made to show them first (`l1_membar`).
+        device.l1_barrier()?;
+        let generation = device.start(mb)?;
         device.await_launch(mb, generation)?;
+    } else {
+        for (tile, generation) in launched {
+            device.select(tile);
+            device.await_launch(mb, generation)?;
+        }
     }
+    // A launch of this module can now be fanned out on the card: every tile has
+    // its programs, arguments, interface template and descriptor.
+    if dispatchable {
+        device.note_installed(fingerprint);
+    } else {
+        device.forget_installed();
+    }
+    Ok(())
+}
+
+/// A repeat launch of a module this device has already staged: one generation
+/// to the dispatcher tile's B, one `ACK` back.
+///
+/// The host writes only that tile's argument blocks; the dispatcher patches
+/// each worker's own coordinate word in, writes the blocks over the NoC and
+/// then the worker's generation, and joins them all before it acknowledges
+/// (`firmware/src/dispatch.rs`). Nothing else changes between two launches of
+/// the same module: the programs, the roles' launch messages, the CB interface
+/// template and the descriptor are resident.
+fn dispatch_launch(
+    device: &mut Device,
+    module: &Module,
+    params: &[u64],
+    grid: [u32; 2],
+    dispatcher: NocCoord,
+) -> Result<(), ttStatus> {
+    device.select(dispatcher);
+    if debug_enabled() {
+        eprintln!(
+            "libskamandros: launch fanned out from tile ({}, {}) over {} tiles",
+            dispatcher.x(),
+            dispatcher.y(),
+            grid[0] * grid[1]
+        );
+    }
+    let [args, writer_args] = args_for(device, module, params, grid, dispatcher)?.map(|(_, v)| v);
+    device.stage_words(u64::from(ARGS_AT), &args)?;
+    device.stage_words(u64::from(ARGS_WRITER), &writer_args)?;
+    // The generation is the store that lets B read what the host staged.
+    device.l1_barrier()?;
+    let mb = mailbox::launch::Mailbox::b();
+    let generation = device.start(mb)?;
+    device.await_launch(mb, generation)?;
+    // The workers' argument blocks were written by the dispatcher, behind the
+    // staging cache's back, so what it claims to have staged is no longer
+    // guaranteed to be in L1. The dispatcher's own tile is the exception: its
+    // blocks are the ones written here.
+    device.forget_staged_except(dispatcher);
     Ok(())
 }
 
