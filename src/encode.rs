@@ -1028,6 +1028,37 @@ fn l1_format(dtype: DType) -> u32 {
     }
 }
 
+/// The L1 format of a Quasar datum.
+///
+/// An `i32` body keeps the hardware's integer format on Quasar: the packer's
+/// `In_data_format` for an `Int32` buffer is `Int32`
+/// (`data_format.cpp:277-279`, the `fp32_dest_acc_en` arm for a Quasar integer
+/// format) and the unpacker's destination format is the source format
+/// (`data_format.cpp:207-208`, `int_fpu_en`). The float formats are not
+/// interchangeable with it: `MEASURED` on qsr, an `i32` tile carried through
+/// `Float32` comes back with every NaN payload cleared (the `0x7F80_0001` and
+/// `0xFFFF_FFFF` of the `bitor` test become the canonical `0x7FC0_0000` and
+/// `0xFFC0_0000`), while the `Int32` descriptor round-trips the same bits.
+fn quasar_l1_format(dtype: DType) -> u32 {
+    match dtype {
+        DType::I32 => DATA_FORMAT_INT32,
+        _ => l1_format(dtype),
+    }
+}
+
+/// The `Dst` bank's format for a value of `dtype`.
+///
+/// `_llk_math_srcAB_hw_configure_` turns the integer `Dst` on when the source
+/// formats are Int32-compatible and the bank is 32-bit
+/// (`llk_math_common.h:141-142`), and the packer then reads the bank in that
+/// format (`data_format.cpp:277-279`).
+fn quasar_dst_format(dtype: DType, dst_is_16_bit: bool) -> u32 {
+    match dtype {
+        DType::I32 => DATA_FORMAT_INT32,
+        _ => dst_format(dst_is_16_bit),
+    }
+}
+
 /// The `Dst` format of the whole kernel: the 16-bit bank is a bf16 datum
 /// (`DST_ACCUM_MODE`'s 16-bit half), the 32-bit bank is an opaque 32-bit one.
 /// The unpacker's `Out_data_format`, the packer's `In_data_format` and the
@@ -1051,6 +1082,7 @@ fn dst_format(dst_is_16_bit: bool) -> u32 {
 const DATA_FORMAT_FP32: u32 = 0;
 const DATA_FORMAT_TF32: u32 = 4;
 const DATA_FORMAT_BF16: u32 = 5;
+const DATA_FORMAT_INT32: u32 = 8;
 
 /// The unpacker's tile descriptor, tt-metal's `unpack_tile_descriptor_t`
 /// (`tt_llk_wormhole_b0/common/inc/cunpack_common.h:22-53`): four words.
@@ -2723,7 +2755,7 @@ fn encode_unpack_quasar(
                 } else {
                     (
                         qthcon::THCON_UNPACKER0_REG0_OUT_DATA_FORMAT,
-                        dst_format(m.dst_is_16_bit),
+                        quasar_dst_format(dtype, m.dst_is_16_bit),
                     )
                 };
                 let transpose = if to_src && haloize {
@@ -2743,7 +2775,7 @@ fn encode_unpack_quasar(
                 }
                 let u = usize::from(unit);
                 let info = &m.cbs[cb];
-                let format = l1_format(info.dtype);
+                let format = quasar_l1_format(info.dtype);
                 if state.bd[u] != Some((cb, format)) {
                     quasar_bd(out, quasar_unpack_bd(unit), info.base, format)?;
                     state.bd[u] = Some((cb, format));
@@ -3208,8 +3240,11 @@ fn quasar_math_op(
             b,
             d,
         } => {
-            out.push(qencode::sfpmov(u32::from(a), u32::from(d), 0).map_err(quasar_unusable)?);
-            out.push(qencode::sfpiadd(0, u32::from(b), u32::from(d), 6).map_err(quasar_unusable)?);
+            // `VC - VD` in two's complement, with the flags left alone (6 is
+            // `ARG_2SCOMP_LREG_DST | CC_NONE`). The subtrahend moves in first:
+            // the instruction's own register is the minuend.
+            out.push(qencode::sfpmov(u32::from(b), u32::from(d), 0).map_err(quasar_unusable)?);
+            out.push(qencode::sfpiadd(0, u32::from(a), u32::from(d), 6).map_err(quasar_unusable)?);
         }
         MirOp::BinarySfp {
             op: BinarySfpOp::Setexp,
@@ -3716,7 +3751,7 @@ fn encode_pack_quasar(m: &MachineKernel, ops: &[MirOp], out: &mut Stream) -> Res
             }
             MirOp::SetPackBase { cb } => {
                 let info = &m.cbs[cb];
-                let format = l1_format(info.dtype);
+                let format = quasar_l1_format(info.dtype);
                 if bd != Some((cb, format)) {
                     quasar_bd(out, QUASAR_PACK_BD, info.base, format)?;
                     bd = Some((cb, format));
@@ -3731,13 +3766,15 @@ fn encode_pack_quasar(m: &MachineKernel, ops: &[MirOp], out: &mut Stream) -> Res
             }
             MirOp::SetPackConfig { dtype, mask } => {
                 // The packer's input is the math `Dst`; its L1 output format is
-                // the descriptor's (`llk_pack_common.h:105-124`). The output is
-                // the `Dst`'s own format for now: a converting pack has no
-                // Quasar arm yet.
-                if l1_format(dtype) != dst_format(m.dst_is_16_bit) {
+                // the descriptor's (`llk_pack_common.h:105-124`). The input is
+                // the bank's own format for the value's dtype — `Int32` for an
+                // integer body, the float format otherwise (`data_format.cpp`
+                // `get_single_pack_src_format`) — so a pack that would convert
+                // between formats has no Quasar arm yet.
+                if quasar_l1_format(dtype) != quasar_dst_format(dtype, m.dst_is_16_bit) {
                     return Err(quasar_shape("a converting pack"));
                 }
-                let format = dst_format(m.dst_is_16_bit);
+                let format = quasar_dst_format(dtype, m.dst_is_16_bit);
                 if in_format != Some(format) {
                     quasar_config(
                         out,
