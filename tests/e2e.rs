@@ -106,6 +106,7 @@ const TT_OK: c_int = 0;
 const TT_ERROR_ARGUMENT: c_int = 1;
 const TT_ERROR_MODULE: c_int = 3;
 const TT_ERROR_VALUE_UNDEFINED: c_int = 14;
+const TT_TODO_ACCESS_SHAPE: c_int = 174;
 const TT_TODO_PACK_F32_TO_BF16: c_int = 180;
 
 /// The `libskamandros.so` this test binary was built next to.
@@ -5965,13 +5966,18 @@ fn bf16_softmax_runs_on_the_simulator() {
 }
 
 /// The embedding gather as pure data movement: the row of ids is copied in as a
-/// whole row, and the copy that follows names that row as its index — one base
+/// row unit, and the copy that follows names that row as its index — one base
 /// per lane — so each lane pulls one weight row into the tile the last copy
 /// drains. No compute role runs.
+///
+/// A parameter is a tiled plane, so a row is not contiguous in it: row `r` of
+/// page `p` is sixteen datums in each of the page's first two faces, and the
+/// gather moves those two halves. That is also why the ids page is written the
+/// way a tile holds row 0.
 const GATHER: &str = "\
 version 9
 grid 1,1
-%ids = param i32 32
+%ids = param i32 1024
 %w = param f32 32768
 %out = param f32 1024
 %ib = buffer i32 1,32
@@ -5988,7 +5994,12 @@ fn a_gather_is_pure_data_movement() {
     // rows of 32 datums; the weight is 32 tiles of rows.
     let tokens: Vec<i32> = (0..32).map(|lane| ((lane * 7 + 3) % 32) as i32).collect();
     let rows: Vec<i32> = tokens.iter().map(|token| token * 32).collect();
-    let ids: Vec<u8> = rows.iter().flat_map(|v| v.to_le_bytes()).collect();
+    // The ids are row 0 of one tiled page: sixteen datums in each of its first
+    // two faces.
+    let mut ids_page = vec![0i32; 1024];
+    ids_page[..16].copy_from_slice(&rows[..16]);
+    ids_page[256..272].copy_from_slice(&rows[16..]);
+    let ids: Vec<u8> = ids_page.iter().flat_map(|v| v.to_le_bytes()).collect();
     let w: Vec<f32> = (0..32768).map(|i| i as f32).collect();
     let weight: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
     let out = run_kernel_tensors(GATHER, &[&ids, &weight], 1024 * 4);
@@ -5996,12 +6007,66 @@ fn a_gather_is_pure_data_movement() {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect();
+    // Lane `lane` lands in tile row `lane`, and each lane's row is row 0 of the
+    // tile its index names.
     for (lane, &token) in tokens.iter().enumerate() {
         for column in 0..32 {
             assert_eq!(
-                got[lane * 32 + column],
-                w[token as usize * 1024 + column],
+                got[tile_index(lane, column)],
+                w[token as usize * 1024 + tile_index(0, column)],
                 "lane {lane} datum {column}"
+            );
+        }
+    }
+}
+
+/// The scatter half of a narrow parameter access: a row read out of one page is
+/// written back into another at a row of its own. A parameter is tile-major, so
+/// the write is two face rows too, sixteen datums each — and a write needs only
+/// its two addresses congruent mod 16, which is why the scatter is the half that
+/// a 16-bit datum can do.
+///
+/// The output page is seeded from a zero page first: a reader copy runs before
+/// the writer's, so a page the writer touches has to be filled by the writer
+/// too.
+const SCATTER: &str = "\
+version 9
+grid 1,1
+%src = param f32 1024
+%zero = param f32 1024
+%out = param f32 1024
+%rb = buffer f32 1,32
+%t = buffer f32 32,32
+%five = const i32 5
+%seven = const i32 7
+copy 1,32 %rb [0] = %src [%five]
+copy 32,32 %t [0] = %zero [0]
+copy 32,32 %out [0] = %t [0]
+copy 1,32 %out [%seven] = %rb [0]
+";
+
+#[test]
+fn a_row_scatter_writes_a_parameter_in_the_tile_layout() {
+    // The source page holds row 5; the output is seeded with zeros.
+    let source: Vec<f32> = (0..1024).map(|i| (i % 97) as f32 - 48.0).collect();
+    let source_bytes: Vec<u8> = source.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let zeros = vec![0u8; 1024 * 4];
+    let out = run_kernel_tensors(SCATTER, &[&source_bytes, &zeros], 1024 * 4);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for row in 0..32 {
+        for column in 0..32 {
+            let want = if row == 7 {
+                source[tile_index(5, column)]
+            } else {
+                0.0
+            };
+            assert_eq!(
+                got[tile_index(row, column)],
+                want,
+                "row {row} column {column}"
             );
         }
     }
@@ -6473,12 +6538,20 @@ fn swiglu_runs_on_the_simulator() {
     }
 }
 
-/// The embedding row gather, then the cast the llama forward makes before the
-/// first RMSNorm: a token's bf16 weights widened to f32.
+/// The embedding row gather in bf16, then the cast the llama forward makes
+/// before the first RMSNorm: a token's bf16 weights widened to f32.
+///
+/// It is refused, and the refusal is the point. A NoC read needs its two
+/// addresses congruent mod 64 (tt-isa's `dm::error::ALIGNMENT`, `dram::ALIGN`:
+/// a write needs only mod 16). A row's half is sixteen datums — 64 bytes of
+/// f32, but 32 bytes of bf16 — and an odd bf16 row sits at a 32-byte offset in
+/// its page, which no fixed L1 placement can match. So `copy 1,32` of a bf16
+/// parameter is `TT_TODO_ACCESS_SHAPE`, not an undefined request. A bf16 row
+/// has to move at page granularity, which is the next step for this path.
 const EMBEDDING_CAST: &str = "\
 version 9
 grid 1,1
-%ids = param i32 32
+%ids = param i32 1024
 %w = param bf16 32768
 %out = param f32 1024
 %ib = buffer i32 1,32
@@ -6494,28 +6567,27 @@ copy 32,32 %out [0] = %bo [0]
 ";
 
 #[test]
-fn embedding_gathers_and_casts_to_f32() {
-    let tokens: Vec<i32> = (0..32).map(|lane| ((lane * 5 + 1) % 32) as i32).collect();
-    let rows: Vec<i32> = tokens.iter().map(|token| token * 32).collect();
-    let ids: Vec<u8> = rows.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let table: Vec<f32> = (0..32768).map(|i| ((i % 61) as f32 - 30.0) / 8.0).collect();
-    let table_bf16: Vec<u16> = table.iter().map(|v| truncate_to_bf16(*v)).collect();
-    let weight: Vec<u8> = table_bf16.iter().flat_map(|h| h.to_le_bytes()).collect();
-    let out = run_kernel_tensors(EMBEDDING_CAST, &[&ids, &weight], 4096);
-    let got: Vec<f32> = out
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-        .collect();
-    for (lane, &token) in tokens.iter().enumerate() {
-        for column in 0..32 {
-            let want = widen_bf16(table_bf16[token as usize * 1024 + column]);
-            assert_eq!(
-                got[lane * 32 + column],
-                want,
-                "lane {lane} datum {column}: embedding of token {token}"
-            );
-        }
-    }
+fn a_bf16_row_gather_is_refused_by_the_alignment_rule() {
+    let lib = library();
+    let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
+    let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
+    let mut module: *mut c_void = std::ptr::null_mut();
+    let mut err: *mut c_char = std::ptr::null_mut();
+    let code = unsafe {
+        compile(
+            EMBEDDING_CAST.as_ptr().cast(),
+            EMBEDDING_CAST.len(),
+            &mut module,
+            &mut err,
+        )
+    };
+    assert_eq!(
+        code,
+        TT_TODO_ACCESS_SHAPE,
+        "a bf16 half-row read has no congruent request: {}",
+        take_error(&free, err)
+    );
+    assert!(module.is_null());
 }
 
 /// `lm_head`: the last token's hidden row against one vocab tile. The activation

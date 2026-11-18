@@ -22,7 +22,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::ir::{Kernel, Op, OpId, ValueKind};
+use crate::ir::{Kernel, Op, OpId, RegShape, ValueKind};
 use crate::module::ParamKind;
 use crate::status::ttStatus;
 use tt_isa::noc::niu::TxnId;
@@ -97,16 +97,55 @@ struct Copy {
     reader: bool,
 }
 
-/// The page a staging ring holds: the unit the access names. A tile is its own
-/// page, and a row is a page of its own — the value contiguous, sixteen datums
-/// to a face row. A column or a datum is not lowered.
-fn unit_page(shape: [crate::ir::Dim; 2]) -> Result<[crate::ir::Dim; 2], ttStatus> {
+/// The page a staging ring holds for a row a parameter access names.
+///
+/// A tile is its own page. A row that lands in `Dst` gets a page of its own —
+/// the value contiguous, sixteen datums to a face row. A row an `Src` reader
+/// consumes, or one lane of an assembly, is staged into a tile page: the FPU's
+/// broadcast reads row 0 of each face and an assembly fills one tile row per
+/// lane, so both read the tile's own layout and neither needs an unpack. A
+/// column is not staged from a parameter at all: its thirty-two datums are one
+/// lane column of a tile, not a run the NoC can gather.
+fn page_of(shape: [crate::ir::Dim; 2], src_only: bool) -> Result<[crate::ir::Dim; 2], ttStatus> {
     match crate::ir::access_shape(shape)? {
-        crate::ir::RegShape::Tile | crate::ir::RegShape::Row => Ok(shape),
+        crate::ir::RegShape::Tile => Ok([32, 32]),
+        crate::ir::RegShape::Row => Ok(if src_only { [32, 32] } else { shape }),
         crate::ir::RegShape::Column | crate::ir::RegShape::Scalar => {
             Err(ttStatus::TT_TODO_ACCESS_SHAPE)
         }
     }
+}
+
+/// Does `value` only feed readers that take it straight into `Src` (the FPU's
+/// broadcast, `matmul`, `sum`, `max`)? Such a value never enters `Dst`, so its
+/// page keeps the tile's own layout.
+fn src_only(k: &Kernel, value: OpId) -> bool {
+    let mut read = false;
+    for (_, op) in k.ops() {
+        for v in op.parameters() {
+            if v != value {
+                continue;
+            }
+            // A copy's own ends are not reads of its index, and an index is a
+            // lane base, not a datapath operand.
+            if matches!(*op, Op::Copy { dst, src, .. } if v != dst && v != src) {
+                continue;
+            }
+            if let Some((tile, narrow)) = crate::ir::broadcast_pair(k, op)
+                && (v == tile || v == narrow)
+            {
+                read = true;
+                continue;
+            }
+            match *op {
+                Op::Matmul { a, b, .. } if v == a || v == b => read = true,
+                Op::Sum { x, s, .. } if v == x || v == s => read = true,
+                Op::Max { x, .. } if v == x => read = true,
+                _ => return false,
+            }
+        }
+    }
+    read
 }
 
 /// Stage every parameter access, split the list into the three segments, and
@@ -210,11 +249,16 @@ impl Mover<'_> {
                     offset,
                     shape,
                 } if self.old.info(buffer).kind == ValueKind::Param => {
-                    let page = unit_page(shape)?;
+                    // A lane's own index is an assembly, which fills the tile's
+                    // rows; a single unit an `Src` reader consumes keeps the
+                    // tile's layout; anything else lands in `Dst`.
+                    let src_layout =
+                        self.old.info(offset).shape != RegShape::Scalar || src_only(self.old, id);
+                    let page = page_of(shape, src_layout)?;
                     let ring = self.stage(buffer, page)?;
                     let zero = self.zero()?;
-                    // The ring's page is the access unit, so the copy moves one
-                    // unit and the ring side names that page itself.
+                    // The copy moves the access's unit, which the ring page
+                    // holds in its own layout (`narrow_pair` places it).
                     self.copies.push(Copy {
                         path: self.loops.clone(),
                         op: Op::Copy {
@@ -222,7 +266,7 @@ impl Mover<'_> {
                             src: buffer,
                             dst_offset: zero,
                             src_offset: offset,
-                            shape: page,
+                            shape,
                         },
                         reader: true,
                     });
@@ -241,11 +285,12 @@ impl Mover<'_> {
                     offset,
                     shape,
                 } if self.old.info(buffer).kind == ValueKind::Param => {
-                    let page = unit_page(shape)?;
+                    // The ring is written by the packer before the copy runs, so
+                    // it holds the value contiguous whatever its consumer.
+                    let page = page_of(shape, false)?;
                     let ring = self.stage(buffer, page)?;
                     let zero = self.zero()?;
-                    // The ring's page is the access unit, so the copy moves one
-                    // unit and the ring side names that page itself.
+                    // As on the load side: the copy moves the access's own unit.
                     self.copies.push(Copy {
                         path: self.loops.clone(),
                         op: Op::Copy {
@@ -253,7 +298,7 @@ impl Mover<'_> {
                             src: ring,
                             dst_offset: offset,
                             src_offset: zero,
-                            shape: page,
+                            shape,
                         },
                         reader: false,
                     });

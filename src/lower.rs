@@ -617,27 +617,31 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     }
                 };
                 let unit_shape = access_shape(access)?;
-                // The page's shape is its layout: a narrow value names a page
-                // that holds the value itself, never a tile the value sits in.
+                // The page's shape is its layout. A narrow value that lands in
+                // `Dst` names a page that holds the value itself, contiguous.
+                // The FPU's broadcast is different: it reads `SrcB`'s row 0 (or
+                // column 0) of each face straight out of a tile page, which is
+                // tt-metal's operand layout, so a value that only an `Src`
+                // reader consumes may name a part of a tile page.
                 let page = match *k.at(buffer) {
                     Op::Cb { page, .. } => page,
                     _ => return Err(ttStatus::TT_ERROR_NOT_A_BUFFER),
                 };
-                if unit_of(page, dtype)?.0 != unit_shape {
-                    let _ = (at, access, page);
-                    return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
-                }
-                let reg = dst_reg(alloc, owner(k, value))?;
                 // A value only an `Src` reader consumes never enters `Dst`: the
                 // unpack goes straight into `SrcA`/`SrcB` at the op that reads
                 // it, and this load only reserves the page.
                 let lands_in_dst = non_matmul_use.contains(&value) || !matmul_use.contains(&value);
+                let page_shape = unit_of(page, dtype)?.0;
+                if page_shape != unit_shape && !(page_shape == RegShape::Tile && !lands_in_dst) {
+                    let _ = (at, access, page);
+                    return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
+                }
+                let reg = dst_reg(alloc, owner(k, value))?;
                 // A narrow access that only an `Src` reader consumes needs no
                 // unpack at all: that op reads the page's own layout. A narrow
                 // value that lands in `Dst` is one x-run of its own datum count,
                 // sixteen datums to a `Dst` row. A column has no lane layout
-                // yet, and a page holds one unit: a tile-holding page cannot be
-                // read as the value itself.
+                // yet.
                 if unit_shape == RegShape::Column && lands_in_dst {
                     let _ = (at, access);
                     return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
@@ -4904,6 +4908,19 @@ fn copy_to(
         RegShape::Row | RegShape::Column => 32,
         RegShape::Tile => 1024,
     };
+    // A row unit is narrower than the parameter's page, so the copy gathers it
+    // from (or scatters it to) the two face rows it occupies. See
+    // [`narrow_pair`].
+    let unit = crate::ir::access_shape(access)?;
+    let page_shape = match *k.at(buffer) {
+        Op::Cb { page, .. } => page,
+        _ => return Err(ttStatus::TT_ERROR_NOT_A_BUFFER),
+    };
+    let page_unit = crate::ir::unit_of(page_shape, dtype)?.0;
+    let block = *plan
+        .arg_block
+        .get(index as usize)
+        .ok_or(ttStatus::TT_ERROR_COPY_ENDS)?;
     // A mover's program has its own counters: `t5` is its NIU base, so the
     // compute roles' counters and its own `a1..a4` are not interchangeable.
     let mut ops = Vec::new();
@@ -4923,32 +4940,44 @@ fn copy_to(
             plan,
             &m.cbs,
         )?;
-        let scale = pool.take()?;
-        ops.push(MirOp::Li {
-            reg: scale,
-            value: bytes,
-        });
-        ops.push(MirOp::IArith {
-            op: IOp::Mul,
-            d: value,
-            a: value,
-            b: scale,
-        });
-        pool.give(scale);
-        emit_request(
-            &mut ops,
-            &mut pool,
-            inbound,
-            cb,
-            *plan
-                .arg_block
-                .get(index as usize)
-                .ok_or(ttStatus::TT_ERROR_COPY_ENDS)?,
-            bytes,
-            value,
-            None,
-            interleaved,
-        )?;
+        if unit == RegShape::Row {
+            narrow_pair(
+                &mut ops,
+                &mut pool,
+                inbound,
+                cb,
+                block,
+                dtype,
+                page_unit,
+                value,
+                None,
+                interleaved,
+            )?;
+        } else {
+            let scale = pool.take()?;
+            ops.push(MirOp::Li {
+                reg: scale,
+                value: bytes,
+            });
+            ops.push(MirOp::IArith {
+                op: IOp::Mul,
+                d: value,
+                a: value,
+                b: scale,
+            });
+            pool.give(scale);
+            emit_request(
+                &mut ops,
+                &mut pool,
+                inbound,
+                cb,
+                block,
+                bytes,
+                value,
+                None,
+                interleaved,
+            )?;
+        }
     } else {
         let (page, el) = index_page(k, plan, &m.cbs, offset)?;
         // The lane loop is one more nesting level, so it takes the next counter
@@ -4985,38 +5014,262 @@ fn copy_to(
             base,
             at: 0,
         });
-        ops.push(MirOp::Li {
-            reg: scale,
-            value: bytes,
-        });
-        ops.push(MirOp::IArith {
-            op: IOp::Mul,
-            d: value,
-            a: value,
-            b: scale,
-        });
-        pool.give(scale);
         pool.give(base);
-        emit_request(
-            &mut ops,
-            &mut pool,
-            inbound,
-            cb,
-            *plan
-                .arg_block
-                .get(index as usize)
-                .ok_or(ttStatus::TT_ERROR_COPY_ENDS)?,
-            bytes,
-            value,
-            Some(counter),
-            interleaved,
-        )?;
+        if unit == RegShape::Row {
+            pool.give(scale);
+            narrow_pair(
+                &mut ops,
+                &mut pool,
+                inbound,
+                cb,
+                block,
+                dtype,
+                page_unit,
+                value,
+                Some(counter),
+                interleaved,
+            )?;
+        } else {
+            ops.push(MirOp::Li {
+                reg: scale,
+                value: bytes,
+            });
+            ops.push(MirOp::IArith {
+                op: IOp::Mul,
+                d: value,
+                a: value,
+                b: scale,
+            });
+            pool.give(scale);
+            emit_request(
+                &mut ops,
+                &mut pool,
+                inbound,
+                cb,
+                block,
+                bytes,
+                value,
+                None,
+                interleaved,
+            )?;
+        }
         ops.push(MirOp::EndLoop);
     }
     pool.give(value);
     for op in ops {
         m.push(core, op);
     }
+    Ok(())
+}
+
+/// The two NoC requests of one narrow row unit: the parameter's pages are
+/// tile-major, so a row is not contiguous there. It is sixteen datums in the
+/// face row `row` of the tile and sixteen more in the same row of the next face
+/// — tt-metal's tiled row order, the one `gather_reader_tiled.cpp` walks for its
+/// face-order datum addresses. A row page keeps the unit contiguous, so the two
+/// halves sit next to each other; a tile page keeps it in the tile's own layout
+/// (row 0, or the lane's row for an assembly), which is what an `Src` reader
+/// reads without an unpack.
+///
+/// `value` holds the unit's index in the access's units; it is consumed (its
+/// register comes back in the pool). The parameter side is gathered, the ring
+/// side is not.
+#[allow(clippy::too_many_arguments)]
+fn narrow_pair(
+    ops: &mut Vec<MirOp>,
+    pool: &mut Pool,
+    inbound: bool,
+    cb: Cb,
+    block: i32,
+    dtype: crate::ir::DType,
+    page_unit: RegShape,
+    value: u8,
+    lane: Option<u8>,
+    interleaved: bool,
+) -> Result<(), ttStatus> {
+    let el = u32::from(dtype.bytes());
+    // A request's two addresses must be congruent mod 64 for a read
+    // (tt-isa's `dm::error::ALIGNMENT`, `dram::ALIGN`). A row's half is sixteen
+    // datums: 64 bytes of f32, always 64-aligned, but 32 bytes of bf16, whose
+    // DRAM offset is 32 when the row is odd. So a bf16 half-row read cannot be
+    // congruent with a tile row, and is refused rather than emitted as a request
+    // the hardware calls undefined; a write needs only mod 16, so a bf16 scatter
+    // is fine.
+    if inbound && el == 2 {
+        return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
+    }
+    // A face is 16x16 datums, a face row sixteen of them, a page a whole tile.
+    let face = 256 * el;
+    let row_bytes = 16 * el;
+    let half = 16 * el;
+    let page_bytes = 1024 * el;
+    /// `out = (in / 32) * a + ((in % 32) / 16) * b + ((in % 32) % 16) * c` —
+    /// the tiled address of the row `in` names, its page and its placement
+    /// inside the page.
+    fn tiled(
+        ops: &mut Vec<MirOp>,
+        pool: &mut Pool,
+        input: u8,
+        out: u8,
+        a: u32,
+        b: u32,
+        c: u32,
+    ) -> Result<(), ttStatus> {
+        let thirty_two = pool.take()?;
+        ops.push(MirOp::Li {
+            reg: thirty_two,
+            value: 32,
+        });
+        let page = pool.take()?;
+        ops.push(MirOp::IArith {
+            op: IOp::Div,
+            d: page,
+            a: input,
+            b: thirty_two,
+        });
+        let row = pool.take()?;
+        ops.push(MirOp::IArith {
+            op: IOp::Rem,
+            d: row,
+            a: input,
+            b: thirty_two,
+        });
+        ops.push(MirOp::Li {
+            reg: thirty_two,
+            value: a,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Mul,
+            d: out,
+            a: page,
+            b: thirty_two,
+        });
+        pool.give(page);
+        ops.push(MirOp::Li {
+            reg: thirty_two,
+            value: 16,
+        });
+        let pair = pool.take()?;
+        ops.push(MirOp::IArith {
+            op: IOp::Div,
+            d: pair,
+            a: row,
+            b: thirty_two,
+        });
+        ops.push(MirOp::Li {
+            reg: thirty_two,
+            value: b,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Mul,
+            d: pair,
+            a: pair,
+            b: thirty_two,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Add,
+            d: out,
+            a: out,
+            b: pair,
+        });
+        pool.give(pair);
+        ops.push(MirOp::Li {
+            reg: thirty_two,
+            value: 16,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Rem,
+            d: row,
+            a: row,
+            b: thirty_two,
+        });
+        ops.push(MirOp::Li {
+            reg: thirty_two,
+            value: c,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Mul,
+            d: row,
+            a: row,
+            b: thirty_two,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Add,
+            d: out,
+            a: out,
+            b: row,
+        });
+        pool.give(row);
+        pool.give(thirty_two);
+        Ok(())
+    }
+    // The parameter side: the unit's page and its place in that page.
+    tiled(ops, pool, value, value, page_bytes, 2 * face, row_bytes)?;
+    let second = pool.take()?;
+    ops.push(MirOp::Li {
+        reg: second,
+        value: face,
+    });
+    ops.push(MirOp::IArith {
+        op: IOp::Add,
+        d: second,
+        a: value,
+        b: second,
+    });
+    // The ring side: contiguous in a row page, and the tile's own row in a tile
+    // page — the lane's row, or row 0 for a single unit.
+    let ring = pool.take()?;
+    match (page_unit, lane) {
+        (RegShape::Tile, Some(counter)) => {
+            tiled(ops, pool, counter, ring, 0, 2 * face, row_bytes)?;
+        }
+        _ => ops.push(MirOp::Li {
+            reg: ring,
+            value: 0,
+        }),
+    }
+    emit_request(
+        ops,
+        pool,
+        inbound,
+        cb,
+        block,
+        half,
+        value,
+        Some(ring),
+        interleaved,
+    )?;
+    // The second half: the next face on the parameter side, and the next face's
+    // row (or the datums after the first sixteen) on the ring side.
+    let step = pool.take()?;
+    ops.push(MirOp::Li {
+        reg: step,
+        value: if page_unit == RegShape::Tile {
+            face
+        } else {
+            half
+        },
+    });
+    ops.push(MirOp::IArith {
+        op: IOp::Add,
+        d: ring,
+        a: ring,
+        b: step,
+    });
+    pool.give(step);
+    emit_request(
+        ops,
+        pool,
+        inbound,
+        cb,
+        block,
+        half,
+        second,
+        Some(ring),
+        interleaved,
+    )?;
+    pool.give(ring);
+    pool.give(second);
     Ok(())
 }
 
@@ -5143,8 +5396,10 @@ fn interleaved_address(
 /// registers, the trigger, and the two spins that wait for the hardware to take
 /// the request and for the transaction to complete.
 ///
-/// A lane's request is one span of the page past the one before it, so `lane`
-/// (the counter) adds `bytes` to the page pointer.
+/// A lane's request is one span of the page past the one before it, so
+/// `ring_offset` is that span as a byte offset added to the page pointer: a
+/// whole page per lane for a tile unit, and the unit's own row (or its place in
+/// the contiguous page) for a narrow one.
 #[allow(clippy::too_many_arguments)]
 fn emit_request(
     ops: &mut Vec<MirOp>,
@@ -5154,7 +5409,7 @@ fn emit_request(
     block: i32,
     bytes: u32,
     value: u8,
-    lane: Option<u8>,
+    ring_offset: Option<u8>,
     interleaved: bool,
 ) -> Result<(), ttStatus> {
     use crate::riscv::cb::{RD_PTR, STRIDE, WR_PTR};
@@ -5193,27 +5448,13 @@ fn emit_request(
         base: reg::A6,
         at: (u32::from(cb.0) * STRIDE) as i32 + field,
     });
-    if let Some(counter) = lane {
-        let span = pool.take()?;
-        let off = pool.take()?;
-        ops.push(MirOp::Li {
-            reg: span,
-            value: bytes,
-        });
-        ops.push(MirOp::IArith {
-            op: IOp::Mul,
-            d: off,
-            a: counter,
-            b: span,
-        });
+    if let Some(offset) = ring_offset {
         ops.push(MirOp::IArith {
             op: IOp::Add,
             d: page,
             a: page,
-            b: off,
+            b: offset,
         });
-        pool.give(off);
-        pool.give(span);
     }
     // `TARG_ADDR` is the request's source and `RET_ADDR` its destination: a
     // read has the parameter as source and L1 as destination, a write the other

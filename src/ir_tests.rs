@@ -570,8 +570,11 @@ copy 1,32 %b [%i] = %w [%i]
 
 /// A narrow `load`/`store` names the page that holds its unit: a `1,32` page is
 /// the value, so the run is sixteen datums to a `Dst` row. A tile-holding page
-/// read as a narrow value, and a column, are loud `TT_TODO_ACCESS_SHAPE` — never
-/// a whole-tile move. The one narrow load that runs without a datapath is the
+/// read as a narrow value is loud `TT_TODO_ACCESS_SHAPE` when the value lands in
+/// `Dst` — the run would name another tile row's datums — but an `Src` reader
+/// takes it as it is, because the FPU's broadcast reads row 0 of each face and
+/// that is what a tile page holds. A column is refused everywhere it would need
+/// a lane layout. The one narrow load that runs without a datapath is the
 /// mover's lane bases (`load 1,32` whose only reader is a copy's index), which
 /// `an_access_shape_is_the_unit_a_copy_moves` gates.
 #[test]
@@ -584,8 +587,8 @@ fn a_narrow_access_names_a_page_of_its_own_unit() {
         };
         assert_eq!(err, want, "{what}");
     };
-    // A tile-holding page cannot be read as a row or a column: the value is not
-    // the page, so the run would name another tile row's datums.
+    // A tile-holding page cannot be read into `Dst` as a row or a column: the
+    // value is not the page, so the run would name another tile row's datums.
     for shape in ["1,32", "32,1"] {
         let text = format!(
             "\
@@ -600,6 +603,28 @@ load {shape} %x = %b [0]
         );
         case(&format!("a {shape} load"), &text, S::TT_TODO_ACCESS_SHAPE);
     }
+    // The FPU's broadcast is the exception: it reads the row out of the tile's
+    // face, so a row taken from a tile page feeds it without an unpack.
+    Kernel::parse(
+        "\
+version 9
+grid 1,1
+%p = param f32 1024
+%o = param f32 1024
+%b = buffer f32 32,32
+%c = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %b [0] = %p [0]
+copy 32,32 %c [0] = %p [0]
+load 32,32 %t = %b [0]
+load 1,32 %r = %c [0]
+%y = mul %t %r
+store 32,32 %bo [0] = %y
+copy 32,32 %o [0] = %bo [0]
+",
+    )
+    .and_then(|k| compile::compile(&k))
+    .expect("a row of a tile page feeds the FPU's broadcast");
     // A row page holds the value: the load runs, the body walks row pair zero,
     // and the pack writes the two rows back.
     Kernel::parse(
@@ -618,6 +643,21 @@ copy 1,32 %o [0] = %v [0]
     )
     .and_then(|k| compile::compile(&k))
     .expect("a 1,32 row through a 1,32 page compiles");
+    // A row of a bf16 parameter is refused: its half is 32 bytes, and a NoC read
+    // needs its two addresses congruent mod 64, which no fixed L1 placement of
+    // an odd row can satisfy (`lower::narrow_pair`).
+    case(
+        "a bf16 row of a parameter",
+        "\
+version 9
+grid 1,1
+%p = param bf16 1024
+%v = buffer bf16 1,32
+copy 1,32 %v [0] = %p [0]
+",
+        S::TT_TODO_ACCESS_SHAPE,
+    );
+
     // A column page is a page of its own too, but a column has no lane layout
     // yet: a column copy is not even a unit the verifier admits, so such a page
     // cannot be filled from a parameter at all.

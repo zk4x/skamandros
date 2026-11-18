@@ -1169,7 +1169,19 @@ impl Kernel {
                         _ => return Err(ttStatus::TT_ERROR_NOT_A_BUFFER),
                     };
                     let (unit_shape, _, _) = unit_of(page, self.dtype(buffer))?;
-                    if lanes.checked_mul(shape[0] * shape[1]) != Some(unit_shape.datums()) {
+                    let moved = lanes
+                        .checked_mul(shape[0] * shape[1])
+                        .ok_or(ttStatus::TT_ERROR_COPY_LANES)?;
+                    let held = unit_shape.datums();
+                    // A narrow unit moves through a page that holds it: its own
+                    // page (one unit) or a tile page (one tile row per lane, as
+                    // an assembly fills the tile, or the value's one row).
+                    let fits = if unit == unit_shape {
+                        moved == held
+                    } else {
+                        unit == RegShape::Row && unit_shape == RegShape::Tile && moved <= held
+                    };
+                    if !fits {
                         return Err(ttStatus::TT_ERROR_COPY_LANES);
                     }
                     let _ = len;
