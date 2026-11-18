@@ -282,6 +282,12 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
     let types = &types;
     let (plan, mut m, alloc) = prepare(k)?;
     m.target = target;
+    // Where this core's logical grid coordinate is staged. The two chips'
+    // launches put it in different words; `%x = grid.x` reads it in RISC-V.
+    m.core_info = match target {
+        Target::Blackhole => crate::mir::CORE_INFO,
+        Target::Quasar => crate::mir::QUASAR_CORE_INFO,
+    };
     let alloc = &alloc;
 
     // The dtype a value occupies `Dst` with. 16-bit mode stores every value as

@@ -246,13 +246,14 @@ fn encode_int(
     out: &mut Stream,
     loops: &mut Vec<OpenLoop>,
     pairs: &[(u8, u8)],
+    core_info: u32,
 ) -> Result<bool, ttStatus> {
     match *op {
         MirOp::Li { reg, value } => out.li(reg, value),
         MirOp::LoadArg { reg, arg } => out.rv(rv::lw(reg, reg::A0, arg)),
         MirOp::Lw { reg, base, at } => out.rv(rv::lw(reg, base, at)),
         MirOp::LoadCoord { reg, axis } => {
-            out.li(reg, crate::mir::CORE_INFO + u32::from(axis) * 4);
+            out.li(reg, core_info + u32::from(axis) * 4);
             out.rv(rv::lw(reg, reg, 0));
         }
         MirOp::IArith { op, d, a, b } => match op {
@@ -337,17 +338,20 @@ pub fn encode(m: &MachineKernel, tail: bool) -> Result<Words, ttStatus> {
         &m.stream(Core::Unpack).collect::<Vec<_>>(),
         &mut out.t0,
         m.dst_is_16_bit,
+        m.core_info,
         tail,
     )?;
     encode_math(
         &m.stream(Core::Math).collect::<Vec<_>>(),
         &mut out.t1,
         m.dst_is_16_bit,
+        m.core_info,
     )?;
     encode_pack(
         &m.stream(Core::Pack).collect::<Vec<_>>(),
         &mut out.t2,
         m.dst_is_16_bit,
+        m.core_info,
     )?;
     Ok(out)
 }
@@ -381,7 +385,7 @@ fn encode_mover(
     })?;
     let mut loops = Vec::new();
     for op in &ops {
-        if encode_int(op, out, &mut loops, &MOVER_PAIRS)? {
+        if encode_int(op, out, &mut loops, &MOVER_PAIRS, m.core_info)? {
             continue;
         }
         match *op {
@@ -575,6 +579,7 @@ fn encode_unpack(
     ops: &[MirOp],
     out: &mut Stream,
     dst_is_16_bit: bool,
+    core_info: u32,
     tail: bool,
 ) -> Result<(), ttStatus> {
     if ops.is_empty() {
@@ -595,7 +600,7 @@ fn encode_unpack(
     };
     let mut loops = Vec::new();
     for op in ops {
-        if encode_int(op, out, &mut loops, &COMPUTE_PAIRS)? {
+        if encode_int(op, out, &mut loops, &COMPUTE_PAIRS, core_info)? {
             continue;
         }
         match *op {
@@ -1296,7 +1301,12 @@ fn unpack_instruction(unit: u8, flip: bool) -> Result<Instruction, ttStatus> {
 // The math core (T1)
 // ---------------------------------------------------------------------------
 
-fn encode_math(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(), ttStatus> {
+fn encode_math(
+    ops: &[MirOp],
+    out: &mut Stream,
+    dst_is_16_bit: bool,
+    core_info: u32,
+) -> Result<(), ttStatus> {
     if ops.is_empty() {
         return Ok(());
     }
@@ -1304,7 +1314,7 @@ fn encode_math(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(
     let mut at = 0usize;
     let mut loops = Vec::new();
     while at < ops.len() {
-        if encode_int(&ops[at], out, &mut loops, &COMPUTE_PAIRS)? {
+        if encode_int(&ops[at], out, &mut loops, &COMPUTE_PAIRS, core_info)? {
             at += 1;
             continue;
         }
@@ -1906,7 +1916,12 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), tt
 // The pack core (T2)
 // ---------------------------------------------------------------------------
 
-fn encode_pack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(), ttStatus> {
+fn encode_pack(
+    ops: &[MirOp],
+    out: &mut Stream,
+    dst_is_16_bit: bool,
+    core_info: u32,
+) -> Result<(), ttStatus> {
     if ops.is_empty() {
         return Ok(());
     }
@@ -1925,7 +1940,7 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(
     let mut last_offset: Option<(Dst, u32)> = None;
     let mut loops = Vec::new();
     for op in ops {
-        if encode_int(op, out, &mut loops, &COMPUTE_PAIRS)? {
+        if encode_int(op, out, &mut loops, &COMPUTE_PAIRS, core_info)? {
             continue;
         }
         match *op {
@@ -2671,7 +2686,7 @@ fn encode_unpack_quasar(
     let mut state = QuasarUnpackState::default();
     let mut loops = Vec::new();
     for op in ops {
-        if encode_int(op, out, &mut loops, &COMPUTE_PAIRS)? {
+        if encode_int(op, out, &mut loops, &COMPUTE_PAIRS, m.core_info)? {
             continue;
         }
         match *op {
@@ -2944,7 +2959,7 @@ fn encode_math_quasar(m: &MachineKernel, ops: &[MirOp], out: &mut Stream) -> Res
     let mut at = 0usize;
     let mut loops = Vec::new();
     while at < ops.len() {
-        if encode_int(&ops[at], out, &mut loops, &COMPUTE_PAIRS)? {
+        if encode_int(&ops[at], out, &mut loops, &COMPUTE_PAIRS, m.core_info)? {
             at += 1;
             continue;
         }
@@ -3734,7 +3749,7 @@ fn encode_pack_quasar(m: &MachineKernel, ops: &[MirOp], out: &mut Stream) -> Res
     let mut bd: Option<(Cb, u32)> = None;
     let mut loops = Vec::new();
     for op in ops {
-        if encode_int(op, out, &mut loops, &COMPUTE_PAIRS)? {
+        if encode_int(op, out, &mut loops, &COMPUTE_PAIRS, m.core_info)? {
             continue;
         }
         match *op {

@@ -97,6 +97,11 @@ pub const CORE_INFO: u32 = tt_isa::arch::blackhole::mailbox::MAILBOX_BASE as u32
 // the mailbox page, and a barrier there would be read as a grid coordinate.
 const _: () = assert!(CORE_INFO as u64 >= tt_isa::arch::blackhole::mailbox::BARRIER + 4);
 
+/// The same two words on Quasar: its mailbox page is 16 bytes, far below the
+/// data arena, so the launch stages the coordinate in a word of its own above
+/// the rings and the ready flag (`runtime::QUASAR_CORE_INFO`).
+pub const QUASAR_CORE_INFO: u32 = 0x10_0010;
+
 /// The edge mask a pack applies: which datums of each 32x32 tile survive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackMask {
@@ -722,6 +727,9 @@ pub struct MachineKernel {
     pub sems: Vec<(u8, u8)>,
     /// The launch grid, taken from the program's `grid` op.
     pub grid: [crate::module::GridTerm; 2],
+    /// Where the host stages this core's logical grid coordinate; the two
+    /// chips' launches put it in different words ([`CORE_INFO`]).
+    pub core_info: u32,
     /// One launch argument per parameter, in program order.
     pub params: Vec<crate::module::ParamKind>,
 }

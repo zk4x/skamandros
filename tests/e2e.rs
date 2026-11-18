@@ -1627,8 +1627,11 @@ fn a_full_grid_repeat_launch_is_fanned_out_on_the_card() {
         take_error(&free, err)
     );
 
-    const NX: u64 = 12;
-    const NY: u64 = 10;
+    // The part's own extent: the Blackhole simulator enables twelve columns
+    // and ten rows, the Quasar one eight and four. The kernel gives every site
+    // one page, so the whole part is the whole grid either way.
+    let (nx, ny) = if on_quasar() { (8u64, 4) } else { (12, 10) };
+    let (NX, NY) = (nx, ny);
     let pages = (NX * NY) as usize;
     let count = pages * 1024;
     let bytes = count * 4;
@@ -4758,11 +4761,13 @@ fn tiled(rows: usize, cols: usize, values: &[f32]) -> Vec<f32> {
 
 #[test]
 fn gate_proj_runs_over_a_full_grid() {
-    // The simulator's part: 12 Tensix columns enabled, 10 rows.
-    const NX: u64 = 12;
-    const NY: u64 = 10;
+    // The part's own extent: the Blackhole simulator enables twelve columns
+    // and ten rows, the Quasar one eight and four. `gate_proj` splits its
+    // output tiles evenly over the sites, so the Quasar case takes an `N` that
+    // divides by 32 (`40 * 4 * 32 = 5120 = 160 tiles, five a site`).
+    let (NX, NY) = if on_quasar() { (8u64, 4) } else { (12, 10) };
+    let N: usize = if on_quasar() { 1280 } else { 1920 };
     const M: usize = 128;
-    const N: usize = 1920;
     const K: usize = 128;
     let (mt, nt, kt) = (M / 32, N / 32, K / 32);
     let ntiles = mt * nt;

@@ -398,126 +398,125 @@ fn quasar_launch(
         );
         return Err(ttStatus::TT_ERROR_UNSUPPORTED);
     };
-    if grid != [1, 1] {
-        eprintln!(
-            "libskamandros: a Quasar launch runs one tile for now; this grid is {}x{}",
-            grid[0], grid[1]
-        );
-        return Err(ttStatus::TT_ERROR_UNSUPPORTED);
-    }
     if program.reader.is_empty() && program.writer.is_empty() {
         return Err(ttStatus::TT_ERROR_EMPTY_MODULE);
     }
-    let tile = device.tile_at(0, 0)?;
-    device.select(tile);
-    if debug_enabled() {
-        eprintln!(
-            "libskamandros: Quasar launch on tile ({}, {}): reader {} words, writer {} words, \
-             compute {} + {} + {}",
-            tile.x(),
-            tile.y(),
-            program.reader.len(),
-            program.writer.len(),
-            program.unpack.len(),
-            program.math.len(),
-            program.pack.len()
-        );
-        eprintln!("reader {:08x?}", program.reader);
-        eprintln!("writer {:08x?}", program.writer);
-        eprintln!("unpack {:08x?}", program.unpack);
-        eprintln!("math {:08x?}", program.math);
-        eprintln!("pack {:08x?}", program.pack);
-    }
-    let args = args_for(device, module, params, grid, tile)?[0].1.clone();
-    device.stage_words(u64::from(ARGS_AT), &args)?;
-    // The last launch's harts advanced this table's counters and set the ready
-    // flag, so the cached words for those ranges are not what is in L1 any more.
-    device.forget_staged(u64::from(module.iface), 4 * module.iface_words.len() as u64);
-    device.forget_staged(u64::from(QUASAR_READY_AT), 4);
-    if !module.iface_words.is_empty() {
-        device.stage_words(u64::from(module.iface), &module.iface_words)?;
-    }
-    if debug_enabled() {
-        eprintln!("args at {ARGS_AT:#x} {args:08x?}");
-        eprintln!("iface at {:#x} {:08x?}", module.iface, module.iface_words);
-    }
-    device.stage_words(u64::from(QUASAR_STUB), &quasar_stub())?;
-    device.stage_words(u64::from(QUASAR_READY_AT), &[0])?;
-    // The mover that reports: the writer drains what the reader pushed, so it
-    // finishes last; with no writer the reader is the whole launch.
-    let mut harts: Vec<(u8, u32)> = Vec::new();
-    if !program.reader.is_empty() {
-        harts.push((QUASAR_READER_HART, quasar_image(QUASAR_READER_HART)));
-    }
-    if !program.writer.is_empty() {
-        harts.push((QUASAR_WRITER_HART, quasar_image(QUASAR_WRITER_HART)));
-    }
-    for (hart, at) in &harts {
-        let words = match *hart {
-            h if h == QUASAR_READER_HART => &program.reader,
-            _ => &program.writer,
-        };
-        let ack = harts.last().map(|(h, _)| *h) == Some(*hart);
-        let image = quasar_finish(words.clone(), ack);
-        if 4 * image.len() as u32 > QUASAR_IMAGE_STRIDE {
-            eprintln!(
-                "libskamandros: a mover's image is {} words; a Quasar image slot holds {}",
-                image.len(),
-                QUASAR_IMAGE_STRIDE / 4
-            );
-            return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
+    // The logical grid the module asks for, as physical tiles, row-major. Each
+    // tile runs the whole program against its own argument block: no dispatch
+    // firmware exists to fan the launch out, so the host stages and starts every
+    // tile itself.
+    let mut tiles = Vec::with_capacity(grid[0] as usize * grid[1] as usize);
+    for y in 0..grid[1] {
+        for x in 0..grid[0] {
+            tiles.push(((x, y), device.tile_at(x, y)?));
         }
-        device.stage_words(u64::from(*at), &image)?;
     }
-    // The three compute harts, each in its own firmware slot, held in reset
-    // until its image is staged (`MEM_TRISC0_FIRMWARE_BASE` and the 5 KiB
-    // stride, `dev_mem_map.h:114-117`).
-    let mut triscs: Vec<(Core, u32, Vec<u32>)> = Vec::new();
-    for (trisc, words) in [
-        (QUASAR_UNPACK_TRISC, &program.unpack),
-        (QUASAR_MATH_TRISC, &program.math),
-        (QUASAR_PACK_TRISC, &program.pack),
-    ] {
-        if words.is_empty() {
-            continue;
+    // Stage and start every tile before waiting for any of them: a tile's harts
+    // are its own, and the grid is meant to run at once.
+    let mut started: Vec<(NocCoord, u32)> = Vec::with_capacity(tiles.len());
+    for ((x, y), tile) in &tiles {
+        device.select(*tile);
+        // This core's logical coordinate: `%x = grid.x` and `%y = grid.y` read
+        // it, the same host-written `core_info` Blackhole's dispatch stages.
+        device.forget_staged(u64::from(crate::mir::QUASAR_CORE_INFO), 8);
+        device.stage_words(u64::from(crate::mir::QUASAR_CORE_INFO), &[*x, *y])?;
+        let args = args_for(device, module, params, grid, *tile)?[0].1.clone();
+        device.stage_words(u64::from(ARGS_AT), &args)?;
+        // The last launch's harts advanced this table's counters and set the
+        // ready flag, so the cached words for those ranges are not what is in L1
+        // any more.
+        device.forget_staged(u64::from(module.iface), 4 * module.iface_words.len() as u64);
+        device.forget_staged(u64::from(QUASAR_READY_AT), 4);
+        if !module.iface_words.is_empty() {
+            device.stage_words(u64::from(module.iface), &module.iface_words)?;
         }
-        let core = Core::Math { engine: 0, trisc };
-        let at = QUASAR_COMPUTE_BASE + QUASAR_TRISC_IMAGE_STRIDE * u32::from(trisc);
-        let image = quasar_compute_image(words);
-        if 4 * image.len() as u32 > QUASAR_TRISC_IMAGE_STRIDE {
-            eprintln!(
-                "libskamandros: TRISC{trisc}'s image is {} words; a Quasar image slot holds {}",
-                image.len(),
-                QUASAR_TRISC_IMAGE_STRIDE / 4
-            );
-            return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
+        device.stage_words(u64::from(QUASAR_STUB), &quasar_stub())?;
+        device.stage_words(u64::from(QUASAR_READY_AT), &[0])?;
+        // The mover that reports: the writer drains what the reader pushed, so
+        // it finishes last; with no writer the reader is the whole launch.
+        let mut harts: Vec<(u8, u32)> = Vec::new();
+        if !program.reader.is_empty() {
+            harts.push((QUASAR_READER_HART, quasar_image(QUASAR_READER_HART)));
         }
-        device.stage_words(u64::from(at), &image)?;
-        triscs.push((core, at, image));
+        if !program.writer.is_empty() {
+            harts.push((QUASAR_WRITER_HART, quasar_image(QUASAR_WRITER_HART)));
+        }
+        for (hart, at) in &harts {
+            let words = match *hart {
+                h if h == QUASAR_READER_HART => &program.reader,
+                _ => &program.writer,
+            };
+            let ack = harts.last().map(|(h, _)| *h) == Some(*hart);
+            let image = quasar_finish(words.clone(), ack);
+            if 4 * image.len() as u32 > QUASAR_IMAGE_STRIDE {
+                eprintln!(
+                    "libskamandros: a mover's image is {} words; a Quasar image slot holds {}",
+                    image.len(),
+                    QUASAR_IMAGE_STRIDE / 4
+                );
+                return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
+            }
+            device.stage_words(u64::from(*at), &image)?;
+        }
+        // The three compute harts, each in its own firmware slot, held in reset
+        // until its image is staged (`MEM_TRISC0_FIRMWARE_BASE` and the 5 KiB
+        // stride, `dev_mem_map.h:114-117`).
+        let mut triscs: Vec<(Core, u32)> = Vec::new();
+        for (trisc, words) in [
+            (QUASAR_UNPACK_TRISC, &program.unpack),
+            (QUASAR_MATH_TRISC, &program.math),
+            (QUASAR_PACK_TRISC, &program.pack),
+        ] {
+            if words.is_empty() {
+                continue;
+            }
+            let core = Core::Math { engine: 0, trisc };
+            let at = QUASAR_COMPUTE_BASE + QUASAR_TRISC_IMAGE_STRIDE * u32::from(trisc);
+            let image = quasar_compute_image(words);
+            if 4 * image.len() as u32 > QUASAR_TRISC_IMAGE_STRIDE {
+                eprintln!(
+                    "libskamandros: TRISC{trisc}'s image is {} words; a Quasar image slot holds {}",
+                    image.len(),
+                    QUASAR_TRISC_IMAGE_STRIDE / 4
+                );
+                return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
+            }
+            device.stage_words(u64::from(at), &image)?;
+            triscs.push((core, at));
+        }
+        for (core, at) in &triscs {
+            // A TRISC holds reset with the bit set and starts when it is
+            // cleared, so it is held before its reset PC is pointed at the
+            // image.
+            device.quasar_set_reset(*core, true)?;
+            device.quasar_start_at(*core, u64::from(*at))?;
+        }
+        // The reset vector: word 0 of L1, which every released mover fetches.
+        device.quasar_start_at(Core::Dm(QUASAR_READER_HART), u64::from(QUASAR_STUB))?;
+        // Everything staged is visible before a hart is released.
+        device.l1_barrier()?;
+        let generation = device.quasar_start()?;
+        for (core, _) in &triscs {
+            device.quasar_set_reset(*core, false)?;
+        }
+        for (hart, _) in &harts {
+            device.quasar_set_reset(Core::Dm(*hart), false)?;
+        }
+        started.push((*tile, generation));
     }
-    for (core, at, _) in &triscs {
-        // A TRISC holds reset with the bit set and starts when it is cleared, so
-        // it is held before its reset PC is pointed at the image.
-        device.quasar_set_reset(*core, true)?;
-        device.quasar_start_at(*core, u64::from(*at))?;
-    }
-    // The reset vector: word 0 of L1, which every released mover fetches.
-    device.quasar_start_at(Core::Dm(QUASAR_READER_HART), u64::from(QUASAR_STUB))?;
-    // Everything staged is visible before a hart is released.
-    device.l1_barrier()?;
-    let generation = device.quasar_start()?;
-    for (core, _, _) in &triscs {
-        device.quasar_set_reset(*core, false)?;
-    }
-    for (hart, _) in &harts {
-        device.quasar_set_reset(Core::Dm(*hart), false)?;
-    }
-    let result = device.quasar_await(generation);
-    for (hart, _) in &harts {
-        device.quasar_set_reset(Core::Dm(*hart), true)?;
-    }
-    for (core, _, _) in &triscs {
-        device.quasar_set_reset(*core, true)?;
+    let mut result = Ok(());
+    for (tile, generation) in started {
+        device.select(tile);
+        let done = device.quasar_await(generation);
+        for hart in 0..8u8 {
+            let _ = device.quasar_set_reset(Core::Dm(hart), true);
+        }
+        for trisc in [QUASAR_UNPACK_TRISC, QUASAR_MATH_TRISC, QUASAR_PACK_TRISC] {
+            let _ = device.quasar_set_reset(Core::Math { engine: 0, trisc }, true);
+        }
+        if done.is_err() && result.is_ok() {
+            result = done;
+        }
     }
     result
 }
