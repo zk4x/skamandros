@@ -69,6 +69,15 @@ pub struct Module {
     pub setup: Vec<u32>,
     /// The CB interface table the host writes before the launch.
     pub iface: u32,
+    /// Byte address of the first multicast site's control block, zero when the
+    /// module has none. Each site is four words ([`crate::mir::McastSite`]).
+    pub mcast_base: u32,
+    /// How many multicast sites follow [`Module::mcast_base`].
+    pub mcast_sites: u32,
+    /// Byte address of the coordinate table every tile holds: one packed NoC
+    /// coordinate per logical `(x, y)` ([`crate::mir::COORDS_WORDS`] words),
+    /// zero when the program has no collective.
+    pub coords: u32,
     /// The rings the table describes, in base-address order.
     pub cbs: Vec<crate::mir::CbInfo>,
     /// The CB interface words every tile's B installs from its own L1

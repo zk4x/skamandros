@@ -219,6 +219,64 @@ pub struct CbInfo {
     pub iface_entry: u32,
 }
 
+/// The four words one multicast copy owns in every tile's L1.
+///
+/// A multicast write reads its data from the sender's L1 and writes it into
+/// every receiver's L1, and the receivers have to know when it landed. The
+/// words are tt-metal's kernel semaphores (`noc_semaphore_set_multicast`,
+/// `noc_semaphore_inc`, `noc_semaphore_wait`):
+///
+/// - [`McastSite::data`] is the word the sender sets to 1 on every receiver
+///   once the page is there;
+/// - [`McastSite::credit`] is the sender's word, one per receiver, incremented
+///   by each receiver once its page is free again (the back-pressure that keeps
+///   the sender from overwriting a page still in use);
+/// - [`McastSite::ret`] is the local return word of a receiver's atomic credit
+///   increment, which the NIU must be given somewhere (`MEM_NOC_ATOMIC_RET_VAL_ADDR`
+///   is address 4 in tt-metal, but a word this compiler owns cannot collide with
+///   the reset vector);
+/// - [`McastSite::one`] holds 1, the four bytes a semaphore multicast writes.
+///
+/// The `data` and `one` words are congruent mod 16 because a NoC write needs
+/// that; the atomic target and return words only need four-byte alignment.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct McastSite {
+    /// Byte address of the site's block in every tile's L1.
+    pub base: u32,
+}
+
+/// The coordinate table's shape: `16` columns (so the index is a shift) by the
+/// ten Tensix rows a Blackhole has.
+pub const COORD_COLUMNS: u32 = 16;
+/// The coordinate table's rows.
+pub const COORD_ROWS: u32 = 10;
+/// Words in the coordinate table.
+pub const COORDS_WORDS: usize = (COORD_COLUMNS * COORD_ROWS) as usize;
+
+impl McastSite {
+    /// Bytes one site occupies: the four protocol words, then the scratch the
+    /// geometry is computed into. A site is 64-byte aligned, so `arrive` and
+    /// `one` are congruent mod 16, which a NoC write requires of a source and
+    /// destination pair.
+    pub const BYTES: u32 = 96;
+
+    pub const fn data(self) -> u32 {
+        self.base
+    }
+
+    pub const fn credit(self) -> u32 {
+        self.base + 4
+    }
+
+    pub const fn ret(self) -> u32 {
+        self.base + 8
+    }
+
+    pub const fn one(self) -> u32 {
+        self.base + 16
+    }
+}
+
 impl CbInfo {
     /// A ring whose placement has not been decided yet.
     pub fn unplaced(dtype: DType, page: [Dim; 2], len: Dim) -> Self {
@@ -528,6 +586,24 @@ pub enum MirOp {
     /// Wait until the NoC word at `field(t5)` reads zero: `lw` then `bne` back.
     /// A spin has no trip count, so it is not a [`MirOp::Loop`].
     NiuPoll { reg: u8, field: i32 },
+    /// Wait until the word at `(base)` is non-zero: `fence`, `lw`, then branch
+    /// back, leaving the value in `reg`. `base` holds the address, because a
+    /// collective's words live at a launch-staged address rather than a fixed
+    /// one. The fence is tt-metal's `invalidate_l1_cache` in
+    /// `noc_semaphore_wait` (`dataflow_api.h:2114-2125`); a NoC write into L1
+    /// can be shadowed by the core's L0 cache otherwise.
+    L1PollNonZero { base: u8, reg: u8 },
+    /// Wait until the word at `(base)` is at least `bound`, leaving the value
+    /// in `reg`. This is the sender's credit wait, and it is a `>=` rather than
+    /// an equality so the counter is never re-armed: credits accumulate, and a
+    /// sender that has run ahead of them simply waits.
+    L1PollBelow { base: u8, reg: u8, bound: u8 },
+    /// Run the ops up to the matching [`MirOp::EndIf`] when `cond` is non-zero.
+    /// A two-word long branch (`bne` over a `jal`, as [`MirOp::Loop`] opens):
+    /// a body may carry a whole multicast request.
+    IfNonZero { cond: u8 },
+    /// The end of an [`MirOp::IfNonZero`] body.
+    EndIf,
     /// `reg = core_info[axis]`: this core's logical grid coordinate.
     LoadCoord { reg: u8, axis: u8 },
     /// `d = a op b`, in RISC-V.
@@ -669,6 +745,15 @@ pub struct MachineKernel {
     pub dst_is_16_bit: bool,
     /// The semaphore table, in index order: `(index, initial value)`.
     pub sems: Vec<(u8, u8)>,
+    /// The multicast sites, in the order the lowering assigned them. Their
+    /// addresses are placed by [`MachineKernel::plan_cbs`].
+    pub mcast: Vec<McastSite>,
+    /// Byte address of the coordinate table: one word per logical `(x, y)`,
+    /// holding the packed NoC coordinate a request names. Placed by
+    /// [`MachineKernel::plan_cbs`] and staged by the runtime, because the
+    /// logical grid is not the physical one on a harvested chip and a rectangle
+    /// has to be named in physical coordinates.
+    pub coords: u32,
     /// The launch grid, taken from the program's `grid` op.
     pub grid: [crate::module::GridTerm; 2],
     /// One launch argument per parameter, in program order.
@@ -1130,6 +1215,14 @@ fn write_op(f: &mut dyn fmt::Write, op: &MirOp) -> fmt::Result {
                 rx(crate::riscv::reg::T5)
             )
         }
+        MirOp::L1PollNonZero { base, reg } => {
+            write!(f, "poll ({}) != 0 -> {}", rx(base), rx(reg))
+        }
+        MirOp::L1PollBelow { base, reg, bound } => {
+            write!(f, "poll ({}) >= {} -> {}", rx(base), rx(bound), rx(reg))
+        }
+        MirOp::IfNonZero { cond } => write!(f, "if {} != 0", rx(cond)),
+        MirOp::EndIf => write!(f, "endif"),
         MirOp::LoadCoord { reg, axis } => write!(f, "lw {}, core_info+{}(0)", rx(reg), axis * 4),
         MirOp::IArith { op, d, a, b } => {
             write!(f, "{} {}, {}, {}", iop_name(op), rx(d), rx(a), rx(b))

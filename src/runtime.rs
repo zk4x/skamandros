@@ -333,7 +333,21 @@ fn args_for(
 ) -> Result<[(Niu, Vec<u32>); 2], ttStatus> {
     let mut arrays = [(Niu::Noc0, Vec::new()), (Niu::Noc1, Vec::new())];
     for (niu, args) in arrays.iter_mut() {
-        *args = vec![grid[0], grid[1], module.iface, me_hi(tile)];
+        // The collective tables: the sites every `expand` owns, and the
+        // logical-to-physical coordinate map a rectangle or a neighbour is
+        // named from. Neither depends on the tile, but both are per-tile
+        // addresses staged in L1, so they ride with the launch arguments the
+        // movers already read.
+        *args = vec![
+            grid[0],
+            grid[1],
+            module.iface,
+            me_hi(tile),
+            module.mcast_base,
+            module.coords,
+            grid[0],
+            grid[1],
+        ];
         for (index, kind) in module.params.iter().enumerate() {
             let word = params[index];
             let channel_bytes = tt_isa::arch::blackhole::dram::CHANNEL_BYTES;
@@ -582,7 +596,8 @@ fn launch_steps(
             device.release_tensix_backend()?;
         }
         device.start_executors()?;
-        let [args, writer_args] = args_for(device, module, params, grid, *tile)?.map(|(_, v)| v);
+        let [args, writer_args] =
+            args_for(device, module, params, grid, *tile)?.map(|(_, v)| v);
         // Both arrays before the first core starts, not only as a side effect of
         // a mover run. Staged: a repeat launch writes only the words that differ.
         device.stage_words(u64::from(ARGS_AT), &args)?;
@@ -637,6 +652,37 @@ fn launch_steps(
         desc[DESC_DISPATCHER as usize] = parent;
         device.stage_words(descriptor_at(0), &desc)?;
         device.stage_words(descriptor_at(DESC_IFACE_AT), interface)?;
+        // The multicast sites' kernel semaphores: every tile starts with the
+        // credit and data words at zero and the four-byte semaphore at one.
+        // They return to that state after a launch that ran to completion (the
+        // sender drains its credits, the receivers clear their data words), so
+        // this is staged once with the programs, not rewritten per launch.
+        if module.mcast_sites != 0 {
+            // `arrive`, `credit`, `ret` start at zero and `one` at one; the
+            // rest of the block is the geometry's scratch.
+            let site_words = (crate::mir::McastSite::BYTES / 4) as usize;
+            let mut words = Vec::with_capacity(module.mcast_sites as usize * site_words);
+            for _ in 0..module.mcast_sites {
+                let mut site = vec![0u32; site_words];
+                site[(crate::mir::McastSite { base: 0 }.one() / 4) as usize] = 1;
+                words.extend_from_slice(&site);
+            }
+            device.stage_words(u64::from(module.mcast_base), &words)?;
+            // The logical-to-physical map a rectangle or a neighbour is named
+            // from. It is a property of the chip, not of the launch, so it is
+            // staged with the programs; a coordinate the grid cannot hold
+            // reads zero and is never named by a verified program.
+            let mut table = vec![0u32; crate::mir::COORDS_WORDS];
+            for y in 0..crate::mir::COORD_ROWS {
+                for x in 0..crate::mir::COORD_COLUMNS {
+                    let at = (y * crate::mir::COORD_COLUMNS + x) as usize;
+                    if let Ok(tile) = device.tile_at(x, y) {
+                        table[at] = u32::from(tile.packed());
+                    }
+                }
+            }
+            device.stage_words(u64::from(module.coords), &table)?;
+        }
         if let Some(list) = list {
             device.stage_words(
                 u64::from(GROUPS_AT + list_slot as u32 * GROUPS_STRIDE),
@@ -754,7 +800,8 @@ fn dispatch_launch(
             grid[0] * grid[1]
         );
     }
-    let [args, writer_args] = args_for(device, module, params, grid, dispatcher)?.map(|(_, v)| v);
+    let [args, writer_args] =
+        args_for(device, module, params, grid, dispatcher)?.map(|(_, v)| v);
     device.stage_words(u64::from(ARGS_AT), &args)?;
     device.stage_words(u64::from(ARGS_WRITER), &writer_args)?;
     // The generation is the store that lets B read what the host staged.

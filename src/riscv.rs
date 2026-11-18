@@ -154,6 +154,11 @@ pub fn bgeu(rs1: u8, rs2: u8, imm: i32) -> u32 {
     b_type(imm, rs2, rs1, 7, 0x63)
 }
 
+/// `bltu rs1, rs2, off`: unsigned below.
+pub fn bltu(rs1: u8, rs2: u8, imm: i32) -> u32 {
+    b_type(imm, rs2, rs1, 6, 0x63)
+}
+
 /// `jal rd, off`: the J-type jump, a +-1 MiB displacement. A loop edge whose
 /// body is larger than a B-type branch's +-4 KiB uses it (`x86`-style long
 /// branch): `bgeu` skips over a `jal` back to the top, and the zero-trip test

@@ -1469,3 +1469,100 @@ copy 32,32 %out [0] = %b [0]
         );
     }
 }
+
+/// A collective names the cores that take part, not a remote address: its two
+/// spans are the whole of its surface. The pick is a cell or the receiver's own
+/// per axis, and a roll's shift is the sender's delta.
+#[test]
+fn a_collective_names_its_cores() {
+    use crate::ir::Extent;
+    const PROGRAM: &str = "\
+version 9
+%a = buffer bf16 32,32
+%five = const i32 5
+%seven = const i32 7
+%six = const i32 6
+%two = const i32 2
+%one = const i32 1
+%neg = const i32 -2
+%gx = const i32 8
+%gy = const i32 8
+expand %a [%five..%seven, ..] from [%six, ..]
+roll %a [.., %two..%six] by [%one, %neg]
+grid %gx,%gy
+";
+    let k = Kernel::parse(PROGRAM).expect("the collective parses");
+    assert_eq!(k.to_string(), PROGRAM, "the text form round-trips");
+
+    let mut expands = 0;
+    let mut rolls = 0;
+    for (_, op) in k.ops() {
+        match *op {
+            Op::Expand { span, from, .. } => {
+                expands += 1;
+                assert!(matches!(span.x, Extent::Range(..)), "five to seven");
+                assert!(matches!(span.y, Extent::Whole), "and every row");
+                assert!(matches!(from.x, Extent::At(_)), "from one column");
+                assert!(matches!(from.y, Extent::Whole), "at the same row");
+            }
+            Op::Roll { span, by, .. } => {
+                rolls += 1;
+                assert!(matches!(span.x, Extent::Whole), "every column");
+                assert!(matches!(span.y, Extent::Range(..)), "rows two to six");
+                assert_eq!(k.const_i32(by[0]), Some(1));
+                assert_eq!(k.const_i32(by[1]), Some(-2), "the sign survives");
+            }
+            _ => {}
+        }
+    }
+    assert_eq!((expands, rolls), (1, 1), "both ops are in the program");
+}
+
+/// A collective that moves nothing, or that names an operand which is not a
+/// buffer, is refused when the program is read.
+#[test]
+fn a_collective_that_moves_nothing_is_refused() {
+    use ttStatus as S;
+    let refused = |text: &str| Kernel::parse(text).expect_err("the program is refused");
+    let program = |body: &str| {
+        format!("version 9\n%a = buffer bf16 32,32\n%p = param bf16 1024\n{body}\ngrid 8,8\n")
+    };
+
+    // `..` on every axis is the receiver's own page: the pick is not narrower
+    // than the span, so no axis fans out.
+    assert_eq!(
+        refused(&program("expand %a [5..7, ..] from [.., ..]")),
+        S::TT_ERROR_EXPAND_PICK,
+        "a pick that is `..` everywhere is not a leader set"
+    );
+    // A range in the pick has no meaning: a pick axis is one cell or `..`.
+    assert_eq!(
+        refused(&program("expand %a [5..7, ..] from [5..7, ..]")),
+        S::TT_ERROR_EXPAND_PICK,
+        "a pick is a cell or the receiver's own, never a run"
+    );
+    // A pinned axis names one cell, so both sides must name the same one.
+    assert_eq!(
+        refused(&program("expand %a [5..7, 6] from [6, 8]")),
+        S::TT_ERROR_EXPAND_PICK,
+        "the pick must lie in the span"
+    );
+    // A shift of zero is not a movement.
+    assert_eq!(
+        refused(&program("roll %a [.., ..] by [0, 0]")),
+        S::TT_ERROR_ROLL_SHIFT,
+        "a roll of nothing is refused"
+    );
+    // Both collectives move a buffer: a parameter has no cores to fan out from.
+    assert_eq!(
+        refused(&program("expand %p [.., ..] from [0, 0]")),
+        S::TT_ERROR_NOT_A_BUFFER,
+        "a parameter is not an L1 buffer"
+    );
+    assert_eq!(
+        refused(&program("roll %p [.., ..] by [1, 0]")),
+        S::TT_ERROR_NOT_A_BUFFER,
+        "a parameter is not an L1 buffer"
+    );
+}
+

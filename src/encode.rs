@@ -370,6 +370,8 @@ fn encode_mover(
         Ok(())
     })?;
     let mut loops = Vec::new();
+    // Each open `IfNonZero`'s unconditional skip word (`jal` to the end).
+    let mut ifs: Vec<usize> = Vec::new();
     for op in &ops {
         if encode_int(op, out, &mut loops, &MOVER_PAIRS)? {
             continue;
@@ -377,6 +379,20 @@ fn encode_mover(
         match *op {
             MirOp::Loop { count } => open_loop_with(out, &mut loops, count, &MOVER_PAIRS)?,
             MirOp::EndLoop => close_loop(out, &mut loops)?,
+            // A conditional body, opened the way a loop is: `bne` skips the
+            // `jal` that jumps over the body, so the body may be long.
+            MirOp::IfNonZero { cond } => {
+                out.rv(rv::bne(cond, reg::ZERO, 8));
+                ifs.push(out.len());
+                out.rv(rv::jal(reg::ZERO, 0));
+            }
+            MirOp::EndIf => {
+                let at = ifs.pop().ok_or_else(|| {
+                    crate::status::internal_bug("encode: an endif has no if")
+                })?;
+                let forward = ((out.len() as i32) - (at as i32)) * 4;
+                out.patch(at, rv::jal(reg::ZERO, forward));
+            }
             // A word store, and the NoC's spin: one instruction and one fixed
             // pair, so neither is a macro op.
             MirOp::Sw { value, base, at } => out.rv(rv::sw(value, base, at)),
@@ -385,6 +401,25 @@ fn encode_mover(
                 out.rv(rv::lw(reg, reg::T5, field));
                 let here = out.len();
                 out.rv(rv::bne(reg, reg::ZERO, ((top as i32) - (here as i32)) * 4));
+            }
+            // A kernel semaphore written by the NoC: tt-metal's
+            // `noc_semaphore_wait` / `noc_semaphore_wait_min`, whose every poll
+            // invalidates the L0 data cache first (`dataflow_api.h:2114-2154`).
+            MirOp::L1PollNonZero { base, reg } => {
+                let top = out.len();
+                out.rv(0x0ff0_000f);
+                out.rv(rv::lw(reg, base, 0));
+                // `reg = (reg == 0)`; loop while it is 1.
+                out.rv(rv::sltiu(reg, reg, 1));
+                let here = out.len();
+                out.rv(rv::bne(reg, reg::ZERO, ((top as i32) - (here as i32)) * 4));
+            }
+            MirOp::L1PollBelow { base, reg, bound } => {
+                let top = out.len();
+                out.rv(0x0ff0_000f);
+                out.rv(rv::lw(reg, base, 0));
+                let here = out.len();
+                out.rv(rv::bltu(reg, bound, ((top as i32) - (here as i32)) * 4));
             }
             // The ring hand-offs are ordinary ops of the machine kernel: the
             // lowering puts each one on the core that performs it.
@@ -424,6 +459,11 @@ fn encode_mover(
     }
     if !loops.is_empty() {
         return Err(ttStatus::TT_ERROR_ENDLOOP_MACHINE);
+    }
+    if !ifs.is_empty() {
+        return Err(crate::status::internal_bug(
+            "encode: a mover program ends inside an if",
+        ));
     }
     Ok(())
 }

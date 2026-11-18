@@ -27,18 +27,39 @@ use crate::module::ParamKind;
 use crate::status::ttStatus;
 use tt_isa::arch::blackhole::noc::niu::TxnId;
 
-/// Transaction ID every request uses. A mover issues in order and drains after
-/// each copy, so one ID is enough.
+/// Transaction ID every addressed request uses. A mover issues in order and
+/// drains after each copy, so one ID is enough.
 pub const TXN: TxnId = match TxnId::new(1) {
     Some(txn) => txn,
     None => panic!("transaction id 1 exists"),
 };
 
-/// The inbound launch argument: the DRAM address a parameter's page is read
-/// from.
-pub const ARG_HEAD: usize = 4;
+/// The transaction ID a collective's requests use. A multicast's acknowledgements
+/// are not waited for — the receivers' credits pace the sender, and they can only
+/// arrive after the page — so its counter is never read and must not be shared
+/// with the copies', whose drain it would disturb.
+pub const TXN_MCAST: TxnId = match TxnId::new(2) {
+    Some(txn) => txn,
+    None => panic!("transaction id 2 exists"),
+};
+
+/// The words of the launch argument block's head: the grid, the CB interface
+/// table, this tile's NOC word, and the collective tables.
+pub const ARG_HEAD: usize = 8;
 /// The launch argument word that holds the CB interface table's address.
 pub const ARG_IFACE: usize = 2;
+
+/// The multicast sites' base: the four-word block each `expand` owns in every
+/// tile. The site index is a compile-time constant, so the lowering adds its
+/// offset to this base instead of the base being baked into the program.
+pub const ARG_MCAST_SITES: i32 = 4 * 4;
+/// The coordinate table's base: one packed NoC coordinate per logical
+/// `(x, y)`, so a rectangle or a neighbour can be named in the coordinates the
+/// NoC actually routes on.
+pub const ARG_COORDS: i32 = 5 * 4;
+/// The launch grid's extents, for the wrap a `roll` over a whole axis takes.
+pub const ARG_GRID_X: i32 = 6 * 4;
+pub const ARG_GRID_Y: i32 = 7 * 4;
 
 /// The most channels a parameter can be striped over: every channel a
 /// Blackhole can have.
@@ -242,6 +263,23 @@ impl Mover<'_> {
                             shape,
                         },
                         reader,
+                    });
+                }
+                // A collective is a reader-segment move: it publishes a page
+                // the segment filled, or hands one on. It is copied into the
+                // segment with the loops it lives under, exactly as a copy is.
+                Op::Expand { src, span, from } => {
+                    self.copies.push(Copy {
+                        path: self.loops.clone(),
+                        op: Op::Expand { src, span, from },
+                        reader: true,
+                    });
+                }
+                Op::Roll { src, span, by } => {
+                    self.copies.push(Copy {
+                        path: self.loops.clone(),
+                        op: Op::Roll { src, span, by },
+                        reader: true,
                     });
                 }
                 Op::Load {
@@ -455,9 +493,33 @@ impl Mover<'_> {
         Ok(())
     }
 
-    /// Emit one group's copies.
+    /// Emit one group's moves.
     fn bodies(&mut self, into: &mut Kernel, group: &[Copy]) -> Result<(), ttStatus> {
         for copy in group {
+            match copy.op.clone() {
+                Op::Expand { src, span, from } => {
+                    self.new_ring(src)?;
+                    let src = self.clone_value(into, src)?;
+                    let span = self.clone_span(into, span)?;
+                    let from = self.clone_span(into, from)?;
+                    into.push(Op::Expand { src, span, from });
+                    continue;
+                }
+                Op::Roll { src, span, by } => {
+                    self.new_ring(src)?;
+                    let src = self.clone_value(into, src)?;
+                    let span = self.clone_span(into, span)?;
+                    let dx = self.clone_value(into, by[0])?;
+                    let dy = self.clone_value(into, by[1])?;
+                    into.push(Op::Roll {
+                        src,
+                        span,
+                        by: [dx, dy],
+                    });
+                    continue;
+                }
+                _ => {}
+            }
             let Op::Copy {
                 dst,
                 src,
@@ -489,6 +551,29 @@ impl Mover<'_> {
             });
         }
         Ok(())
+    }
+
+    /// Rebuild a span inside the segment being built.
+    fn clone_span(&mut self, into: &mut Kernel, span: crate::ir::Span) -> Result<crate::ir::Span, ttStatus> {
+        Ok(crate::ir::Span {
+            x: self.clone_extent(into, span.x)?,
+            y: self.clone_extent(into, span.y)?,
+        })
+    }
+
+    fn clone_extent(
+        &mut self,
+        into: &mut Kernel,
+        extent: crate::ir::Extent,
+    ) -> Result<crate::ir::Extent, ttStatus> {
+        Ok(match extent {
+            crate::ir::Extent::Whole => crate::ir::Extent::Whole,
+            crate::ir::Extent::At(a) => crate::ir::Extent::At(self.clone_value(into, a)?),
+            crate::ir::Extent::Range(a, b) => crate::ir::Extent::Range(
+                self.clone_value(into, a)?,
+                self.clone_value(into, b)?,
+            ),
+        })
     }
 
     /// Whether `id` is a value this pass created (rather than one of the old

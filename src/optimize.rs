@@ -929,8 +929,14 @@ pub fn verify(m: &MachineKernel) -> Result<(), ttStatus> {
                 | MirOp::Lw { .. }
                 | MirOp::Sw { .. }
                 | MirOp::NiuPoll { .. }
+                | MirOp::L1PollNonZero { .. }
+                | MirOp::L1PollBelow { .. }
                 | MirOp::IArith { .. }
                 | MirOp::Cmov { .. } => {}
+                // A multicast copy's conditional bodies live on the movers,
+                // which this check does not walk; the encoder checks their
+                // nesting.
+                MirOp::IfNonZero { .. } | MirOp::EndIf => {}
                 MirOp::EndLoop => {
                     depth = depth.checked_sub(1).ok_or_else(|| {
                         let _ = (name, at);

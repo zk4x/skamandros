@@ -126,6 +126,56 @@ impl DType {
 /// unit) hold.
 pub type Dim = u32;
 
+/// One axis of a core span: the whole axis (`..`), one coordinate (`6`), or an
+/// ascending half-open range (`5..8`).
+///
+/// A coordinate is a value, so it may be a literal or `%y`: "my row" is
+/// `At(%y)`, which is how a program written once addresses the group it is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Extent {
+    /// `..`: every coordinate on the axis.
+    Whole,
+    /// One coordinate.
+    At(OpId),
+    /// `a..b`, `a < b`, both exclusive of nothing but `b`.
+    Range(OpId, OpId),
+}
+
+impl Extent {
+    /// Does this extent name exactly one coordinate?
+    pub const fn is_one(self) -> bool {
+        matches!(self, Extent::At(_))
+    }
+}
+
+/// A rectangle of cores, `[x, y]`: the participants of a collective.
+///
+/// A cross-core op names one of these instead of a remote address, because the
+/// program's L1 layout is identical on every core: a buffer name *is* the same
+/// address everywhere, and the only thing a collective has to add is which
+/// cores take part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub x: Extent,
+    pub y: Extent,
+}
+
+/// The coordinate values a span names, in field order: `x`'s operands then
+/// `y`'s, with `At` contributing one and `Range` two.
+fn span_operands(span: Span) -> [Option<OpId>; 4] {
+    let x = match span.x {
+        Extent::Whole => [None, None],
+        Extent::At(a) => [Some(a), None],
+        Extent::Range(a, b) => [Some(a), Some(b)],
+    };
+    let y = match span.y {
+        Extent::Whole => [None, None],
+        Extent::At(a) => [Some(a), None],
+        Extent::Range(a, b) => [Some(a), Some(b)],
+    };
+    [x[0], x[1], y[0], y[1]]
+}
+
 /// The shape of a register value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegShape {
@@ -395,6 +445,40 @@ pub enum Op {
         src_offset: OpId,
         shape: [Dim; 2],
     },
+    /// `expand %a [span] from [pick]`: every core in `span` ends with the page
+    /// the `pick` cores hold, the pick cores being the group's leaders.
+    ///
+    /// The rule is `torch.expand`'s: per axis `pick` is either one coordinate
+    /// (`[5, 6]`) or `..`, meaning "the coordinate this receiver already has".
+    /// So `pick` is `..` on every axis where it is *not* narrower than `span`,
+    /// and a coordinate where it is. The group is partitioned among the pick
+    /// cells along the axes where `pick` is narrower, and each pick cell
+    /// multicasts to its part of `span`: one NoC request per pick cell, and the
+    /// routers replicate it.
+    ///
+    /// The source is the same buffer on the pick cores — the program's L1
+    /// layout is identical everywhere, and a multicast's one address field is
+    /// the sender's own page. `pick` must lie in `span` (the leader is a member
+    /// of its group), and it must be narrower than `span` on at least one axis
+    /// (else the op is an identity).
+    ///
+    /// Both sides are the same buffer, so no destination is named; a fan-out
+    /// that has to land in a different buffer aliases it first.
+    Expand { src: OpId, span: Span, from: Span },
+    /// `roll %a [span] by [dx, dy]`: the page each core in `span` holds moves
+    /// to `core + (dx, dy)`. One unicast per cell.
+    ///
+    /// `Whole` on an axis is a ring — the page leaving the far end arrives at
+    /// the near one — and a bounded span drops what leaves it, which is how a
+    /// chain is written. The shift is the sender's: "my page lands at
+    /// `mine + v`, not "I take from `mine - v`.
+    ///
+    /// The destination is the same buffer name at the same page, so it is not
+    /// named. The source page is the buffer's read pointer and the destination
+    /// page its write pointer: they coincide for a one-page ring and differ by
+    /// the ring depth when a pipeline forwards a page it received while
+    /// receiving the next one.
+    Roll { src: OpId, span: Span, by: [OpId; 2] },
     /// L1 buffer into a register value. `shape` is the unit the index's base
     /// names; the result has that shape. The offset counts units of that shape
     /// — a page for a tile, a row for `1,32`, a column for `32,1`, a datum for
@@ -504,8 +588,25 @@ impl Op {
                 src,
                 dst_offset,
                 src_offset,
-                ..
+                shape: _,
             } => [dst, src, dst_offset, src_offset].get(idx).copied(),
+            // The coordinates a span names are values like any other, so they
+            // are walked in field order after the buffer.
+            Op::Expand { src, span, from } => {
+                let s = span_operands(span);
+                let f = span_operands(from);
+                [Some(src), s[0], s[1], s[2], s[3], f[0], f[1], f[2], f[3]]
+                    .get(idx)
+                    .copied()
+                    .flatten()
+            }
+            Op::Roll { src, span, by } => {
+                let s = span_operands(span);
+                [Some(src), Some(by[0]), Some(by[1]), s[0], s[1], s[2], s[3]]
+                    .get(idx)
+                    .copied()
+                    .flatten()
+            }
             Op::Load { buffer, offset, .. } => [buffer, offset].get(idx).copied(),
             Op::Store {
                 src,
@@ -565,6 +666,9 @@ impl Op {
                 src_offset,
                 ..
             } => ParamsMut::Four([dst, src, dst_offset, src_offset].into_iter()),
+            // A collective's span coordinates are names, not operands: the reuse
+            // pass renames buffers, and nothing here may be rebound.
+            Op::Expand { .. } | Op::Roll { .. } => ParamsMut::Empty,
             Op::Load { buffer, offset, .. } => ParamsMut::Two(Some(buffer), Some(offset)),
             Op::Store {
                 src,
@@ -974,6 +1078,8 @@ impl Kernel {
                 Store { buffer, .. } => (ValueKind::Buffer, of(buffer).dtype, RegShape::Tile),
                 Grid { .. } => (ValueKind::Shape, INDEX, RegShape::Scalar),
                 Copy { .. }
+                | Expand { .. }
+                | Roll { .. }
                 | EndLoop
                 | EndReader
                 | EndCompute
@@ -1364,6 +1470,53 @@ impl Kernel {
                 Op::Max { acc, x } => {
                     self.expect_reduce(acc, x, at)?;
                 }
+                Op::Expand { src, span, from } => {
+                    if !matches!(*self.at(src), Op::Cb { .. }) {
+                        return Err(ttStatus::TT_ERROR_NOT_A_BUFFER);
+                    }
+                    // `from` names the group's leaders: per axis one coordinate
+                    // or `..`, the coordinate this receiver already has. A range
+                    // has no meaning there — the pick is one cell or the
+                    // receiver's own.
+                    if !matches!(from.x, Extent::Whole | Extent::At(_))
+                        || !matches!(from.y, Extent::Whole | Extent::At(_))
+                    {
+                        return Err(ttStatus::TT_ERROR_EXPAND_PICK);
+                    }
+                    // At least one axis must carry the fan-out: a pick that is
+                    // `..` on an axis the span covers is the receiver's own
+                    // page, so that axis moves nothing. A pick that is `At` on
+                    // an axis the span already pins to one cell moves nothing
+                    // either.
+                    let fans = |pick: Extent, extent: Extent| {
+                        matches!(pick, Extent::At(_)) && !extent.is_one()
+                    };
+                    if !fans(from.x, span.x) && !fans(from.y, span.y) {
+                        return Err(ttStatus::TT_ERROR_EXPAND_PICK);
+                    }
+                    // A pinned axis names one cell, so the pick and the span
+                    // must agree on it wherever both are literal.
+                    for (pick, extent) in [(from.x, span.x), (from.y, span.y)] {
+                        if let (Extent::At(a), Extent::At(b)) = (pick, extent) {
+                            if let (Some(a), Some(b)) = (self.const_i32(a), self.const_i32(b)) {
+                                if a != b {
+                                    return Err(ttStatus::TT_ERROR_EXPAND_PICK);
+                                }
+                            }
+                        }
+                    }
+                }
+                Op::Roll { src, span, by } => {
+                    if !matches!(*self.at(src), Op::Cb { .. }) {
+                        return Err(ttStatus::TT_ERROR_NOT_A_BUFFER);
+                    }
+                    let _ = span;
+                    if let (Some(dx), Some(dy)) = (self.const_i32(by[0]), self.const_i32(by[1])) {
+                        if dx == 0 && dy == 0 {
+                            return Err(ttStatus::TT_ERROR_ROLL_SHIFT);
+                        }
+                    }
+                }
                 Op::Wait { cb, .. }
                 | Op::Reserve { cb, .. }
                 | Op::Push { cb, .. }
@@ -1383,6 +1536,8 @@ impl Kernel {
                 if !matches!(
                     *op,
                     Op::Copy { .. }
+                        | Op::Expand { .. }
+                        | Op::Roll { .. }
                         | Op::Store { .. }
                         | Op::EndLoop
                         | Op::EndReader
@@ -1629,6 +1784,38 @@ impl Parser {
                         });
                         continue;
                     }
+                    "expand" => {
+                        t.word();
+                        let src = self.value(&mut t)?;
+                        let span = t.span(self)?;
+                        if t.word() != Some("from") {
+                            return Err(ttStatus::TT_ERROR_PARSE);
+                        }
+                        let from = t.span(self)?;
+                        t.end()?;
+                        self.push(Op::Expand { src, span, from });
+                        continue;
+                    }
+                    "roll" => {
+                        t.word();
+                        let src = self.value(&mut t)?;
+                        let span = t.span(self)?;
+                        if t.word() != Some("by") {
+                            return Err(ttStatus::TT_ERROR_PARSE);
+                        }
+                        t.char('[')?;
+                        let dx = self.signed_term(&mut t)?;
+                        t.comma()?;
+                        let dy = self.signed_term(&mut t)?;
+                        t.char(']')?;
+                        t.end()?;
+                        self.push(Op::Roll {
+                            src,
+                            span,
+                            by: [dx, dy],
+                        });
+                        continue;
+                    }
                     "store" => {
                         t.word();
                         let shape = t.shape2()?;
@@ -1814,6 +2001,19 @@ impl Parser {
         Ok(self.intern_i32(n as i32))
     }
 
+    /// A term with an optional leading `-`: a roll's shift is signed.
+    fn signed_term(&mut self, t: &mut Tokens<'_>) -> Result<OpId, ttStatus> {
+        if t.peek_char() == Some('-') {
+            t.at += 1;
+            let n = t.number()?;
+            let Ok(v) = i32::try_from(n) else {
+                return Err(ttStatus::TT_ERROR_PARSE);
+            };
+            return Ok(self.intern_i32(-v));
+        }
+        self.term(t)
+    }
+
     fn definition(&mut self, t: &mut Tokens<'_>) -> Result<(), ttStatus> {
         let name = t.name()?;
         t.eq()?;
@@ -1987,6 +2187,18 @@ impl Printer<'_, '_> {
         }
     }
 
+    /// One span, as the text form writes it: `[5..8, ..]`.
+    fn span(&self, span: Span) -> String {
+        fn axis(p: &Printer<'_, '_>, e: Extent) -> String {
+            match e {
+                Extent::Whole => "..".to_owned(),
+                Extent::At(a) => p.name(a),
+                Extent::Range(a, b) => format!("{}..{}", p.name(a), p.name(b)),
+            }
+        }
+        format!("[{}, {}]", axis(self, span.x), axis(self, span.y))
+    }
+
     fn op(&mut self, id: OpId, op: &Op) -> fmt::Result {
         let k = self.k;
         let named = k.names.contains_key(&id);
@@ -2075,6 +2287,21 @@ impl Printer<'_, '_> {
                 self.name(dst_offset),
                 self.name(src),
                 self.name(src_offset)
+            ),
+            Op::Expand { src, span, from } => writeln!(
+                self.f,
+                "expand {} {} from {}",
+                self.name(src),
+                self.span(span),
+                self.span(from)
+            ),
+            Op::Roll { src, span, by } => writeln!(
+                self.f,
+                "roll {} {} by [{}, {}]",
+                self.name(src),
+                self.span(span),
+                self.name(by[0]),
+                self.name(by[1])
             ),
             Op::Load {
                 buffer,
@@ -2386,6 +2613,41 @@ impl<'a> Tokens<'a> {
         }
         self.at += 1;
         Ok(value)
+    }
+
+    fn char(&mut self, c: char) -> Result<(), ttStatus> {
+        if self.peek_char() != Some(c) {
+            return Err(ttStatus::TT_ERROR_PARSE);
+        }
+        self.at += c.len_utf8();
+        Ok(())
+    }
+
+    /// One axis of a core span: `..`, a coordinate, or `a..b`.
+    fn extent(&mut self, p: &mut Parser) -> Result<Extent, ttStatus> {
+        if self.peek_char() == Some('.') {
+            self.dot()?;
+            self.dot()?;
+            return Ok(Extent::Whole);
+        }
+        let first = p.term(self)?;
+        if self.peek_char() == Some('.') {
+            self.dot()?;
+            self.dot()?;
+            let second = p.term(self)?;
+            return Ok(Extent::Range(first, second));
+        }
+        Ok(Extent::At(first))
+    }
+
+    /// `[x, y]`: the cores a collective names.
+    fn span(&mut self, p: &mut Parser) -> Result<Span, ttStatus> {
+        self.char('[')?;
+        let x = self.extent(p)?;
+        self.comma()?;
+        let y = self.extent(p)?;
+        self.char(']')?;
+        Ok(Span { x, y })
     }
 
     fn shape2(&mut self) -> Result<[Dim; 2], ttStatus> {

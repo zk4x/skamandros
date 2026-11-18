@@ -88,10 +88,14 @@ pub fn render(m: &MachineKernel) -> Result<Module, ttStatus> {
             ring.len,
         )?);
     }
-    let args_words = 4 + module_params_words(&m.params);
+    let args_words = crate::mover::ARG_HEAD as u32 + module_params_words(&m.params);
+    let mcast_base = m.mcast.first().map_or(0, |site| site.base);
     let mut module = Module {
         grid: m.grid.clone(),
         params: m.params.clone(),
+        mcast_base,
+        mcast_sites: m.mcast.len() as u32,
+        coords: m.coords,
         reader: words[0].clone(),
         writer: words[4].clone(),
         cores: [words[1].clone(), words[2].clone(), words[3].clone()],
@@ -130,7 +134,13 @@ fn module_params_words(params: &[ParamKind]) -> u32 {
 /// A hash of everything a launch stages on a tile, apart from the resolved
 /// grid (`Module::hash`).
 fn module_hash(module: &Module) -> u64 {
-    let mut words: Vec<u32> = vec![module.iface, module.params.len() as u32];
+    let mut words: Vec<u32> = vec![
+        module.iface,
+        module.params.len() as u32,
+        module.mcast_base,
+        module.mcast_sites,
+        module.coords,
+    ];
     for program in [&module.reader, &module.writer, &module.setup] {
         words.push(program.len() as u32);
         words.extend_from_slice(program);

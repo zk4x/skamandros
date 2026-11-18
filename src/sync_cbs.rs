@@ -170,11 +170,38 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
     // `(at, op, before)` insertions, applied after the scan so the ids stay
     // valid. A write is one page, so `n` is one throughout.
     let mut edits: Vec<(OpId, Op, bool)> = Vec::new();
-    // Producer hand-offs, in program order, around each write.
-    for (at, op) in k.ops() {
-        if let Some(ring) = write_ring(op, &rings) {
-            edits.push((at, Op::Reserve { cb: ring, n: 1 }, true));
-            edits.push((at, Op::Push { cb: ring, n: 1 }, false));
+    // Producer hand-offs, in program order, around each write. An `expand`
+    // publishes the page the copy before it reserved rather than a new one, so
+    // it takes no `Reserve` and the copy it follows leaves the `Push` to it: the
+    // page is only complete once the fan-out has landed.
+    let writes_in_order: Vec<(OpId, Op)> = k.ops().map(|(at, op)| (at, op.clone())).collect();
+    for (i, (at, op)) in writes_in_order.iter().enumerate() {
+        let Some(ring) = write_ring(op, &rings) else {
+            continue;
+        };
+        let expand_publishes = matches!(op, Op::Expand { .. });
+        // The expand that publishes this page is the next op to touch the ring;
+        // the values it is computed from may sit in between, and they are not
+        // ring traffic.
+        let mut next_publishes_it = false;
+        if !expand_publishes {
+            for (_, next) in writes_in_order.iter().skip(i + 1) {
+                match next {
+                    Op::Expand { src, .. } if *src == ring => {
+                        next_publishes_it = true;
+                        break;
+                    }
+                    Op::EndReader | Op::EndCompute | Op::EndLoop => break,
+                    other if other.parameters().any(|v| v == ring) => break,
+                    _ => {}
+                }
+            }
+        }
+        if !expand_publishes {
+            edits.push((*at, Op::Reserve { cb: ring, n: 1 }, true));
+        }
+        if !next_publishes_it {
+            edits.push((*at, Op::Push { cb: ring, n: 1 }, false));
         }
     }
     // Consumer hand-offs. A page produced at the same depth is waited for and
@@ -507,6 +534,7 @@ fn write_ring(op: &Op, rings: &BTreeSet<OpId>) -> Option<OpId> {
     match *op {
         Op::Store { buffer, .. } if rings.contains(&buffer) => Some(buffer),
         Op::Copy { dst, .. } if rings.contains(&dst) => Some(dst),
+        Op::Expand { src, .. } if rings.contains(&src) => Some(src),
         _ => None,
     }
 }

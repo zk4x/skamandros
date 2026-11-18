@@ -973,6 +973,38 @@ pub fn plan_cbs(m: &mut MachineKernel) -> Result<(), ttStatus> {
         let _ = (iface, end);
         return Err(ttStatus::TT_ERROR_L1_ARENA);
     }
+    // A multicast copy's kernel semaphores follow the interface table: the
+    // same four words in every tile, so a sender can name a receiver's word and
+    // a receiver can name its sender's.
+    let mcast = end.div_ceil(ALIGN) * ALIGN;
+    let sites = u32::try_from(m.mcast.len()).map_err(|_| ttStatus::TT_ERROR_L1_OVERFLOW)?;
+    let mcast_end = sites
+        .checked_mul(crate::mir::McastSite::BYTES)
+        .and_then(|bytes| mcast.checked_add(bytes))
+        .ok_or(ttStatus::TT_ERROR_L1_OVERFLOW)?;
+    if u64::from(mcast_end) > tt_isa::arch::blackhole::l1::DATA.end {
+        let _ = (mcast, mcast_end);
+        return Err(ttStatus::TT_ERROR_L1_ARENA);
+    }
+    for (i, site) in m.mcast.iter_mut().enumerate() {
+        site.base = mcast + (i as u32) * crate::mir::McastSite::BYTES;
+    }
+    // The coordinate table follows the sites: one packed NoC coordinate per
+    // logical `(x, y)`, indexed `y * COORD_COLUMNS + x`. A harvested chip's
+    // logical columns are not its physical ones, so a rectangle cannot be
+    // computed from the logical span alone.
+    if !m.mcast.is_empty() {
+        let at = mcast_end.div_ceil(ALIGN) * ALIGN;
+        let bytes = crate::mir::COORDS_WORDS as u32 * 4;
+        let end = at
+            .checked_add(bytes)
+            .ok_or(ttStatus::TT_ERROR_L1_OVERFLOW)?;
+        if u64::from(end) > tt_isa::arch::blackhole::l1::DATA.end {
+            let _ = (at, end);
+            return Err(ttStatus::TT_ERROR_L1_ARENA);
+        }
+        m.coords = at;
+    }
     for (k, (_, info)) in infos.iter_mut().enumerate() {
         let stride = u32::try_from(k)
             .ok()

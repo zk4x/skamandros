@@ -1794,6 +1794,20 @@ fn run_kernel_scalars_paged(
     pages: &[usize],
     out_bytes: usize,
 ) -> Vec<u8> {
+    run_kernel_launches(program, scalars, inputs, pages, out_bytes, 1).0
+}
+
+/// The same launch, repeated `launches` times once everything is staged, with
+/// the wall time of the launches alone. Compiling, the upload and the download
+/// are outside the clock: only a launch's cost is being measured.
+fn run_kernel_launches(
+    program: &str,
+    scalars: &[u64],
+    inputs: &[&[u8]],
+    pages: &[usize],
+    out_bytes: usize,
+    launches: usize,
+) -> (Vec<u8>, std::time::Duration) {
     let _device = device();
     let lib = library();
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
@@ -1865,8 +1879,12 @@ fn run_kernel_scalars_paged(
     let mut params: Vec<u64> = scalars.to_vec();
     params.extend_from_slice(&tensors);
     params.push(output_at);
-    let code = unsafe { launch(module, params.as_ptr(), params.len(), &mut err) };
-    assert_eq!(code, TT_OK, "ttLaunch: {}", take_error(&free, err));
+    let clock = std::time::Instant::now();
+    for _ in 0..launches {
+        let code = unsafe { launch(module, params.as_ptr(), params.len(), &mut err) };
+        assert_eq!(code, TT_OK, "ttLaunch: {}", take_error(&free, err));
+    }
+    let elapsed = clock.elapsed();
 
     let mut back = vec![0u8; out_bytes];
     assert_eq!(
@@ -1881,7 +1899,7 @@ fn run_kernel_scalars_paged(
         "unload: {}",
         take_error(&free, err)
     );
-    back
+    (back, elapsed)
 }
 
 /// `(int)f`: truncation toward zero, in two's complement.
@@ -4787,6 +4805,215 @@ fn gate_proj_runs_over_a_full_grid() {
                     tile_rc(i)
                 );
             }
+        }
+    }
+}
+
+/// The 2-D blocked matmul's throughput on whatever device is attached.
+///
+/// This *reports* instead of gating: the figure is the oracle for a lowering
+/// change, and a regression shows as a moved number rather than a failed
+/// assertion. `SKAM_PERF_LAUNCHES` sets the repeat count (20 by default), and
+/// only the launches are timed — compiling, the upload and the download stay
+/// outside the clock, so the number is the kernel's.
+///
+/// A simulator's figure is model time, not silicon: run it on the card for a
+/// number worth recording.
+#[test]
+fn gate_proj_throughput() {
+    const NX: u64 = 12;
+    const NY: u64 = 10;
+    const M: usize = 128;
+    const N: usize = 1920;
+    const K: usize = 128;
+    let (mt, nt, kt) = (M / 32, N / 32, K / 32);
+    let ntiles = mt * nt;
+    let launches: usize = std::env::var("SKAM_PERF_LAUNCHES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(20);
+
+    let a_vals: Vec<f32> = (0..M * K).map(|i| (i % 7) as f32 - 3.0).collect();
+    let w_vals: Vec<f32> = (0..N * K).map(|i| (i % 5) as f32 - 2.0).collect();
+    let a: Vec<u16> = tiled(M, K, &a_vals)
+        .iter()
+        .map(|v| truncate_to_bf16(*v))
+        .collect();
+    let w: Vec<u16> = tiled(N, K, &w_vals)
+        .iter()
+        .map(|v| truncate_to_bf16(*v))
+        .collect();
+    let bytes = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|h| h.to_le_bytes()).collect() };
+    let scalars = [NX, NY, ntiles as u64, kt as u64, nt as u64];
+    let (out, elapsed) = run_kernel_launches(
+        GATE_PROJ,
+        &scalars,
+        &[&bytes(&a), &bytes(&w)],
+        &[],
+        ntiles * 1024 * 4,
+        launches,
+    );
+    // A launch that wrote nothing is a failed run, not a slow one.
+    assert!(
+        out.chunks_exact(4)
+            .any(|c| f32::from_le_bytes(c.try_into().unwrap()) != 0.0),
+        "the matmul wrote nothing"
+    );
+
+    let per = elapsed / u32::try_from(launches).unwrap_or(1);
+    let macs = 2.0 * (M * N * K) as f64;
+    println!(
+        "gate_proj {M}x{K} by {K}x{N} over {NX}x{NY}: {launches} launches in {elapsed:?}, \
+         {per:?} each, {:.2} GMAC/s",
+        macs * launches as f64 / elapsed.as_secs_f64() / 1e9
+    );
+}
+
+/// The fan-out: one leader per row publishes its page into every core of its
+/// row, so each core ends with the page its row's leader read.
+///
+/// `expand %b [.., ..] from [0, ..]` names column 0 as the leader on the pinned
+/// axis and the whole row as its part of the span, so the request count is one
+/// per row and every other core is a receiver.
+#[test]
+fn a_row_fans_out_from_its_leader() {
+    const NX: u64 = 4;
+    const NY: u64 = 3;
+    const EXPAND: &str = "\
+version 9
+%nx = const i32 4
+%ny = const i32 3
+%in = param f32 12288
+%out = param f32 12288
+%b = buffer f32 32,32
+%x = grid.x
+%y = grid.y
+%row = mul %y %nx
+%t = add %row %x
+copy 32,32 %b [0] = %in [%t]
+expand %b [.., ..] from [0, ..]
+copy 32,32 %out [%t] = %b [0]
+grid %nx,%ny
+";
+    let ntiles = (NX * NY) as usize;
+    // Page order, one tile per core: the copy moves a page whole, so the
+    // reference needs no layout of its own.
+    let mut input = vec![0f32; ntiles * 1024];
+    for (at, datum) in input.iter_mut().enumerate() {
+        *datum = at as f32;
+    }
+    let bytes: Vec<u8> = input.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_scalars(EXPAND, &[], &[&bytes], ntiles * 1024 * 4);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for y in 0..NY {
+        for x in 0..NX {
+            let leader = (y * NX) as usize;
+            let at = ((y * NX + x) as usize) * 1024;
+            for i in 0..1024 {
+                assert_eq!(
+                    got[at + i],
+                    input[leader * 1024 + i],
+                    "core ({x},{y}) datum {i} is not its row leader's page"
+                );
+            }
+        }
+    }
+}
+
+/// The fan-out down a column: `from [.., 0]` pins the pick on the row, so the
+/// leaders are row 0 and each owns its column.
+#[test]
+fn a_column_fans_out_from_its_leader() {
+    const NX: u64 = 3;
+    const NY: u64 = 4;
+    const EXPAND: &str = "\
+version 9
+%nx = const i32 3
+%ny = const i32 4
+%in = param f32 12288
+%out = param f32 12288
+%b = buffer f32 32,32
+%x = grid.x
+%y = grid.y
+%row = mul %y %nx
+%t = add %row %x
+copy 32,32 %b [0] = %in [%t]
+expand %b [.., ..] from [.., 0]
+copy 32,32 %out [%t] = %b [0]
+grid %nx,%ny
+";
+    let ntiles = (NX * NY) as usize;
+    let mut input = vec![0f32; ntiles * 1024];
+    for (at, datum) in input.iter_mut().enumerate() {
+        *datum = at as f32;
+    }
+    let bytes: Vec<u8> = input.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_scalars(EXPAND, &[], &[&bytes], ntiles * 1024 * 4);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for y in 0..NY {
+        for x in 0..NX {
+            let leader = x as usize;
+            let at = ((y * NX + x) as usize) * 1024;
+            for i in 0..1024 {
+                assert_eq!(
+                    got[at + i],
+                    input[leader * 1024 + i],
+                    "core ({x},{y}) datum {i} is not its column leader's page"
+                );
+            }
+        }
+    }
+}
+
+/// A single leader for the whole grid: both pick axes are scalars, so one core
+/// owns the span and one request carries it to every other core.
+#[test]
+fn one_leader_fills_the_grid() {
+    const NX: u64 = 3;
+    const NY: u64 = 3;
+    const EXPAND: &str = "\
+version 9
+%nx = const i32 3
+%ny = const i32 3
+%in = param f32 9216
+%out = param f32 9216
+%b = buffer f32 32,32
+%x = grid.x
+%y = grid.y
+%row = mul %y %nx
+%t = add %row %x
+copy 32,32 %b [0] = %in [%t]
+expand %b [.., ..] from [1, 1]
+copy 32,32 %out [%t] = %b [0]
+grid %nx,%ny
+";
+    let ntiles = (NX * NY) as usize;
+    let mut input = vec![0f32; ntiles * 1024];
+    for (at, datum) in input.iter_mut().enumerate() {
+        *datum = at as f32;
+    }
+    let bytes: Vec<u8> = input.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_scalars(EXPAND, &[], &[&bytes], ntiles * 1024 * 4);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    // The leader is `(1, 1)`, the fourth tile in row-major order.
+    let leader = 1 * NX as usize + 1;
+    for t in 0..ntiles {
+        for i in 0..1024 {
+            assert_eq!(
+                got[t * 1024 + i],
+                input[leader * 1024 + i],
+                "tile {t} datum {i} is not the grid leader's page"
+            );
         }
     }
 }

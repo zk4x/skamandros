@@ -18,7 +18,8 @@
 use std::collections::BTreeMap;
 
 use crate::ir::{
-    BOp, DType, Dim, Kernel, Op, OpId, RegShape, UOp, ValueInfo, access_shape, unit_of,
+    BOp, DType, Dim, Extent, Kernel, Op, OpId, RegShape, Span, UOp, ValueInfo, access_shape,
+    unit_of,
 };
 use crate::mir::{
     Bcast, BinarySfpOp, Cb, Core, Dst, ElwOp, IOp, LReg, MachineKernel, MirOp, PackMask, UnarySfpOp,
@@ -129,6 +130,9 @@ struct Plan {
     /// The byte offset of each parameter's launch-argument block, in program
     /// order. See [`crate::mover::arg_blocks`].
     arg_block: Vec<i32>,
+    /// The site an `expand` owns, by its op id, in the order the sites were
+    /// minted.
+    expand: BTreeMap<OpId, usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -195,6 +199,7 @@ fn prepare(k: &Kernel) -> Result<(Plan, MachineKernel, Alloc), ttStatus> {
         ones: None,
         staged: BTreeMap::new(),
         arg_block: Vec::new(),
+        expand: BTreeMap::new(),
     };
     for (id, op) in k.ops() {
         if let Op::Cb { dtype, page, len } = *op {
@@ -225,6 +230,16 @@ fn prepare(k: &Kernel) -> Result<(Plan, MachineKernel, Alloc), ttStatus> {
             plan.staged.insert(value, cb);
         }
     }
+    // One site per `expand`, in program order: the words its leaders and
+    // receivers share. Nothing is detected — a copy the program wrote local
+    // stays local, and only an `expand` fans out (AGENTS.md, "One lowering per
+    // op").
+    for (at, op) in k.ops() {
+        if matches!(op, Op::Expand { .. }) {
+            plan.expand.insert(at, plan.expand.len());
+        }
+    }
+    m.mcast = vec![crate::mir::McastSite::default(); plan.expand.len()];
     m.grid = crate::compile::grid_terms(k)?;
     m.params = crate::compile::parameter_kinds(k);
     plan.arg_block = crate::mover::arg_blocks(&m.params);
@@ -590,6 +605,20 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                 }
                 continue;
             }
+            // A collective is a read-side move: it publishes a page the reader
+            // segment filled. Anywhere else the program has no page to move.
+            Op::Expand { src, span, from } => {
+                if mover != Some(Core::Reader) {
+                    return Err(ttStatus::TT_ERROR_COLLECTIVE_PLACEMENT);
+                }
+                let site = *plan
+                    .expand
+                    .get(&at)
+                    .ok_or_else(|| crate::status::internal_bug("lower: an expand has no site"))?;
+                expand_to(k, types, &plan, &param, &loops, &mut m, site, src, span, from)?;
+                continue;
+            }
+            Op::Roll { .. } => return Err(ttStatus::TT_TODO_COLLECTIVE),
             Op::Load {
                 buffer,
                 offset,
@@ -4921,6 +4950,9 @@ fn copy_to(
         .arg_block
         .get(index as usize)
         .ok_or(ttStatus::TT_ERROR_COPY_ENDS)?;
+    // `copy` is local by definition: DRAM to this core's L1, or this core's L1
+    // to DRAM. A fan-out is an `expand` the program wrote, never something this
+    // path recovers from the operands.
     // A mover's program has its own counters: `t5` is its NIU base, so the
     // compute roles' counters and its own `a1..a4` are not interchangeable.
     let mut ops = Vec::new();
@@ -5059,6 +5091,901 @@ fn copy_to(
     for op in ops {
         m.push(core, op);
     }
+    Ok(())
+}
+
+/// The byte offsets of an `expand` site's words.
+///
+/// The first four are the protocol ([`crate::mir::McastSite`]); the rest is the
+/// geometry, spilled because a mover has six registers and a span has more
+/// terms than that. The fold is once per page — a 2 KiB multicast — so a dozen
+/// L1 words cost nothing against it.
+const SITE_ARRIVE: u32 = crate::mir::McastSite { base: 0 }.data();
+const SITE_CREDIT: u32 = crate::mir::McastSite { base: 0 }.credit();
+const SITE_RET: u32 = crate::mir::McastSite { base: 0 }.ret();
+const SITE_ONE: u32 = crate::mir::McastSite { base: 0 }.one();
+const SITE_MY_X: u32 = 32;
+const SITE_MY_Y: u32 = 36;
+const SITE_LO_X: u32 = 40;
+const SITE_HI_X: u32 = 44;
+const SITE_LO_Y: u32 = 48;
+const SITE_HI_Y: u32 = 52;
+const SITE_LEAD_X: u32 = 56;
+const SITE_LEAD_Y: u32 = 60;
+const SITE_IS_LEADER: u32 = 64;
+const SITE_IS_RECEIVER: u32 = 68;
+const SITE_REMOTE: u32 = 72;
+const SITE_RECT: u32 = 76;
+const SITE_NEAR: u32 = 84;
+const SITE_FAR: u32 = 88;
+
+fn store_at(ops: &mut Vec<MirOp>, base: u8, at: u32, value: u8) {
+    ops.push(MirOp::Sw {
+        value,
+        base,
+        at: at as i32,
+    });
+}
+
+fn load_at(ops: &mut Vec<MirOp>, dest: u8, base: u8, at: u32) {
+    ops.push(MirOp::Lw {
+        reg: dest,
+        base,
+        at: at as i32,
+    });
+}
+
+/// The packed NoC coordinate of the logical `(x, y)` a site's scratch names,
+/// read out of the staged table: `table[(y << 4) | x]`. The table is indexed by
+/// shift rather than by multiply because its stride is the sixteen columns a
+/// Blackhole can address.
+fn packed_corner(
+    ops: &mut Vec<MirOp>,
+    pool: &mut Pool,
+    sbase: u8,
+    x_at: u32,
+    y_at: u32,
+) -> Result<u8, ttStatus> {
+    let coords = pool.take()?;
+    ops.push(MirOp::LoadArg {
+        reg: coords,
+        arg: crate::mover::ARG_COORDS,
+    });
+    let x = pool.take()?;
+    let y = pool.take()?;
+    let t = pool.take()?;
+    load_at(ops, x, sbase, x_at);
+    load_at(ops, y, sbase, y_at);
+    ops.push(MirOp::Li { reg: t, value: 4 });
+    ops.push(MirOp::IArith {
+        op: IOp::Sll,
+        d: y,
+        a: y,
+        b: t,
+    });
+    ops.push(MirOp::IArith {
+        op: IOp::Or,
+        d: x,
+        a: x,
+        b: y,
+    });
+    ops.push(MirOp::Li { reg: t, value: 2 });
+    ops.push(MirOp::IArith {
+        op: IOp::Sll,
+        d: x,
+        a: x,
+        b: t,
+    });
+    ops.push(MirOp::IArith {
+        op: IOp::Add,
+        d: x,
+        a: x,
+        b: coords,
+    });
+    ops.push(MirOp::Lw {
+        reg: t,
+        base: x,
+        at: 0,
+    });
+    pool.give(y);
+    pool.give(x);
+    pool.give(coords);
+    Ok(t)
+}
+
+/// `dest = sbase + at`, for a small constant.
+fn site_addr(
+    ops: &mut Vec<MirOp>,
+    pool: &mut Pool,
+    dest: u8,
+    sbase: u8,
+    at: u32,
+) -> Result<(), ttStatus> {
+    ops.push(MirOp::IArith {
+        op: IOp::Add,
+        d: dest,
+        a: sbase,
+        b: reg::ZERO,
+    });
+    let c = pool.take()?;
+    ops.push(MirOp::Li { reg: c, value: at });
+    ops.push(MirOp::IArith {
+        op: IOp::Add,
+        d: dest,
+        a: dest,
+        b: c,
+    });
+    pool.give(c);
+    Ok(())
+}
+
+/// `1` when `lo <= v <= hi`, `0` otherwise, from the site's scratch.
+///
+/// The comparison is `hi - lo >= v - lo` in signed arithmetic: a `v` below `lo`
+/// makes `v - lo` negative, which fails the test, and every coordinate is small
+/// and non-negative, so the signed forms are exact.
+fn within(
+    ops: &mut Vec<MirOp>,
+    pool: &mut Pool,
+    sbase: u8,
+    v_at: u32,
+    lo_at: u32,
+    hi_at: u32,
+) -> Result<u8, ttStatus> {
+    let value = pool.take()?;
+    let span = pool.take()?;
+    let out = pool.take()?;
+    load_at(ops, value, sbase, v_at);
+    load_at(ops, out, sbase, lo_at);
+    ops.push(MirOp::IArith {
+        op: IOp::Sub,
+        d: value,
+        a: value,
+        b: out,
+    });
+    load_at(ops, span, sbase, hi_at);
+    load_at(ops, out, sbase, lo_at);
+    ops.push(MirOp::IArith {
+        op: IOp::Sub,
+        d: span,
+        a: span,
+        b: out,
+    });
+    ops.push(MirOp::IArith {
+        op: IOp::Slt,
+        d: out,
+        a: span,
+        b: value,
+    });
+    let inside = pool.take()?;
+    // `!(span < value)`: `Eq` against the zero register inverts without needing
+    // a constant in a register of its own.
+    ops.push(MirOp::IArith {
+        op: IOp::Eq,
+        d: inside,
+        a: out,
+        b: reg::ZERO,
+    });
+    pool.give(out);
+    pool.give(span);
+    pool.give(value);
+    Ok(inside)
+}
+
+/// The first and last coordinate an extent names, into the site's scratch:
+/// `Whole` is the launch grid's own extent, `At` is one coordinate, `Range` is
+/// `a .. b - 1`.
+#[allow(clippy::too_many_arguments)]
+fn extent_bounds(
+    k: &Kernel,
+    types: &Types,
+    plan: &Plan,
+    param: &BTreeMap<OpId, u32>,
+    loops: &[OpId],
+    cbs: &crate::slab::Slab<Cb, crate::mir::CbInfo>,
+    ops: &mut Vec<MirOp>,
+    pool: &mut Pool,
+    base: u8,
+    extent: Extent,
+    lo_at: u32,
+    hi_at: u32,
+    whole_arg: i32,
+) -> Result<(), ttStatus> {
+    match extent {
+        Extent::Whole => {
+            let n = pool.take()?;
+            ops.push(MirOp::LoadArg {
+                reg: n,
+                arg: whole_arg,
+            });
+            let one = pool.take()?;
+            ops.push(MirOp::Li { reg: one, value: 1 });
+            ops.push(MirOp::IArith {
+                op: IOp::Sub,
+                d: n,
+                a: n,
+                b: one,
+            });
+            pool.give(one);
+            store_at(ops, base, hi_at, n);
+            pool.give(n);
+            store_at(ops, base, lo_at, reg::ZERO);
+        }
+        Extent::At(v) => {
+            let r = pool.take()?;
+            scalar_with(k, types, ops, param, loops, v, r, pool, &MOVER_INDEX, plan, cbs)?;
+            store_at(ops, base, lo_at, r);
+            store_at(ops, base, hi_at, r);
+            pool.give(r);
+        }
+        Extent::Range(a, b) => {
+            let r = pool.take()?;
+            scalar_with(k, types, ops, param, loops, a, r, pool, &MOVER_INDEX, plan, cbs)?;
+            store_at(ops, base, lo_at, r);
+            scalar_with(k, types, ops, param, loops, b, r, pool, &MOVER_INDEX, plan, cbs)?;
+            let one = pool.take()?;
+            ops.push(MirOp::Li { reg: one, value: 1 });
+            ops.push(MirOp::IArith {
+                op: IOp::Sub,
+                d: r,
+                a: r,
+                b: one,
+            });
+            pool.give(one);
+            store_at(ops, base, hi_at, r);
+            pool.give(r);
+        }
+    }
+    Ok(())
+}
+
+/// `expand`: every leader publishes its page into the cores its part of the
+/// span names, with one NoC multicast each.
+///
+/// The program is one text, so every core decides from its own coordinate:
+///
+/// - a **leader** agrees with `from` on the axes `from` pins, so there are
+///   `|from|` of them, each owning the part of `span` that shares its
+///   coordinate on the axes `from` leaves open;
+/// - a **receiver** is in the span and is not a leader.
+///
+/// The protocol is the cheapest one that is correct, and every piece of it is
+/// forced:
+///
+/// - *flow control* is a credit count in the leader's own L1, one per receiver.
+///   A receiver deposits one when it has a page it can spare, so the leader runs
+///   ahead by the ring's depth instead of stalling on each page. The counter is
+///   only ever incremented, so it is never re-armed and no reset can race a
+///   deposit.
+/// - *completion* is the request's own transaction counter. A response-marked
+///   multicast leaves it at `1 - recipients`; both requests share the id, so one
+///   wait covers the page and the flag. Nothing is counted in software.
+/// - *ordering* between the page and the arrival flag is the static multicast
+///   virtual channel's: two requests from this NIU to this rectangle take the
+///   same route in order, which is tt-metal's own construction
+///   (`noc_async_write_multicast` then `noc_semaphore_set_multicast`). Waiting
+///   for the page's acknowledgements before sending the flag would be stronger
+///   and would cost a round trip per page for a guarantee the route already
+///   gives.
+///
+/// The leader's own page is not a recipient (`BRCST_SRC_INCLUDE` clear): it
+/// already holds what its read brought.
+#[allow(clippy::too_many_arguments)]
+fn expand_to(
+    k: &Kernel,
+    types: &Types,
+    plan: &Plan,
+    param: &BTreeMap<OpId, u32>,
+    loops: &[OpId],
+    m: &mut MachineKernel,
+    site: usize,
+    src: OpId,
+    span: Span,
+    from: Span,
+) -> Result<(), ttStatus> {
+    use crate::mover::{ARG_COORDS, ARG_GRID_X, ARG_GRID_Y, ARG_MCAST_SITES};
+    let cb = *plan
+        .cb
+        .get(&src)
+        .ok_or(ttStatus::TT_ERROR_BUFFER_NOT_PLACED)?;
+    let (dtype, page) = match *k.at(src) {
+        Op::Cb { dtype, page, .. } => (dtype, page),
+        _ => return Err(ttStatus::TT_ERROR_NOT_A_BUFFER),
+    };
+    let len = page[0]
+        .checked_mul(page[1])
+        .and_then(|datums| datums.checked_mul(dtype.bytes()))
+        .ok_or(ttStatus::TT_ERROR_NOC_REQUEST_BYTES)?;
+    if len == 0 || len > tt_isa::arch::blackhole::noc::niu::MAX_REQUEST_BYTES {
+        let _ = (len, page);
+        return Err(ttStatus::TT_ERROR_NOC_REQUEST_BYTES);
+    }
+
+    let mut ops: Vec<MirOp> = Vec::new();
+    let mut pool = Pool::new(&MOVER_POOL);
+
+    // The site block. `sbase` stays live for the whole op; everything else is
+    // reloaded from scratch when it is needed, because six registers is the
+    // whole pool.
+    let sbase = pool.take()?;
+    ops.push(MirOp::LoadArg {
+        reg: sbase,
+        arg: ARG_MCAST_SITES,
+    });
+    {
+        let off = pool.take()?;
+        ops.push(MirOp::Li {
+            reg: off,
+            value: site as u32 * crate::mir::McastSite::BYTES,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Add,
+            d: sbase,
+            a: sbase,
+            b: off,
+        });
+        pool.give(off);
+    }
+
+    // This core's coordinate, and the span's bounds.
+    {
+        let x = pool.take()?;
+        ops.push(MirOp::LoadCoord { reg: x, axis: 0 });
+        store_at(&mut ops, sbase, SITE_MY_X, x);
+        pool.give(x);
+        let y = pool.take()?;
+        ops.push(MirOp::LoadCoord { reg: y, axis: 1 });
+        store_at(&mut ops, sbase, SITE_MY_Y, y);
+        pool.give(y);
+    }
+    extent_bounds(
+        k, types, plan, param, loops, &m.cbs, &mut ops, &mut pool, sbase, span.x, SITE_LO_X,
+        SITE_HI_X, ARG_GRID_X,
+    )?;
+    extent_bounds(
+        k, types, plan, param, loops, &m.cbs, &mut ops, &mut pool, sbase, span.y, SITE_LO_Y,
+        SITE_HI_Y, ARG_GRID_Y,
+    )?;
+
+    // inside := the span holds me on both axes.
+    let inside = within(&mut ops, &mut pool, sbase, SITE_MY_X, SITE_LO_X, SITE_HI_X)?;
+    {
+        let other = within(&mut ops, &mut pool, sbase, SITE_MY_Y, SITE_LO_Y, SITE_HI_Y)?;
+        ops.push(MirOp::IArith {
+            op: IOp::And,
+            d: inside,
+            a: inside,
+            b: other,
+        });
+        pool.give(other);
+    }
+
+    // leader := inside, and my coordinate agrees with the pick on every axis it
+    // pins. The pick's coordinate on a pinned axis is also the leader a
+    // receiver credits, so it is kept.
+    let leader = pool.take()?;
+    ops.push(MirOp::IArith {
+        op: IOp::Add,
+        d: leader,
+        a: inside,
+        b: reg::ZERO,
+    });
+    for (extent, my_at, lead_at) in [(from.x, SITE_MY_X, SITE_LEAD_X), (from.y, SITE_MY_Y, SITE_LEAD_Y)] {
+        match extent {
+            Extent::Whole => {
+                let mine = pool.take()?;
+                load_at(&mut ops, mine, sbase, my_at);
+                store_at(&mut ops, sbase, lead_at, mine);
+                pool.give(mine);
+            }
+            Extent::At(v) => {
+                let picked = pool.take()?;
+                scalar_with(
+                    k, types, &mut ops, param, loops, v, picked, &mut pool, &MOVER_INDEX, plan,
+                    &m.cbs,
+                )?;
+                store_at(&mut ops, sbase, lead_at, picked);
+                let mine = pool.take()?;
+                load_at(&mut ops, mine, sbase, my_at);
+                let same = pool.take()?;
+                ops.push(MirOp::IArith {
+                    op: IOp::Eq,
+                    d: same,
+                    a: mine,
+                    b: picked,
+                });
+                ops.push(MirOp::IArith {
+                    op: IOp::And,
+                    d: leader,
+                    a: leader,
+                    b: same,
+                });
+                pool.give(same);
+                pool.give(mine);
+                pool.give(picked);
+            }
+            Extent::Range(..) => {
+                return Err(crate::status::internal_bug(
+                    "lower: an expand pick axis is a run",
+                ));
+            }
+        }
+    }
+    store_at(&mut ops, sbase, SITE_IS_LEADER, leader);
+    // receiver := inside && !leader
+    {
+        let receiver = pool.take()?;
+        ops.push(MirOp::IArith {
+            op: IOp::Eq,
+            d: receiver,
+            a: leader,
+            b: reg::ZERO,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::And,
+            d: receiver,
+            a: receiver,
+            b: inside,
+        });
+        store_at(&mut ops, sbase, SITE_IS_RECEIVER, receiver);
+        pool.give(receiver);
+    }
+    pool.give(leader);
+    pool.give(inside);
+
+    // --- the leader's body
+    let cond = pool.take()?;
+    load_at(&mut ops, cond, sbase, SITE_IS_LEADER);
+    ops.push(MirOp::IfNonZero { cond });
+    pool.give(cond);
+
+    // Its rectangle: the span's whole extent on an axis the pick pins to one
+    // cell (a scalar pick is one value for the whole group), and its own
+    // coordinate on an axis the pick leaves open (`..` — "the coordinate this
+    // receiver already has", so the slab is one cell thick).
+    for (extent, my_at, lo_at, hi_at) in [
+        (from.x, SITE_MY_X, SITE_LO_X, SITE_HI_X),
+        (from.y, SITE_MY_Y, SITE_LO_Y, SITE_HI_Y),
+    ] {
+        if matches!(extent, Extent::Whole) {
+            let mine = pool.take()?;
+            load_at(&mut ops, mine, sbase, my_at);
+            store_at(&mut ops, sbase, lo_at, mine);
+            store_at(&mut ops, sbase, hi_at, mine);
+            pool.give(mine);
+        }
+    }
+    // remote := the rectangle's cells less this one. Zero means the span pins
+    // this core alone, so there is no request to make.
+    {
+        let cells = pool.take()?;
+        let other = pool.take()?;
+        load_at(&mut ops, cells, sbase, SITE_HI_X);
+        load_at(&mut ops, other, sbase, SITE_LO_X);
+        ops.push(MirOp::IArith {
+            op: IOp::Sub,
+            d: cells,
+            a: cells,
+            b: other,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Add,
+            d: cells,
+            a: cells,
+            b: reg::ZERO,
+        });
+        let one = pool.take()?;
+        ops.push(MirOp::Li { reg: one, value: 1 });
+        ops.push(MirOp::IArith {
+            op: IOp::Add,
+            d: cells,
+            a: cells,
+            b: one,
+        });
+        load_at(&mut ops, other, sbase, SITE_HI_Y);
+        let height = pool.take()?;
+        load_at(&mut ops, height, sbase, SITE_LO_Y);
+        ops.push(MirOp::IArith {
+            op: IOp::Sub,
+            d: other,
+            a: other,
+            b: height,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Add,
+            d: other,
+            a: other,
+            b: one,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Mul,
+            d: cells,
+            a: cells,
+            b: other,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Sub,
+            d: cells,
+            a: cells,
+            b: one,
+        });
+        store_at(&mut ops, sbase, SITE_REMOTE, cells);
+        pool.give(one);
+        pool.give(height);
+        pool.give(other);
+        pool.give(cells);
+    }
+    {
+        let remote = pool.take()?;
+        load_at(&mut ops, remote, sbase, SITE_REMOTE);
+        ops.push(MirOp::IfNonZero { cond: remote });
+        pool.give(remote);
+    }
+
+    // One credit per receiver, taken as a batch: the counter only grows, so the
+    // leader's subtraction leaves the difference for the next page.
+    {
+        let credit = pool.take()?;
+        site_addr(&mut ops, &mut pool, credit, sbase, SITE_CREDIT)?;
+        let remote = pool.take()?;
+        load_at(&mut ops, remote, sbase, SITE_REMOTE);
+        let value = pool.take()?;
+        ops.push(MirOp::L1PollBelow {
+            base: credit,
+            reg: value,
+            bound: remote,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Sub,
+            d: value,
+            a: value,
+            b: remote,
+        });
+        pool.give(remote);
+        ops.push(MirOp::Sw {
+            value,
+            base: credit,
+            at: 0,
+        });
+        pool.give(value);
+        pool.give(credit);
+    }
+
+    // The rectangle's word: the far corner in the low half and the near corner
+    // in the high half, both in the NoC's own coordinates. The corners come from
+    // the staged table, because a logical column is not a physical one on a
+    // harvested chip.
+    {
+        let far = packed_corner(&mut ops, &mut pool, sbase, SITE_HI_X, SITE_HI_Y)?;
+        store_at(&mut ops, sbase, SITE_FAR, far);
+        pool.give(far);
+        let near = packed_corner(&mut ops, &mut pool, sbase, SITE_LO_X, SITE_LO_Y)?;
+        store_at(&mut ops, sbase, SITE_NEAR, near);
+        pool.give(near);
+
+        // rect = x_end | y_end << 6 | x_start << 12 | y_start << 18
+        let rect = pool.take()?;
+        let far = pool.take()?;
+        let mask = pool.take()?;
+        load_at(&mut ops, far, sbase, SITE_FAR);
+        ops.push(MirOp::Li { reg: mask, value: 0x3F });
+        ops.push(MirOp::IArith { op: IOp::And, d: rect, a: far, b: mask });
+        ops.push(MirOp::Li {
+            reg: mask,
+            value: 0xFC0,
+        });
+        ops.push(MirOp::IArith { op: IOp::And, d: far, a: far, b: mask });
+        ops.push(MirOp::IArith { op: IOp::Or, d: rect, a: rect, b: far });
+        pool.give(far);
+        let near = pool.take()?;
+        load_at(&mut ops, near, sbase, SITE_NEAR);
+        ops.push(MirOp::Li { reg: mask, value: 0x3F });
+        ops.push(MirOp::IArith { op: IOp::And, d: near, a: near, b: mask });
+        ops.push(MirOp::Li { reg: mask, value: 12 });
+        ops.push(MirOp::IArith { op: IOp::Sll, d: near, a: near, b: mask });
+        ops.push(MirOp::IArith { op: IOp::Or, d: rect, a: rect, b: near });
+        load_at(&mut ops, near, sbase, SITE_NEAR);
+        ops.push(MirOp::Li { reg: mask, value: 6 });
+        ops.push(MirOp::IArith { op: IOp::Srl, d: near, a: near, b: mask });
+        ops.push(MirOp::Li { reg: mask, value: 0x3F });
+        ops.push(MirOp::IArith { op: IOp::And, d: near, a: near, b: mask });
+        // `y_start` sits 24 bits above `x_start`: six node-id bits each, and the
+        // coordinate word is `x_end | y_end << 6 | x_start << 12 | y_start << 18`
+        // (tt-metal's `NOC_MULTICAST_COORD`).
+        ops.push(MirOp::Li {
+            reg: mask,
+            value: 18,
+        });
+        ops.push(MirOp::IArith { op: IOp::Sll, d: near, a: near, b: mask });
+        ops.push(MirOp::IArith { op: IOp::Or, d: rect, a: rect, b: near });
+        store_at(&mut ops, sbase, SITE_RECT, rect);
+        pool.give(mask);
+        pool.give(near);
+        pool.give(rect);
+    }
+
+    // The page: the ring's write pointer, which is the address every receiver's
+    // write pointer already holds — the program is uniform and the rings advance
+    // in step.
+    let page_addr = pool.take()?;
+    ops.push(MirOp::Lw {
+        reg: page_addr,
+        base: reg::A6,
+        at: (u32::from(cb.0) * crate::riscv::cb::STRIDE) as i32 + crate::riscv::cb::WR_PTR,
+    });
+    emit_mcast_request(&mut ops, &mut pool, sbase, page_addr, page_addr, len)?;
+    pool.give(page_addr);
+    // The arrival flag: four bytes from this site's `one` to the same word in
+    // every receiver.
+    {
+        let one = pool.take()?;
+        site_addr(&mut ops, &mut pool, one, sbase, SITE_ONE)?;
+        let arrive = pool.take()?;
+        site_addr(&mut ops, &mut pool, arrive, sbase, SITE_ARRIVE)?;
+        emit_mcast_request(&mut ops, &mut pool, sbase, one, arrive, 4)?;
+        pool.give(arrive);
+        pool.give(one);
+    }
+    // The requests' completion is the receivers' credits, not an
+    // acknowledgement: a credit can only be deposited after the page was
+    // consumed, which is after the NIU drained it out of this core's L1. So
+    // nothing waits on this transaction id's counter, and nothing reads it —
+    // which is also why it is a second id, so its drift cannot disturb the
+    // copies' wait for their own.
+    ops.push(MirOp::EndIf);
+    ops.push(MirOp::EndIf);
+
+    // --- the receiver's body: give the leader its credit, then wait — with the
+    // L0 cache invalidated — for the flag the leader's second multicast writes.
+    let cond = pool.take()?;
+    load_at(&mut ops, cond, sbase, SITE_IS_RECEIVER);
+    ops.push(MirOp::IfNonZero { cond });
+    pool.give(cond);
+    {
+        // The leader's packed coordinate, from the coordinate table.
+        let coords = pool.take()?;
+        ops.push(MirOp::LoadArg {
+            reg: coords,
+            arg: ARG_COORDS,
+        });
+        let a = pool.take()?;
+        let b = pool.take()?;
+        let c = pool.take()?;
+        load_at(&mut ops, a, sbase, SITE_LEAD_X);
+        load_at(&mut ops, b, sbase, SITE_LEAD_Y);
+        ops.push(MirOp::Li { reg: c, value: 4 });
+        ops.push(MirOp::IArith {
+            op: IOp::Sll,
+            d: b,
+            a: b,
+            b: c,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Or,
+            d: a,
+            a: a,
+            b,
+        });
+        ops.push(MirOp::Li { reg: c, value: 2 });
+        ops.push(MirOp::IArith {
+            op: IOp::Sll,
+            d: a,
+            a: a,
+            b: c,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Add,
+            d: a,
+            a: a,
+            b: coords,
+        });
+        ops.push(MirOp::Lw {
+            reg: b,
+            base: a,
+            at: 0,
+        });
+        pool.give(c);
+        pool.give(coords);
+        // The credit word lives in the leader's tile.
+        let credit = pool.take()?;
+        site_addr(&mut ops, &mut pool, credit, sbase, SITE_CREDIT)?;
+        let ret = pool.take()?;
+        site_addr(&mut ops, &mut pool, ret, sbase, SITE_RET)?;
+        let lead = pool.take()?;
+        ops.push(MirOp::IArith {
+            op: IOp::Add,
+            d: lead,
+            a: b,
+            b: reg::ZERO,
+        });
+        pool.give(b);
+        pool.give(a);
+        emit_atomic_increment(
+            &mut ops,
+            &mut pool,
+            credit,
+            lead,
+            ret,
+            (SITE_CREDIT >> 2) & 3,
+        )?;
+        pool.give(lead);
+        pool.give(ret);
+        pool.give(credit);
+    }
+    {
+        let arrive = pool.take()?;
+        site_addr(&mut ops, &mut pool, arrive, sbase, SITE_ARRIVE)?;
+        let word = pool.take()?;
+        ops.push(MirOp::L1PollNonZero {
+            base: arrive,
+            reg: word,
+        });
+        ops.push(MirOp::Sw {
+            value: reg::ZERO,
+            base: arrive,
+            at: 0,
+        });
+        pool.give(word);
+        pool.give(arrive);
+    }
+    ops.push(MirOp::EndIf);
+
+    pool.give(sbase);
+    for op in ops {
+        m.push(Core::Reader, op);
+    }
+    Ok(())
+}
+
+/// One multicast write: the initiator's registers, then `CMD_CTRL`. It waits for
+/// the NIU to accept the request, not for its acknowledgements, so the second
+/// request of an `expand` can follow immediately.
+///
+/// The control word and the rectangle are read from the site's scratch, which
+/// keeps them off the mover's six registers. The word itself is tt-metal's
+/// `ncrisc_noc_fast_write` with `mcast` set (`noc_nonblocking_api.h:635-636`):
+/// `BRCST_PACKET`, `PATH_RESERVE`, `RESP_MARKED`, and the multicast class on the
+/// static virtual channel (`NOC_MULTICAST_WRITE_VC` = 4,
+/// `dataflow_api_common.h:58`).
+fn emit_mcast_request(
+    ops: &mut Vec<MirOp>,
+    pool: &mut Pool,
+    sbase: u8,
+    src: u8,
+    dest: u8,
+    len: u32,
+) -> Result<(), ttStatus> {
+    use tt_isa::arch::blackhole::noc::niu::initiator;
+    /// `CMD_WR | RESP_MARKED | BRCST_PACKET | VC_STATIC | PATH_RESERVE |
+    /// STATIC_VC(4)`: tt-metal's multicast fast write (`noc_nonblocking_api.h`,
+    /// `ncrisc_noc_fast_write` with `mcast` set), with `NOC_MULTICAST_WRITE_VC`
+    /// = 4 as the static channel (`dataflow_api_common.h:58`).
+    ///
+    /// `BRCST_XY` is left at zero — an x-major tree — for every rectangle.
+    /// tt-metal sets it from the caller's `multicast_mode`
+    /// (`firmware/src/tt-1xx/blackhole/noc.c:241`), but it picks the tree's
+    /// shape and not its recipients, and ttsim refuses the bit outright
+    /// (`noc_cmd_ctrl: noc_ctrl=0x181b2`). The shape is a routing choice to
+    /// revisit when the simulator models it.
+    const CTRL: u32 = 2 | (1 << 4) | (1 << 5) | (1 << 7) | (1 << 8) | (1 << 15);
+    let rect = pool.take()?;
+    load_at(ops, rect, sbase, SITE_RECT);
+    for (at, value) in [
+        (initiator::TARG_ADDR_LO, src),
+        (initiator::TARG_ADDR_MID, reg::ZERO),
+        (initiator::TARG_ADDR_HI, reg::T3),
+        (initiator::RET_ADDR_LO, dest),
+        (initiator::RET_ADDR_MID, reg::ZERO),
+        (initiator::RET_ADDR_HI, rect),
+    ] {
+        ops.push(MirOp::Sw {
+            value,
+            base: reg::T5,
+            at: at as i32,
+        });
+    }
+    let word = pool.take()?;
+    ops.push(MirOp::Li {
+        reg: word,
+        value: (crate::mover::TXN_MCAST.index() as u32) << 10,
+    });
+    ops.push(MirOp::Sw {
+        value: word,
+        base: reg::T5,
+        at: initiator::PACKET_TAG as i32,
+    });
+    for (value, at) in [
+        (CTRL, initiator::CTRL),
+        (len, initiator::AT_LEN_BE),
+        (0, initiator::AT_DATA),
+        (1, initiator::CMD_CTRL),
+    ] {
+        ops.push(MirOp::Li {
+            reg: word,
+            value,
+        });
+        ops.push(MirOp::Sw {
+            value: word,
+            base: reg::T5,
+            at: at as i32,
+        });
+    }
+    // Accepted, not completed: the initiator is free for the next request.
+    ops.push(MirOp::NiuPoll {
+        reg: word,
+        field: initiator::CMD_CTRL as i32,
+    });
+    pool.give(word);
+    pool.give(rect);
+    Ok(())
+}
+
+/// One atomic increment of a remote L1 word: a receiver's credit to its leader.
+/// This is tt-isa's `Command::AtomicIncrement` laid out by hand, as
+/// [`emit_request`] lays out a copy: `NOC_AT_LEN_BE`'s increment opcode, a
+/// full-width (`IntWidth` 31) add, and the word's place in its 16-byte unit. It
+/// waits for the transaction id to drain, so the credit has landed before the
+/// receiver goes on to wait for its page.
+fn emit_atomic_increment(
+    ops: &mut Vec<MirOp>,
+    pool: &mut Pool,
+    target: u8,
+    target_hi: u8,
+    ret: u8,
+    ofs: u32,
+) -> Result<(), ttStatus> {
+    use tt_isa::arch::blackhole::noc::niu::{
+        RESP_MARKED, STATIC_VC_1, initiator, reqs_outstanding,
+    };
+    const CMD_AT: u32 = 1;
+    const AT_INCREMENT: u32 = 1 << 12;
+    let word = pool.take()?;
+    for (at, value) in [
+        (initiator::TARG_ADDR_LO, target),
+        (initiator::TARG_ADDR_MID, reg::ZERO),
+        (initiator::TARG_ADDR_HI, target_hi),
+        (initiator::RET_ADDR_LO, ret),
+        (initiator::RET_ADDR_MID, reg::ZERO),
+        (initiator::RET_ADDR_HI, reg::T3),
+    ] {
+        ops.push(MirOp::Sw {
+            value,
+            base: reg::T5,
+            at: at as i32,
+        });
+    }
+    let len_be = AT_INCREMENT | (31 << 2) | ofs;
+    for (value, at) in [
+        ((crate::mover::TXN.index() as u32) << 10, initiator::PACKET_TAG),
+        (CMD_AT | RESP_MARKED | STATIC_VC_1, initiator::CTRL),
+        (len_be, initiator::AT_LEN_BE),
+        (1, initiator::AT_DATA),
+        (1, initiator::CMD_CTRL),
+    ] {
+        ops.push(MirOp::Li {
+            reg: word,
+            value,
+        });
+        ops.push(MirOp::Sw {
+            value: word,
+            base: reg::T5,
+            at: at as i32,
+        });
+    }
+    ops.push(MirOp::NiuPoll {
+        reg: word,
+        field: initiator::CMD_CTRL as i32,
+    });
+    ops.push(MirOp::Lw {
+        reg: word,
+        base: reg::T5,
+        at: initiator::CMD_CTRL as i32,
+    });
+    ops.push(MirOp::NiuPoll {
+        reg: word,
+        field: reqs_outstanding(crate::mover::TXN) as i32,
+    });
+    pool.give(word);
     Ok(())
 }
 
