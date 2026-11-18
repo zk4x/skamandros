@@ -126,6 +126,9 @@ struct Plan {
     ones: Option<OnesPage>,
     /// The staging page of each value the FPU reads that is not a `load`.
     staged: BTreeMap<OpId, Cb>,
+    /// The byte offset of each parameter's launch-argument block, in program
+    /// order. See [`crate::mover::arg_blocks`].
+    arg_block: Vec<i32>,
 }
 
 #[derive(Clone, Copy)]
@@ -191,6 +194,7 @@ fn prepare(k: &Kernel) -> Result<(Plan, MachineKernel, Alloc), ttStatus> {
         cb: BTreeMap::new(),
         ones: None,
         staged: BTreeMap::new(),
+        arg_block: Vec::new(),
     };
     for (id, op) in k.ops() {
         if let Op::Cb { dtype, page, len } = *op {
@@ -223,6 +227,7 @@ fn prepare(k: &Kernel) -> Result<(Plan, MachineKernel, Alloc), ttStatus> {
     }
     m.grid = crate::compile::grid_terms(k)?;
     m.params = crate::compile::parameter_kinds(k);
+    plan.arg_block = crate::mover::arg_blocks(&m.params);
     // The rings are placed *before* the walk: a mover that names a page's L1
     // address (a copy whose index is read out of a page) needs it here, and the
     // ring set is already final — the program's rings, the ones page and the
@@ -3056,10 +3061,11 @@ fn eval(
         }
         Op::Variable { .. } => {
             let index = *param.get(&value).ok_or(ttStatus::TT_TODO_LOOP_ADDRESS)?;
-            role.push(MirOp::LoadArg {
-                reg: dest,
-                arg: crate::mover::param_arg(index).0,
-            });
+            let arg = *plan
+                .arg_block
+                .get(index as usize)
+                .ok_or(ttStatus::TT_TODO_LOOP_ADDRESS)?;
+            role.push(MirOp::LoadArg { reg: dest, arg });
             Ok(())
         }
         Op::GridCoord { axis, .. } => {
@@ -4895,7 +4901,10 @@ fn copy_to(
             &mut pool,
             inbound,
             cb,
-            index,
+            *plan
+                .arg_block
+                .get(index as usize)
+                .ok_or(ttStatus::TT_ERROR_COPY_ENDS)?,
             bytes,
             value,
             None,
@@ -4954,7 +4963,10 @@ fn copy_to(
             &mut pool,
             inbound,
             cb,
-            index,
+            *plan
+                .arg_block
+                .get(index as usize)
+                .ok_or(ttStatus::TT_ERROR_COPY_ENDS)?,
             bytes,
             value,
             Some(counter),
@@ -4981,10 +4993,9 @@ fn copy_to(
 fn interleaved_address(
     ops: &mut Vec<MirOp>,
     pool: &mut Pool,
-    param: u32,
+    block: i32,
     value: u8,
 ) -> Result<(u8, u8), ttStatus> {
-    let block = crate::mover::param_block(param as usize);
     let page = pool.take()?;
     let banks = pool.take()?;
     ops.push(MirOp::Lw {
@@ -5101,7 +5112,7 @@ fn emit_request(
     pool: &mut Pool,
     inbound: bool,
     cb: Cb,
-    param: u32,
+    block: i32,
     bytes: u32,
     value: u8,
     lane: Option<u8>,
@@ -5112,9 +5123,9 @@ fn emit_request(
     if bytes == 0 || bytes > tt_isa::noc::niu::MAX_REQUEST_BYTES {
         return Err(ttStatus::TT_ERROR_NOC_REQUEST_BYTES);
     }
-    let (lo_arg, hi_arg) = crate::mover::param_arg(param);
+    let (lo_arg, hi_arg) = (block, block + 4);
     let (lo, hi) = if interleaved {
-        interleaved_address(ops, pool, param, value)?
+        interleaved_address(ops, pool, block, value)?
     } else {
         let lo = pool.take()?;
         let hi = pool.take()?;

@@ -557,6 +557,14 @@ pub fn all_images() -> Vec<(&'static str, &'static [u8])> {
     ]
 }
 
+/// FNV-1a over words: enough to skip rewriting an unchanged program or setup,
+/// not a correctness check on the words.
+fn hash_words(words: &[u32]) -> u64 {
+    words.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, word| {
+        (h ^ u64::from(*word)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 /// One Blackhole, reached through a TLB window.
 ///
 /// The transport is one field: [`Link::Sim`] is the `dlopen`ed simulator, and
@@ -597,6 +605,29 @@ pub struct Device {
     /// hash)`. The program cache is per tile, and a launch only names the
     /// address; an identical program on the same tile is not rewritten.
     placed: Vec<(NocCoord, u32, u64, u64)>,
+    /// Host-staged words already at their tile address, keyed by
+    /// `(tile x, tile y, address)`. A launch compares what it would write with
+    /// this and writes only the runs that differ, so a repeated launch has no
+    /// argument traffic at all and a first launch writes each block once.
+    staged: std::collections::HashMap<(u8, u8, u64), Vec<u32>>,
+    /// The value the next `l1_barrier` writes. Alternating means the word can
+    /// never already hold the value being written, so one write and one
+    /// read-back prove the write landed (tt-metal's two-phase
+    /// `insert_host_to_device_barrier` is this written out without knowing the
+    /// previous value).
+    barrier_flag: u32,
+    /// Tiles whose Tensix backend has been released from soft reset. Releasing
+    /// is idempotent, and the register read it costs is per launch otherwise.
+    backend_released: Vec<NocCoord>,
+    /// The setup program's hash each tile last ran to completion. Semaphores
+    /// end a clean launch at the values the setup wrote, so the same setup does
+    /// not have to run again on that tile.
+    setup_done: Vec<(NocCoord, u64)>,
+    /// Has the host written DRAM since the last barrier? A launch only needs
+    /// the DRAM barrier if it has: the barrier exists to make posted host
+    /// writes visible to the device, and a launch after no host write has
+    /// nothing to flush.
+    dram_dirty: bool,
 }
 
 impl Device {
@@ -641,6 +672,11 @@ impl Device {
             exec_started: Vec::new(),
             launch_seq: 0,
             placed: Vec::new(),
+            staged: std::collections::HashMap::new(),
+            barrier_flag: L1_BARRIER_SET,
+            backend_released: Vec::new(),
+            setup_done: Vec::new(),
+            dram_dirty: false,
         };
         // Before any tile is named: with translation off, a logical column number
         // is a physical one, and the first n of them are the wrong set.
@@ -703,6 +739,11 @@ impl Device {
             exec_started: Vec::new(),
             launch_seq: 0,
             placed: Vec::new(),
+            staged: std::collections::HashMap::new(),
+            barrier_flag: L1_BARRIER_SET,
+            backend_released: Vec::new(),
+            setup_done: Vec::new(),
+            dram_dirty: false,
         };
         // The ARC publishes every address the rest of this reads, so it is
         // waited for first, as tt-metal waits before it creates its messenger or
@@ -1440,6 +1481,7 @@ impl Device {
 
     /// Write `bytes` to DRAM at a flat address.
     pub fn dram_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), ttStatus> {
+        self.dram_dirty = true;
         if address & INTERLEAVED_TAG != 0 {
             return self.dram_write_interleaved(address, bytes);
         }
@@ -1470,6 +1512,17 @@ impl Device {
         Ok(())
     }
 
+    /// Has the host written DRAM since the last launch's barrier?
+    pub fn dram_dirty(&self) -> bool {
+        self.dram_dirty
+    }
+
+    /// Record that every host DRAM write so far has been made visible, so a
+    /// launch with no new writes does not pay for another barrier.
+    pub fn mark_dram_clean(&mut self) {
+        self.dram_dirty = false;
+    }
+
     /// Read DRAM at a flat address.
     pub fn dram_read(&mut self, address: u64, out: &mut [u8]) -> Result<(), ttStatus> {
         if address & INTERLEAVED_TAG != 0 {
@@ -1485,34 +1538,41 @@ impl Device {
     }
 
     /// Flush this tile's L1: write the barrier word and wait for it to read
-    /// back, twice with different values.
+    /// back.
     ///
     /// tt-metal's `l1_membar` -> `insert_host_to_device_barrier`
-    /// (`local_chip.cpp:472-508`): a barrier writes `0xAA`, waits for the tile
-    /// to show it, then does the same with `0xBB`, so every L1 write the host
-    /// made before it — the program, the launch words, the arguments — has
-    /// reached the tile before a core reads it. The word is
-    /// [`tt_isa::mailbox::BARRIER`], which no core reads: tt-metal's own
-    /// `MEM_L1_BARRIER` would land inside this driver's B image.
+    /// (`local_chip.cpp:472-508`) writes `0xAA`, waits for the tile to show it,
+    /// then does the same with `0xBB`, so a read that returns the value just
+    /// written cannot be a leftover from the previous barrier. This keeps that
+    /// guarantee with one phase by alternating the value across calls: the word
+    /// never already holds the one being written, so a read-back of it is proof
+    /// the write landed and, behind it, every earlier L1 write.
+    ///
+    /// The word is [`tt_isa::mailbox::BARRIER`], which no core reads: tt-metal's
+    /// own `MEM_L1_BARRIER` would land inside this driver's B image.
     pub fn l1_barrier(&mut self) -> Result<(), ttStatus> {
-        for flag in [L1_BARRIER_SET, L1_BARRIER_RESET] {
-            self.write32(mailbox::BARRIER, flag)?;
-            let mut polls = 0u32;
-            loop {
-                if self.read32(mailbox::BARRIER)? == flag {
-                    break;
-                }
-                polls += 1;
-                if polls == L1_BARRIER_POLLS {
-                    eprintln!(
-                        "libskamandros: the L1 barrier word at {:#x} of tile ({}, {}) did not \
-                         show {flag:#04x}; the host's writes are not reaching the tile",
-                        mailbox::BARRIER,
-                        self.tile.x(),
-                        self.tile.y()
-                    );
-                    return Err(ttStatus::TT_ERROR_DEVICE);
-                }
+        let flag = self.barrier_flag;
+        self.barrier_flag = if flag == L1_BARRIER_SET {
+            L1_BARRIER_RESET
+        } else {
+            L1_BARRIER_SET
+        };
+        self.write32(mailbox::BARRIER, flag)?;
+        let mut polls = 0u32;
+        loop {
+            if self.read32(mailbox::BARRIER)? == flag {
+                break;
+            }
+            polls += 1;
+            if polls == L1_BARRIER_POLLS {
+                eprintln!(
+                    "libskamandros: the L1 barrier word at {:#x} of tile ({}, {}) did not \
+                     show {flag:#04x}; the host's writes are not reaching the tile",
+                    mailbox::BARRIER,
+                    self.tile.x(),
+                    self.tile.y()
+                );
+                return Err(ttStatus::TT_ERROR_DEVICE);
             }
         }
         Ok(())
@@ -1520,12 +1580,71 @@ impl Device {
 
     /// Write into this tile's L1.
     pub fn l1_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), ttStatus> {
+        // A direct write invalidates what `stage_words` remembered at this
+        // address: the cache may only claim what is actually in L1. Staging
+        // ranges are disjoint, so the exact key is the only one that can be
+        // touched.
+        let tile = self.tile;
+        self.staged.remove(&(tile.x(), tile.y(), address));
+        self.l1_write_uncached(address, bytes)
+    }
+
+    fn l1_write_uncached(&mut self, address: u64, bytes: &[u8]) -> Result<(), ttStatus> {
         self.check_l1(address, bytes.len())?;
         let tile = self.tile;
         if DMA_ENABLED && bytes.len() >= DMA_MIN && self.dma_write(tile, address, bytes)? {
             return Ok(());
         }
         self.window_write(tile, address, bytes)
+    }
+
+    /// Write `words` at `at` unless they are already there, and then write only
+    /// the runs that changed.
+    ///
+    /// The launch path stages the same core info, argument arrays and launch
+    /// words on every tile of every launch. Their contents barely change between
+    /// launches (an argument array differs only in the tile's own coordinate
+    /// word for a fixed grid), and every unchanged dword is a PCIe store that
+    /// need not happen. The cache is per tile and address, and a direct
+    /// [`Device::l1_write`] to the same address drops the entry.
+    pub fn stage_words(&mut self, at: u64, words: &[u32]) -> Result<(), ttStatus> {
+        if words.is_empty() {
+            return Ok(());
+        }
+        self.check_l1(at, 4 * words.len())?;
+        let tile = self.tile;
+        let key = (tile.x(), tile.y(), at);
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        match self.staged.get(&key).filter(|w| w.len() == words.len()) {
+            Some(cached) => {
+                let mut start = None;
+                for j in 0..=words.len() {
+                    let differs = j < words.len() && cached[j] != words[j];
+                    match (differs, start) {
+                        (true, None) => start = Some(j),
+                        (false, Some(s)) => {
+                            runs.push((s, j));
+                            start = None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            None => runs.push((0, words.len())),
+        }
+        if runs.is_empty() {
+            return Ok(());
+        }
+        self.staged.remove(&key);
+        for (start, end) in runs {
+            let bytes: Vec<u8> = words[start..end]
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect();
+            self.l1_write_uncached(at + 4 * start as u64, &bytes)?;
+        }
+        self.staged.insert(key, words.to_vec());
+        Ok(())
     }
 
     /// Read one dword from the tile (an L1 word or a core register).
@@ -1594,9 +1713,17 @@ impl Device {
 
     /// Release the Tensix backend — unpackers, packers, Matrix Unit, Vector Unit
     /// and the rest — from soft reset, leaving the five RISC-V cores alone.
+    ///
+    /// Idempotent, so a tile whose backend is already out of reset costs
+    /// nothing after the first launch.
     pub fn release_tensix_backend(&mut self) -> Result<(), ttStatus> {
+        if self.backend_released.contains(&self.tile) {
+            return Ok(());
+        }
         let current = self.read32(tensix::SOFT_RESET_0)?;
-        self.write32(tensix::SOFT_RESET_0, current & !tensix::BACKEND_RESET_MASK)
+        self.write32(tensix::SOFT_RESET_0, current & !tensix::BACKEND_RESET_MASK)?;
+        self.backend_released.push(self.tile);
+        Ok(())
     }
 
     /// Wait until `predicate` accepts the word at `address`.
@@ -1684,6 +1811,10 @@ impl Device {
         // stages it again instead of waiting on a mailbox nobody will write.
         self.exec_started.clear();
         self.placed.clear();
+        // What was staged is only valid until the cores are reset, and the
+        // semaphores are no longer known to hold the setup program's values.
+        self.staged.clear();
+        self.setup_done.clear();
         first
     }
 
@@ -1741,6 +1872,12 @@ impl Device {
             for &(core, _, _) in &EXEC_SUBORDINATES {
                 self.set_core_reset(core, false)?;
             }
+            // This boot cleared the tile's mailboxes behind the staging cache's
+            // back.
+            let tile = self.tile;
+            self.staged
+                .retain(|&(x, y, _), _| (x, y) != (tile.x(), tile.y()));
+            self.setup_done.retain(|(t, _)| *t != tile);
             self.exec_started.push(self.tile);
             Ok(())
         }
@@ -1791,9 +1928,7 @@ impl Device {
         }
         // FNV-1a: enough to skip rewriting an unchanged program, not a
         // correctness check on the words.
-        let hash = words.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, word| {
-            (h ^ u64::from(*word)).wrapping_mul(0x0000_0100_0000_01b3)
-        });
+        let hash = hash_words(words);
         let len = words.len() as u64;
         if self.placed.iter().any(|&(t, a, l, h)| {
             t.x() == self.tile.x() && t.y() == self.tile.y() && a == at && l == len && h == hash
@@ -1808,10 +1943,33 @@ impl Device {
         Ok(())
     }
 
-    /// Write a launch message without starting it: the text address, its length,
-    /// the arguments base, and a cleared generation and `ACK`. The dispatcher
-    /// names a subordinate's program this way, then writes the generation that
-    /// starts it.
+    /// Has this tile already run this exact setup program to completion?
+    ///
+    /// The setup is `SEMINIT` per semaphore on the role cores. A launch that
+    /// completes cleanly leaves every semaphore at the value the setup wrote,
+    /// so the same setup words do not have to run again on that tile; T0's
+    /// launch, its L1 barrier and its completion poll are then all saved.
+    pub fn setup_ran(&self, words: &[u32]) -> bool {
+        let hash = hash_words(words);
+        self.setup_done
+            .iter()
+            .any(|&(t, h)| t == self.tile && h == hash)
+    }
+
+    /// Record that this tile has run `words` as its setup program.
+    pub fn note_setup(&mut self, words: &[u32]) {
+        let hash = hash_words(words);
+        self.setup_done.retain(|&(t, _)| t != self.tile);
+        self.setup_done.push((self.tile, hash));
+    }
+
+    /// Write a launch message without starting it: the text address, its length
+    /// and the arguments base.
+    ///
+    /// The generation and `ACK` are not cleared here: the generation a launch
+    /// writes is new, so a stale `ACK` can never equal it, and clearing it is a
+    /// store nobody reads. A subordinate is named before the dispatcher writes
+    /// the generation that starts it.
     pub fn prepare(
         &mut self,
         mb: mailbox::launch::Mailbox,
@@ -1819,11 +1977,9 @@ impl Device {
         words: u32,
         args: u32,
     ) -> Result<(), ttStatus> {
-        self.write32(mb.program_addr(), text)?;
-        self.write32(mb.program_len(), words)?;
-        self.write32(mb.args(), args)?;
-        self.write32(mb.ack(), 0)?;
-        self.write32(mb.generation(), 0)?;
+        self.stage_words(mb.program_addr(), &[text])?;
+        self.stage_words(mb.program_len(), &[words])?;
+        self.stage_words(mb.args(), &[args])?;
         Ok(())
     }
 
@@ -1833,7 +1989,8 @@ impl Device {
     pub fn start(&mut self, mb: mailbox::launch::Mailbox) -> Result<u32, ttStatus> {
         self.launch_seq = self.launch_seq.wrapping_add(1).max(1);
         let generation = self.launch_seq;
-        self.write32(mb.ack(), 0)?;
+        // One store: the generation is the word the core polls, and it is new,
+        // so it cannot be mistaken for the run before it.
         self.write32(mb.generation(), generation)?;
         Ok(generation)
     }
@@ -1850,7 +2007,7 @@ impl Device {
         enables: u32,
     ) -> Result<u32, ttStatus> {
         self.prepare(mb, text, words, args)?;
-        self.write32(mb.enables(), enables)?;
+        self.stage_words(mb.enables(), &[enables])?;
         self.start(mb)
     }
 

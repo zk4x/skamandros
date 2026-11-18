@@ -23,6 +23,7 @@
 use std::collections::BTreeMap;
 
 use crate::ir::{Kernel, Op, OpId, ValueKind};
+use crate::module::ParamKind;
 use crate::status::ttStatus;
 use tt_isa::noc::niu::TxnId;
 
@@ -39,31 +40,40 @@ pub const ARG_HEAD: usize = 4;
 /// The launch argument word that holds the CB interface table's address.
 pub const ARG_IFACE: usize = 2;
 
-/// The byte offsets of the launch-argument block a parameter occupies.
-///
-/// Every parameter's block is [`INTERLEAVED_WORDS`] wide, whatever its kind:
-/// one `(offset, endpoint)` pair per DRAM channel, then the channel count and
-/// the page size. A scalar or a contiguous tensor uses the first pair and a
-/// count of one; an interleaved tensor lets the mover resolve a page's channel
-/// on the core, which is tt-metal's `InterleavedAddrGen` /
-/// `get_noc_addr_from_bank_id`. A fixed width keeps the layout a function of
-/// the parameter's index alone, on both the compiler's side and the runtime's.
-pub fn param_arg(param: u32) -> (i32, i32) {
-    let lo = param_block(param as usize);
-    (lo, lo + 4)
-}
-
 /// The most channels a parameter can be striped over: every channel a
 /// Blackhole can have.
 pub const MAX_BANKS: usize = tt_isa::dram::CHANNELS as usize;
 
-/// Words a parameter's block occupies: a pair per channel, then the channel
-/// count and the page size.
+/// Words an interleaved parameter's block occupies: a pair per channel, then
+/// the channel count and the page size.
 pub const INTERLEAVED_WORDS: usize = 2 * MAX_BANKS + 2;
 
-/// The byte offset of parameter `index`'s block in the launch arguments.
-pub fn param_block(index: usize) -> i32 {
-    ((ARG_HEAD + INTERLEAVED_WORDS * index) * 4) as i32
+/// Words one parameter's argument block occupies.
+///
+/// A scalar and a contiguous tensor take one `(offset, endpoint)` pair. An
+/// interleaved tensor takes [`INTERLEAVED_WORDS`], which is what lets the mover
+/// resolve a page's channel on the core (tt-metal's `InterleavedAddrGen` /
+/// `get_noc_addr_from_bank_id`). The width is a function of the parameter's
+/// kind, so the layout is still a function of the parameter's index alone on
+/// both the compiler's side and the runtime's — without making every ordinary
+/// parameter pay for the striped case's channel table.
+pub const fn arg_words(kind: ParamKind) -> usize {
+    match kind {
+        ParamKind::Scalar | ParamKind::Tensor => 2,
+        ParamKind::Interleaved => INTERLEAVED_WORDS,
+    }
+}
+
+/// The byte offset of each parameter's block in the launch arguments, in
+/// program order.
+pub fn arg_blocks(params: &[ParamKind]) -> Vec<i32> {
+    let mut words = ARG_HEAD;
+    let mut blocks = Vec::with_capacity(params.len());
+    for kind in params {
+        blocks.push((words * 4) as i32);
+        words += arg_words(*kind);
+    }
+    blocks
 }
 
 /// The byte offset, inside a parameter's block, of its channel count and its

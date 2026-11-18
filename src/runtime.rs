@@ -264,9 +264,12 @@ fn args_for(
         for (index, kind) in module.params.iter().enumerate() {
             let word = params[index];
             let channel_bytes = tt_isa::dram::CHANNEL_BYTES;
-            if let Some(layout) = device.interleaved_at(word) {
+            if *kind == crate::compile::ParamKind::Interleaved {
                 // A striped tensor: a pair per channel, then the count and the
                 // page, exactly what the mover's address arithmetic reads.
+                let layout = device
+                    .interleaved_at(word)
+                    .ok_or(ttStatus::TT_ERROR_ARGUMENT)?;
                 let mut pairs = 0u32;
                 for (bank, base) in layout.base.iter().enumerate() {
                     let flat = u64::from(bank as u32) * channel_bytes + base;
@@ -278,7 +281,7 @@ fn args_for(
                     args.push(0);
                     args.push(0);
                 }
-                args.push(pairs as u32);
+                args.push(pairs);
                 args.push(layout.page);
                 continue;
             }
@@ -289,21 +292,13 @@ fn args_for(
                 // `get_noc_addr_from_bank_id` does: the endpoint comes from the
                 // bank, the address is the bank-local offset
                 // (`dataflow_api_addrgen.h:516-533`).
-                crate::compile::ParamKind::Tensor | crate::compile::ParamKind::Interleaved => {
+                _ => {
                     let hi = device.dram_hi(word, *niu)?;
                     ((word % channel_bytes) as u32, hi)
                 }
             };
-            // The plain pair, then the unused channels and the "one channel,
-            // no page" count the block's fixed width expects.
             args.push(low);
             args.push(high);
-            for _ in 1..crate::mover::MAX_BANKS {
-                args.push(0);
-                args.push(0);
-            }
-            args.push(1);
-            args.push(0);
         }
         if (args_at(*niu) as u64) + 4 * args.len() as u64 > tt_isa::l1::PROGRAM_CACHE.end {
             let _ = args.len();
@@ -334,30 +329,37 @@ fn launch_steps(
     // `local_chip.cpp:446-476`), because a host write is posted and may land on
     // any bank after the launch reads it. An address is `channel *
     // CHANNEL_BYTES`, so the same word is written on each channel in turn.
-    for flag in [BARRIER_SET, BARRIER_RESET] {
-        for channel in device.dram_channels() {
-            let at = u64::from(channel.index()) * CHANNEL_BYTES + DRAM_BARRIER;
-            device.dram_write(at, &flag.to_le_bytes())?;
-            let mut back = [0u8; 4];
-            let mut polls = 0u32;
-            loop {
-                device.dram_read(at, &mut back)?;
-                if u32::from_le_bytes(back) == flag {
-                    break;
-                }
-                polls += 1;
-                if polls == BARRIER_POLLS {
-                    eprintln!(
-                        "libskamandros: the DRAM barrier word at offset {DRAM_BARRIER:#x} of \
-                         channel {} still reads {:#010x}, not {flag:#010x}: the host's writes are \
-                         not reaching that channel",
-                        channel.index(),
-                        u32::from_le_bytes(back)
-                    );
-                    return Err(ttStatus::TT_ERROR_DEVICE);
+    //
+    // Only when this process has written DRAM since the last launch: the
+    // barrier exists for posted host writes, and a launch with none has nothing
+    // to flush. The kernel's own DRAM writes are ordered by its NoC requests.
+    if device.dram_dirty() {
+        for flag in [BARRIER_SET, BARRIER_RESET] {
+            for channel in device.dram_channels() {
+                let at = u64::from(channel.index()) * CHANNEL_BYTES + DRAM_BARRIER;
+                device.dram_write(at, &flag.to_le_bytes())?;
+                let mut back = [0u8; 4];
+                let mut polls = 0u32;
+                loop {
+                    device.dram_read(at, &mut back)?;
+                    if u32::from_le_bytes(back) == flag {
+                        break;
+                    }
+                    polls += 1;
+                    if polls == BARRIER_POLLS {
+                        eprintln!(
+                            "libskamandros: the DRAM barrier word at offset {DRAM_BARRIER:#x} of \
+                             channel {} still reads {:#010x}, not {flag:#010x}: the host's writes \
+                             are not reaching that channel",
+                            channel.index(),
+                            u32::from_le_bytes(back)
+                        );
+                        return Err(ttStatus::TT_ERROR_DEVICE);
+                    }
                 }
             }
         }
+        device.mark_dram_clean();
     }
 
     // The logical grid the module asks for, as physical tiles, row-major. Each
@@ -408,35 +410,36 @@ fn launch_steps(
                 )?);
             }
             let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            // Not staged: the cores advance the ring's read and write pointers
+            // in this table, so each launch starts them from the base again —
+            // tt-metal's `setup_local_cb_read_write_interfaces` runs per launch
+            // for the same reason.
             device.l1_write(u64::from(module.iface), &bytes)?;
         }
         // This core's logical coordinate, host-written like tt-metal's
         // `core_info`: `%x = grid.x` and `%y = grid.y` read it.
-        let mut info = Vec::with_capacity(8);
-        info.extend_from_slice(&x.to_le_bytes());
-        info.extend_from_slice(&y.to_le_bytes());
-        device.l1_write(u64::from(crate::mir::CORE_INFO), &info)?;
+        device.stage_words(u64::from(crate::mir::CORE_INFO), &[*x, *y])?;
         // The mover's `USABLE` mailbox: the chip's `ENABLED_GDDR` word, in the
         // compacted logical channel numbering its decoder uses
         // (`tt_isa::dm::Descriptor::decode`). The mover reads it once when it
         // starts, so it lands before the executor is released.
         let mask = device.dram_mask();
-        device.write32(tt_isa::dm::USABLE, mask)?;
+        device.stage_words(tt_isa::dm::USABLE, &[mask])?;
         if compute {
             device.release_tensix_backend()?;
         }
         device.start_executors()?;
         let [args, writer_args] = args_for(device, module, params, grid, *tile)?.map(|(_, v)| v);
-        // Write both arrays before the first core starts, not only as a side
-        // effect of a mover run.
-        for (at, words) in [(ARGS_AT, &args), (ARGS_WRITER, &writer_args)] {
-            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-            device.l1_write(u64::from(at), &bytes)?;
-        }
-        // The semaphore and unpacker setup runs on T0 first and to completion,
-        // as BRISC initialises the semaphores before it releases the TRISCs. A
+        // Both arrays before the first core starts, not only as a side effect of
+        // a mover run. Staged: a repeat launch writes only the words that differ.
+        device.stage_words(u64::from(ARGS_AT), &args)?;
+        device.stage_words(u64::from(ARGS_WRITER), &writer_args)?;
+        // The semaphore setup runs on T0 first and to completion, as BRISC
+        // initialises the semaphores before it releases the TRISCs. A launch
+        // that completes cleanly leaves the semaphores at the values it wrote,
+        // so this is once per tile per distinct setup, not once per launch. A
         // launch with no compute program has no semaphores to set up.
-        if compute && !module.setup.is_empty() {
+        if compute && !module.setup.is_empty() && !device.setup_ran(&module.setup) {
             stage_role(device, 0, &module.setup, ARGS_AT)?;
             // The arguments and the setup program are in L1; the generation that
             // starts T0 on them is a store to a different address, so the tile
@@ -446,6 +449,7 @@ fn launch_steps(
             let mb = mailbox::launch::Mailbox::of(0);
             let generation = device.start(mb)?;
             device.await_launch(mb, generation)?;
+            device.note_setup(&module.setup);
         }
 
         // Name every program of the launch. B is dispatched once and starts
@@ -527,14 +531,22 @@ fn stage_role(
     let mb = mailbox::launch::Mailbox::of(thread as u32);
     let text = slot(ROLE_SLOT[thread]);
     device.place(text, words)?;
-    device.write32(mb.thread_index(), thread as u32)?;
-    device.write32(mb.dst_access_fmt(), 0)?;
-    device.write32(mb.dump_row_first(), 0)?;
-    device.write32(mb.dump_row_count(), 0)?;
-    device.write32(mb.trace(), 0)?;
-    device.write32(mb.push_window(), 0)?;
-    device.write32(mb.unwedge(), 0)?;
-    device.write32(mb.mop_cfg_valid(), 0)?;
+    // The role's configuration words are host state the executor never
+    // touches, so staging them costs nothing on a repeat launch.
+    for (at, value) in [
+        (mb.thread_index(), thread as u32),
+        (mb.dst_access_fmt(), 0),
+        (mb.dump_row_first(), 0),
+        (mb.dump_row_count(), 0),
+        (mb.trace(), 0),
+        (mb.push_window(), 0),
+        (mb.unwedge(), 0),
+        (mb.mop_cfg_valid(), 0),
+    ] {
+        device.stage_words(at, &[value])?;
+    }
+    // `status` is written by the executor at start and finish, so clearing it
+    // is a direct write the staging cache must not remember.
     device.write32(mb.status(), 0)?;
     device.prepare(mb, text, words.len() as u32, args_at)
 }
