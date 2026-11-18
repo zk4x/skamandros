@@ -370,6 +370,15 @@ pub enum MirOp {
         op: ElwOp,
         bcast: Bcast,
         addr_mod: u32,
+        /// The `Src` banks this instruction hands back to the unpacker
+        /// (`clear_dvalid`: 1 `SrcA`, 2 `SrcB`, 3 both). tt-metal's broadcast
+        /// MOP clears `SrcB` after the last instruction of every face and both
+        /// after the last face (`llk_math_eltwise_binary_broadcast.h:117-126`).
+        clear: u32,
+        /// `dest_accum_en`: add this pass into the `Dst` rows instead of
+        /// overwriting them, which is how a multiply's fidelity phases add up
+        /// (`llk_math_eltwise_binary_broadcast.h:41-45`).
+        accum: bool,
         reg: Dst,
         at: u32,
     },
@@ -987,15 +996,25 @@ fn write_op(f: &mut dyn fmt::Write, op: &MirOp) -> fmt::Result {
             op,
             bcast,
             addr_mod,
+            clear,
+            accum,
             reg,
             at,
-        } => write!(
-            f,
-            "elw{} {} {}, am{addr_mod}",
-            elw_name(op),
-            dst_addr(reg, at),
-            bcast_name(bcast)
-        ),
+        } => {
+            let clear = if clear != 0 {
+                format_args!(" clr{clear}")
+            } else {
+                format_args!("")
+            };
+            write!(
+                f,
+                "elw{} {}, am{addr_mod} {}{clear}{}",
+                elw_name(op),
+                dst_addr(reg, at),
+                bcast_name(bcast),
+                if accum { " accum" } else { "" }
+            )
+        }
         MirOp::Gapool {
             flip_src_b,
             flip_src_a,

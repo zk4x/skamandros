@@ -2191,6 +2191,8 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                                         op: ElwOp::Add,
                                         bcast: Bcast::None,
                                         addr_mod: 2,
+                                        clear: 0,
+                                        accum: false,
                                         reg: base,
                                         at: dst_off,
                                     },
@@ -3070,6 +3072,31 @@ fn fpu_broadcast(
             m.push(Core::Unpack, MirOp::CbWait { cb, n: 1 });
         }
     }
+    // One face is two instructions of eight rows. `ELWMUL` is the Matrix
+    // Unit's *sliced* multiply: one pass takes the top four mantissa bits of
+    // each operand and each further phase adds the next slice into the same
+    // `Dst` rows, so a single pass is a five-bit product. tt-metal's
+    // `MathFidelity` counts those passes and its softmax configures `HiFi4`;
+    // `ELWADD`/`ELWSUB` are one pass at any fidelity, which is why only the
+    // multiply repeats.
+    //
+    // Quasar then applies `math_fidelity_schedule` (`cmath_common.h:45-78`),
+    // which drops the passes the register formats cannot use: a `Tf32` `Src`
+    // carries every low mantissa bit, a `Float16_b` one carries none, so a bf16
+    // operand takes away the phase that would read it (qsr checks exactly
+    // this: `check_fidelity_phase: fidelity_phase=1 src_a_fmt=5 ... one phase
+    // covers SrcA`). Blackhole's `Src` has no per-format phase count — every
+    // pass slices the same registers — so it keeps the requested `HiFi4`.
+    let wide = |dt: crate::ir::DType| matches!(dt, crate::ir::DType::F32);
+    let phases: u32 = if !matches!(op, BOp::Mul) {
+        1
+    } else if target != Target::Quasar || (wide(dt_a) && wide(dt_b)) {
+        4
+    } else if wide(dt_a) || wide(dt_b) {
+        2
+    } else {
+        1
+    };
     // The counters start at 0 and `ADDR_MOD_0` steps `SrcA` and `Dst` eight
     // rows per instruction, and `SrcB` too unless the broadcast holds it still.
     m.push(
@@ -3083,93 +3110,152 @@ fn fpu_broadcast(
             dst_cr: false,
         },
     );
-    m.push(
-        Core::Math,
-        thread_word(&[
-            (thread::ADDR_MOD_AB_SEC0_SrcAIncr, 8),
-            (
-                thread::ADDR_MOD_AB_SEC0_SrcBIncr,
-                match bcast {
-                    Bcast::Col => 8u16,
-                    Bcast::Row | Bcast::Scalar => 0,
-                    Bcast::None => {
-                        return Err(crate::status::internal_bug(
-                            "lower: the FPU broadcast has no broadcast mode",
-                        ));
-                    }
-                },
-            ),
-            (thread::ADDR_MOD_AB_SEC0_SrcBClear, 0),
-            (thread::ADDR_MOD_AB_SEC0_SrcAClear, 0),
-        ])?,
-    );
-    m.push(
-        Core::Math,
-        thread_word(&[
-            (thread::ADDR_MOD_DST_SEC0_DestIncr, 0),
-            (thread::ADDR_MOD_DST_SEC0_DestCR, 0),
-            // The last phase of a multiply hands the phase counter back to 0.
-            (thread::ADDR_MOD_DST_SEC0_FidelityClear, 1),
-        ])?,
-    );
-    // `ADDR_MOD_1`: the next fidelity phase of the same eight rows — no
-    // counter moves, only the phase, so the instruction re-multiplies the same
-    // operands' next mantissa slice into the same `Dst` rows.
-    m.push(
-        Core::Math,
-        thread_word(&[
-            (thread::ADDR_MOD_AB_SEC1_SrcAIncr, 0),
-            (thread::ADDR_MOD_AB_SEC1_SrcBIncr, 0),
-            (thread::ADDR_MOD_AB_SEC1_SrcBClear, 0),
-            (thread::ADDR_MOD_AB_SEC1_SrcAClear, 0),
-        ])?,
-    );
-    m.push(
-        Core::Math,
-        thread_word(&[
-            (thread::ADDR_MOD_DST_SEC1_DestIncr, 0),
-            (thread::ADDR_MOD_DST_SEC1_DestCR, 0),
-            (thread::ADDR_MOD_DST_SEC1_FidelityIncr, 1),
-        ])?,
-    );
-    // The section is written, never accumulated into; `reg_sync` places the wait
-    // for a packer that still reads it.
-    // `ELWMUL`'s word carries bit 21 set, so the hardware accumulates into the
-    // destination (tt-isa's measured encoding; `ELWADD`/`ELWSUB` overwrite).
-    // That is also how the four fidelity phases add up, so the result section is
-    // zeroed first and the phases accumulate onto nothing.
-    if matches!(op, BOp::Mul) {
+    // The two chips' unpackers hand the broadcast over differently: Quasar has
+    // no `Src` destination-face counter and hands each bank back on the ELW
+    // itself, while Blackhole's `SETADCZW` names both faces and its `SETRWC`
+    // clears the banks between them. The Quasar arm is tt-metal's
+    // `llk_unpack_binary_broadcast_operands.h` / `llk_math_eltwise_binary_broadcast.h`
+    // pair, op for op.
+    if target == Target::Quasar {
+        // `_llk_math_eltwise_binary_broadcast_addrmod_`
+        // (`llk_math_eltwise_binary_broadcast.h:129-166`), slot for slot:
+        //
+        // - 0: eight `SrcA` rows, `SrcB` eight rows only for a column broadcast,
+        //   and the fidelity phase cleared once the multiply's passes are done.
+        // - 1: the counters go back to 0 and the phase is cleared — the last
+        //   instruction of the fold.
+        // - 2: a column broadcast's face start: `SrcA` moves, `SrcB`'s counter
+        //   clears so the next face reads its own row 0.
+        // - 3: no counter moves, only the next fidelity phase.
+        //
+        // `Dst` never moves here: the eight-row band is the instruction's own
+        // operand, so the counter stays where the fold started.
         m.push(
             Core::Math,
-            MirOp::LaneConst {
-                lreg: LReg(0),
-                bits: 0.0f32.to_bits(),
-            },
+            thread_word(&[
+                (thread::ADDR_MOD_AB_SEC0_SrcAIncr, 8),
+                (
+                    thread::ADDR_MOD_AB_SEC0_SrcBIncr,
+                    match bcast {
+                        Bcast::Col => 8u16,
+                        Bcast::Row | Bcast::Scalar => 0,
+                        Bcast::None => {
+                            return Err(crate::status::internal_bug(
+                                "lower: the FPU broadcast has no broadcast mode",
+                            ));
+                        }
+                    },
+                ),
+                (thread::ADDR_MOD_AB_SEC0_SrcBClear, 0),
+                (thread::ADDR_MOD_AB_SEC0_SrcAClear, 0),
+            ])?,
         );
-        for row in (0..DST_ROWS).step_by(2) {
+        m.push(
+            Core::Math,
+            thread_word(&[
+                (thread::ADDR_MOD_DST_SEC0_DestIncr, 0),
+                (thread::ADDR_MOD_DST_SEC0_DestCR, 0),
+                (
+                    thread::ADDR_MOD_DST_SEC0_FidelityClear,
+                    u16::from(phases > 1),
+                ),
+            ])?,
+        );
+        m.push(
+            Core::Math,
+            thread_word(&[
+                (thread::ADDR_MOD_AB_SEC1_SrcAIncr, 0),
+                (thread::ADDR_MOD_AB_SEC1_SrcBIncr, 0),
+                (thread::ADDR_MOD_AB_SEC1_SrcBClear, 1),
+                (thread::ADDR_MOD_AB_SEC1_SrcAClear, 1),
+            ])?,
+        );
+        m.push(
+            Core::Math,
+            thread_word(&[
+                (thread::ADDR_MOD_DST_SEC1_DestIncr, 0),
+                (thread::ADDR_MOD_DST_SEC1_DestCR, 0),
+                (thread::ADDR_MOD_DST_SEC1_FidelityClear, 1),
+            ])?,
+        );
+        if bcast == Bcast::Col {
             m.push(
                 Core::Math,
-                MirOp::Sfpstore {
-                    lreg: LReg(0),
-                    reg: out,
-                    at: row,
-                    dtype: if m.dst_is_16_bit {
-                        crate::ir::DType::Bf16
-                    } else {
-                        crate::ir::DType::F32
-                    },
-                },
+                thread_word(&[
+                    (thread::ADDR_MOD_AB_SEC2_SrcAIncr, 8),
+                    (thread::ADDR_MOD_AB_SEC2_SrcBIncr, 0),
+                    (thread::ADDR_MOD_AB_SEC2_SrcBClear, 1),
+                    (thread::ADDR_MOD_AB_SEC2_SrcAClear, 0),
+                ])?,
+            );
+            m.push(
+                Core::Math,
+                thread_word(&[
+                    (thread::ADDR_MOD_DST_SEC2_DestIncr, 0),
+                    (thread::ADDR_MOD_DST_SEC2_DestCR, 0),
+                    (thread::ADDR_MOD_DST_SEC2_FidelityClear, 1),
+                ])?,
             );
         }
-    }
-    for face in 0..4u32 {
+        if phases > 1 {
+            m.push(
+                Core::Math,
+                thread_word(&[
+                    (thread::ADDR_MOD_AB_SEC3_SrcAIncr, 0),
+                    (thread::ADDR_MOD_AB_SEC3_SrcBIncr, 0),
+                    (thread::ADDR_MOD_AB_SEC3_SrcBClear, 0),
+                    (thread::ADDR_MOD_AB_SEC3_SrcAClear, 0),
+                ])?,
+            );
+            m.push(
+                Core::Math,
+                thread_word(&[
+                    (thread::ADDR_MOD_DST_SEC3_DestIncr, 0),
+                    (thread::ADDR_MOD_DST_SEC3_DestCR, 0),
+                    (thread::ADDR_MOD_DST_SEC3_FidelityIncr, 1),
+                ])?,
+            );
+        }
+        // The section is written, never accumulated into; `reg_sync` places the wait
+        // for a packer that still reads it.
+        // `ELWMUL`'s word carries bit 21 set, so the hardware accumulates into the
+        // destination (tt-isa's measured encoding; `ELWADD`/`ELWSUB` overwrite).
+        // That is also how the four fidelity phases add up, so the result section is
+        // zeroed first and the phases accumulate onto nothing.
+        if matches!(op, BOp::Mul) {
+            m.push(
+                Core::Math,
+                MirOp::LaneConst {
+                    lreg: LReg(0),
+                    bits: 0.0f32.to_bits(),
+                },
+            );
+            for row in (0..DST_ROWS).step_by(2) {
+                m.push(
+                    Core::Math,
+                    MirOp::Sfpstore {
+                        lreg: LReg(0),
+                        reg: out,
+                        at: row,
+                        dtype: if m.dst_is_16_bit {
+                            crate::ir::DType::Bf16
+                        } else {
+                            crate::ir::DType::F32
+                        },
+                    },
+                );
+            }
+        }
+        // `SrcA`: the whole tile once, before the fold. tt-metal's MOP runs
+        // `unpack_srca_tile_inc` once per tile and has the math step `SrcA` a row
+        // band at a time (`llk_unpack_binary_broadcast_operands.h:105-118`).
         m.push(
             Core::Unpack,
             MirOp::Setadczw {
                 u0: true,
                 u1: false,
-                z0: Some(face),
-                z1: None,
+                z0: Some(0),
+                z1: Some(0),
             },
         );
         m.push(
@@ -3188,62 +3274,28 @@ fn fpu_broadcast(
             Core::Unpack,
             MirOp::Unpacr {
                 unit: 0,
-                count: FACE_DATUMS,
+                count: TILE_DATUMS,
                 flip: true,
             },
         );
-        // `SrcB`: the page face the FPU reads for `SrcA`'s face. A narrow
-        // value's page keeps only its own part, so both halves of the tile read
-        // the same face: a row's faces 0 and 1 (row 0) serve the tile's four
-        // faces two at a time, and a column's faces 0 and 2 (column 0) serve
-        // each pair of face rows.
-        let b_face = match bcast {
+        // Which page face of the narrow value `SrcA`'s face reads, and how many
+        // faces the unpacker posts. A row's faces 0 and 1 hold the row's two halves
+        // and serve the tile's faces two at a time; a column's faces 0 and 2 hold
+        // its two halves and each serves a pair of face rows; a scalar is one datum,
+        // posted once (`srcb_face_index`, `llk_unpack_binary_broadcast_operands.h:45-58`).
+        let b_face = |face: u32| match bcast {
             Bcast::Row => face & 1,
             Bcast::Col => face & !1,
-            Bcast::Scalar => 0,
-            Bcast::None => {
-                return Err(crate::status::internal_bug(
-                    "lower: the FPU broadcast has no broadcast mode",
-                ));
-            }
+            Bcast::Scalar | Bcast::None => 0,
         };
-        m.push(
-            Core::Unpack,
-            MirOp::Setadczw {
-                u0: false,
-                u1: true,
-                z0: Some(b_face),
-                z1: None,
-            },
-        );
-        m.push(
-            Core::Unpack,
-            MirOp::UnpackConfig {
-                unit: 1,
-                to_src: true,
-                dtype: dt_b,
-                haloize: false,
-                add_dest_cntr: false,
-                ch1_z_stride: 0,
-            },
-        );
-        m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 1 });
-        m.push(
-            Core::Unpack,
-            MirOp::Unpacr {
-                unit: 1,
-                count: FACE_DATUMS,
-                flip: true,
-            },
-        );
+        let srcb_posts = if bcast == Bcast::Scalar { 1 } else { 4 };
         // One face is two instructions of eight rows. `ELWMUL` is the Matrix
         // Unit's *sliced* multiply: one pass takes the top four mantissa bits of
         // each operand and each further phase adds the next slice into the same
         // `Dst` rows, so a single pass is a five-bit product. tt-metal's
         // `MathFidelity` counts those passes and its softmax configures
         // `HiFi4`; `ELWADD`/`ELWSUB` are one pass at any fidelity, which is why
-        // only the multiply repeats. The last pass clears the phase and steps
-        // the counters on to the next eight rows.
+        // only the multiply repeats. The last pass clears the phase.
         //
         // Quasar then applies `math_fidelity_schedule` (`cmath_common.h:45-78`),
         // which drops the passes the register formats cannot use: a `Tf32` `Src`
@@ -3253,55 +3305,300 @@ fn fpu_broadcast(
         // one phase covers SrcA`). Blackhole's `Src` has no per-format phase
         // count — every pass slices the same registers — so it keeps the
         // requested `HiFi4`.
-        let wide = |dt: crate::ir::DType| matches!(dt, crate::ir::DType::F32);
-        let phases: u32 = if !matches!(op, BOp::Mul) {
-            1
-        } else if target != Target::Quasar || (wide(dt_a) && wide(dt_b)) {
-            4
-        } else if wide(dt_a) || wide(dt_b) {
-            2
-        } else {
-            1
-        };
-        for half in 0..2u32 {
-            for phase in 0..phases {
+        for face in 0..4u32 {
+            // `SrcB`: this face's broadcast face, into the bank's face 0 — the one
+            // face the math re-reads (`llk_unpack_binary_broadcast_operands.h:130-142`:
+            // `UNPACR1_FACE(0 /*Dst Face Idx*/, srcb_face_index(face), ...)`).
+            if face < srcb_posts {
+                m.push(
+                    Core::Unpack,
+                    MirOp::Setadczw {
+                        u0: false,
+                        u1: true,
+                        z0: Some(b_face(face)),
+                        z1: Some(0),
+                    },
+                );
+                m.push(
+                    Core::Unpack,
+                    MirOp::UnpackConfig {
+                        unit: 1,
+                        to_src: true,
+                        dtype: dt_b,
+                        haloize: false,
+                        add_dest_cntr: false,
+                        ch1_z_stride: 0,
+                    },
+                );
+                m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 1 });
+                m.push(
+                    Core::Unpack,
+                    MirOp::Unpacr {
+                        unit: 1,
+                        count: FACE_DATUMS,
+                        flip: true,
+                    },
+                );
+            }
+            for half in 0..2u32 {
+                for phase in 0..phases {
+                    let last_phase = phase + 1 == phases;
+                    let last_half = half == 1;
+                    // The address modifiers are tt-metal's
+                    // (`_llk_math_eltwise_binary_broadcast_addrmod_`): the phase
+                    // steps only the fidelity counter (3); the last instruction of a
+                    // face steps `SrcA` and clears `SrcB`'s counter — a column's
+                    // counter moves within the face, a row's does not (0, or 2 for a
+                    // column); and the last face hands both banks back and resets
+                    // their counters (1).
+                    let addr_mod = if last_phase && last_half {
+                        if face == 3 {
+                            1
+                        } else if bcast == Bcast::Col {
+                            2
+                        } else {
+                            0
+                        }
+                    } else if last_phase {
+                        0
+                    } else {
+                        3
+                    };
+                    // `p_elwise::CLR_SRCB_VLD` after a face, `CLR_SRCAB_VLD` after
+                    // the last one (`llk_math_eltwise_binary_broadcast.h:117-126`).
+                    let clear = if last_phase && last_half {
+                        if face == 3 {
+                            3
+                        } else if face + 1 < srcb_posts {
+                            2
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
+                    m.push(
+                        Core::Math,
+                        MirOp::Elw {
+                            op: match op {
+                                BOp::Add => ElwOp::Add,
+                                BOp::Sub => ElwOp::Sub,
+                                BOp::Mul => ElwOp::Mul,
+                                other => {
+                                    return Err(crate::status::internal_bug(format_args!(
+                                        "lower: an SFPU broadcast of {other:?}"
+                                    )));
+                                }
+                            },
+                            bcast,
+                            addr_mod,
+                            clear,
+                            // A multiply's passes after the first add into the
+                            // rows the first one wrote.
+                            accum: matches!(op, BOp::Mul) && phase > 0,
+                            reg: out,
+                            at: 16 * face + 8 * half,
+                        },
+                    );
+                }
+            }
+        }
+    } else {
+        m.push(
+            Core::Math,
+            thread_word(&[
+                (thread::ADDR_MOD_AB_SEC0_SrcAIncr, 8),
+                (
+                    thread::ADDR_MOD_AB_SEC0_SrcBIncr,
+                    match bcast {
+                        Bcast::Col => 8u16,
+                        Bcast::Row | Bcast::Scalar => 0,
+                        Bcast::None => {
+                            return Err(crate::status::internal_bug(
+                                "lower: the FPU broadcast has no broadcast mode",
+                            ));
+                        }
+                    },
+                ),
+                (thread::ADDR_MOD_AB_SEC0_SrcBClear, 0),
+                (thread::ADDR_MOD_AB_SEC0_SrcAClear, 0),
+            ])?,
+        );
+        m.push(
+            Core::Math,
+            thread_word(&[
+                (thread::ADDR_MOD_DST_SEC0_DestIncr, 0),
+                (thread::ADDR_MOD_DST_SEC0_DestCR, 0),
+                // The last phase of a multiply hands the phase counter back to 0.
+                (thread::ADDR_MOD_DST_SEC0_FidelityClear, 1),
+            ])?,
+        );
+        // `ADDR_MOD_1`: the next fidelity phase of the same eight rows — no
+        // counter moves, only the phase, so the instruction re-multiplies the same
+        // operands' next mantissa slice into the same `Dst` rows.
+        m.push(
+            Core::Math,
+            thread_word(&[
+                (thread::ADDR_MOD_AB_SEC1_SrcAIncr, 0),
+                (thread::ADDR_MOD_AB_SEC1_SrcBIncr, 0),
+                (thread::ADDR_MOD_AB_SEC1_SrcBClear, 0),
+                (thread::ADDR_MOD_AB_SEC1_SrcAClear, 0),
+            ])?,
+        );
+        m.push(
+            Core::Math,
+            thread_word(&[
+                (thread::ADDR_MOD_DST_SEC1_DestIncr, 0),
+                (thread::ADDR_MOD_DST_SEC1_DestCR, 0),
+                (thread::ADDR_MOD_DST_SEC1_FidelityIncr, 1),
+            ])?,
+        );
+        // The section is written, never accumulated into; `reg_sync` places the wait
+        // for a packer that still reads it.
+        // `ELWMUL`'s word carries bit 21 set, so the hardware accumulates into the
+        // destination (tt-isa's measured encoding; `ELWADD`/`ELWSUB` overwrite).
+        // That is also how the four fidelity phases add up, so the result section is
+        // zeroed first and the phases accumulate onto nothing.
+        if matches!(op, BOp::Mul) {
+            m.push(
+                Core::Math,
+                MirOp::LaneConst {
+                    lreg: LReg(0),
+                    bits: 0.0f32.to_bits(),
+                },
+            );
+            for row in (0..DST_ROWS).step_by(2) {
                 m.push(
                     Core::Math,
-                    MirOp::Elw {
-                        op: match op {
-                            BOp::Add => ElwOp::Add,
-                            BOp::Sub => ElwOp::Sub,
-                            BOp::Mul => ElwOp::Mul,
-                            other => {
-                                return Err(crate::status::internal_bug(format_args!(
-                                    "lower: an SFPU broadcast of {other:?}"
-                                )));
-                            }
-                        },
-                        bcast,
-                        addr_mod: if phase + 1 == phases { 0 } else { 1 },
+                    MirOp::Sfpstore {
+                        lreg: LReg(0),
                         reg: out,
-                        at: 16 * face + 8 * half,
+                        at: row,
+                        dtype: if m.dst_is_16_bit {
+                            crate::ir::DType::Bf16
+                        } else {
+                            crate::ir::DType::F32
+                        },
                     },
                 );
             }
         }
-        // `SETRWC(CLR_AB, .., SET_AB)`: the banks go back before the next
-        // face's unpack, which is the only way the unpacker may refill them
-        // (tt-metal's reduce clears after every face for the same reason). The
-        // unpacker refills each face from the bank's start, so the counters stay
-        // at 0 and the `SFPU` afterwards addresses `Dst` relative to 0.
-        m.push(
-            Core::Math,
-            MirOp::Setrwc {
-                src_a: 0,
-                src_b: 0,
-                dst: 0,
-                flip_src_a: true,
-                flip_src_b: true,
-                dst_cr: false,
-            },
-        );
+        for face in 0..4u32 {
+            m.push(
+                Core::Unpack,
+                MirOp::Setadczw {
+                    u0: true,
+                    u1: false,
+                    z0: Some(face),
+                    z1: None,
+                },
+            );
+            m.push(
+                Core::Unpack,
+                MirOp::UnpackConfig {
+                    unit: 0,
+                    to_src: true,
+                    dtype: dt_a,
+                    haloize: false,
+                    add_dest_cntr: false,
+                    ch1_z_stride: 0,
+                },
+            );
+            m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_a, unit: 0 });
+            m.push(
+                Core::Unpack,
+                MirOp::Unpacr {
+                    unit: 0,
+                    count: FACE_DATUMS,
+                    flip: true,
+                },
+            );
+            // `SrcB`: the page face the FPU reads for `SrcA`'s face. A narrow
+            // value's page keeps only its own part, so both halves of the tile read
+            // the same face: a row's faces 0 and 1 (row 0) serve the tile's four
+            // faces two at a time, and a column's faces 0 and 2 (column 0) serve
+            // each pair of face rows.
+            let b_face = match bcast {
+                Bcast::Row => face & 1,
+                Bcast::Col => face & !1,
+                Bcast::Scalar => 0,
+                Bcast::None => {
+                    return Err(crate::status::internal_bug(
+                        "lower: the FPU broadcast has no broadcast mode",
+                    ));
+                }
+            };
+            m.push(
+                Core::Unpack,
+                MirOp::Setadczw {
+                    u0: false,
+                    u1: true,
+                    z0: Some(b_face),
+                    z1: None,
+                },
+            );
+            m.push(
+                Core::Unpack,
+                MirOp::UnpackConfig {
+                    unit: 1,
+                    to_src: true,
+                    dtype: dt_b,
+                    haloize: false,
+                    add_dest_cntr: false,
+                    ch1_z_stride: 0,
+                },
+            );
+            m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 1 });
+            m.push(
+                Core::Unpack,
+                MirOp::Unpacr {
+                    unit: 1,
+                    count: FACE_DATUMS,
+                    flip: true,
+                },
+            );
+            for half in 0..2u32 {
+                for phase in 0..phases {
+                    m.push(
+                        Core::Math,
+                        MirOp::Elw {
+                            op: match op {
+                                BOp::Add => ElwOp::Add,
+                                BOp::Sub => ElwOp::Sub,
+                                BOp::Mul => ElwOp::Mul,
+                                other => {
+                                    return Err(crate::status::internal_bug(format_args!(
+                                        "lower: an SFPU broadcast of {other:?}"
+                                    )));
+                                }
+                            },
+                            bcast,
+                            addr_mod: if phase + 1 == phases { 0 } else { 1 },
+                            clear: 0,
+                            accum: false,
+                            reg: out,
+                            at: 16 * face + 8 * half,
+                        },
+                    );
+                }
+            }
+            // `SETRWC(CLR_AB, .., SET_AB)`: the banks go back before the next
+            // face's unpack, which is the only way the unpacker may refill them
+            // (tt-metal's reduce clears after every face for the same reason). The
+            // unpacker refills each face from the bank's start, so the counters stay
+            // at 0 and the `SFPU` afterwards addresses `Dst` relative to 0.
+            m.push(
+                Core::Math,
+                MirOp::Setrwc {
+                    src_a: 0,
+                    src_b: 0,
+                    dst: 0,
+                    flip_src_a: true,
+                    flip_src_b: true,
+                    dst_cr: false,
+                },
+            );
+        }
     }
     // The counters are back to 0 for the `SFPU`, which addresses `Dst` relative
     // to them.

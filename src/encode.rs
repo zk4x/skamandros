@@ -1607,6 +1607,8 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), tt
             op,
             bcast,
             addr_mod,
+            clear: _,
+            accum,
             reg,
             at,
         } => {
@@ -1622,14 +1624,14 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), tt
             };
             let encoded = match op {
                 ElwOp::Add => encode::Elwadd::ZERO
-                    .add_dst(0)
+                    .add_dst(u32::from(accum))
                     .broadcast_src_b_row(brow)
                     .broadcast_src_b_col0(col)
                     .addr_mod(addr_mod)
                     .dst_row(row)
                     .encode(),
                 ElwOp::Sub => encode::Elwsub::ZERO
-                    .add_dst(0)
+                    .add_dst(u32::from(accum))
                     .broadcast_src_b_row(brow)
                     .broadcast_src_b_col0(col)
                     .addr_mod(addr_mod)
@@ -3273,6 +3275,8 @@ fn quasar_math_op(
             op,
             bcast,
             addr_mod,
+            clear,
+            accum,
             reg,
             at,
         } => {
@@ -3288,22 +3292,22 @@ fn quasar_math_op(
             let row = quasar_dst_row(out, section, reg, at, row_delta)?;
             let encoded = match op {
                 ElwOp::Add => qencode::Elwadd::ZERO
-                    .clear_dvalid(0)
-                    .dest_accum_en(0)
+                    .clear_dvalid(clear)
+                    .dest_accum_en(u32::from(accum))
                     .instr_mod19(code)
                     .addr_mode(addr_mod)
                     .dst(row)
                     .encode(),
                 ElwOp::Sub => qencode::Elwsub::ZERO
-                    .clear_dvalid(0)
-                    .dest_accum_en(0)
+                    .clear_dvalid(clear)
+                    .dest_accum_en(u32::from(accum))
                     .instr_mod19(code)
                     .addr_mode(addr_mod)
                     .dst(row)
                     .encode(),
                 ElwOp::Mul => qencode::Elwmul::ZERO
-                    .clear_dvalid(0)
-                    .dest_accum_en(0)
+                    .clear_dvalid(clear)
+                    .dest_accum_en(u32::from(accum))
                     .instr_mod19(code)
                     .addr_mode(addr_mod)
                     .dst(row)
