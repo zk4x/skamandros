@@ -97,6 +97,18 @@ struct Copy {
     reader: bool,
 }
 
+/// The page a staging ring holds: the unit the access names. A tile is its own
+/// page, and a row is a page of its own — the value contiguous, sixteen datums
+/// to a face row. A column or a datum is not lowered.
+fn unit_page(shape: [crate::ir::Dim; 2]) -> Result<[crate::ir::Dim; 2], ttStatus> {
+    match crate::ir::access_shape(shape)? {
+        crate::ir::RegShape::Tile | crate::ir::RegShape::Row => Ok(shape),
+        crate::ir::RegShape::Column | crate::ir::RegShape::Scalar => {
+            Err(ttStatus::TT_TODO_ACCESS_SHAPE)
+        }
+    }
+}
+
 /// Stage every parameter access, split the list into the three segments, and
 /// insert the ring hand-offs.
 pub fn add_movers(k: &Kernel) -> Result<Kernel, ttStatus> {
@@ -134,8 +146,10 @@ struct Mover<'a> {
     prologue_of: BTreeMap<OpId, OpId>,
     /// Old ring value to its new id.
     ring_of: BTreeMap<OpId, OpId>,
-    /// Old parameter to the ring its access was staged through.
-    staged_of: BTreeMap<OpId, OpId>,
+    /// Old parameter, with the page layout its access names, to the ring it was
+    /// staged through. A parameter read both as a tile and as a row keeps one
+    /// ring per layout.
+    staged_of: BTreeMap<(OpId, [crate::ir::Dim; 2]), OpId>,
     /// Old induction to the new loop op being built, inside one segment.
     map: BTreeMap<OpId, OpId>,
     /// The loop nesting being walked, outermost first.
@@ -196,8 +210,11 @@ impl Mover<'_> {
                     offset,
                     shape,
                 } if self.old.info(buffer).kind == ValueKind::Param => {
-                    let ring = self.stage(buffer)?;
+                    let page = unit_page(shape)?;
+                    let ring = self.stage(buffer, page)?;
                     let zero = self.zero()?;
+                    // The ring's page is the access unit, so the copy moves one
+                    // unit and the ring side names that page itself.
                     self.copies.push(Copy {
                         path: self.loops.clone(),
                         op: Op::Copy {
@@ -205,7 +222,7 @@ impl Mover<'_> {
                             src: buffer,
                             dst_offset: zero,
                             src_offset: offset,
-                            shape,
+                            shape: page,
                         },
                         reader: true,
                     });
@@ -224,8 +241,11 @@ impl Mover<'_> {
                     offset,
                     shape,
                 } if self.old.info(buffer).kind == ValueKind::Param => {
-                    let ring = self.stage(buffer)?;
+                    let page = unit_page(shape)?;
+                    let ring = self.stage(buffer, page)?;
                     let zero = self.zero()?;
+                    // The ring's page is the access unit, so the copy moves one
+                    // unit and the ring side names that page itself.
                     self.copies.push(Copy {
                         path: self.loops.clone(),
                         op: Op::Copy {
@@ -233,7 +253,7 @@ impl Mover<'_> {
                             src: ring,
                             dst_offset: offset,
                             src_offset: zero,
-                            shape,
+                            shape: page,
                         },
                         reader: false,
                     });
@@ -254,9 +274,9 @@ impl Mover<'_> {
     }
 
     /// Define the staging ring of a parameter access, one page of the
-    /// parameter's datum.
-    fn stage(&mut self, param: OpId) -> Result<OpId, ttStatus> {
-        if let Some(ring) = self.staged_of.get(&param).copied() {
+    /// parameter's datum in the layout the access names.
+    fn stage(&mut self, param: OpId, page: [crate::ir::Dim; 2]) -> Result<OpId, ttStatus> {
+        if let Some(ring) = self.staged_of.get(&(param, page)).copied() {
             return Ok(ring);
         }
         let info = self.old.info(param);
@@ -271,12 +291,12 @@ impl Mover<'_> {
             ring,
             Op::Cb {
                 dtype: info.dtype,
-                page: [32, 32],
+                page,
                 len: 1,
             },
         ));
         self.names.push((ring, name));
-        self.staged_of.insert(param, ring);
+        self.staged_of.insert((param, page), ring);
         Ok(ring)
     }
 

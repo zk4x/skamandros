@@ -102,15 +102,15 @@ pub enum ttStatus {
     TT_ERROR_COPY_CAST = 35,
     /// An op that needs a buffer was given a value of another kind.
     TT_ERROR_NOT_A_BUFFER = 36,
-    /// A direct load reads a parameter that is not a tile.
+    /// A direct load reads a parameter that is not a tiled plane.
     TT_ERROR_LOAD_PARAM_NOT_TILE = 37,
-    /// A direct store writes a parameter that is not a tile.
+    /// A direct store writes a parameter that is not a tiled plane.
     TT_ERROR_STORE_PARAM_NOT_TILE = 38,
     /// A store's value is not a register value.
     TT_ERROR_STORE_VALUE_NOT_REGISTER = 39,
     /// A store to a parameter writes a value of another dtype.
     TT_ERROR_STORE_PARAM_CAST = 40,
-    /// A store to a parameter writes a value that is not a tile.
+    /// A store to a parameter writes a value of another shape than the unit.
     TT_ERROR_STORE_PARAM_VALUE_NOT_TILE = 41,
     /// A store to a buffer writes a value of another dtype.
     TT_ERROR_STORE_BUFFER_CAST = 42,

@@ -396,13 +396,17 @@ pub enum Op {
         shape: [Dim; 2],
     },
     /// L1 buffer into a register value. `shape` is the unit the index's base
-    /// names; the result has that shape.
+    /// names; the result has that shape. The offset counts units of that shape
+    /// — a page for a tile, a row for `1,32`, a column for `32,1`, a datum for
+    /// `1,1` — so a narrow access names one unit of a tiled page without a
+    /// second index.
     Load {
         buffer: OpId,
         offset: OpId,
         shape: [Dim; 2],
     },
-    /// A register value into an L1 buffer.
+    /// A register value into an L1 buffer. The offset counts units of `shape`,
+    /// as in [`Op::Load`].
     Store {
         src: OpId,
         buffer: OpId,
@@ -1177,13 +1181,19 @@ impl Kernel {
                     shape,
                 } => {
                     let b = self.info(buffer);
-                    let unit = access_shape(shape)?;
+                    // The unit is checked for both ends: against the ring the
+                    // mover stages, a narrow unit names a part of the page, and
+                    // against a parameter it is the page itself.
+                    access_shape(shape)?;
                     if self.expect_offset(offset, at)? != 1 {
                         return Err(ttStatus::TT_TODO_MULTI_LANE);
                     }
                     let datums = shape[0] * shape[1];
                     if b.kind == ValueKind::Param {
-                        if unit != RegShape::Tile || b.shape != RegShape::Tile {
+                        // A parameter is a tiled plane; the unit may be narrower
+                        // than its page, and the staging ring holds one unit per
+                        // page, so the access's offset is the unit's own index.
+                        if b.shape != RegShape::Tile {
                             return Err(ttStatus::TT_ERROR_LOAD_PARAM_NOT_TILE);
                         }
                     } else {
@@ -1229,13 +1239,16 @@ impl Kernel {
                         return Err(ttStatus::TT_ERROR_STORE_VALUE_NOT_REGISTER);
                     }
                     if b.kind == ValueKind::Param {
-                        if unit != RegShape::Tile || b.shape != RegShape::Tile {
+                        // As with a load: the unit names a part of a page, and
+                        // `mover` turns the one unit index into the page it
+                        // lives in and the row or column inside it.
+                        if b.shape != RegShape::Tile {
                             return Err(ttStatus::TT_ERROR_STORE_PARAM_NOT_TILE);
                         }
                         if v.dtype != b.dtype {
                             return Err(ttStatus::TT_ERROR_STORE_PARAM_CAST);
                         }
-                        if v.shape != RegShape::Tile && v.kind != ValueKind::Acc {
+                        if v.shape != unit && v.kind != ValueKind::Acc {
                             return Err(ttStatus::TT_ERROR_STORE_PARAM_VALUE_NOT_TILE);
                         }
                         continue;
