@@ -1938,8 +1938,17 @@ impl Device {
         self.l1_write_uncached(address, bytes)
     }
 
-    /// Drop every staging-memory entry of this tile whose bytes overlap
-    /// `[at, at + len)`.
+    /// Drop the staged-word cache over a range the harts write themselves.
+    ///
+    /// The cache exists so a repeat launch does not re-send words that have not
+    /// changed. That is only sound for memory the host is the sole writer of: a
+    /// launch's harts advance the circular-buffer counters in the interface
+    /// table and set the ready flag, so the next launch must send its own zeros
+    /// over them rather than trust what it staged last time.
+    pub fn forget_staged(&mut self, at: u64, len: u64) {
+        self.forget_overlapping(at, len);
+    }
+
     fn forget_overlapping(&mut self, at: u64, len: u64) {
         let tile = self.tile;
         self.staged.retain(|&(x, y, address), words| {

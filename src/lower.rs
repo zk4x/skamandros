@@ -1113,7 +1113,7 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                     };
                     fpu_broadcast(
                         &mut m, k, types, &plan, alloc, &acc_mask, value, op, tile, narrow, bcast,
-                        at,
+                        at, target,
                     )?;
                     // A page whose last reader this broadcast was is released
                     // here; `continue` skips the common block below.
@@ -2322,45 +2322,55 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                         // and 3 into the second (tt-metal's `SETRWC(CR_D, 8)`
                         // twice).
                         let dst_off = if face % 2 == 0 { 0u32 } else { 16 };
-                        if max {
+                        // The fold's fidelity phases: `math_fidelity_schedule`
+                        // (`cmath_common.h:52-77`). `SrcA` carries the data, so
+                        // a `Tf32` register (an `f32` operand) needs all four and
+                        // a `Float16_b` one (a `bf16` operand, which has no low
+                        // mantissa bits) needs exactly one — qsr refuses the
+                        // extra ones (`check_fidelity_phase: fidelity_phase=1
+                        // src_a_fmt=5 ... one phase covers SrcA`). The last phase
+                        // clears the counter.
+                        //
+                        // `max` takes the same phases: tt-metal's
+                        // `_llk_math_reduce_col_mop_config_` is templated on the
+                        // pool type only, so `GMPOOL` issues the identical
+                        // sequence (`ADDR_MOD_2` for every phase but the last,
+                        // the clearing `ADDR_MOD_0` after it), and qsr checks the
+                        // phase counter for a pool (`GMPOOL in fidelity phase
+                        // 1`).
+                        // A `max` is LoFi whatever the operands are
+                        // (`_llk_math_reduce_init_`: "MAX always runs LoFi"),
+                        // so its fold is one pool per face; a `sum` folds the
+                        // `math_fidelity_schedule` phases above.
+                        let phases: &[u32] = if max {
+                            &[0]
+                        } else if target == Target::Quasar && dt_x != crate::ir::DType::F32 {
+                            &[0]
+                        } else {
+                            &[3, 3, 3, 0]
+                        };
+                        for &addr_mod in phases {
                             m.push(
                                 Core::Math,
-                                MirOp::Gmpool {
-                                    flip_src_b: false,
-                                    flip_src_a: false,
-                                    addr_mod: 0,
-                                    arg_max: 0,
-                                    reg: base,
-                                    at: dst_off,
-                                },
-                            );
-                        } else {
-                            // The fold's fidelity phases: `math_fidelity_schedule`
-                            // (`cmath_common.h:52-77`). `SrcA` carries the data,
-                            // so a `Tf32` register (an `f32` operand) needs all
-                            // four and a `Float16_b` one (a `bf16` operand, which
-                            // has no low mantissa bits) needs exactly one — qsr
-                            // refuses the extra ones (`check_fidelity_phase:
-                            // fidelity_phase=1 src_a_fmt=5 ... one phase covers
-                            // SrcA`). The last phase clears the counter.
-                            let phases: &[u32] =
-                                if target == Target::Quasar && dt_x != crate::ir::DType::F32 {
-                                    &[0]
+                                if max {
+                                    MirOp::Gmpool {
+                                        flip_src_b: false,
+                                        flip_src_a: false,
+                                        addr_mod,
+                                        arg_max: 0,
+                                        reg: base,
+                                        at: dst_off,
+                                    }
                                 } else {
-                                    &[3, 3, 3, 0]
-                                };
-                            for &addr_mod in phases {
-                                m.push(
-                                    Core::Math,
                                     MirOp::Gapool {
                                         flip_src_b: false,
                                         flip_src_a: false,
                                         addr_mod,
                                         reg: base,
                                         at: dst_off,
-                                    },
-                                );
-                            }
+                                    }
+                                },
+                            );
                         }
                         // `SETRWC(CLR_AB, 0, 0, 0, 0, SET_AD)`: hand both banks back
                         // and leave the counters where the face started.
@@ -3041,6 +3051,7 @@ fn fpu_broadcast(
     narrow: crate::ir::OpId,
     bcast: Bcast,
     at: OpId,
+    target: Target,
 ) -> Result<(), ttStatus> {
     let (cb_a, stage_a) = fpu_page(k, &plan, tile, at, ttStatus::TT_TODO_BROADCAST)?;
     let (cb_b, stage_b) = fpu_page(k, &plan, narrow, at, ttStatus::TT_TODO_BROADCAST)?;
@@ -3233,7 +3244,25 @@ fn fpu_broadcast(
         // `HiFi4`; `ELWADD`/`ELWSUB` are one pass at any fidelity, which is why
         // only the multiply repeats. The last pass clears the phase and steps
         // the counters on to the next eight rows.
-        let phases: u32 = if matches!(op, BOp::Mul) { 4 } else { 1 };
+        //
+        // Quasar then applies `math_fidelity_schedule` (`cmath_common.h:45-78`),
+        // which drops the passes the register formats cannot use: a `Tf32` `Src`
+        // carries every low mantissa bit, a `Float16_b` one carries none, so a
+        // bf16 operand takes away the phase that would read it (qsr checks
+        // exactly this: `check_fidelity_phase: fidelity_phase=1 src_a_fmt=5 ...
+        // one phase covers SrcA`). Blackhole's `Src` has no per-format phase
+        // count — every pass slices the same registers — so it keeps the
+        // requested `HiFi4`.
+        let wide = |dt: crate::ir::DType| matches!(dt, crate::ir::DType::F32);
+        let phases: u32 = if !matches!(op, BOp::Mul) {
+            1
+        } else if target != Target::Quasar || (wide(dt_a) && wide(dt_b)) {
+            4
+        } else if wide(dt_a) || wide(dt_b) {
+            2
+        } else {
+            1
+        };
         for half in 0..2u32 {
             for phase in 0..phases {
                 m.push(

@@ -80,7 +80,7 @@ const SLOT_WRITER: u32 = 1;
 /// sharing a slot would evict the role program every launch.
 const SLOT_SETUP: u32 = 2;
 const ROLE_SLOT: [u32; 3] = [3, 4, 5];
-const ARGS_AT: u32 = PROGRAM_AREA + 6 * SLOT_BYTES;
+pub(crate) const ARGS_AT: u32 = PROGRAM_AREA + 6 * SLOT_BYTES;
 /// The writer's array, one kilobyte after the reader's: its DRAM endpoints are
 /// NoC #1's.
 const ARGS_WRITER: u32 = ARGS_AT + 0x400;
@@ -430,6 +430,10 @@ fn quasar_launch(
     }
     let args = args_for(device, module, params, grid, tile)?[0].1.clone();
     device.stage_words(u64::from(ARGS_AT), &args)?;
+    // The last launch's harts advanced this table's counters and set the ready
+    // flag, so the cached words for those ranges are not what is in L1 any more.
+    device.forget_staged(u64::from(module.iface), 4 * module.iface_words.len() as u64);
+    device.forget_staged(u64::from(QUASAR_READY_AT), 4);
     if !module.iface_words.is_empty() {
         device.stage_words(u64::from(module.iface), &module.iface_words)?;
     }

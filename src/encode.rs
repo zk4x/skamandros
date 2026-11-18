@@ -28,6 +28,7 @@ use tt_isa::arch::blackhole::backend::{
 use tt_isa::arch::blackhole::noc::niu::Niu;
 use tt_isa::arch::blackhole::sync::{self, Semaphore};
 use tt_isa::arch::quasar::issue;
+use tt_isa::arch::quasar::mailbox as quasar_mailbox;
 use tt_isa::arch::quasar::{Quasar, backend as qbackend, sfpu as qsfpu};
 use tt_isa::cfg::blackhole::{alu, global, pack0, thcon, thread, unpack0, unpack1};
 use tt_isa::cfg::quasar::{alu as qalu, thcon as qthcon};
@@ -2557,22 +2558,35 @@ fn quasar_seed(out: &mut Stream, m: &MachineKernel) -> Result<(), ttStatus> {
         };
         out.extend(qbackend::init_after(sem, value, max, idle).map_err(quasar_unusable)?);
     }
+    // The ready flag carries the launch's generation, not a bare `1`: `Config`
+    // and L1 outlive a launch, and a hart that started before the host had
+    // cleared the previous launch's flag would read it as its own. The host
+    // increments `GENERATION` before it releases the harts, so a stale value can
+    // never match.
     out.asm(|a| {
         a.li(reg::T0, crate::runtime::QUASAR_READY_AT);
-        a.li(reg::T1, 1);
+        a.li(reg::T2, quasar_mailbox::GENERATION as u32);
+        a.word(rv::lw(reg::T1, reg::T2, 0));
         a.word(rv::sw(reg::T1, reg::T0, 0));
         Ok(())
     })
 }
 
 /// Wait for the unpack hart to publish the seeded semaphores.
+///
+/// The flag is this launch's generation ([`quasar_seed`]), so a value left by
+/// the launch before it does not release this hart early — which would leave it
+/// latched on a semaphore the previous launch had already driven to its bound,
+/// before the seed reset it.
 fn quasar_await_ready(out: &mut Stream) -> Result<(), ttStatus> {
     out.asm(|a| {
         a.li(reg::T0, crate::runtime::QUASAR_READY_AT);
+        a.li(reg::T2, quasar_mailbox::GENERATION as u32);
+        a.word(rv::lw(reg::T3, reg::T2, 0));
         let top = a.fresh_label();
         a.label(top.clone());
         a.word(rv::lw(reg::T1, reg::T0, 0));
-        a.beq_label(reg::T1, reg::ZERO, top);
+        a.bne_label(reg::T1, reg::T3, top);
         Ok(())
     })
 }
@@ -2975,6 +2989,25 @@ fn quasar_section(out: &mut Stream, section: &mut Option<Dst>, reg: Dst) -> Resu
     Ok(())
 }
 
+/// The `Dst` row an FPU instruction names.
+///
+/// A Quasar FPU read or write is `dest_section_base + dest_counter + operand`
+/// (`move_d2a_fixed_face`, `cmath_common.h:294-297`: "MOVD2A src is relative to
+/// dest_section_base + dest_counter"), and the section base is the tile
+/// (`_set_dst_write_addr_by_rows_`). So the operand is the row *within* the
+/// tile and the base names the tile — the same split the SFPU arms use. `at`
+/// is only absolute on Blackhole, where the counter is the whole address.
+fn quasar_dst_row(
+    out: &mut Stream,
+    section: &mut Option<Dst>,
+    reg: Dst,
+    at: u32,
+    row_delta: u32,
+) -> Result<u32, ttStatus> {
+    quasar_section(out, section, reg)?;
+    Ok(at + row_delta)
+}
+
 fn quasar_math_op(
     op: &MirOp,
     row_delta: u32,
@@ -3233,10 +3266,8 @@ fn quasar_math_op(
             flip_b,
         } => {
             let clear = u32::from(flip_a) | (u32::from(flip_b) << 1);
-            out.push(
-                qencode::mvmul(clear, 0, addr_mod, dst_row(reg, at, row_delta))
-                    .map_err(quasar_unusable)?,
-            );
+            let row = quasar_dst_row(out, section, reg, at, row_delta)?;
+            out.push(qencode::mvmul(clear, 0, addr_mod, row).map_err(quasar_unusable)?);
         }
         MirOp::Elw {
             op,
@@ -3254,7 +3285,7 @@ fn quasar_math_op(
                 Bcast::Col => 1,
                 Bcast::Scalar => 3,
             };
-            let row = dst_row(reg, at, row_delta);
+            let row = quasar_dst_row(out, section, reg, at, row_delta)?;
             let encoded = match op {
                 ElwOp::Add => qencode::Elwadd::ZERO
                     .clear_dvalid(0)
@@ -3288,6 +3319,7 @@ fn quasar_math_op(
             at,
         } => {
             let clear = u32::from(flip_src_a) | (u32::from(flip_src_b) << 1);
+            let row = quasar_dst_row(out, section, reg, at, row_delta)?;
             out.push(
                 qencode::Gapool::ZERO
                     .clear_dvalid(clear)
@@ -3297,7 +3329,7 @@ fn quasar_math_op(
                     .instr_mod19(1)
                     .pool_addr_mode(addr_mod)
                     .rsvd(0)
-                    .dst(dst_row(reg, at, row_delta))
+                    .dst(row)
                     .encode()
                     .map_err(quasar_unusable)?,
             );
@@ -3316,13 +3348,14 @@ fn quasar_math_op(
                 return Err(quasar_shape("an arg-max pool"));
             }
             let clear = u32::from(flip_src_a) | (u32::from(flip_src_b) << 1);
+            let row = quasar_dst_row(out, section, reg, at, row_delta)?;
             out.push(
                 qencode::Gmpool::ZERO
                     .clear_dvalid(clear)
                     .instr_mod19(1)
                     .pool_addr_mode(addr_mod)
                     .rsvd(0)
-                    .dst(dst_row(reg, at, row_delta))
+                    .dst(row)
                     .encode()
                     .map_err(quasar_unusable)?,
             );
@@ -3584,7 +3617,11 @@ fn encode_pack_quasar(m: &MachineKernel, ops: &[MirOp], out: &mut Stream) -> Res
     quasar_await_ready(out)?;
     let idle = quasar_idle(Core::Pack);
     let mut in_format: Option<u32> = None;
-    let mut pack_mask = PackMask::None;
+    // `None` means "not written yet", not "the pass-through mask": the packer's
+    // `Config` outlives the program that wrote it, so a launch that inherits an
+    // edge mask from the one before it must write the pass-through values
+    // before it packs anything (`_llk_pack_reduce_mask_clear_`).
+    let mut pack_mask: Option<PackMask> = None;
     let mut bd: Option<(Cb, u32)> = None;
     let mut loops = Vec::new();
     for op in ops {
@@ -3639,12 +3676,15 @@ fn encode_pack_quasar(m: &MachineKernel, ops: &[MirOp], out: &mut Stream) -> Res
                 // masking datums to zero. Mask0 covers every datum of a row and
                 // mask1 the datums that survive, selected per face-row by the
                 // two-bit-per-row fields in words 56..59.
-                if pack_mask != mask {
+                if pack_mask != Some(mask) {
                     // Words 52 and 54 also hold the pack strides; the pack path
                     // writes whole words, so the zeros of the untouched fields
                     // are part of the value written here.
                     let (mask0, mask1) = match mask {
-                        PackMask::None | PackMask::Col => (0xFFFF, 0x0000),
+                        // `EDGE_MASK_ROW_DATUMS_NONE`: the pass-through mask
+                        // `_llk_pack_reduce_mask_clear_` writes.
+                        PackMask::None => (0x0000, 0x0000),
+                        PackMask::Col => (0xFFFF, 0x0000),
                         // `EDGE_MASK_ROW_DATUMS_EXCEPT_0`: column 0 survives.
                         PackMask::Row => (0xFFFF, 0xFFFE),
                     };
@@ -3669,7 +3709,7 @@ fn encode_pack_quasar(m: &MachineKernel, ops: &[MirOp], out: &mut Stream) -> Res
                             (59, select),
                         ],
                     )?;
-                    pack_mask = mask;
+                    pack_mask = Some(mask);
                 }
             }
             MirOp::SetPackOffset { reg, at } => {
