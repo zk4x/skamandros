@@ -345,6 +345,101 @@ load 1,32 %y = %ib [0]
     );
 }
 
+/// One offset, one meaning: it counts units of the access shape, so the same
+/// index names a page for a `32,32` tile, a row for a `1,32`, a column for a
+/// `32,1` and a datum for a `1,1`. Nothing else tells a narrow access which part
+/// of the page it means.
+#[test]
+fn the_offset_counts_units_of_the_access_shape() {
+    const PROGRAM: &str = "\
+version 9
+grid 1,1
+%p = param f32 2048
+%b = buffer f32 32,64
+copy 32,32 %b [0] = %p [0]
+copy 32,32 %b [1] = %p [1]
+load 32,32 %t = %b [1]
+load 1,32 %r = %b [5]
+load 32,1 %c = %b [3]
+load 1,1 %d = %b [7]
+";
+    let k = Kernel::parse(PROGRAM).expect("the units parse");
+    let units: Vec<([u32; 2], Option<i32>)> = k
+        .ops()
+        .filter_map(|(_, op)| match *op {
+            Op::Load { offset, shape, .. } => Some((shape, k.const_i32(offset))),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        units,
+        vec![
+            ([32, 32], Some(1)),
+            ([1, 32], Some(5)),
+            ([32, 1], Some(3)),
+            ([1, 1], Some(7)),
+        ],
+        "each access counts its own unit"
+    );
+    // The text form prints the one index back unchanged: the shape carries the
+    // unit, so there is no second number to print.
+    let printed = k.to_string();
+    for line in [
+        "load 32,32 %t = %b [1]",
+        "load 1,32 %r = %b [5]",
+        "load 1,1 %d = %b [7]",
+    ] {
+        assert!(printed.contains(line), "{line} in\n{printed}");
+    }
+}
+
+/// A narrow access against a parameter counts units of its shape, so the mover
+/// splits the one index when it stages the access through a one-page ring: the
+/// copy moves the page the unit lives in (`index / units`) and the access
+/// against the ring names the row inside it (`index % units`).
+#[test]
+fn a_narrow_parameter_access_is_staged_as_a_page_and_a_row() {
+    const PROGRAM: &str = "\
+version 9
+grid 1,1
+%p = param f32 1024
+%o = param f32 1024
+%i = const i32 37
+load 1,32 %x = %p [%i]
+store 1,32 %o [%i] = %x
+";
+    let k = Kernel::parse(PROGRAM).expect("a narrow parameter access parses");
+    let staged = crate::mover::add_movers(&k).expect("the access is staged");
+    let by = |value: crate::ir::OpId| match *staged.at(value) {
+        Op::Binary { op, b, .. } if staged.const_i32(b) == Some(32) => Some(op),
+        _ => None,
+    };
+    let (mut pages, mut rows) = (0, 0);
+    for (_, op) in staged.ops() {
+        match *op {
+            Op::Copy {
+                src_offset,
+                dst_offset,
+                ..
+            } => {
+                pages += usize::from(by(src_offset) == Some(crate::ir::BOp::Div));
+                pages += usize::from(by(dst_offset) == Some(crate::ir::BOp::Div));
+            }
+            Op::Load { offset, .. } | Op::Store { offset, .. } => {
+                rows += usize::from(by(offset) == Some(crate::ir::BOp::Mod));
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        (pages, rows),
+        (2, 2),
+        "each access splits into its page and its row"
+    );
+    // The staged program is what verification sees, and it holds.
+    staged.verify().expect("the staged program verifies");
+}
+
 /// The access shape is the unit: a copy's unit has to be one NoC request, a
 /// shape between the four is refused, and the lanes of a vector index fill one
 /// `L1` page exactly.
