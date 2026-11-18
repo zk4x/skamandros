@@ -60,6 +60,9 @@ const BARRIER_POLLS: u32 = 1000;
 /// follow the last slot.
 const SLOT_READER: u32 = 0;
 const SLOT_WRITER: u32 = 1;
+/// The setup program's slot. It is not one of the role slots: T0 runs both, and
+/// sharing a slot would evict the role program every launch.
+const SLOT_SETUP: u32 = 2;
 const ROLE_SLOT: [u32; 3] = [3, 4, 5];
 const ARGS_AT: u32 = PROGRAM_AREA + 6 * SLOT_BYTES;
 /// The writer's array, one kilobyte after the reader's: its DRAM endpoints are
@@ -435,12 +438,15 @@ fn launch_steps(
         device.stage_words(u64::from(ARGS_AT), &args)?;
         device.stage_words(u64::from(ARGS_WRITER), &writer_args)?;
         // The semaphore setup runs on T0 first and to completion, as BRISC
-        // initialises the semaphores before it releases the TRISCs. A launch
-        // that completes cleanly leaves the semaphores at the values it wrote,
-        // so this is once per tile per distinct setup, not once per launch. A
-        // launch with no compute program has no semaphores to set up.
-        if compute && !module.setup.is_empty() && !device.setup_ran(&module.setup) {
-            stage_role(device, 0, &module.setup, ARGS_AT)?;
+        // initialises the semaphores before it releases the TRISCs. It runs on
+        // every launch, not once per tile: a launch does not necessarily leave
+        // every semaphore at the value the setup wrote, and re-initialising is
+        // what puts the next launch's pacing back (skipping it measured a
+        // kernel ~20% slower, as well as relying on an end state no code
+        // guarantees). It has its own program slot so it does not evict T0's
+        // role program.
+        if compute && !module.setup.is_empty() {
+            stage_at(device, 0, SLOT_SETUP, &module.setup, ARGS_AT)?;
             // The arguments and the setup program are in L1; the generation that
             // starts T0 on them is a store to a different address, so the tile
             // is made to show every earlier write first (tt-metal's `l1_membar`
@@ -449,7 +455,6 @@ fn launch_steps(
             let mb = mailbox::launch::Mailbox::of(0);
             let generation = device.start(mb)?;
             device.await_launch(mb, generation)?;
-            device.note_setup(&module.setup);
         }
 
         // Name every program of the launch. B is dispatched once and starts
@@ -512,11 +517,23 @@ const ROLE_ENABLE: [u32; 3] = [
     mailbox::launch::ENABLE_T2,
 ];
 
-/// Place `words` at `thread`'s fixed cache slot and name it in that role's
+/// Place `words` in `thread`'s launch program slot and name it in that role's
 /// launch message, with no generation: RISCV B writes the one that starts it.
 fn stage_role(
     device: &mut Device,
     thread: usize,
+    words: &[u32],
+    args_at: u32,
+) -> Result<(), ttStatus> {
+    stage_at(device, thread, ROLE_SLOT[thread], words, args_at)
+}
+
+/// [`stage_role`], in an explicit program-cache slot: the setup program runs on
+/// T0 too, but out of a slot of its own.
+fn stage_at(
+    device: &mut Device,
+    thread: usize,
+    slot_index: u32,
     words: &[u32],
     args_at: u32,
 ) -> Result<(), ttStatus> {
@@ -529,7 +546,7 @@ fn stage_role(
         return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
     }
     let mb = mailbox::launch::Mailbox::of(thread as u32);
-    let text = slot(ROLE_SLOT[thread]);
+    let text = slot(slot_index);
     device.place(text, words)?;
     // The role's configuration words are host state the executor never
     // touches, so staging them costs nothing on a repeat launch.

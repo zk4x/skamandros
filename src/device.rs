@@ -619,10 +619,6 @@ pub struct Device {
     /// Tiles whose Tensix backend has been released from soft reset. Releasing
     /// is idempotent, and the register read it costs is per launch otherwise.
     backend_released: Vec<NocCoord>,
-    /// The setup program's hash each tile last ran to completion. Semaphores
-    /// end a clean launch at the values the setup wrote, so the same setup does
-    /// not have to run again on that tile.
-    setup_done: Vec<(NocCoord, u64)>,
     /// Has the host written DRAM since the last barrier? A launch only needs
     /// the DRAM barrier if it has: the barrier exists to make posted host
     /// writes visible to the device, and a launch after no host write has
@@ -675,7 +671,6 @@ impl Device {
             staged: std::collections::HashMap::new(),
             barrier_flag: L1_BARRIER_SET,
             backend_released: Vec::new(),
-            setup_done: Vec::new(),
             dram_dirty: false,
         };
         // Before any tile is named: with translation off, a logical column number
@@ -742,7 +737,6 @@ impl Device {
             staged: std::collections::HashMap::new(),
             barrier_flag: L1_BARRIER_SET,
             backend_released: Vec::new(),
-            setup_done: Vec::new(),
             dram_dirty: false,
         };
         // The ARC publishes every address the rest of this reads, so it is
@@ -1814,7 +1808,6 @@ impl Device {
         // What was staged is only valid until the cores are reset, and the
         // semaphores are no longer known to hold the setup program's values.
         self.staged.clear();
-        self.setup_done.clear();
         first
     }
 
@@ -1877,7 +1870,6 @@ impl Device {
             let tile = self.tile;
             self.staged
                 .retain(|&(x, y, _), _| (x, y) != (tile.x(), tile.y()));
-            self.setup_done.retain(|(t, _)| *t != tile);
             self.exec_started.push(self.tile);
             Ok(())
         }
@@ -1941,26 +1933,6 @@ impl Device {
             .retain(|&(t, a, _, _)| t.x() != self.tile.x() || t.y() != self.tile.y() || a != at);
         self.placed.push((self.tile, at, len, hash));
         Ok(())
-    }
-
-    /// Has this tile already run this exact setup program to completion?
-    ///
-    /// The setup is `SEMINIT` per semaphore on the role cores. A launch that
-    /// completes cleanly leaves every semaphore at the value the setup wrote,
-    /// so the same setup words do not have to run again on that tile; T0's
-    /// launch, its L1 barrier and its completion poll are then all saved.
-    pub fn setup_ran(&self, words: &[u32]) -> bool {
-        let hash = hash_words(words);
-        self.setup_done
-            .iter()
-            .any(|&(t, h)| t == self.tile && h == hash)
-    }
-
-    /// Record that this tile has run `words` as its setup program.
-    pub fn note_setup(&mut self, words: &[u32]) {
-        let hash = hash_words(words);
-        self.setup_done.retain(|&(t, _)| t != self.tile);
-        self.setup_done.push((self.tile, hash));
     }
 
     /// Write a launch message without starting it: the text address, its length
