@@ -1183,9 +1183,8 @@ impl Kernel {
                     let datums = shape[0] * shape[1];
                     if b.kind == ValueKind::Param {
                         // A parameter is a tiled plane; the unit may be narrower
-                        // than its page, because `mover` splits the unit index
-                        // into the page it names and the row or column inside
-                        // it before the staged program is checked.
+                        // than its page, and the staging ring holds one unit per
+                        // page, so the access's offset is the unit's own index.
                         if b.shape != RegShape::Tile {
                             return Err(ttStatus::TT_ERROR_LOAD_PARAM_NOT_TILE);
                         }

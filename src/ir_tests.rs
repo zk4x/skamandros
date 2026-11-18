@@ -393,12 +393,12 @@ load 1,1 %d = %b [7]
     }
 }
 
-/// A narrow access against a parameter counts units of its shape, so the mover
-/// splits the one index when it stages the access through a one-page ring: the
-/// copy moves the page the unit lives in (`index / units`) and the access
-/// against the ring names the row inside it (`index % units`).
+/// A narrow access against a parameter counts units of its shape, and the mover
+/// stages each unit as its own page: the ring's page is the unit (`1,32`), the
+/// copy moves that unit at the unit's own index, and the access against the ring
+/// names page zero, because the value is the page.
 #[test]
-fn a_narrow_parameter_access_is_staged_as_a_page_and_a_row() {
+fn a_narrow_parameter_access_is_staged_as_its_own_page() {
     const PROGRAM: &str = "\
 version 9
 grid 1,1
@@ -410,32 +410,38 @@ store 1,32 %o [%i] = %x
 ";
     let k = Kernel::parse(PROGRAM).expect("a narrow parameter access parses");
     let staged = crate::mover::add_movers(&k).expect("the access is staged");
-    let by = |value: crate::ir::OpId| match *staged.at(value) {
-        Op::Binary { op, b, .. } if staged.const_i32(b) == Some(32) => Some(op),
-        _ => None,
-    };
-    let (mut pages, mut rows) = (0, 0);
+    let pages: Vec<[crate::ir::Dim; 2]> = staged
+        .ops()
+        .filter_map(|(_, op)| match *op {
+            Op::Cb { page, .. } => Some(page),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        pages.contains(&[1, 32]),
+        "a 1,32 access stages a 1,32 page: {pages:?}"
+    );
+    // The index is the unit's own: no page/row division anywhere.
+    for (at, op) in staged.ops() {
+        if let Op::Binary { op, b, .. } = *op {
+            if matches!(op, crate::ir::BOp::Div | crate::ir::BOp::Mod)
+                && staged.const_i32(b) == Some(32)
+            {
+                panic!("a narrow access splits its index at {at:?}");
+            }
+        }
+    }
+    // The access against the ring names page zero.
+    let mut named = 0;
     for (_, op) in staged.ops() {
         match *op {
-            Op::Copy {
-                src_offset,
-                dst_offset,
-                ..
-            } => {
-                pages += usize::from(by(src_offset) == Some(crate::ir::BOp::Div));
-                pages += usize::from(by(dst_offset) == Some(crate::ir::BOp::Div));
-            }
             Op::Load { offset, .. } | Op::Store { offset, .. } => {
-                rows += usize::from(by(offset) == Some(crate::ir::BOp::Mod));
+                named += usize::from(staged.const_i32(offset) == Some(0));
             }
             _ => {}
         }
     }
-    assert_eq!(
-        (pages, rows),
-        (2, 2),
-        "each access splits into its page and its row"
-    );
+    assert!(named >= 2, "the ring's own page is named by each access");
     // The staged program is what verification sees, and it holds.
     staged.verify().expect("the staged program verifies");
 }
@@ -535,13 +541,14 @@ copy 1,32 %b [%i] = %w [%i]
     );
 }
 
-/// A narrow `load`/`store` names a shape the format has, but no lowering yet:
-/// every form is a loud `TT_TODO_ACCESS_SHAPE`, never a whole-tile move. The
-/// one narrow load that does run is the mover's lane bases (`load 1,32` whose
-/// only reader is a copy's index), which `an_access_shape_is_the_unit_a_copy_moves`
-/// gates.
+/// A narrow `load`/`store` names the page that holds its unit: a `1,32` page is
+/// the value, so the run is sixteen datums to a `Dst` row. A tile-holding page
+/// read as a narrow value, and a column, are loud `TT_TODO_ACCESS_SHAPE` — never
+/// a whole-tile move. The one narrow load that runs without a datapath is the
+/// mover's lane bases (`load 1,32` whose only reader is a copy's index), which
+/// `an_access_shape_is_the_unit_a_copy_moves` gates.
 #[test]
-fn a_narrow_access_is_refused_until_its_lowering_lands() {
+fn a_narrow_access_names_a_page_of_its_own_unit() {
     use ttStatus as S;
     let case = |what: &str, text: &str, want: S| {
         let err = match Kernel::parse(text) {
@@ -550,10 +557,8 @@ fn a_narrow_access_is_refused_until_its_lowering_lands() {
         };
         assert_eq!(err, want, "{what}");
     };
-    // A `1,32` row and a `32,1` column have no machine path yet: a row is one
-    // face-row run per half, and a column has no unpack form at all (tt-metal
-    // materialises one only through a transpose). A `1,1` access is not here:
-    // it is the mover's scalar read (`a_symbolic_offset_into_a_row_buffer_reads_one_datum`).
+    // A tile-holding page cannot be read as a row or a column: the value is not
+    // the page, so the run would name another tile row's datums.
     for shape in ["1,32", "32,1"] {
         let text = format!(
             "\
@@ -568,20 +573,39 @@ load {shape} %x = %b [0]
         );
         case(&format!("a {shape} load"), &text, S::TT_TODO_ACCESS_SHAPE);
     }
-    // A page with no faces (`1,32`/`32,1` buffer) is refused the same way: its
-    // unit is 32 datums, not a tile.
-    case(
-        "a 1,32 load from a row page",
+    // A row page holds the value: the load runs, the body walks row pair zero,
+    // and the pack writes the two rows back.
+    Kernel::parse(
         "\
 version 9
 grid 1,1
 %p = param f32 1024
+%o = param f32 1024
 %v = buffer f32 1,32
 copy 1,32 %v [0] = %p [0]
 load 1,32 %x = %v [0]
 %y = neg %x
+store 1,32 %v [0] = %y
+copy 1,32 %o [0] = %v [0]
 ",
-        S::TT_TODO_ACCESS_SHAPE,
+    )
+    .and_then(|k| compile::compile(&k))
+    .expect("a 1,32 row through a 1,32 page compiles");
+    // A column page is a page of its own too, but a column has no lane layout
+    // yet: a column copy is not even a unit the verifier admits, so such a page
+    // cannot be filled from a parameter at all.
+    case(
+        "a 32,1 copy from a parameter",
+        "\
+version 9
+grid 1,1
+%p = param f32 1024
+%v = buffer f32 32,1
+copy 32,1 %v [0] = %p [0]
+load 32,1 %x = %v [0]
+%y = neg %x
+",
+        S::TT_ERROR_COPY_UNIT,
     );
     // A store of an accumulator is the one narrow store the verifier admits
     // (the region is packed whole and the mask trims it); the pack of a narrow

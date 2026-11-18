@@ -612,17 +612,39 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     }
                 };
                 let unit_shape = access_shape(access)?;
+                // The page's shape is its layout: a narrow value names a page
+                // that holds the value itself, never a tile the value sits in.
+                let page = match *k.at(buffer) {
+                    Op::Cb { page, .. } => page,
+                    _ => return Err(ttStatus::TT_ERROR_NOT_A_BUFFER),
+                };
+                if unit_of(page, dtype)?.0 != unit_shape {
+                    let _ = (at, access, page);
+                    return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
+                }
                 let reg = dst_reg(alloc, owner(k, value))?;
                 // A value only an `Src` reader consumes never enters `Dst`: the
                 // unpack goes straight into `SrcA`/`SrcB` at the op that reads
                 // it, and this load only reserves the page.
                 let lands_in_dst = non_matmul_use.contains(&value) || !matmul_use.contains(&value);
-                // Only a tile (one whole page) is lowered into the datapath
-                // today; a row, a column or a datum needs the narrowed unpack,
-                // which is not written. A narrow access that only an `Src`
-                // reader consumes needs no unpack at all: that op reads the
-                // page's own layout.
-                if unit_shape != RegShape::Tile && lands_in_dst {
+                // A narrow access that only an `Src` reader consumes needs no
+                // unpack at all: that op reads the page's own layout. A narrow
+                // value that lands in `Dst` is one x-run of its own datum count,
+                // sixteen datums to a `Dst` row. A column has no lane layout
+                // yet, and a page holds one unit: a tile-holding page cannot be
+                // read as the value itself.
+                if unit_shape == RegShape::Column && lands_in_dst {
+                    let _ = (at, access);
+                    return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
+                }
+                if unit_shape != RegShape::Tile
+                    && lands_in_dst
+                    && wide
+                    && dtype == crate::ir::DType::Bf16
+                {
+                    // Widening is `MOVA2D`, and only its eight-row form is
+                    // modeled (`MOVA2D` on `ttsim` takes eight rows), so a
+                    // narrow bf16 row cannot be widened into a 32-bit `Dst`.
                     let _ = (at, access);
                     return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
                 }
@@ -782,6 +804,12 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                 // the accumulator's own dtype, and the SFPU writes it row by
                 // row.
                 if types.of(buffer).kind == crate::ir::ValueKind::Acc {
+                    // The accumulator's region is a whole tile; a narrow one
+                    // would be filled with a tile's rows.
+                    if access_shape(access)? != RegShape::Tile {
+                        let _ = (at, access);
+                        return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
+                    }
                     let (bits, from) = match *k.at(src) {
                         Op::Const { bits, dtype, .. } => (bits, dtype),
                         _ => {
@@ -835,12 +863,24 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     }
                 };
                 let unit_shape = access_shape(access)?;
-                // Only a tile is lowered today; a narrower pack needs the
-                // packer's `SETADCX` narrowing.
-                if unit_shape != RegShape::Tile {
+                // The page's shape is its layout, as on the load side.
+                let page = match *k.at(buffer) {
+                    Op::Cb { page, .. } => page,
+                    _ => return Err(ttStatus::TT_ERROR_NOT_A_BUFFER),
+                };
+                if unit_of(page, dtype)?.0 != unit_shape {
+                    let _ = (at, access, page);
+                    return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
+                }
+                // A column has no pack form yet: its 32 datums are one lane
+                // column of a tile, not a run the packer writes.
+                if unit_shape == RegShape::Column {
                     let _ = (at, access);
                     return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
                 }
+                // A narrow value is packed as its own rows: the packer's
+                // `SETADCX` run is sixteen datums and the row mask names the
+                // two `Dst` rows the value occupies.
                 let rows = rows_of(unit_shape, at)?;
                 let cb = cb_id(plan.cb.get(&buffer).copied().ok_or_else(|| {
                     let _ = buffer;
@@ -4758,16 +4798,15 @@ fn mod_body(role: &mut Vec<MirOp>) {
 }
 
 /// The `Dst` rows an SFPU body walks. An instruction covers 32 lanes, two
-/// 16-datum rows, so a tile is its 64 rows two at a time. A narrow value keeps
-/// the acc's narrow part (a `1,32` in rows 0 and 16, a `32,1` in column 0), and
-/// its lane layout in the lane — sixteen meaningful lanes of each — is not
-/// lowered: a value that reaches the datapath with that shape is refused rather
-/// than walked with a tile's addressing.
+/// 16-datum rows, so a tile is its 64 rows two at a time. A row lives in the
+/// first row pair only — 32 datums in rows 0 and 1. A column has no lane layout
+/// yet: its 32 datums sit in one lane column, which the lane bodies do not walk.
 fn sfp_rows(shape: RegShape, at: OpId) -> Result<Vec<u32>, ttStatus> {
     Ok(match shape {
         RegShape::Tile => (0..DST_ROWS).step_by(2).collect(),
-        RegShape::Row | RegShape::Column => {
-            let _ = (at, shape);
+        RegShape::Row => vec![0],
+        RegShape::Column => {
+            let _ = at;
             return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
         }
         RegShape::Scalar => {

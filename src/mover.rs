@@ -55,31 +55,18 @@ struct Copy {
     op: Op,
     /// Into a ring (the reader segment) or out of one (the writer segment).
     reader: bool,
-    /// Units of a narrow access in one page of the ring it is staged through.
-    /// The program counts units of the access (`1,32` a row, `1,1` a datum), so
-    /// the parameter side of this copy moves page `index / split` and the ring
-    /// side names `index % split`, the row of that page. One for a tile, whose
-    /// unit is the page.
-    split: u32,
 }
 
-/// How many units of an access shape fit in one page of a staging ring.
-///
-/// A ring is one `32,32` page, and the program's offset counts units of the
-/// access: a `1,32` row is 32 of them, a `32,1` column 32, a `1,1` datum all
-/// 1024, a tile one. The page a narrow access reads is `offset / units` and the
-/// row or column inside it `offset % units`.
-fn units_per_page(shape: [crate::ir::Dim; 2]) -> Result<u32, ttStatus> {
-    const DATUMS: u32 = 32 * 32;
-    let datums = shape[0]
-        .checked_mul(shape[1])
-        .filter(|d| *d != 0 && DATUMS % *d == 0)
-        .ok_or_else(|| {
-            crate::status::internal_bug(format_args!(
-                "mover: access unit {shape:?} does not divide a page"
-            ))
-        })?;
-    Ok(DATUMS / datums)
+/// The page a staging ring holds: the unit the access names. A tile is its own
+/// page, and a row is a page of its own — the value contiguous, sixteen datums
+/// to a face row. A column or a datum is not lowered.
+fn unit_page(shape: [crate::ir::Dim; 2]) -> Result<[crate::ir::Dim; 2], ttStatus> {
+    match crate::ir::access_shape(shape)? {
+        crate::ir::RegShape::Tile | crate::ir::RegShape::Row => Ok(shape),
+        crate::ir::RegShape::Column | crate::ir::RegShape::Scalar => {
+            Err(ttStatus::TT_TODO_ACCESS_SHAPE)
+        }
+    }
 }
 
 /// Stage every parameter access, split the list into the three segments, and
@@ -119,8 +106,10 @@ struct Mover<'a> {
     prologue_of: BTreeMap<OpId, OpId>,
     /// Old ring value to its new id.
     ring_of: BTreeMap<OpId, OpId>,
-    /// Old parameter to the ring its access was staged through.
-    staged_of: BTreeMap<OpId, OpId>,
+    /// Old parameter, with the page layout its access names, to the ring it was
+    /// staged through. A parameter read both as a tile and as a row keeps one
+    /// ring per layout.
+    staged_of: BTreeMap<(OpId, [crate::ir::Dim; 2]), OpId>,
     /// Old induction to the new loop op being built, inside one segment.
     map: BTreeMap<OpId, OpId>,
     /// The loop nesting being walked, outermost first.
@@ -174,7 +163,6 @@ impl Mover<'_> {
                             shape,
                         },
                         reader,
-                        split: 1,
                     });
                 }
                 Op::Load {
@@ -182,17 +170,11 @@ impl Mover<'_> {
                     offset,
                     shape,
                 } if self.old.info(buffer).kind == ValueKind::Param => {
-                    let ring = self.stage(buffer)?;
+                    let page = unit_page(shape)?;
+                    let ring = self.stage(buffer, page)?;
                     let zero = self.zero()?;
-                    let split = units_per_page(shape)?;
-                    let inner = if split == 1 {
-                        zero
-                    } else {
-                        self.modulo(offset, split)?
-                    };
-                    // The copy moves the whole page: its unit is a tile, whatever
-                    // the unit of the access that names a part of it.
-                    let page = [32, 32];
+                    // The ring's page is the access unit, so the copy moves one
+                    // unit and the ring side names that page itself.
                     self.copies.push(Copy {
                         path: self.loops.clone(),
                         op: Op::Copy {
@@ -203,13 +185,12 @@ impl Mover<'_> {
                             shape: page,
                         },
                         reader: true,
-                        split,
                     });
                     self.compute.push((
                         id,
                         Op::Load {
                             buffer: ring,
-                            offset: inner,
+                            offset: zero,
                             shape,
                         },
                     ));
@@ -220,17 +201,11 @@ impl Mover<'_> {
                     offset,
                     shape,
                 } if self.old.info(buffer).kind == ValueKind::Param => {
-                    let ring = self.stage(buffer)?;
+                    let page = unit_page(shape)?;
+                    let ring = self.stage(buffer, page)?;
                     let zero = self.zero()?;
-                    let split = units_per_page(shape)?;
-                    let inner = if split == 1 {
-                        zero
-                    } else {
-                        self.modulo(offset, split)?
-                    };
-                    // The copy moves the whole page: its unit is a tile, whatever
-                    // the unit of the access that names a part of it.
-                    let page = [32, 32];
+                    // The ring's page is the access unit, so the copy moves one
+                    // unit and the ring side names that page itself.
                     self.copies.push(Copy {
                         path: self.loops.clone(),
                         op: Op::Copy {
@@ -241,14 +216,13 @@ impl Mover<'_> {
                             shape: page,
                         },
                         reader: false,
-                        split,
                     });
                     self.compute.push((
                         id,
                         Op::Store {
                             src,
                             buffer: ring,
-                            offset: inner,
+                            offset: zero,
                             shape,
                         },
                     ));
@@ -260,9 +234,9 @@ impl Mover<'_> {
     }
 
     /// Define the staging ring of a parameter access, one page of the
-    /// parameter's datum.
-    fn stage(&mut self, param: OpId) -> Result<OpId, ttStatus> {
-        if let Some(ring) = self.staged_of.get(&param).copied() {
+    /// parameter's datum in the layout the access names.
+    fn stage(&mut self, param: OpId, page: [crate::ir::Dim; 2]) -> Result<OpId, ttStatus> {
+        if let Some(ring) = self.staged_of.get(&(param, page)).copied() {
             return Ok(ring);
         }
         let info = self.old.info(param);
@@ -277,12 +251,12 @@ impl Mover<'_> {
             ring,
             Op::Cb {
                 dtype: info.dtype,
-                page: [32, 32],
+                page,
                 len: 1,
             },
         ));
         self.names.push((ring, name));
-        self.staged_of.insert(param, ring);
+        self.staged_of.insert((param, page), ring);
         Ok(ring)
     }
 
@@ -311,29 +285,6 @@ impl Mover<'_> {
             Op::Const {
                 dtype: crate::ir::INDEX,
                 bits: 0,
-            },
-        ));
-        Ok(id)
-    }
-
-    /// `offset % split`: the row or column of the page a narrow access names,
-    /// emitted into the compute segment beside the access that reads it.
-    fn modulo(&mut self, offset: OpId, split: u32) -> Result<OpId, ttStatus> {
-        let k = self.fresh()?;
-        self.compute.push((
-            k,
-            Op::Const {
-                dtype: crate::ir::INDEX,
-                bits: split,
-            },
-        ));
-        let id = self.fresh()?;
-        self.compute.push((
-            id,
-            Op::Binary {
-                op: crate::ir::BOp::Mod,
-                a: offset,
-                b: k,
             },
         ));
         Ok(id)
@@ -438,18 +389,8 @@ impl Mover<'_> {
             self.new_ring(if copy.reader { dst } else { src })?;
             let dst = self.clone_value(into, dst)?;
             let src = self.clone_value(into, src)?;
-            let mut dst_offset = self.clone_value(into, dst_offset)?;
-            let mut src_offset = self.clone_value(into, src_offset)?;
-            // A narrow access counts units of its own shape and the ring's page
-            // holds `split` of them: the parameter side of the copy moves the
-            // page that unit lives in, `index / split`.
-            if copy.split > 1 {
-                if copy.reader {
-                    src_offset = self.divides(into, src_offset, copy.split);
-                } else {
-                    dst_offset = self.divides(into, dst_offset, copy.split);
-                }
-            }
+            let dst_offset = self.clone_value(into, dst_offset)?;
+            let src_offset = self.clone_value(into, src_offset)?;
             // The producer reserves a free page and publishes it; the consumer
             // waits for a published page and releases it (tt-metal's
             // `writer_unary_1.cpp` is `cb_wait_front`/`cb_pop_front`). Those
@@ -469,20 +410,6 @@ impl Mover<'_> {
     /// program's).
     fn is_staged(&self, id: OpId) -> bool {
         self.staged_of.values().any(|ring| *ring == id)
-    }
-
-    /// `value / split` inside the segment being built: the page a narrow unit
-    /// lives in.
-    fn divides(&mut self, into: &mut Kernel, value: OpId, split: u32) -> OpId {
-        let k = into.push(Op::Const {
-            dtype: crate::ir::INDEX,
-            bits: split,
-        });
-        into.push(Op::Binary {
-            op: crate::ir::BOp::Div,
-            a: value,
-            b: k,
-        })
     }
 
     /// The new id of a ring.
