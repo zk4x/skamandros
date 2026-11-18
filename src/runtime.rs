@@ -22,12 +22,14 @@
 use std::sync::Mutex;
 
 use crate::compile::Module;
-use crate::device::Device;
+use crate::device::{Architecture, Device};
 use crate::status::ttStatus;
 use tt_isa::arch::blackhole::dram::CHANNEL_BYTES;
 use tt_isa::arch::blackhole::mailbox;
 use tt_isa::arch::blackhole::noc::NocCoord;
 use tt_isa::arch::blackhole::noc::niu::Niu;
+use tt_isa::arch::quasar::mailbox as quasar_mailbox;
+use tt_isa::tensix::Core;
 
 /// The one open device, if [`init`] has been called.
 static DEVICE: Mutex<Option<Device>> = Mutex::new(None);
@@ -146,20 +148,16 @@ const fn slot(index: u32) -> u32 {
 
 /// Open the device. Idempotent; the simulator is initialized once per process.
 ///
-/// The transport is chosen the way tt-metal chooses: if `$TT_METAL_SIMULATOR`
-/// names a shared object, the simulator is used, and otherwise the card
-/// (`Device::open_hardware`). `TT_HARDWARE=1` is additionally required before this
+/// [`Device::open`] chooses the transport the way tt-metal chooses: if
+/// `$TT_METAL_SIMULATOR` names a shared object, the simulator is used, and
+/// otherwise the card. `TT_HARDWARE=1` is additionally required before this
 /// driver will touch silicon — a bring-up gate that goes away once a kernel has
 /// run on the card — so with neither variable set, [`init`] refuses rather than
 /// guessing which of the two the caller wanted.
 pub fn init() -> Result<(), ttStatus> {
     let mut device = lock()?;
     if device.is_none() {
-        let simulator = std::env::var_os(crate::device::LIB_PATH_ENV).filter(|p| !p.is_empty());
-        *device = Some(match simulator {
-            Some(_) => Device::open()?,
-            None => Device::open_hardware()?,
-        });
+        *device = Some(Device::open()?);
     }
     Ok(())
 }
@@ -236,6 +234,16 @@ fn run(
     params: &[u64],
     grid: [u32; 2],
 ) -> Result<(), ttStatus> {
+    // The two chips launch differently and neither path can stand in for the
+    // other: Blackhole runs its own firmware on five cores, Quasar has no such
+    // firmware and runs the two movers the module carries for it.
+    if device.arch() == Architecture::Quasar {
+        let result = quasar_launch(device, module, params, grid);
+        if result.is_err() {
+            device.quasar_quiesce()?;
+        }
+        return result;
+    }
     let result = launch_steps(device, module, params, grid);
     if result.is_err() {
         // A failed launch is a status, not a wedged tile: stop the cores this
@@ -245,6 +253,290 @@ fn run(
         device.quiesce()?;
     }
     result
+}
+
+/// Where a Quasar mover's boot stub lives: the image its reset vector jumps to.
+///
+/// All eight movers fetch L1 word 0 and every one of them is released the same
+/// way, so word 0 holds a jump to one stub and the stub picks the image by
+/// `mhartid`. The images are one [`QUASAR_IMAGE_STRIDE`] apart from
+/// [`QUASAR_IMAGE_BASE`].
+///
+/// The stub sits exactly at `MEM_DM_FIRMWARE_BASE`
+/// (`tt_isa::arch::quasar::l1::DM_FIRMWARE`), which is where a released mover
+/// fetches and is already reserved for mover code. The images are placed at the
+/// top of the 4 MiB L1, above every region the launch uses: the CB rings are
+/// laid out in the data arena ([`crate::alloc::plan_cbs`], `0x2_0000` up to
+/// Blackhole's `mailbox::MAILBOX_BASE`) and the program cache and argument
+/// blocks follow it, all below `0x1_8000_0`. One [`QUASAR_IMAGE_STRIDE`] per
+/// mover leaves room for the largest program the launch accepts.
+const QUASAR_STUB: u32 = 0xF000;
+/// The word the unpack hart sets once it has seeded the semaphores, and the
+/// math and pack harts spin on before their first one.
+///
+/// A semaphore nobody has seeded has a maximum of zero, so the two consumers
+/// cannot wait on one; the launch stages this word cleared, and the flag is what
+/// makes the seed visible before either consumer takes a semaphore. It sits
+/// above every region a launch stages (the rings, the program cache, the
+/// argument blocks, all below `0x1_8000_0`) and below the movers' images.
+pub const QUASAR_READY_AT: u32 = 0x10_0000;
+const QUASAR_IMAGE_BASE: u32 = 0x3C_0000;
+const QUASAR_IMAGE_STRIDE: u32 = 0x2000;
+/// The two movers a launch runs: a tile's movers are 0..=7, and tt-metal keeps
+/// 0 and 1 for its own ISR and remapper, so a kernel's movers start at 2.
+const QUASAR_READER_HART: u8 = 2;
+const QUASAR_WRITER_HART: u8 = 3;
+/// The three compute harts of engine 0, in tt-metal's thread order: 0 unpacks,
+/// 1 does the math, 2 packs, 3 isolates the SFPU (`ckernel_trisc_id.h:10-14`).
+const QUASAR_UNPACK_TRISC: u8 = 0;
+const QUASAR_MATH_TRISC: u8 = 1;
+const QUASAR_PACK_TRISC: u8 = 2;
+/// Where a compute hart's image is staged.
+///
+/// tt-metal puts a TRISC's firmware at `MEM_TRISC0_FIRMWARE_BASE` with a 5 KiB
+/// stride (`dev_mem_map.h:114-117`), but that is the *firmware* slot and an
+/// unfolded kernel's program does not fit in it: a launch stages its own image,
+/// so it takes its own slots, above the rings and argument blocks (all below
+/// `0x1_8000_0`) and below the movers' images at `0x3C_0000`.
+const QUASAR_COMPUTE_BASE: u32 = 0x20_0000;
+/// 32 KiB per hart: an unfolded lane kernel's program is a few thousand words
+/// (gelu's math image is 23 KiB), far past tt-metal's 5 KiB firmware slot.
+const QUASAR_TRISC_IMAGE_STRIDE: u32 = 0x8000;
+
+/// The image of the mover with hart id `hart`.
+fn quasar_image(hart: u8) -> u32 {
+    QUASAR_IMAGE_BASE + QUASAR_IMAGE_STRIDE * u32::from(hart)
+}
+
+/// The stub every mover runs first: read the hart id, jump to that hart's image,
+/// and hand it the launch's argument block in `a0`.
+///
+/// A Quasar mover has no launch message of its own: it fetches at L1 word 0,
+/// and `quasar_start_at` points that word here. `mhartid` (CSR 0xF14) is the
+/// only thing that tells the eight movers apart, and the simulator was measured
+/// to return 0..=7 there.
+fn quasar_stub() -> Vec<u32> {
+    use crate::riscv::reg;
+    let base = QUASAR_IMAGE_BASE >> 12;
+    let mut words = Vec::with_capacity(6);
+    words.push(crate::riscv::csrr(reg::T0, crate::riscv::MHARTID));
+    words.push(crate::riscv::slli(
+        reg::T0,
+        reg::T0,
+        QUASAR_IMAGE_STRIDE.trailing_zeros(),
+    ));
+    words.push(crate::riscv::lui(reg::T1, base));
+    words.push(crate::riscv::add(reg::T0, reg::T0, reg::T1));
+    // `li a0, ARGS_AT`: the argument block, as the launch's `a0` on every other
+    // chip would carry it.
+    let high = ARGS_AT.wrapping_add(0x800) >> 12;
+    let low = ARGS_AT as i32 - ((high as i32) << 12);
+    words.push(crate::riscv::lui(reg::A0, high));
+    words.push(crate::riscv::addi(reg::A0, reg::A0, low));
+    words.push(crate::riscv::jalr(reg::ZERO, reg::T0, 0));
+    words
+}
+
+/// Turn a mover program into a self-contained image.
+///
+/// The rendered program ends in `ret`, because on Blackhole a resident
+/// executor calls it. A Quasar mover is not called by anything: the host starts
+/// it at its first word, so `ret` would jump to whatever `ra` happens to hold.
+/// The last word is therefore replaced by the launch's epilogue — publish the
+/// generation, or park — and the hart never returns.
+fn quasar_finish(mut words: Vec<u32>, ack: bool) -> Vec<u32> {
+    use crate::riscv::reg;
+    if words.last() == Some(&crate::riscv::ret()) {
+        words.pop();
+    }
+    if ack {
+        words.extend(quasar_ack());
+    } else {
+        words.push(crate::riscv::jal(reg::ZERO, 0));
+    }
+    words
+}
+
+/// The words that publish the launch generation once a mover's program is done.
+///
+/// A Quasar launch has no resident runner to do it: the program is an image the
+/// host starts, so the epilogue is appended to the image of the mover that
+/// finishes last. `a0` and the caller-saved registers are free by then.
+fn quasar_ack() -> Vec<u32> {
+    use crate::riscv::reg;
+    vec![
+        crate::riscv::lw(reg::T1, reg::ZERO, quasar_mailbox::GENERATION as i32),
+        crate::riscv::sw(reg::T1, reg::ZERO, quasar_mailbox::ACK as i32),
+        crate::riscv::jal(reg::ZERO, 0),
+    ]
+}
+
+/// Run a module on a Quasar: stage the two movers' images and the CB interface,
+/// start them, and wait for the one that reports.
+///
+/// This is the whole launch. There is no dispatch firmware on this chip, no
+/// fan-out tree and no resident executor: the host writes the images and the
+/// arguments, points the reset vector at the stub, releases the two movers and
+/// waits for the generation. A module with datapath work has no Quasar program
+/// (its unpacker and packer configuration is still Blackhole's) and is refused
+/// rather than run with a program that configures the wrong registers.
+fn quasar_launch(
+    device: &mut Device,
+    module: &Module,
+    params: &[u64],
+    grid: [u32; 2],
+) -> Result<(), ttStatus> {
+    let Some(program) = &module.quasar else {
+        eprintln!(
+            "libskamandros: this module has no Quasar program ({})",
+            match module.quasar_refusal {
+                Some(ttStatus::TT_ERROR_UNSUPPORTED) =>
+                    "a part of its datapath has no Quasar lowering".to_string(),
+                Some(reason) => format!("the lowering was refused: {reason:?}"),
+                None => "none was compiled".to_string(),
+            }
+        );
+        return Err(ttStatus::TT_ERROR_UNSUPPORTED);
+    };
+    if grid != [1, 1] {
+        eprintln!(
+            "libskamandros: a Quasar launch runs one tile for now; this grid is {}x{}",
+            grid[0], grid[1]
+        );
+        return Err(ttStatus::TT_ERROR_UNSUPPORTED);
+    }
+    if program.reader.is_empty() && program.writer.is_empty() {
+        return Err(ttStatus::TT_ERROR_EMPTY_MODULE);
+    }
+    let tile = device.tile_at(0, 0)?;
+    device.select(tile);
+    if debug_enabled() {
+        eprintln!(
+            "libskamandros: Quasar launch on tile ({}, {}): reader {} words, writer {} words, \
+             compute {} + {} + {}",
+            tile.x(),
+            tile.y(),
+            program.reader.len(),
+            program.writer.len(),
+            program.unpack.len(),
+            program.math.len(),
+            program.pack.len()
+        );
+        eprintln!("reader {:08x?}", program.reader);
+        eprintln!("writer {:08x?}", program.writer);
+        eprintln!("unpack {:08x?}", program.unpack);
+        eprintln!("math {:08x?}", program.math);
+        eprintln!("pack {:08x?}", program.pack);
+    }
+    let args = args_for(device, module, params, grid, tile)?[0].1.clone();
+    device.stage_words(u64::from(ARGS_AT), &args)?;
+    if !module.iface_words.is_empty() {
+        device.stage_words(u64::from(module.iface), &module.iface_words)?;
+    }
+    if debug_enabled() {
+        eprintln!("args at {ARGS_AT:#x} {args:08x?}");
+        eprintln!("iface at {:#x} {:08x?}", module.iface, module.iface_words);
+    }
+    device.stage_words(u64::from(QUASAR_STUB), &quasar_stub())?;
+    device.stage_words(u64::from(QUASAR_READY_AT), &[0])?;
+    // The mover that reports: the writer drains what the reader pushed, so it
+    // finishes last; with no writer the reader is the whole launch.
+    let mut harts: Vec<(u8, u32)> = Vec::new();
+    if !program.reader.is_empty() {
+        harts.push((QUASAR_READER_HART, quasar_image(QUASAR_READER_HART)));
+    }
+    if !program.writer.is_empty() {
+        harts.push((QUASAR_WRITER_HART, quasar_image(QUASAR_WRITER_HART)));
+    }
+    for (hart, at) in &harts {
+        let words = match *hart {
+            h if h == QUASAR_READER_HART => &program.reader,
+            _ => &program.writer,
+        };
+        let ack = harts.last().map(|(h, _)| *h) == Some(*hart);
+        let image = quasar_finish(words.clone(), ack);
+        if 4 * image.len() as u32 > QUASAR_IMAGE_STRIDE {
+            eprintln!(
+                "libskamandros: a mover's image is {} words; a Quasar image slot holds {}",
+                image.len(),
+                QUASAR_IMAGE_STRIDE / 4
+            );
+            return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
+        }
+        device.stage_words(u64::from(*at), &image)?;
+    }
+    // The three compute harts, each in its own firmware slot, held in reset
+    // until its image is staged (`MEM_TRISC0_FIRMWARE_BASE` and the 5 KiB
+    // stride, `dev_mem_map.h:114-117`).
+    let mut triscs: Vec<(Core, u32, Vec<u32>)> = Vec::new();
+    for (trisc, words) in [
+        (QUASAR_UNPACK_TRISC, &program.unpack),
+        (QUASAR_MATH_TRISC, &program.math),
+        (QUASAR_PACK_TRISC, &program.pack),
+    ] {
+        if words.is_empty() {
+            continue;
+        }
+        let core = Core::Math { engine: 0, trisc };
+        let at = QUASAR_COMPUTE_BASE + QUASAR_TRISC_IMAGE_STRIDE * u32::from(trisc);
+        let image = quasar_compute_image(words);
+        if 4 * image.len() as u32 > QUASAR_TRISC_IMAGE_STRIDE {
+            eprintln!(
+                "libskamandros: TRISC{trisc}'s image is {} words; a Quasar image slot holds {}",
+                image.len(),
+                QUASAR_TRISC_IMAGE_STRIDE / 4
+            );
+            return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
+        }
+        device.stage_words(u64::from(at), &image)?;
+        triscs.push((core, at, image));
+    }
+    for (core, at, _) in &triscs {
+        // A TRISC holds reset with the bit set and starts when it is cleared, so
+        // it is held before its reset PC is pointed at the image.
+        device.quasar_set_reset(*core, true)?;
+        device.quasar_start_at(*core, u64::from(*at))?;
+    }
+    // The reset vector: word 0 of L1, which every released mover fetches.
+    device.quasar_start_at(Core::Dm(QUASAR_READER_HART), u64::from(QUASAR_STUB))?;
+    // Everything staged is visible before a hart is released.
+    device.l1_barrier()?;
+    let generation = device.quasar_start()?;
+    for (core, _, _) in &triscs {
+        device.quasar_set_reset(*core, false)?;
+    }
+    for (hart, _) in &harts {
+        device.quasar_set_reset(Core::Dm(*hart), false)?;
+    }
+    let result = device.quasar_await(generation);
+    for (hart, _) in &harts {
+        device.quasar_set_reset(Core::Dm(*hart), true)?;
+    }
+    for (core, _, _) in &triscs {
+        device.quasar_set_reset(*core, true)?;
+    }
+    result
+}
+
+/// Turn a compute program into an image a Quasar TRISC can be started at.
+///
+/// `a0` is the launch's argument block, which the movers' stub supplies and a
+/// TRISC has no supplier for, so the image starts with `li a0, ARGS_AT`. Its
+/// trailing `ret` becomes a park for the same reason it does for a mover: no
+/// executor calls this hart.
+fn quasar_compute_image(words: &[u32]) -> Vec<u32> {
+    use crate::riscv::reg;
+    let high = ARGS_AT.wrapping_add(0x800) >> 12;
+    let low = ARGS_AT as i32 - ((high as i32) << 12);
+    let mut image = Vec::with_capacity(words.len() + 4);
+    image.push(crate::riscv::lui(reg::A0, high));
+    image.push(crate::riscv::addi(reg::A0, reg::A0, low));
+    image.extend_from_slice(words);
+    if image.last() == Some(&crate::riscv::ret()) {
+        image.pop();
+    }
+    image.push(crate::riscv::jal(reg::ZERO, 0));
+    image
 }
 
 /// The grid extent of one axis, from the launch's scalar arguments. Zero, a
@@ -336,7 +628,12 @@ fn args_for(
         *args = vec![grid[0], grid[1], module.iface, me_hi(tile)];
         for (index, kind) in module.params.iter().enumerate() {
             let word = params[index];
-            let channel_bytes = tt_isa::arch::blackhole::dram::CHANNEL_BYTES;
+            // A DRAM address is a channel and an offset inside it, and the two
+            // chips' channels are not the same size.
+            let channel_bytes = match device.arch() {
+                Architecture::Blackhole => tt_isa::arch::blackhole::dram::CHANNEL_BYTES,
+                Architecture::Quasar => tt_isa::arch::quasar::dram::CHANNEL_BYTES,
+            };
             if *kind == crate::compile::ParamKind::Interleaved {
                 // A striped tensor: a pair per channel, then the count and the
                 // page, exactly what the mover's address arithmetic reads.
@@ -411,7 +708,7 @@ fn launch_steps(
     if device.dram_dirty() {
         for flag in [BARRIER_SET, BARRIER_RESET] {
             for channel in device.dram_channels() {
-                let at = u64::from(channel.index()) * CHANNEL_BYTES + DRAM_BARRIER;
+                let at = u64::from(channel) * CHANNEL_BYTES + DRAM_BARRIER;
                 device.dram_write(at, &flag.to_le_bytes())?;
                 let mut back = [0u8; 4];
                 let mut polls = 0u32;
@@ -424,9 +721,8 @@ fn launch_steps(
                     if polls == BARRIER_POLLS {
                         eprintln!(
                             "libskamandros: the DRAM barrier word at offset {DRAM_BARRIER:#x} of \
-                             channel {} still reads {:#010x}, not {flag:#010x}: the host's writes \
-                             are not reaching that channel",
-                            channel.index(),
+                             channel {channel} still reads {:#010x}, not {flag:#010x}: the host's \
+                             writes are not reaching that channel",
                             u32::from_le_bytes(back)
                         );
                         return Err(ttStatus::TT_ERROR_DEVICE);

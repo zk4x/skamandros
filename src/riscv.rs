@@ -8,6 +8,7 @@
 //! `lui`/`addi`; the assembler patches branch immediates at `finish`.
 
 use tt_isa::arch::blackhole::Blackhole;
+use tt_isa::arch::quasar::Quasar;
 use tt_isa::arch::{Arch, Specials};
 
 /// Register numbers of the caller-saved set the programs use. A program is a
@@ -70,6 +71,22 @@ fn b_type(imm: i32, rs2: u8, rs1: u8, funct3: u32, opcode: u32) -> u32 {
 fn u_type(imm20: u32, rd: u8, opcode: u32) -> u32 {
     (imm20 << 12) | (u32::from(rd) << 7) | opcode
 }
+
+/// `jalr rd, rs1, imm`: jump to `rs1 + imm`, linking into `rd`. A Quasar
+/// mover's boot image is selected by its hart id, so the jump target is in a
+/// register.
+pub fn jalr(rd: u8, rs1: u8, imm: i32) -> u32 {
+    i_type(imm, rs1, 0, rd, 0x67)
+}
+
+/// `csrr rd, csr` (`csrrs rd, csr, x0`).
+pub fn csrr(rd: u8, csr: u32) -> u32 {
+    i_type(csr as i32, 0, 2, rd, 0x73)
+}
+
+/// `mhartid`: the hart's own index. On Quasar the movers boot from one shared
+/// image, so the mover's index is how it finds its own program.
+pub const MHARTID: u32 = 0xF14;
 
 pub fn lui(rd: u8, imm20: u32) -> u32 {
     u_type(imm20, rd, 0x37)
@@ -221,8 +238,24 @@ pub fn ret() -> u32 {
 pub fn coprocessor_done(a: &mut Asm) {
     let check = match Blackhole::SPECIALS {
         Specials::Blackhole(specials) => specials.coprocessor_done_check,
-        Specials::Quasar => unreachable!("skamandros lowers for Blackhole"),
+        // The constant is the Blackhole *type*'s, whatever chip the program is
+        // for; a Quasar program calls [`coprocessor_done_quasar`].
+        Specials::Quasar => unreachable!("Blackhole::SPECIALS is Blackhole's"),
     };
+    coprocessor_done_at(a, check);
+}
+
+/// [`coprocessor_done`] for a Quasar TRISC.
+///
+/// Quasar's `pc_buf_base` is `PCBUFFER_BASE`, `0x0081_0000`
+/// (`tt_t6_trisc_map.h:22`), and the same store-then-load is tt-metal's
+/// `tensix_sync()` there: it writes `pc_buf_base[1]` and reads it back, which
+/// "will block until we're idle" (`tt_llk_quasar/common/inc/ckernel.h:154-163`).
+pub fn coprocessor_done_quasar(a: &mut Asm) {
+    coprocessor_done_at(a, Quasar::PC_BUF_BASE + 4);
+}
+
+fn coprocessor_done_at(a: &mut Asm, check: u64) {
     a.li(reg::T0, check as u32);
     a.word(sw(reg::ZERO, reg::T0, 0));
     a.word(lw(reg::T1, reg::T0, 0));
@@ -432,6 +465,20 @@ impl Asm {
             label.into(),
             Fixup::Branch {
                 funct3: 1,
+                rs1,
+                rs2,
+            },
+        ));
+    }
+
+    /// `beq rs1, rs2, label`, patched at `finish`.
+    pub fn beq_label(&mut self, rs1: u8, rs2: u8, label: impl Into<String>) {
+        let at = self.word(0);
+        self.fixups.push((
+            at,
+            label.into(),
+            Fixup::Branch {
+                funct3: 0,
                 rs1,
                 rs2,
             },

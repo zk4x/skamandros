@@ -30,22 +30,45 @@ pub fn compile(k: &Kernel) -> Result<Module, ttStatus> {
         eprintln!("--- virtual kernel ---\n{k}");
     }
     let mut machine = k.lower()?;
+    passes(&mut machine)?;
+    let mut module = machine.render()?;
+    // The Quasar programs: the two movers a launch runs, and the three compute
+    // harts when this kernel has datapath work. The datapath is lowered for
+    // Quasar separately from Blackhole's (a page is a buffer-descriptor tile
+    // index there, not a base address), so a shape it cannot express leaves the
+    // module without a Quasar program and a launch on that chip is refused with
+    // the reason rather than run with the wrong one.
+    let quasar = k.lower_for(crate::mir::Target::Quasar).and_then(|mut q| {
+        passes(&mut q)?;
+        crate::encode::quasar_programs(&q)
+    });
+    match quasar {
+        Ok(program) => module.quasar = Some(program),
+        Err(reason) => module.quasar_refusal = Some(reason),
+    }
+    module.hash = module_hash(&module);
+    Ok(module)
+}
+
+/// The machine passes, in the one order that is correct: fuse the row bodies,
+/// derive the hand-offs, add the `Dst` locks, fuse the cross-core order, then
+/// bring the allocation inside the hardware's limits and check it.
+fn passes(machine: &mut MachineKernel) -> Result<(), ttStatus> {
     // The row bodies are fused before the hand-offs are derived: a value that
     // stays in a lane register has no `Dst` for a seam to carry.
-    crate::alloc::fuse_bodies(&mut machine)?;
+    crate::alloc::fuse_bodies(machine)?;
     // The hand-offs are derived from the accesses, before fusion replaces the
     // cross-core order with the per-core streams.
-    crate::optimize::reg_sync(&mut machine)?;
+    crate::optimize::reg_sync(machine)?;
     // The IR locks carry tt-metal's `Dst` section hand-off (a whole section at
     // a time, which the per-slot seams cannot express across a loop). The
     // seams above still order the unpacker's pages and pace `Src`/`Dst` reuse.
     machine.sems.extend(crate::lower::LOCK_SEMS);
-    crate::optimize::fuse(&mut machine);
+    crate::optimize::fuse(machine);
     // The allocator is what brings the lane registers and `Dst` ids inside the
     // hardware's limits, so it runs before the check that enforces them.
     machine.alloc()?;
-    machine.verify()?;
-    machine.render()
+    machine.verify()
 }
 
 /// Render one machine kernel: the five programs as words, the setup program
@@ -101,6 +124,8 @@ pub fn render(m: &MachineKernel) -> Result<Module, ttStatus> {
         cbs,
         iface_words,
         args_words,
+        quasar: None,
+        quasar_refusal: None,
         hash: 0,
     };
     module.hash = module_hash(&module);
@@ -134,6 +159,18 @@ fn module_hash(module: &Module) -> u64 {
     for program in [&module.reader, &module.writer, &module.setup] {
         words.push(program.len() as u32);
         words.extend_from_slice(program);
+    }
+    if let Some(quasar) = &module.quasar {
+        for program in [
+            &quasar.reader,
+            &quasar.writer,
+            &quasar.unpack,
+            &quasar.math,
+            &quasar.pack,
+        ] {
+            words.push(program.len() as u32);
+            words.extend_from_slice(program);
+        }
     }
     for cores in [&module.cores, &module.silicon_cores] {
         words.push(cores.len() as u32);
@@ -201,4 +238,149 @@ fn term(k: &Kernel, value: crate::ir::OpId) -> Result<GridTerm, ttStatus> {
         return Ok(GridTerm::Param(ordinal as u32));
     }
     Err(ttStatus::TT_ERROR_GRID)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A kernel that only moves bytes: one copy into a page and one out.
+    const COPY: &str = "\
+version 9
+grid 1,1
+%in = param f32 1024
+%out = param f32 1024
+%b = buffer f32 32,32
+copy 32,32 %b [0] = %in [0]
+copy 32,32 %out [0] = %b [0]
+";
+
+    /// A kernel that runs the datapath: the same copies with a `neg` between.
+    const NEG: &str = "\
+version 9
+grid 1,1
+%in = param f32 1024
+%out = param f32 1024
+%bi = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %bi [0] = %in [0]
+load 32,32 %x = %bi [0]
+%y = neg %x
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
+";
+
+    /// A matmul, whose operands the unpacker must put in `SrcA`/`SrcB`.
+    const DOT: &str = "\
+version 9
+grid 1,1
+%pa = param f32 1024
+%pb = param f32 1024
+%out = param f32 1024
+%ba = buffer f32 32,32
+%bb = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %ba [0] = %pa [0]
+copy 32,32 %bb [0] = %pb [0]
+%m = acc f32 32,32
+%zero = const f32 0
+store 32,32 %m = %zero
+load 32,32 %a = %ba [0]
+load 32,32 %b = %bb [0]
+matmul %m %a %b
+store 32,32 %bo [0] = %m
+copy 32,32 %out [0] = %bo [0]
+";
+
+    /// A row reduce: `max` along the rows, whose transpose is `TRNSPSRCB` on
+    /// Blackhole and has no Quasar encoding at all.
+    const REDUCE_ROW: &str = "\
+version 9
+grid 1,1
+%px = param f32 1024
+%out = param f32 1024
+%bx = buffer f32 32,32
+%bo = buffer f32 32,32
+copy 32,32 %bx [0] = %px [0]
+%acc = acc f32 32,1
+%low = const f32 -1000
+store 32,32 %acc = %low
+load 32,32 %x = %bx [0]
+max %acc %x
+store 32,32 %bo [0] = %acc
+copy 32,32 %out [0] = %bo [0]
+";
+
+    fn compiled(text: &str) -> Module {
+        let k = Kernel::parse(text).expect("the program parses");
+        compile(&k).expect("the program compiles")
+    }
+
+    /// A Quasar launch runs the two movers, so a kernel that only moves bytes
+    /// carries their programs; its Blackhole programs are untouched beside them.
+    #[test]
+    fn a_copy_kernel_carries_a_quasar_program() {
+        let module = compiled(COPY);
+        let quasar = module.quasar.as_ref().expect("a Quasar program");
+        assert!(!quasar.reader.is_empty(), "the reader's program");
+        assert!(!quasar.writer.is_empty(), "the writer's program");
+        assert_ne!(module.reader, quasar.reader, "the request is not the same");
+        // The Quasar request fires the read buffer through RoCC; the Blackhole
+        // one stores a trigger into the initiator's block and never issues.
+        let issue = tt_isa::arch::quasar::issue::cmdbuf_issue(1);
+        assert!(
+            quasar.reader.contains(&issue),
+            "the reader stages and fires its read command buffer"
+        );
+        assert!(!module.reader.contains(&issue));
+    }
+
+    /// A kernel whose datapath the Quasar backend can lower carries the three
+    /// compute programs beside the movers: an elementwise tile runs on Quasar's
+    /// unpack, math and pack harts.
+    #[test]
+    fn a_compute_kernel_carries_quasar_compute_programs() {
+        let module = compiled(NEG);
+        let quasar = module.quasar.as_ref().expect("a Quasar program");
+        assert!(!quasar.unpack.is_empty(), "the unpack hart's program");
+        assert!(!quasar.math.is_empty(), "the math hart's program");
+        assert!(!quasar.pack.is_empty(), "the pack hart's program");
+        // The negation is `SFPMOV` with the sign bit inverted, pushed as the
+        // rotation a Tensix word takes in a RISC-V stream.
+        let mov = tt_isa::isa::quasar::encode::sfpmov(0, 1, 1)
+            .expect("SFPMOV")
+            .ttinsn_word()
+            .expect("inline");
+        assert!(
+            quasar.math.contains(&mov),
+            "the math hart's program holds the negate"
+        );
+    }
+
+    /// A dot product unpacks both operands whole into `SrcA`/`SrcB` and walks
+    /// them with the Matrix Unit, so it now has a Quasar program.
+    #[test]
+    fn a_matmul_carries_quasar_compute_programs() {
+        let module = compiled(DOT);
+        let quasar = module.quasar.as_ref().expect("a Quasar program");
+        assert!(!quasar.unpack.is_empty(), "the unpack hart's program");
+        assert!(!quasar.math.is_empty(), "the math hart's program");
+        assert!(!quasar.pack.is_empty(), "the pack hart's program");
+        assert!(module.quasar_refusal.is_none());
+    }
+
+    /// A shape the Quasar datapath cannot express yet leaves the module with no
+    /// Quasar program and a launch on that chip refused, rather than run with the
+    /// wrong program.
+    #[test]
+    fn an_unlowered_shape_carries_no_quasar_program() {
+        // A row reduce transposes through `TRNSPSRCB`, which Quasar does not
+        // have: its row fold transposes inside `MOVD2B` instead.
+        let module = compiled(REDUCE_ROW);
+        assert!(module.quasar.is_none());
+        assert_eq!(
+            module.quasar_refusal,
+            Some(crate::status::ttStatus::TT_ERROR_UNSUPPORTED)
+        );
+    }
 }

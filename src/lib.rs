@@ -23,6 +23,7 @@ mod mir;
 mod module;
 mod mover;
 mod optimize;
+mod quasar_mover;
 mod riscv;
 mod runtime;
 mod slab;

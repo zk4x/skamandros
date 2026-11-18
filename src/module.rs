@@ -41,6 +41,29 @@ impl Default for GridTerm {
     }
 }
 
+/// The mover programs of a Quasar launch.
+///
+/// A Quasar tile has no Blackhole-style firmware between the host and the
+/// harts: the reader and the writer are two of its movers, run from images the
+/// host stages. Their programs are the same machine kernel as Blackhole's with
+/// the NoC request staged in a RoCC command buffer instead of the initiator's
+/// register block, so they are lowered separately (the movers' address
+/// arithmetic is identical, the request is not).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuasarProgram {
+    /// The inbound mover's program (DRAM into L1), words.
+    pub reader: Vec<u32>,
+    /// The outbound mover's program (L1 into DRAM), words.
+    pub writer: Vec<u32>,
+    /// The unpack hart's program (TRISC0 of engine 0), or empty when the kernel
+    /// has no datapath work.
+    pub unpack: Vec<u32>,
+    /// The math hart's program (TRISC1).
+    pub math: Vec<u32>,
+    /// The pack hart's program (TRISC2).
+    pub pack: Vec<u32>,
+}
+
 /// One compiled kernel: the mover programs, the three compute programs, the
 /// grid they run over, and the parameters the launch supplies.
 #[derive(Debug, Clone, Default)]
@@ -67,6 +90,13 @@ pub struct Module {
     /// The setup program thread 0 runs before the three roles are released: the
     /// semaphore initialisation, sized to the `Dst` slots this kernel uses.
     pub setup: Vec<u32>,
+    /// The movers' programs for a Quasar launch, when this kernel has no
+    /// datapath work (a Quasar launch runs those two harts and nothing else).
+    pub quasar: Option<QuasarProgram>,
+    /// Why this module has no Quasar program, when the lowering got that far.
+    /// A launch on a Quasar reports it instead of guessing: the module is still
+    /// valid, and a Blackhole launch runs it exactly as before.
+    pub quasar_refusal: Option<crate::status::ttStatus>,
     /// The CB interface table the host writes before the launch.
     pub iface: u32,
     /// The rings the table describes, in base-address order.

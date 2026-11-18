@@ -929,6 +929,9 @@ pub fn verify(m: &MachineKernel) -> Result<(), ttStatus> {
                 | MirOp::Lw { .. }
                 | MirOp::Sw { .. }
                 | MirOp::NiuPoll { .. }
+                | MirOp::CmdbufWrReg { .. }
+                | MirOp::CmdbufIssue { .. }
+                | MirOp::RoccPoll { .. }
                 | MirOp::IArith { .. }
                 | MirOp::Cmov { .. } => {}
                 MirOp::EndLoop => {

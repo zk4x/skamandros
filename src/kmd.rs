@@ -69,11 +69,13 @@ pub const BAR0_BYTES: u64 = 512 * 1024 * 1024;
 /// apertures this module's BAR0 mapping does not cover.
 pub const NUM_2MIB_WINDOWS: u32 = 202;
 
-/// Tenstorrent's PCI vendor id, and a Blackhole's device id (`blackhole.c:59`
-/// carries the ARC coordinates beside them; the driver's `pci_device_id` table
-/// is the authority).
+/// Tenstorrent's PCI vendor id, and the device ids this driver recognises
+/// (`blackhole.c:59` carries the ARC coordinates beside the vendor id; the
+/// driver's `pci_device_id` table is the authority). `0xFEED` is Quasar's,
+/// as the qsr model reports it in configuration space.
 pub const VENDOR_ID_TENSTORRENT: u16 = 0x1E52;
 pub const DEVICE_ID_BLACKHOLE: u16 = 0xB140;
+pub const DEVICE_ID_QUASAR: u16 = 0xFEED;
 
 /// The tt-kmd userspace ABI, transcribed from `/usr/src/tenstorrent-2.11.0/ioctl.h`.
 pub mod abi {
@@ -576,9 +578,27 @@ impl Kmd {
         };
         call(fd.as_fd(), abi::GET_DEVICE_INFO, &mut dev)
             .map_err(|e| failed("reading the device's identity", e))?;
-        if dev.vendor_id != VENDOR_ID_TENSTORRENT || dev.device_id != DEVICE_ID_BLACKHOLE {
+        if dev.vendor_id != VENDOR_ID_TENSTORRENT {
             eprintln!(
-                "libskamandros: {path:?} is {:#06x}:{:#06x}, not a Blackhole",
+                "libskamandros: {path:?} is {:#06x}:{:#06x}, not a Tenstorrent device",
+                dev.vendor_id, dev.device_id
+            );
+            return Err(ttStatus::TT_ERROR_NOT_BLACKHOLE);
+        }
+        // A Quasar is a real identity the device layer knows, but the mapping
+        // and bring-up below are Blackhole's: BAR0's aperture, its TLB array
+        // and the ARC. Refuse it here rather than map a Quasar's BAR with the
+        // wrong geometry.
+        if dev.device_id == DEVICE_ID_QUASAR {
+            eprintln!(
+                "libskamandros: {path:?} is a Quasar; the tt-kmd path is Blackhole's, and Quasar \
+                 bring-up exists only through the simulator for now"
+            );
+            return Err(ttStatus::TT_ERROR_UNSUPPORTED);
+        }
+        if dev.device_id != DEVICE_ID_BLACKHOLE {
+            eprintln!(
+                "libskamandros: {path:?} is {:#06x}:{:#06x}, not a chip this build drives",
                 dev.vendor_id, dev.device_id
             );
             return Err(ttStatus::TT_ERROR_NOT_BLACKHOLE);

@@ -21,7 +21,8 @@ use crate::ir::{
     BOp, DType, Dim, Kernel, Op, OpId, RegShape, UOp, ValueInfo, access_shape, unit_of,
 };
 use crate::mir::{
-    Bcast, BinarySfpOp, Cb, Core, Dst, ElwOp, IOp, LReg, MachineKernel, MirOp, PackMask, UnarySfpOp,
+    Bcast, BinarySfpOp, Cb, Core, Dst, ElwOp, IOp, LReg, MachineKernel, MirOp, PackMask, Target,
+    UnarySfpOp,
 };
 use crate::riscv::reg;
 use crate::status::ttStatus;
@@ -265,16 +266,22 @@ impl Kernel {
     /// Lower the verified SSA program to the machine IR, with one register per
     /// value and no hardware limit applied.
     pub fn lower(&self) -> Result<MachineKernel, ttStatus> {
-        let k = self;
-        lower_with(k)
+        self.lower_for(Target::Blackhole)
+    }
+
+    /// Lower for `target`: the same machine kernel, with that chip's NoC
+    /// request sequence in the movers.
+    pub fn lower_for(&self, target: Target) -> Result<MachineKernel, ttStatus> {
+        lower_with(self, target)
     }
 }
 
 /// Lower `k` to the five programs.
-fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
+fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
     let types = Types { k };
     let types = &types;
     let (plan, mut m, alloc) = prepare(k)?;
+    m.target = target;
     let alloc = &alloc;
 
     // The dtype a value occupies `Dst` with. 16-bit mode stores every value as
@@ -1604,218 +1611,225 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     stage(&mut m, k, &types, alloc, &acc_mask, b, cb_b)?;
                 }
                 let base = dst_reg(alloc, acc)?;
-                // Scratch for `mvmul_group`, which emits a run of math ops: the
-                // run is appended to the one IR as it is produced.
-                let mut math_scratch: Vec<MirOp> = Vec::new();
-                // The Matrix Unit writes the accumulator's rows; `reg_sync`
-                // places the wait for a packer that still reads them.
-                // The Matrix Unit's address modifiers, fidelity phase and row
-                // counters are this thread's `ThreadConfig` and RWC state. Every
-                // word goes out as a whole `SETC16`, so an entry carrying several
-                // fields of one word is composed here.
-                for entry in [
-                    vec![(thread::ADDR_MOD_AB_SEC0_SrcAIncr, 0u16)],
-                    vec![(thread::ADDR_MOD_DST_SEC0_DestIncr, 0)],
-                    vec![(thread::ADDR_MOD_AB_SEC1_SrcAIncr, 0)],
-                    vec![(thread::ADDR_MOD_DST_SEC1_FidelityIncr, 1)],
-                    // End of a group's first `SrcB` half: `SrcB` on eight rows,
-                    // phase back to 0.
-                    vec![
-                        (thread::ADDR_MOD_AB_SEC2_SrcBIncr, 8),
-                        (thread::ADDR_MOD_AB_SEC2_SrcBClear, 0),
-                    ],
-                    vec![
-                        (thread::ADDR_MOD_DST_SEC2_DestIncr, 0),
-                        (thread::ADDR_MOD_DST_SEC2_DestCR, 0),
-                        (thread::ADDR_MOD_DST_SEC2_FidelityClear, 1),
-                    ],
-                    // End of a group that is not the `fi`'s last: phase and
-                    // `SrcB` back to 0.
-                    vec![
-                        (thread::ADDR_MOD_AB_SEC3_SrcBIncr, 0),
-                        (thread::ADDR_MOD_AB_SEC3_SrcBClear, 1),
-                    ],
-                    vec![
-                        (thread::ADDR_MOD_DST_SEC3_DestIncr, 0),
-                        (thread::ADDR_MOD_DST_SEC3_DestCR, 0),
-                        (thread::ADDR_MOD_DST_SEC3_FidelityClear, 1),
-                    ],
-                    // End of an `fi`: as 3, and the `Dst` base on 32 rows for
-                    // the next `fi`.
-                    vec![
-                        (thread::ADDR_MOD_AB_SEC4_SrcBIncr, 0),
-                        (thread::ADDR_MOD_AB_SEC4_SrcBClear, 1),
-                    ],
-                    vec![
-                        (thread::ADDR_MOD_DST_SEC4_DestIncr, 32),
-                        (thread::ADDR_MOD_DST_SEC4_DestCR, 0),
-                        (thread::ADDR_MOD_DST_SEC4_FidelityClear, 1),
-                    ],
-                    vec![(thread::FIDELITY_BASE_Phase, 0)],
-                ] {
-                    m.push(Core::Math, thread_word(&entry)?);
-                }
-                // Src rows and the `Dst` counter start at 0.
-                m.push(
-                    Core::Math,
-                    MirOp::Setrwc {
-                        src_a: 0,
-                        src_b: 0,
-                        dst: 0,
-                        flip_src_a: false,
-                        flip_src_b: false,
-                        dst_cr: false,
-                    },
-                );
-                // The accumulator's rows are added to, never cleared: an `acc`
-                // holds whatever the program last put there, and zeroing it is a
-                // `store_to %acc from %zero` the program writes itself.
-                // One `(fi, k)` group: A's face `(fi, k)` into `SrcB`, B's two
-                // faces `(k, 0)` and `(k, 1)` into `SrcA`. The unpacker and the
-                // Matrix Unit alternate through the bank handover, so the two
-                // roles interleave by ownership, not by instruction position.
-                // A staged operand's page is published by the packer (T2) before
-                // the unpacker reads it, and released after the last face.
-                for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
-                    if staged {
-                        m.push(Core::Unpack, MirOp::CbWait { cb, n: 1 });
+                if target == Target::Quasar {
+                    // The Quasar FPU's own geometry: eight `Dst` rows per
+                    // `MVMUL`, six address modifiers, and both operands
+                    // unpacked whole (`llk_math_matmul.h`).
+                    quasar_matmul(&mut m, base, cb_a, cb_b, dt_a, dt_b, stage_a, stage_b)?;
+                } else {
+                    // Scratch for `mvmul_group`, which emits a run of math ops: the
+                    // run is appended to the one IR as it is produced.
+                    let mut math_scratch: Vec<MirOp> = Vec::new();
+                    // The Matrix Unit writes the accumulator's rows; `reg_sync`
+                    // places the wait for a packer that still reads them.
+                    // The Matrix Unit's address modifiers, fidelity phase and row
+                    // counters are this thread's `ThreadConfig` and RWC state. Every
+                    // word goes out as a whole `SETC16`, so an entry carrying several
+                    // fields of one word is composed here.
+                    for entry in [
+                        vec![(thread::ADDR_MOD_AB_SEC0_SrcAIncr, 0u16)],
+                        vec![(thread::ADDR_MOD_DST_SEC0_DestIncr, 0)],
+                        vec![(thread::ADDR_MOD_AB_SEC1_SrcAIncr, 0)],
+                        vec![(thread::ADDR_MOD_DST_SEC1_FidelityIncr, 1)],
+                        // End of a group's first `SrcB` half: `SrcB` on eight rows,
+                        // phase back to 0.
+                        vec![
+                            (thread::ADDR_MOD_AB_SEC2_SrcBIncr, 8),
+                            (thread::ADDR_MOD_AB_SEC2_SrcBClear, 0),
+                        ],
+                        vec![
+                            (thread::ADDR_MOD_DST_SEC2_DestIncr, 0),
+                            (thread::ADDR_MOD_DST_SEC2_DestCR, 0),
+                            (thread::ADDR_MOD_DST_SEC2_FidelityClear, 1),
+                        ],
+                        // End of a group that is not the `fi`'s last: phase and
+                        // `SrcB` back to 0.
+                        vec![
+                            (thread::ADDR_MOD_AB_SEC3_SrcBIncr, 0),
+                            (thread::ADDR_MOD_AB_SEC3_SrcBClear, 1),
+                        ],
+                        vec![
+                            (thread::ADDR_MOD_DST_SEC3_DestIncr, 0),
+                            (thread::ADDR_MOD_DST_SEC3_DestCR, 0),
+                            (thread::ADDR_MOD_DST_SEC3_FidelityClear, 1),
+                        ],
+                        // End of an `fi`: as 3, and the `Dst` base on 32 rows for
+                        // the next `fi`.
+                        vec![
+                            (thread::ADDR_MOD_AB_SEC4_SrcBIncr, 0),
+                            (thread::ADDR_MOD_AB_SEC4_SrcBClear, 1),
+                        ],
+                        vec![
+                            (thread::ADDR_MOD_DST_SEC4_DestIncr, 32),
+                            (thread::ADDR_MOD_DST_SEC4_DestCR, 0),
+                            (thread::ADDR_MOD_DST_SEC4_FidelityClear, 1),
+                        ],
+                        vec![(thread::FIDELITY_BASE_Phase, 0)],
+                    ] {
+                        m.push(Core::Math, thread_word(&entry)?);
                     }
-                }
-                for fi in 0..2u32 {
-                    for kk in 0..2u32 {
-                        m.push(
-                            Core::Unpack,
-                            MirOp::Setadczw {
-                                u0: false,
-                                u1: true,
-                                z0: Some(2 * fi + kk),
-                                z1: None,
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::UnpackConfig {
-                                unit: 1,
-                                to_src: true,
-                                dtype: dt_a,
-                                haloize: false,
-                                add_dest_cntr: false,
-                                ch1_z_stride: 0,
-                            },
-                        );
-                        m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_a, unit: 1 });
-                        m.push(
-                            Core::Unpack,
-                            MirOp::Unpacr {
-                                unit: 1,
-                                count: FACE_DATUMS,
-                                flip: true,
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::Setadczw {
-                                u0: true,
-                                u1: false,
-                                z0: Some(2 * kk),
-                                z1: None,
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::UnpackConfig {
-                                unit: 0,
-                                to_src: true,
-                                dtype: dt_b,
-                                haloize: false,
-                                add_dest_cntr: false,
-                                ch1_z_stride: 0,
-                            },
-                        );
-                        m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 0 });
-                        m.push(
-                            Core::Unpack,
-                            MirOp::Unpacr {
-                                unit: 0,
-                                count: FACE_DATUMS,
-                                flip: true,
-                            },
-                        );
-                        mvmul_group(&mut math_scratch, base, 0);
-                        for op in math_scratch.drain(..) {
-                            m.push(Core::Math, op);
+                    // Src rows and the `Dst` counter start at 0.
+                    m.push(
+                        Core::Math,
+                        MirOp::Setrwc {
+                            src_a: 0,
+                            src_b: 0,
+                            dst: 0,
+                            flip_src_a: false,
+                            flip_src_b: false,
+                            dst_cr: false,
+                        },
+                    );
+                    // The accumulator's rows are added to, never cleared: an `acc`
+                    // holds whatever the program last put there, and zeroing it is a
+                    // `store_to %acc from %zero` the program writes itself.
+                    // One `(fi, k)` group: A's face `(fi, k)` into `SrcB`, B's two
+                    // faces `(k, 0)` and `(k, 1)` into `SrcA`. The unpacker and the
+                    // Matrix Unit alternate through the bank handover, so the two
+                    // roles interleave by ownership, not by instruction position.
+                    // A staged operand's page is published by the packer (T2) before
+                    // the unpacker reads it, and released after the last face.
+                    for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
+                        if staged {
+                            m.push(Core::Unpack, MirOp::CbWait { cb, n: 1 });
                         }
-                        m.push(
-                            Core::Math,
-                            MirOp::Mvmul {
-                                reg: base,
-                                at: 8,
-                                addr_mod: MATMUL_AM_GROUP,
-                                flip_a: true,
-                                flip_b: false,
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::Setadczw {
-                                u0: true,
-                                u1: false,
-                                z0: Some(2 * kk + 1),
-                                z1: None,
-                            },
-                        );
-                        m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 0 });
-                        m.push(
-                            Core::Unpack,
-                            MirOp::Unpacr {
-                                unit: 0,
-                                count: FACE_DATUMS,
-                                flip: true,
-                            },
-                        );
-                        mvmul_group(&mut math_scratch, base, 16);
-                        for op in math_scratch.drain(..) {
-                            m.push(Core::Math, op);
+                    }
+                    for fi in 0..2u32 {
+                        for kk in 0..2u32 {
+                            m.push(
+                                Core::Unpack,
+                                MirOp::Setadczw {
+                                    u0: false,
+                                    u1: true,
+                                    z0: Some(2 * fi + kk),
+                                    z1: None,
+                                },
+                            );
+                            m.push(
+                                Core::Unpack,
+                                MirOp::UnpackConfig {
+                                    unit: 1,
+                                    to_src: true,
+                                    dtype: dt_a,
+                                    haloize: false,
+                                    add_dest_cntr: false,
+                                    ch1_z_stride: 0,
+                                },
+                            );
+                            m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_a, unit: 1 });
+                            m.push(
+                                Core::Unpack,
+                                MirOp::Unpacr {
+                                    unit: 1,
+                                    count: FACE_DATUMS,
+                                    flip: true,
+                                },
+                            );
+                            m.push(
+                                Core::Unpack,
+                                MirOp::Setadczw {
+                                    u0: true,
+                                    u1: false,
+                                    z0: Some(2 * kk),
+                                    z1: None,
+                                },
+                            );
+                            m.push(
+                                Core::Unpack,
+                                MirOp::UnpackConfig {
+                                    unit: 0,
+                                    to_src: true,
+                                    dtype: dt_b,
+                                    haloize: false,
+                                    add_dest_cntr: false,
+                                    ch1_z_stride: 0,
+                                },
+                            );
+                            m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 0 });
+                            m.push(
+                                Core::Unpack,
+                                MirOp::Unpacr {
+                                    unit: 0,
+                                    count: FACE_DATUMS,
+                                    flip: true,
+                                },
+                            );
+                            mvmul_group(&mut math_scratch, base, 0);
+                            for op in math_scratch.drain(..) {
+                                m.push(Core::Math, op);
+                            }
+                            m.push(
+                                Core::Math,
+                                MirOp::Mvmul {
+                                    reg: base,
+                                    at: 8,
+                                    addr_mod: MATMUL_AM_GROUP,
+                                    flip_a: true,
+                                    flip_b: false,
+                                },
+                            );
+                            m.push(
+                                Core::Unpack,
+                                MirOp::Setadczw {
+                                    u0: true,
+                                    u1: false,
+                                    z0: Some(2 * kk + 1),
+                                    z1: None,
+                                },
+                            );
+                            m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 0 });
+                            m.push(
+                                Core::Unpack,
+                                MirOp::Unpacr {
+                                    unit: 0,
+                                    count: FACE_DATUMS,
+                                    flip: true,
+                                },
+                            );
+                            mvmul_group(&mut math_scratch, base, 16);
+                            for op in math_scratch.drain(..) {
+                                m.push(Core::Math, op);
+                            }
+                            let end = if kk == 0 {
+                                MATMUL_AM_GROUP
+                            } else {
+                                MATMUL_AM_FI
+                            };
+                            m.push(
+                                Core::Math,
+                                MirOp::Mvmul {
+                                    reg: base,
+                                    at: 24,
+                                    addr_mod: end,
+                                    flip_a: true,
+                                    flip_b: true,
+                                },
+                            );
                         }
-                        let end = if kk == 0 {
-                            MATMUL_AM_GROUP
-                        } else {
-                            MATMUL_AM_FI
-                        };
-                        m.push(
-                            Core::Math,
-                            MirOp::Mvmul {
-                                reg: base,
-                                at: 24,
-                                addr_mod: end,
-                                flip_a: true,
-                                flip_b: true,
-                            },
-                        );
                     }
-                }
-                // The Matrix Unit advanced the thread's `Dst` counter as it
-                // walked the accumulator, and an `SFPLOAD`/`SFPSTORE` address is
-                // relative to it, so the counter goes back to 0. Its writes are
-                // still in flight, so the accumulator is not readable (the pack
-                // follows on T2) until the unit drains.
-                m.push(Core::Math, MirOp::WaitMatrix);
-                for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
-                    if staged {
-                        m.push(Core::Unpack, MirOp::CbPop { cb, n: 1 });
+                    // The Matrix Unit advanced the thread's `Dst` counter as it
+                    // walked the accumulator, and an `SFPLOAD`/`SFPSTORE` address is
+                    // relative to it, so the counter goes back to 0. Its writes are
+                    // still in flight, so the accumulator is not readable (the pack
+                    // follows on T2) until the unit drains.
+                    m.push(Core::Math, MirOp::WaitMatrix);
+                    for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
+                        if staged {
+                            m.push(Core::Unpack, MirOp::CbPop { cb, n: 1 });
+                        }
                     }
+                    m.push(
+                        Core::Math,
+                        MirOp::Setrwc {
+                            src_a: 0,
+                            src_b: 0,
+                            dst: 0,
+                            flip_src_a: false,
+                            flip_src_b: false,
+                            dst_cr: false,
+                        },
+                    );
                 }
-                m.push(
-                    Core::Math,
-                    MirOp::Setrwc {
-                        src_a: 0,
-                        src_b: 0,
-                        dst: 0,
-                        flip_src_a: false,
-                        flip_src_b: false,
-                        dst_cr: false,
-                    },
-                );
             }
             // `sum col`/`max col`: `GAPOOL`/`GMPOOL` fold each 16x16 face over
             // its rows into the destination row, one value per column, and the
@@ -1980,7 +1994,10 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                                     u0: true,
                                     u1: false,
                                     z0: Some(face),
-                                    z1: None,
+                                    // The face the fold reads is the bank's
+                                    // face 0: the fold's counter is reset after
+                                    // every face (see the scaler below).
+                                    z1: Some(0),
                                 },
                             );
                             m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_x, unit: 0 });
@@ -1998,7 +2015,13 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                                     u0: false,
                                     u1: true,
                                     z0: Some(face),
-                                    z1: None,
+                                    // The scaler row lands at the destination
+                                    // face the fold addresses: the reader hands
+                                    // the `Src` bank back after every face, so
+                                    // each face's row is written to face 0 (on
+                                    // Quasar `UNPACR1_FACE`'s dst-face operand,
+                                    // tt-metal's `UNPACR1_FACE_INC(0, 0, ...)`).
+                                    z1: Some(0),
                                 },
                             );
                             m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 1 });
@@ -2237,7 +2260,10 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                                 u0: true,
                                 u1: false,
                                 z0: Some(face),
-                                z1: None,
+                                // Face 0 of the bank: the fold resets its
+                                // counters after every face, so each face's
+                                // data is written where the fold reads it.
+                                z1: Some(0),
                             },
                         );
                         m.push(
@@ -2266,7 +2292,10 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                                 u0: false,
                                 u1: true,
                                 z0: Some(face),
-                                z1: None,
+                                // Face 0 of the bank: the fold resets its
+                                // counters after every face, so each face's
+                                // data is written where the fold reads it.
+                                z1: Some(0),
                             },
                         );
                         m.push(
@@ -2306,9 +2335,21 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                                 },
                             );
                         } else {
-                            // Four fidelity phases, the last clearing the phase
-                            // (tt-metal's `reduce_configure_mop`).
-                            for addr_mod in [3u32, 3, 3, 0] {
+                            // The fold's fidelity phases: `math_fidelity_schedule`
+                            // (`cmath_common.h:52-77`). `SrcA` carries the data,
+                            // so a `Tf32` register (an `f32` operand) needs all
+                            // four and a `Float16_b` one (a `bf16` operand, which
+                            // has no low mantissa bits) needs exactly one — qsr
+                            // refuses the extra ones (`check_fidelity_phase:
+                            // fidelity_phase=1 src_a_fmt=5 ... one phase covers
+                            // SrcA`). The last phase clears the counter.
+                            let phases: &[u32] =
+                                if target == Target::Quasar && dt_x != crate::ir::DType::F32 {
+                                    &[0]
+                                } else {
+                                    &[3, 3, 3, 0]
+                                };
+                            for &addr_mod in phases {
                                 m.push(
                                     Core::Math,
                                     MirOp::Gapool {
@@ -2647,6 +2688,269 @@ fn transpose_dst(m: &mut MachineKernel, reg: Dst) -> Result<(), ttStatus> {
             src_b: 0,
             dst: 0,
             flip_src_a: true,
+            flip_src_b: true,
+            dst_cr: false,
+        },
+    );
+    Ok(())
+}
+
+/// `ELTWISE_MATH_ROWS` on Quasar: the eight `Dst` rows one `MVMUL` writes
+/// (`cmath_common.h:89`, `MATH_ROWS`).
+const QUASAR_FPU_ROWS: u16 = 8;
+/// `MAX_FACE_C_DIM`: the sixteen rows one column-face step covers.
+const QUASAR_FACE_C: u16 = 16;
+/// `src_b_row_stride` for a full 32x32 operand: `face_rows * num_k_faces`
+/// (`llk_math_matmul.h`, `_llk_math_matmul_execution_geometry_`).
+const QUASAR_SRC_B_ROW_STRIDE: u16 = 32;
+/// The address modifier each of the fifteen replayed `MVMUL`s selects: one per
+/// (FPU row group, SrcA face, SrcB face) step, with the transition at the end
+/// of every face pair (`_llk_math_matmul_load_replay_`, `llk_math_matmul.h`).
+const QUASAR_MATMUL_REPLAY: [u32; 15] = [0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0];
+/// `ADDR_MOD_4`: ends a fidelity phase — both sources restart, `Dst` rewinds
+/// through its carriage return, and the fidelity counter steps.
+const QUASAR_MATMUL_AM_PHASE: u32 = 4;
+/// `ADDR_MOD_5`: ends the tile — as `ADDR_MOD_4`, but `Dst` steps to the next
+/// tile and the fidelity counter is cleared.
+const QUASAR_MATMUL_AM_TILE: u32 = 5;
+/// The fidelity phases one tile issues, and the counter step between them.
+///
+/// `math_fidelity_schedule` (`cmath_common.h:52-77`) for a `HiFi4` request:
+/// phase 1 needs low `SrcA` mantissa bits, phase 2 low `SrcB` ones and phase 3
+/// both, so a register format without them drops the phases it cannot use.
+/// `Tf32` (what an `f32` operand unpacks as) carries them; `Float16_b` (a
+/// `bf16` operand) does not, and a narrow `SrcA` has no phase 1, so its second
+/// phase is phase 2 and the counter steps by two.
+fn quasar_matmul_fidelity(wide_a: bool, wide_b: bool) -> (u32, u32) {
+    let mut phases = 1;
+    if wide_a {
+        phases += 1;
+    }
+    if wide_b {
+        phases += 1;
+    }
+    if wide_a && wide_b {
+        phases += 1;
+    }
+    let increment = if phases == 1 {
+        0
+    } else if wide_a {
+        1
+    } else {
+        2
+    };
+    (phases, increment)
+}
+
+/// One tile of `A @ B` on Quasar, transcribed from
+/// `_llk_math_matmul_addrmod_`, `_llk_math_matmul_load_replay_` and
+/// `_llk_math_matmul_tile_` (`tt_llk_quasar/llk_lib/llk_math_matmul.h`).
+///
+/// The walk is not Blackhole's. Quasar's FPU writes eight `Dst` rows per
+/// `MVMUL` (`ELTWISE_MATH_ROWS`) and does not step `Dst` on its own, so the
+/// tile's four output faces and two K faces are laid out by six address
+/// modifiers and a fixed sixteen-`MVMUL` image: eight per K face, one per
+/// (SrcB face, SrcA face, FPU row group).
+///
+/// Both operands are unpacked whole — four faces each — before the image runs,
+/// because the Matrix Unit walks the faces with its own `SrcA`/`SrcB` counters
+/// instead of the unpacker refilling one face at a time.
+fn quasar_matmul(
+    m: &mut MachineKernel,
+    base: Dst,
+    cb_a: Cb,
+    cb_b: Cb,
+    dt_a: crate::ir::DType,
+    dt_b: crate::ir::DType,
+    stage_a: bool,
+    stage_b: bool,
+) -> Result<(), ttStatus> {
+    /// Can this operand's register format feed more than one fidelity phase?
+    /// Only the formats carrying low mantissa bits can
+    /// (`math_fidelity_schedule`'s `has_low_mantissa`); a `bf16` operand
+    /// unpacks as `Float16_b`, which cannot.
+    fn wide(dtype: crate::ir::DType) -> bool {
+        dtype == crate::ir::DType::F32
+    }
+    // `SrcA` is the operand unpacker 0 loads (`cb_b`), `SrcB` the one
+    // unpacker 1 loads (`cb_a`).
+    let (phases, increment) = quasar_matmul_fidelity(wide(dt_b), wide(dt_a));
+    // `_llk_math_matmul_addrmod_` for ct_dim = rt_dim = 1: the shape has two
+    // column faces and two row faces, so all three traversal slots are live.
+    // A `MVMUL` writes the next eight `Dst` rows, so every slot that executes
+    // advances `Dst` by one FPU row group; `ADDR_MOD_3` rewinds it to the
+    // start of the tile through the carriage return instead.
+    for entry in [
+        // `ADDR_MOD_0`: the next FPU row group of the same face pair.
+        vec![
+            (thread::ADDR_MOD_AB_SEC0_SrcAIncr, 0),
+            (thread::ADDR_MOD_AB_SEC0_SrcBCR, 0),
+            (thread::ADDR_MOD_AB_SEC0_SrcBIncr, QUASAR_FPU_ROWS),
+        ],
+        vec![
+            (thread::ADDR_MOD_DST_SEC0_DestIncr, QUASAR_FPU_ROWS),
+            (thread::ADDR_MOD_DST_SEC0_DestCR, 0),
+        ],
+        // `ADDR_MOD_1`: the next column face of `SrcA`; `SrcB`'s carriage
+        // return discards the row-group step `ADDR_MOD_0` took.
+        vec![
+            (thread::ADDR_MOD_AB_SEC1_SrcAIncr, QUASAR_FACE_C),
+            (thread::ADDR_MOD_AB_SEC1_SrcBIncr, 0),
+            (thread::ADDR_MOD_AB_SEC1_SrcBCR, 1),
+        ],
+        vec![
+            (thread::ADDR_MOD_DST_SEC1_DestIncr, QUASAR_FPU_ROWS),
+            (thread::ADDR_MOD_DST_SEC1_DestCR, 0),
+        ],
+        // `ADDR_MOD_2`: the next row of the output face grid — rewind the
+        // `SrcA` column face and rebase `SrcB` one row of faces down.
+        vec![
+            (thread::ADDR_MOD_AB_SEC2_SrcAIncr, 0),
+            (thread::ADDR_MOD_AB_SEC2_SrcACR, 1),
+            (thread::ADDR_MOD_AB_SEC2_SrcBIncr, QUASAR_SRC_B_ROW_STRIDE),
+            (thread::ADDR_MOD_AB_SEC2_SrcBCR, 1),
+        ],
+        vec![
+            (thread::ADDR_MOD_DST_SEC2_DestIncr, QUASAR_FPU_ROWS),
+            (thread::ADDR_MOD_DST_SEC2_DestCR, 0),
+        ],
+        // `ADDR_MOD_3`: both sources step one K face and `Dst` rewinds to the
+        // start of the tile. `SrcB`'s step is negative (the six-bit two's
+        // complement of `src_b_row_stride - face_rows`).
+        vec![
+            (thread::ADDR_MOD_AB_SEC3_SrcAIncr, QUASAR_SRC_B_ROW_STRIDE),
+            (thread::ADDR_MOD_AB_SEC3_SrcACR, 1),
+            (
+                thread::ADDR_MOD_AB_SEC3_SrcBIncr,
+                0x3f & (16u16.wrapping_sub(QUASAR_SRC_B_ROW_STRIDE)),
+            ),
+            (thread::ADDR_MOD_AB_SEC3_SrcBCR, 1),
+        ],
+        vec![
+            (thread::ADDR_MOD_DST_SEC3_DestIncr, 0),
+            (thread::ADDR_MOD_DST_SEC3_DestCR, 1),
+        ],
+        // `ADDR_MOD_4`: ends a fidelity phase.
+        vec![
+            (thread::ADDR_MOD_AB_SEC4_SrcAClear, 1),
+            (thread::ADDR_MOD_AB_SEC4_SrcBClear, 1),
+        ],
+        vec![
+            (thread::ADDR_MOD_DST_SEC4_DestIncr, 0),
+            (thread::ADDR_MOD_DST_SEC4_DestCR, 1),
+            (thread::ADDR_MOD_DST_SEC4_FidelityIncr, increment as u16),
+        ],
+        // `ADDR_MOD_5`: ends the tile.
+        vec![
+            (thread::ADDR_MOD_AB_SEC5_SrcAClear, 1),
+            (thread::ADDR_MOD_AB_SEC5_SrcBClear, 1),
+        ],
+        vec![
+            (thread::ADDR_MOD_DST_SEC5_DestIncr, DST_ROWS as u16),
+            (thread::ADDR_MOD_DST_SEC5_DestCR, 1),
+            (thread::ADDR_MOD_DST_SEC5_FidelityClear, 1),
+        ],
+        vec![(thread::FIDELITY_BASE_Phase, 0)],
+    ] {
+        m.push(Core::Math, thread_word(&entry)?);
+    }
+    // A staged operand's page is published by the packer (T2) before the
+    // unpacker reads it.
+    for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
+        if staged {
+            m.push(Core::Unpack, MirOp::CbWait { cb, n: 1 });
+        }
+    }
+    // `_llk_unpack_matmul_mop_config_` for a full four-face tile: `SrcB`
+    // (unpacker 1) takes input 0 with no tile step, `SrcA` (unpacker 0) input
+    // 1. One `UNPACR*_TILE_INC` per operand lands all four faces, and the
+    // instruction's data-valid hands the bank to the Matrix Unit.
+    for (unit, cb, dtype) in [(1u8, cb_a, dt_a), (0u8, cb_b, dt_b)] {
+        m.push(
+            Core::Unpack,
+            MirOp::UnpackConfig {
+                unit,
+                to_src: true,
+                dtype,
+                haloize: false,
+                add_dest_cntr: false,
+                ch1_z_stride: 0,
+            },
+        );
+        m.push(Core::Unpack, MirOp::SetUnpackBase { cb, unit });
+        m.push(
+            Core::Unpack,
+            MirOp::Unpacr {
+                unit,
+                count: TILE_DATUMS,
+                flip: true,
+            },
+        );
+    }
+    // `_llk_math_matmul_init_` ends with `_reset_counters_<SET_ABD_F>`, and
+    // `_llk_math_matmul_tile_` runs one image per fidelity phase.
+    m.push(
+        Core::Math,
+        MirOp::Setrwc {
+            src_a: 0,
+            src_b: 0,
+            dst: 0,
+            flip_src_a: false,
+            flip_src_b: false,
+            dst_cr: false,
+        },
+    );
+    for phase in 0..phases {
+        for addr_mod in QUASAR_MATMUL_REPLAY {
+            m.push(
+                Core::Math,
+                MirOp::Mvmul {
+                    reg: base,
+                    at: 0,
+                    addr_mod,
+                    flip_a: false,
+                    flip_b: false,
+                },
+            );
+        }
+        let tile_done = phase + 1 == phases;
+        m.push(
+            Core::Math,
+            MirOp::Mvmul {
+                reg: base,
+                at: 0,
+                addr_mod: if tile_done {
+                    QUASAR_MATMUL_AM_TILE
+                } else {
+                    QUASAR_MATMUL_AM_PHASE
+                },
+                // The tile's last `MVMUL` clears the `SrcA` valid
+                // (`p_setrwc::CLR_A`), letting the next unpack overwrite it.
+                flip_a: tile_done,
+                flip_b: false,
+            },
+        );
+    }
+    // The Matrix Unit's writes are still in flight, so the accumulator is not
+    // readable (the pack follows on T2) until it drains.
+    m.push(Core::Math, MirOp::WaitMatrix);
+    for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
+        if staged {
+            m.push(Core::Unpack, MirOp::CbPop { cb, n: 1 });
+        }
+    }
+    // `_llk_math_matmul_tile_` ends with `SETRWC(CLR_B, 0, 0, SET_ABD_F)`: the
+    // tile's last `MVMUL` cleared `SrcA`'s valid, and this clears `SrcB`'s, so
+    // the next unpack owns both banks. Without the clear a following matmul
+    // takes the bank's still-asserted valid as fresh data and reads whatever
+    // the previous tile left there.
+    m.push(
+        Core::Math,
+        MirOp::Setrwc {
+            src_a: 0,
+            src_b: 0,
+            dst: 0,
+            flip_src_a: false,
             flip_src_b: true,
             dst_cr: false,
         },
@@ -4952,6 +5256,7 @@ fn copy_to(
                 value,
                 None,
                 interleaved,
+                m.target,
             )?;
         } else {
             let scale = pool.take()?;
@@ -4976,6 +5281,7 @@ fn copy_to(
                 value,
                 None,
                 interleaved,
+                m.target,
             )?;
         }
     } else {
@@ -5028,6 +5334,7 @@ fn copy_to(
                 value,
                 Some(counter),
                 interleaved,
+                m.target,
             )?;
         } else {
             ops.push(MirOp::Li {
@@ -5051,6 +5358,7 @@ fn copy_to(
                 value,
                 None,
                 interleaved,
+                m.target,
             )?;
         }
         ops.push(MirOp::EndLoop);
@@ -5086,6 +5394,7 @@ fn narrow_pair(
     value: u8,
     lane: Option<u8>,
     interleaved: bool,
+    target: Target,
 ) -> Result<(), ttStatus> {
     let el = u32::from(dtype.bytes());
     // A request's two addresses must be congruent mod 64 for a read
@@ -5238,6 +5547,7 @@ fn narrow_pair(
         value,
         Some(ring),
         interleaved,
+        target,
     )?;
     // The second half: the next face on the parameter side, and the next face's
     // row (or the datums after the first sixteen) on the ring side.
@@ -5267,6 +5577,7 @@ fn narrow_pair(
         second,
         Some(ring),
         interleaved,
+        target,
     )?;
     pool.give(ring);
     pool.give(second);
@@ -5411,7 +5722,21 @@ fn emit_request(
     value: u8,
     ring_offset: Option<u8>,
     interleaved: bool,
+    target: Target,
 ) -> Result<(), ttStatus> {
+    if target == Target::Quasar {
+        return emit_request_quasar(
+            ops,
+            pool,
+            inbound,
+            cb,
+            block,
+            bytes,
+            value,
+            ring_offset,
+            interleaved,
+        );
+    }
     use crate::riscv::cb::{RD_PTR, STRIDE, WR_PTR};
     use tt_isa::arch::blackhole::noc::niu::{
         CMD_RD, CMD_WR, RESP_MARKED, STATIC_VC_1, initiator, reqs_outstanding,
@@ -5536,6 +5861,153 @@ fn emit_request(
     ops.push(MirOp::NiuPoll {
         reg: page,
         field: reqs_outstanding(crate::mover::TXN) as i32,
+    });
+    pool.give(page);
+    Ok(())
+}
+
+/// One NoC request as a Quasar mover's program: the same address in each
+/// register, staged in an overlay command buffer through RoCC instructions,
+/// fired, and waited for by the overlay's own completion counter.
+///
+/// This is tt-metal's `ncrisc_noc_fast_read` / `ncrisc_noc_fast_write`
+/// (`internal/tt-2xx/quasar/noc_nonblocking_api_v2.h:32-125`): `MISC`, the two
+/// virtual channels, the source and destination address with the coordinate
+/// that names their tile, the length, then the issue. A read answers on the
+/// read-data VC and its return coordinate is this tile; a write's source is
+/// local. `MISC_WRITE` marks a write, and a read leaves `MISC` at zero.
+///
+/// Completion is `ncrisc_noc_reads_flushed` / `ncrisc_noc_nonposted_writes_sent`
+/// (`noc_cmd_buf_common.h:487-509`): `scmdbuf_tr_ack` counts transactions that
+/// are not yet acknowledged, `scmdbuf_wr_sent` counts writes not yet read out of
+/// L1, and zero is the flush.
+fn emit_request_quasar(
+    ops: &mut Vec<MirOp>,
+    pool: &mut Pool,
+    inbound: bool,
+    cb: Cb,
+    block: i32,
+    bytes: u32,
+    value: u8,
+    ring_offset: Option<u8>,
+    interleaved: bool,
+) -> Result<(), ttStatus> {
+    use crate::quasar_mover::{
+        MISC_WRITE, READ_BUFFER, REQ_VC, RESP_VC_READ, RESP_VC_WRITE, WRITE_BUFFER, register,
+    };
+    use crate::riscv::cb::{RD_PTR, STRIDE, WR_PTR};
+    if bytes == 0 || bytes > crate::quasar_mover::Mover::MAX_BYTES {
+        return Err(ttStatus::TT_ERROR_NOC_REQUEST_BYTES);
+    }
+    let buffer = if inbound { READ_BUFFER } else { WRITE_BUFFER };
+    // `li tmp, value; cmdbuf_wr_reg buffer, register, tmp`, with `tmp` given
+    // straight back: a command-buffer register is written from a GPR, so a
+    // constant costs two instructions.
+    fn staged(
+        ops: &mut Vec<MirOp>,
+        pool: &mut Pool,
+        buffer: u8,
+        register: u8,
+        value: u32,
+    ) -> Result<(), ttStatus> {
+        let tmp = pool.take()?;
+        ops.push(MirOp::Li { reg: tmp, value });
+        ops.push(MirOp::CmdbufWrReg {
+            buffer,
+            register,
+            value: tmp,
+        });
+        pool.give(tmp);
+        Ok(())
+    }
+    // The transaction's kind and its two virtual channels, which tt-metal stages
+    // first so that an address register is never live while they are formed.
+    staged(
+        ops,
+        pool,
+        buffer,
+        register::MISC,
+        if inbound { 0 } else { MISC_WRITE },
+    )?;
+    staged(ops, pool, buffer, register::REQ_VC, REQ_VC)?;
+    staged(
+        ops,
+        pool,
+        buffer,
+        register::RESP_VC,
+        if inbound { RESP_VC_READ } else { RESP_VC_WRITE },
+    )?;
+    let (lo_arg, hi_arg) = (block, block + 4);
+    let (lo, hi) = if interleaved {
+        interleaved_address(ops, pool, block, value)?
+    } else {
+        let lo = pool.take()?;
+        let hi = pool.take()?;
+        ops.push(MirOp::LoadArg {
+            reg: lo,
+            arg: lo_arg,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Add,
+            d: lo,
+            a: lo,
+            b: value,
+        });
+        ops.push(MirOp::LoadArg {
+            reg: hi,
+            arg: hi_arg,
+        });
+        (lo, hi)
+    };
+    let page = pool.take()?;
+    let field = if inbound { WR_PTR } else { RD_PTR };
+    ops.push(MirOp::Lw {
+        reg: page,
+        base: reg::A6,
+        at: (u32::from(cb.0) * STRIDE) as i32 + field,
+    });
+    if let Some(offset) = ring_offset {
+        ops.push(MirOp::IArith {
+            op: IOp::Add,
+            d: page,
+            a: page,
+            b: offset,
+        });
+    }
+    // This tile's packed coordinate, which a transaction names as its local
+    // end. `t3` is the mover's reserved coordinate register — the same one
+    // Blackhole's request writes its high words from, loaded in that prologue
+    // and here on demand, because the staging below already holds every register
+    // the pool has.
+    let me = reg::T3;
+    ops.push(MirOp::LoadArg { reg: me, arg: 12 });
+    // The remote end carries the coordinate that names its tile; the local end
+    // carries this one.
+    let (src_addr, src_coord, dst_addr, dst_coord) = if inbound {
+        (lo, hi, page, me)
+    } else {
+        (page, me, lo, hi)
+    };
+    for (register, value) in [
+        (register::SRC_ADDR, src_addr),
+        (register::SRC_COORD, src_coord),
+        (register::DEST_ADDR, dst_addr),
+        (register::DEST_COORD, dst_coord),
+    ] {
+        ops.push(MirOp::CmdbufWrReg {
+            buffer,
+            register,
+            value,
+        });
+    }
+    pool.give(lo);
+    pool.give(hi);
+    staged(ops, pool, buffer, register::LEN_BYTES, bytes)?;
+    ops.push(MirOp::CmdbufIssue { buffer });
+    // The hardware has taken the request: wait for the transfer to land.
+    ops.push(MirOp::RoccPoll {
+        write: !inbound,
+        reg: page,
     });
     pool.give(page);
     Ok(())

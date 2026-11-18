@@ -528,6 +528,18 @@ pub enum MirOp {
     /// Wait until the NoC word at `field(t5)` reads zero: `lw` then `bne` back.
     /// A spin has no trip count, so it is not a [`MirOp::Loop`].
     NiuPoll { reg: u8, field: i32 },
+    /// `tt.rocc.cmdbuf_wr_reg`: write `value` into command-buffer `buffer`'s
+    /// register `register` (`tt_rocc_accel_reg.h` indices, the low six bits of
+    /// the RoCC `funct7`). A Quasar mover programs an overlay command buffer
+    /// this way; there is no memory-mapped initiator block to store into.
+    CmdbufWrReg { buffer: u8, register: u8, value: u8 },
+    /// `tt.rocc.cmdbuf_issue_trans`: fire the transaction staged in `buffer`.
+    CmdbufIssue { buffer: u8 },
+    /// The overlay's completion counter, then a spin until it reads zero:
+    /// `tt.rocc.scmdbuf_wr_sent` (a write's data has left L1) or
+    /// `tt.rocc.scmdbuf_tr_ack` (every issued transaction is acknowledged) into
+    /// `reg`, then `bne reg, zero` back to the read.
+    RoccPoll { write: bool, reg: u8 },
     /// `reg = core_info[axis]`: this core's logical grid coordinate.
     LoadCoord { reg: u8, axis: u8 },
     /// `d = a op b`, in RISC-V.
@@ -655,10 +667,25 @@ impl MirOp {
 /// The slabs are created by `lower` without any hardware constraint — one `Dst`
 /// per value, one lane register per temporary, one ring per buffer — and
 /// [`MachineKernel::alloc`] is what brings them inside the hardware's limits.
+/// The chip a machine kernel is lowered for. It selects the movers' NoC
+/// request sequence; the datapath programs are the same on both.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum Target {
+    #[default]
+    Blackhole,
+    Quasar,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MachineKernel {
     /// Every op, in the order the lowering met it, with the core it runs on.
     pub ops: Vec<(Core, MirOp)>,
+    /// The chip this machine kernel is lowered for. Only the movers differ: a
+    /// Blackhole mover stores its NoC request into the initiator's register
+    /// block, a Quasar mover stages it in a RoCC command buffer. Everything
+    /// above that — the rings, the arguments, the address arithmetic — is the
+    /// same program on both.
+    pub target: Target,
     /// The circular buffers the ops name.
     pub cbs: Slab<Cb, CbInfo>,
     /// The `Dst` registers the ops name.
@@ -1131,6 +1158,16 @@ fn write_op(f: &mut dyn fmt::Write, op: &MirOp) -> fmt::Result {
             )
         }
         MirOp::LoadCoord { reg, axis } => write!(f, "lw {}, core_info+{}(0)", rx(reg), axis * 4),
+        MirOp::CmdbufWrReg {
+            buffer,
+            register,
+            value,
+        } => write!(f, "cmdbuf_wr_reg {buffer}, {register}, {}", rx(value)),
+        MirOp::CmdbufIssue { buffer } => write!(f, "cmdbuf_issue {buffer}"),
+        MirOp::RoccPoll { write, reg } => {
+            let name = if write { "wr_sent" } else { "tr_ack" };
+            write!(f, "poll {name} {}", rx(reg))
+        }
         MirOp::IArith { op, d, a, b } => {
             write!(f, "{} {}, {}, {}", iop_name(op), rx(d), rx(a), rx(b))
         }

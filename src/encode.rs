@@ -15,7 +15,8 @@
 
 use crate::ir::DType;
 use crate::mir::{
-    Bcast, BinarySfpOp, Cb, Core, Dst, ElwOp, IOp, MachineKernel, MirOp, PackMask, UnarySfpOp,
+    Bcast, BinarySfpOp, Cb, Core, Dst, ElwOp, IOp, MachineKernel, MirOp, PackMask, Target,
+    UnarySfpOp,
 };
 use crate::riscv::{self as rv, Asm, reg};
 use crate::status::ttStatus;
@@ -26,9 +27,13 @@ use tt_isa::arch::blackhole::backend::{
 };
 use tt_isa::arch::blackhole::noc::niu::Niu;
 use tt_isa::arch::blackhole::sync::{self, Semaphore};
+use tt_isa::arch::quasar::issue;
+use tt_isa::arch::quasar::{Quasar, backend as qbackend, sfpu as qsfpu};
 use tt_isa::cfg::blackhole::{alu, global, pack0, thcon, thread, unpack0, unpack1};
+use tt_isa::cfg::quasar::{alu as qalu, thcon as qthcon};
 use tt_isa::isa::Instruction;
 use tt_isa::isa::blackhole::{defs, encode};
+use tt_isa::isa::quasar::encode as qencode;
 
 /// The GPR the configuration program stages each word through.
 pub const SCRATCH_GPR: u32 = 8;
@@ -364,8 +369,12 @@ fn encode_mover(
     }
     let niu = if outbound { Niu::Noc1 } else { Niu::Noc0 };
     out.asm(|a| {
-        a.li(reg::T5, niu.base() as u32);
-        a.word(rv::lw(reg::T3, reg::A0, 12));
+        if m.target == Target::Blackhole {
+            // `t5` is the initiator's register block, `t3` this tile's own NoC
+            // word; a Quasar mover has neither, so it only reads its ring table.
+            a.li(reg::T5, niu.base() as u32);
+            a.word(rv::lw(reg::T3, reg::A0, 12));
+        }
         a.word(rv::lw(reg::A6, reg::A0, crate::mover::ARG_IFACE as i32 * 4));
         Ok(())
     })?;
@@ -383,6 +392,24 @@ fn encode_mover(
             MirOp::NiuPoll { reg, field } => {
                 let top = out.len();
                 out.rv(rv::lw(reg, reg::T5, field));
+                let here = out.len();
+                out.rv(rv::bne(reg, reg::ZERO, ((top as i32) - (here as i32)) * 4));
+            }
+            // A Quasar mover's NoC: the command buffer is written through RoCC
+            // instructions, and the completion test is the overlay's own counter.
+            MirOp::CmdbufWrReg {
+                buffer,
+                register,
+                value,
+            } => out.rv(issue::cmdbuf_wr_reg(buffer, register, value)),
+            MirOp::CmdbufIssue { buffer } => out.rv(issue::cmdbuf_issue(buffer)),
+            MirOp::RoccPoll { write, reg } => {
+                let top = out.len();
+                out.rv(if write {
+                    issue::scmdbuf_wr_sent(reg)
+                } else {
+                    issue::scmdbuf_tr_ack(reg)
+                });
                 let here = out.len();
                 out.rv(rv::bne(reg, reg::ZERO, ((top as i32) - (here as i32)) * 4));
             }
@@ -2173,6 +2200,1574 @@ fn pack_done(sem: Semaphore) -> Result<[Instruction; 2], ttStatus> {
 fn unpack_done() -> Result<Instruction, ttStatus> {
     wait_for_unpacker0(Before::EVERYTHING)
         .map_err(|e| crate::status::internal_bug(format_args!("encode: unpacker wait: {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// Quasar's datapath
+// ---------------------------------------------------------------------------
+//
+// Quasar's unpacker and packer are buffer-descriptor driven. Where Blackhole
+// bakes a page's shape into the unit's `Config` bank (`SETADCX`/`SETADCZW`, the
+// `THCON_SEC*_REG*` descriptor) and reads from a base address, Quasar keeps a
+// table of 32 descriptors in the `Config` array and the transfer names one:
+//
+//   * word 0 holds the L1 base in 16-byte units and the L1 data format,
+//   * word 1 the X dimension, word 2 the Y and Z dimensions,
+//   * the unpack TRISC owns ids 0..16 and the pack TRISC 16..24
+//     (`llk_bfd_alloc.h`),
+//   * `UNPACR_DEST_TILE_INC`/`PACR0_TILE_INC` name the id and the tile-count
+//     increments.
+//
+// So the shape is written once, and what changes per page is a *tile index* into
+// the descriptor, set by `SET_SRC`/`SET_DST_TILE_FACE_ROW_IDX` and consumed by
+// the next transfer. tt-metal spells the page the same way
+// (`_llk_unpack_unary_operand_to_dest_tile_` and `_llk_pack_` both take an
+// `l1_tile_idx`), which is why this encoder never rewrites the descriptor's base
+// while the engine may still be reading it.
+
+/// `CFG_REGS_BASE`: the `Config` array in each hart's local map
+/// (`tt_t6_trisc_map.h:31`).
+///
+/// A Quasar TRISC writes `Config` with a plain store — tt-metal's
+/// `bd_table[i] = ...` (`ckernel_buf_desc.h:132-153`) and
+/// `cfg[ctrl_regs[...]] = ...` (`ckernel.h:774-800`) are both word stores — and
+/// the hardware keeps such a store ordered against the Tensix instructions that
+/// read the same word: `TENSIX_TRISC_SYNC[n]`'s `DISABLETRACKGLOBALCFG` resets to
+/// zero, i.e. tracking is on, and `ckernel.h:270-288` says so
+/// (`t6_debug_map.h:874-886`). Blackhole has no such tracking, which is why its
+/// page pointer has to be pushed as `SETDMAREG`+`WRCFG` (`cb_base`).
+const QUASAR_CFG: u32 = Quasar::TENSIX_CFG_BASE as u32;
+/// `IBUFFER_BASE`: the store target that pushes a Tensix instruction
+/// (`tt_t6_trisc_map.h:21`), as `cb_base` uses it.
+const QUASAR_INSTRN_BUF: u32 = Quasar::INSTRN_BUF_BASE as u32;
+/// `BUFFER_DESCRIPTOR_TABLE_REG0_L1_BASE_ADDR_ADDR32`: the table's first word;
+/// one descriptor is four words of which three are written
+/// (`cfg_defines.h:1469-1490`, `ckernel_buf_desc.h:195-201`).
+const QUASAR_BD: u32 = 108;
+/// The unpack TRISC's descriptor partition, `[0, 16)` (`llk_bfd_alloc.h`).
+const QUASAR_UNPACK_BD: u32 = 0;
+/// The pack TRISC's, `[16, 24)`.
+const QUASAR_PACK_BD: u32 = 16;
+/// A 32x32 tile's descriptor: `x=16, y=16, z=4` is the only shape the table
+/// calls a tile, and a face is 16 datums by 16 rows (`llk_bfd_alloc.h:62-90`).
+const QUASAR_BD_X: u32 = 16;
+const QUASAR_BD_Y: u32 = 16;
+const QUASAR_BD_Z: u32 = 4;
+/// `Tile_Face_Row_Sel`'s `TILE_SEL`: set only the tile counter.
+const QUASAR_TILE_SEL: u32 = 0;
+/// `EngineSel` of unpacker 0 and packer 0 (`p_unpacr::UNP_A`, `p_pacr::PACK0`).
+///
+/// `UNP_DEST` is driven off `UNP_A`'s counters, not its own
+/// (`llk_unpack_unary_operand_to_dest.h:143-160`), so both the L1 index and the
+/// `Dst` index of an unpack-to-`Dst` are `UNP_A`'s.
+const QUASAR_ENGINE_UNP_A: u32 = 0;
+const QUASAR_ENGINE_UNP_B: u32 = 1;
+const QUASAR_ENGINE_PACK0: u32 = 3;
+/// Datums in one `Dst` tile: `UNPACR_DEST_TILE_INC` moves exactly one tile.
+const QUASAR_TILE_DATUMS: u32 = 32 * 32;
+/// Datums in one face: a 32x32 tile is four 16x16 faces, and a `Src` unpack
+/// may move one at a time (`UNPACR{0,1}_FACE`).
+const QUASAR_FACE_DATUMS: u32 = 16 * 16;
+/// Datums in one face row: the `UNPACR{0,1}_ROW` run, and the scaler the
+/// AB-reduce math reads (`llk_unpack_reduce.h`'s per-face scaler unpack).
+const QUASAR_ROW_DATUMS: u32 = 16;
+/// The address-modifier slot the SFPU's `Src`/`Dst` accesses name: `ADDR_MOD_7`,
+/// which `_sfpu_configure_addrmod_` (`ckernel_sfpu.h:32-45`) leaves with every
+/// counter increment at zero.
+const QUASAR_SFPU_ADDR_MOD: u32 = 7;
+/// The `EngineSel` of unpacker `unit`: `UNP_A` is 0 and `UNP_B` is 1
+/// (`SET_SRC_TILE_FACE_ROW_IDX`'s table, `assembly.yaml`).
+fn quasar_engine(unit: u8) -> Result<u32, ttStatus> {
+    match unit {
+        0 => Ok(QUASAR_ENGINE_UNP_A),
+        1 => Ok(QUASAR_ENGINE_UNP_B),
+        _ => Err(quasar_shape("an unpacker other than 0 or 1")),
+    }
+}
+
+/// The buffer-descriptor id unpacker `unit` owns: the unpack TRISC's partition
+/// is `[0, 16)`, one id per engine (`llk_bfd_alloc.h`).
+fn quasar_unpack_bd(unit: u8) -> u32 {
+    u32::from(unit)
+}
+
+/// The register-file format a `Src` unpack writes: `Tf32` for a 32-bit operand
+/// and `Float16_b` for a 16-bit one.
+///
+/// This is `unpack_dst_format` (`jit_build/genfiles.cpp:1074-1079`): with
+/// `fp32_dest_acc_en` and every buffer `Float32` the conditional format is
+/// `Tf32` (4), and a bf16 buffer unpacks as itself (5). It is *not* the `Dst`
+/// format: a 32-bit accumulator is `Float32` (0).
+fn src_register_format(dtype: DType) -> u32 {
+    match dtype {
+        DType::Bf16 => DATA_FORMAT_BF16,
+        _ => DATA_FORMAT_TF32,
+    }
+}
+
+/// One `Src` unpack: a face at a time, or a whole tile in one instruction.
+///
+/// tt-metal's `_llk_unpack_unary_operand_mop_config_` issues one
+/// `UNPACR0_TILE_INC(0, 1, buf_desc_id, 1)` per tile (`llk_unpack_unary_operand.h:97-118`),
+/// while the per-face sequences — the matmul operand walk and the transposing
+/// unpack — name the source and destination face explicitly with
+/// `UNPACR0_FACE`/`UNPACR1_FACE`. Both are the same hardware path; only the
+/// counters they use differ, and `set_dat_valid` is the bank handover the
+/// Matrix Unit waits for.
+fn quasar_unpack_src(
+    out: &mut Stream,
+    unit: u8,
+    count: u32,
+    set_dvalid: bool,
+    (src_face, dst_face): (u32, u32),
+    transpose: bool,
+    have_bd: bool,
+) -> Result<(), ttStatus> {
+    if !have_bd {
+        return Err(quasar_shape("a `Src` unpack with no descriptor"));
+    }
+    let bd = quasar_unpack_bd(unit);
+    let dvalid = u32::from(set_dvalid);
+    match count {
+        QUASAR_FACE_DATUMS => {
+            let i = match unit {
+                0 => qencode::Unpacr0Face::ZERO
+                    .dst_face_idx(dst_face)
+                    .src_face_idx(src_face)
+                    .dst_tile_offset_idx_inc(0)
+                    .src_tile_offset_idx_inc(0)
+                    .buffer_descriptor_table_sel(bd)
+                    .set_dat_valid(dvalid)
+                    .encode(),
+                _ => qencode::Unpacr1Face::ZERO
+                    .dst_face_idx(dst_face)
+                    .src_face_idx(src_face)
+                    .dst_tile_offset_idx_inc(0)
+                    .src_tile_offset_idx_inc(0)
+                    .buffer_descriptor_table_sel(bd)
+                    .set_dat_valid(dvalid)
+                    .encode(),
+            };
+            out.push(i.map_err(quasar_unusable)?);
+        }
+        // One row of a face. The reduce's scaler is exactly this: tt-metal's
+        // `_llk_unpack_reduce_mop_config_` hands the scaler face to the
+        // AB-reduce math one face at a time, and the row form is the one
+        // `_llk_unpack_unary_broadcast_operands_mop_config_` uses for a scalar
+        // broadcast (`UNPACR1_ROW(0, 0, 0, 0, 0, 0, buf_desc_id, 1)`).
+        //
+        // The destination is the reader's own row 0, not the source face's:
+        // `src_face` names the L1 face the row comes from, and a reader that
+        // takes one row per face hands the `Src` bank back between faces
+        // (tt-metal's reduce clears both banks after every face), so each face's
+        // row lands where that reader addresses it — row 0.
+        QUASAR_ROW_DATUMS => {
+            let i = match unit {
+                0 => qencode::Unpacr0Row::ZERO
+                    .dst_row_idx(0)
+                    .src_row_idx(0)
+                    .dst_face_idx(0)
+                    .src_face_idx(src_face)
+                    .dst_tile_offset_idx_inc(0)
+                    .src_tile_offset_idx_inc(0)
+                    .buffer_descriptor_table_sel(bd)
+                    .set_dat_valid(dvalid)
+                    .encode(),
+                _ => qencode::Unpacr1Row::ZERO
+                    .dst_row_idx(0)
+                    .src_row_idx(0)
+                    .dst_face_idx(0)
+                    .src_face_idx(src_face)
+                    .dst_tile_offset_idx_inc(0)
+                    .src_tile_offset_idx_inc(0)
+                    .buffer_descriptor_table_sel(bd)
+                    .set_dat_valid(dvalid)
+                    .encode(),
+            };
+            out.push(i.map_err(quasar_unusable)?);
+        }
+        QUASAR_TILE_DATUMS if !transpose => {
+            let i = match unit {
+                0 => qencode::unpacr0_tile_inc(0, 1, bd, dvalid),
+                _ => qencode::unpacr1_tile_inc(0, 1, bd, dvalid),
+            };
+            out.push(i.map_err(quasar_unusable)?);
+        }
+        QUASAR_TILE_DATUMS => {
+            return Err(quasar_shape(
+                "a whole-tile transposing unpack (the faces must be permuted one at a time)",
+            ));
+        }
+        _ => {
+            return Err(quasar_shape(
+                "a `Src` run that is neither a face nor a tile",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The stall resource classes one compute hart's own instructions belong to.
+///
+/// Every mask names [`qbackend::block::SYNC`] as well: a `SEMGET` that follows a
+/// `SEMWAIT` must be held until the wait clears, and the get is itself a Sync Unit
+/// instruction (`SyncUnit.md`'s rule, which qsr enforces — it refuses a `SEMGET`
+/// whose thread's `SEMWAIT` "block mask lacks B1"). tt-metal reaches the same
+/// place from the other side, with `t6_semaphore_get<kIdle..>` putting a
+/// `STALLWAIT(STALL_SYNC, ..)` in front of the get.
+fn quasar_block(core: Core) -> u32 {
+    let own = match core {
+        Core::Unpack => qbackend::block::UNPACK,
+        Core::Pack => qbackend::block::PACK,
+        _ => qbackend::block::MATH | qbackend::block::SFPU,
+    };
+    own | qbackend::block::SYNC
+}
+
+/// The units a hart drains before it posts or takes a semaphore: tt-metal's
+/// per-thread `hw::t6_semaphore_*` idle list
+/// (`hw/inc/api/compute/experimental/semaphore_compute_impl.h:113-137`).
+fn quasar_idle(core: Core) -> &'static [u32] {
+    match core {
+        Core::Unpack => &[qbackend::res::UNPACK0, qbackend::res::UNPACK1],
+        Core::Pack => &[qbackend::res::PACK0],
+        _ => &[qbackend::res::MATH, qbackend::res::SFPU],
+    }
+}
+
+/// Refuse a Quasar lowering, naming the op under `SKAM_DEBUG`: the next slice
+/// starts from the first thing a kernel needs that this backend does not have.
+fn quasar_unsupported(op: &MirOp) -> ttStatus {
+    if std::env::var_os("SKAM_DEBUG").is_some() {
+        eprintln!("libskamandros: no Quasar lowering for {op:?}");
+    }
+    ttStatus::TT_ERROR_UNSUPPORTED
+}
+
+/// Refuse a shape this backend cannot express yet, naming it under `SKAM_DEBUG`.
+fn quasar_shape(what: &str) -> ttStatus {
+    if std::env::var_os("SKAM_DEBUG").is_some() {
+        eprintln!("libskamandros: no Quasar lowering for {what}");
+    }
+    ttStatus::TT_ERROR_UNSUPPORTED
+}
+
+fn quasar_unusable(e: impl std::fmt::Display) -> ttStatus {
+    let _ = e;
+    ttStatus::TT_ERROR_ENCODE
+}
+
+fn quasar_semaphore(index: u8) -> Result<qbackend::Semaphore, ttStatus> {
+    qbackend::Semaphore::new(index).ok_or(ttStatus::TT_ERROR_SEMAPHORE)
+}
+
+/// Write `Config` words with plain stores. See [`QUASAR_CFG`].
+fn quasar_config(out: &mut Stream, words: &[(u16, u32)]) -> Result<(), ttStatus> {
+    out.asm(|a| {
+        for &(addr32, value) in words {
+            a.li(reg::T0, QUASAR_CFG + 4 * u32::from(addr32));
+            a.li(reg::T1, value);
+            a.word(rv::sw(reg::T1, reg::T0, 0));
+        }
+        Ok(())
+    })
+}
+
+fn quasar_config_fields(out: &mut Stream, words: &ConfigWords) -> Result<(), ttStatus> {
+    quasar_config(out, words.words())
+}
+
+/// One buffer descriptor, as `construct_buf_desc` builds it
+/// (`ckernel_buf_desc.h:132-153`): the L1 base in 16-byte units plus the data
+/// format in word 0, the X dimension in word 1, and Y and Z in word 2.
+fn quasar_bd(out: &mut Stream, id: u32, base: u32, format: u32) -> Result<(), ttStatus> {
+    let word0 = (base >> 4) | (format << 20);
+    let at = QUASAR_BD + 4 * id;
+    quasar_config(
+        out,
+        &[
+            (at as u16, word0),
+            ((at + 1) as u16, QUASAR_BD_X << 20),
+            ((at + 2) as u16, QUASAR_BD_Y | (QUASAR_BD_Z << 8)),
+        ],
+    )
+}
+
+/// Push `SET_SRC`/`SET_DST_TILE_FACE_ROW_IDX` naming this page's tile.
+///
+/// The descriptor's base is the ring's first page, so the page is a tile index
+/// into it, `(pointer - base) / page_bytes`. `opcode_base` is the instruction
+/// word with every field but the counter already placed: the counter is a
+/// run-time value, so the word is built in a register and pushed, the same way
+/// `cb_base` pushes `SETDMAREG` on Blackhole.
+fn quasar_page(
+    out: &mut Stream,
+    opcode_base: u32,
+    cb: Cb,
+    info: &crate::mir::CbInfo,
+    field: i32,
+) -> Result<(), ttStatus> {
+    if !info.page_bytes.is_power_of_two() {
+        return Err(ttStatus::TT_ERROR_UNSUPPORTED);
+    }
+    out.asm(|a| {
+        a.word(rv::lw(
+            reg::T0,
+            reg::A6,
+            (u32::from(cb) * rv::cb::STRIDE) as i32 + field,
+        ));
+        a.li(reg::T1, info.base);
+        a.word(rv::sub(reg::T0, reg::T0, reg::T1));
+        a.word(rv::srli(reg::T0, reg::T0, info.page_bytes.trailing_zeros()));
+        a.li(reg::T1, opcode_base);
+        a.word(rv::or(reg::T1, reg::T1, reg::T0));
+        a.li(reg::T2, QUASAR_INSTRN_BUF);
+        a.word(rv::sw(reg::T1, reg::T2, 0));
+        Ok(())
+    })
+}
+
+/// The instruction word of a `SET_*_TILE_FACE_ROW_IDX` with every field but the
+/// counter placed.
+const fn set_src_tile_word(engine: u32) -> u32 {
+    (0x06 << 24) | (QUASAR_TILE_SEL << 21) | (engine << 18)
+}
+
+const fn set_dst_tile_word(engine: u32) -> u32 {
+    (0x0d << 24) | (QUASAR_TILE_SEL << 21) | (engine << 18)
+}
+
+/// `SEMINIT` the machine IR's semaphores, then publish the flag that releases
+/// the other two compute harts.
+///
+/// One hart seeds them all, exactly as Blackhole's thread-0 setup program does,
+/// because a `SEMINIT` from a consumer could reset a value a producer has
+/// already posted. The other two spin on [`crate::runtime::QUASAR_READY_AT`]
+/// rather than on a semaphore: a semaphore nobody has seeded has a maximum of
+/// zero, so a post could never raise it.
+fn quasar_seed(out: &mut Stream, m: &MachineKernel) -> Result<(), ttStatus> {
+    let idle = quasar_idle(Core::Unpack);
+    for &(index, value) in &m.sems {
+        let sem = quasar_semaphore(index)?;
+        // The `Dst` lock is a one-token semaphore (`semaphore_init`).
+        let max = if index == crate::lower::SEM_MATH_PACK {
+            1
+        } else {
+            qbackend::MAX_VALUE
+        };
+        out.extend(qbackend::init_after(sem, value, max, idle).map_err(quasar_unusable)?);
+    }
+    out.asm(|a| {
+        a.li(reg::T0, crate::runtime::QUASAR_READY_AT);
+        a.li(reg::T1, 1);
+        a.word(rv::sw(reg::T1, reg::T0, 0));
+        Ok(())
+    })
+}
+
+/// Wait for the unpack hart to publish the seeded semaphores.
+fn quasar_await_ready(out: &mut Stream) -> Result<(), ttStatus> {
+    out.asm(|a| {
+        a.li(reg::T0, crate::runtime::QUASAR_READY_AT);
+        let top = a.fresh_label();
+        a.label(top.clone());
+        a.word(rv::lw(reg::T1, reg::T0, 0));
+        a.beq_label(reg::T1, reg::ZERO, top);
+        Ok(())
+    })
+}
+
+/// What the unpack hart's `Config` bank and counters hold, so a repeated
+/// configuration costs nothing. It is dropped at a loop head, where the
+/// previous execution is the loop's own tail rather than the instruction
+/// before it.
+#[derive(Clone, Copy, Default)]
+struct QuasarUnpackState {
+    /// Per unit: the whole `UNPACKERn_REG0` word last written. It carries both
+    /// the register-file format (bits 0..8) and `TRANSPOSE` (bit 8), and a
+    /// Quasar TRISC writes `Config` a word at a time, so the two fields are
+    /// composed rather than written separately.
+    reg0: [Option<u32>; 2],
+    /// Per unit: the ring whose descriptor is in that unit's table slot.
+    bd: [Option<(Cb, u32)>; 2],
+    /// Per unit: `(source, destination)` face the last `SETADCZW` named.
+    faces: [(u32, u32); 2],
+    /// Per unit: whether the last `UnpackConfig` sent its page to `Src` rather
+    /// than `Dst`.
+    to_src: [bool; 2],
+    /// Per unit: whether that `Src` unpack transposes each face.
+    src_transpose: [bool; 2],
+}
+
+/// The unpack hart's program.
+///
+/// A page reaches either `Dst` (`UNP_DEST`, one whole tile per
+/// `UNPACR_DEST_TILE_INC`) or `SrcA`/`SrcB` (`UNP_A`/`UNP_B`, one
+/// `UNPACR{0,1}_FACE` per face so the Matrix Unit can take a face at a time).
+/// The `Dst` path is ordered by the semaphore sections; the `Src` path hands the
+/// bank over with the instruction's `SetDatValid`, which is what the Matrix
+/// Unit's reads wait for.
+fn encode_unpack_quasar(
+    m: &MachineKernel,
+    ops: &[MirOp],
+    out: &mut Stream,
+) -> Result<(), ttStatus> {
+    if ops.is_empty() {
+        return Ok(());
+    }
+    // `a0` = the launch arguments; word 2 is the CB interface table.
+    out.rv(rv::lw(reg::A6, reg::A0, crate::mover::ARG_IFACE as i32 * 4));
+    quasar_seed(out, m)?;
+    let idle = quasar_idle(Core::Unpack);
+    let block = quasar_block(Core::Unpack);
+    let mut state = QuasarUnpackState::default();
+    let mut loops = Vec::new();
+    for op in ops {
+        if encode_int(op, out, &mut loops, &COMPUTE_PAIRS)? {
+            continue;
+        }
+        match *op {
+            MirOp::Loop { count } => {
+                state = QuasarUnpackState::default();
+                open_loop(out, &mut loops, count)?;
+            }
+            MirOp::EndLoop => close_loop(out, &mut loops)?,
+            MirOp::Setdst { reg } => {
+                // The `Dst` tile an unpack-to-`Dst` lands in.
+                out.push(
+                    qencode::set_dst_tile_face_row_idx(
+                        QUASAR_TILE_SEL,
+                        QUASAR_ENGINE_UNP_A,
+                        u32::from(reg),
+                    )
+                    .map_err(quasar_unusable)?,
+                );
+            }
+            MirOp::Setadcx { unit, first, count } => {
+                // A descriptor-decoded unpack covers its own x/y/z: one whole
+                // tile from datum 0. A narrower run would need a descriptor per
+                // shape, which nothing lowers yet.
+                if unit != 0 || first != 0 || count != QUASAR_TILE_DATUMS {
+                    return Err(quasar_shape("a datum run narrower than a tile"));
+                }
+            }
+            MirOp::Setadczw { u0, u1, z0, z1 } => {
+                // The face the next unpack reads, and the face it is written
+                // to. On `Src` these are the `UNPACR{0,1}_FACE` operands, so
+                // they are remembered rather than written to a counter; a
+                // Blackhole bank bakes them into `SETADCZW`, which Quasar's
+                // descriptor does not have.
+                for unit in [0usize, 1] {
+                    if (unit == 0 && !u0) || (unit == 1 && !u1) {
+                        continue;
+                    }
+                    let src = z0.unwrap_or(state.faces[unit].0);
+                    let dst = z1.unwrap_or(src);
+                    state.faces[unit] = (src, dst);
+                }
+            }
+            MirOp::UnpackConfig {
+                unit,
+                to_src,
+                dtype,
+                haloize,
+                add_dest_cntr,
+                ch1_z_stride,
+            } => {
+                let u = usize::from(unit);
+                state.to_src[u] = to_src;
+                state.src_transpose[u] = to_src && haloize;
+                // The address-mod fields a Blackhole unpacker bakes into its
+                // bank describe the face a tile's destination starts at. On
+                // Quasar that face is the `UNPACR_FACE` operand, so the two
+                // fields are carried by `SETADCZW` and nothing is written here;
+                // a `Dst` unpack has no face counter to steer at all.
+                if !to_src && (haloize || add_dest_cntr || ch1_z_stride != 0) {
+                    return Err(quasar_shape(
+                        "an unpack into `Dst` with a face counter or a transpose",
+                    ));
+                }
+                // `_llk_unpack_hw_configure_` (`llk_unpack_common.h:34-54`):
+                // `UNP_A` and `UNP_DEST` share unpacker 0's `REG0`, `UNP_B` has
+                // its own. A `Src` unpack writes the *register file's* format —
+                // tf32 for a 32-bit operand, bf16 for a 16-bit one
+                // (`genfiles.cpp:1074-1079`: `unpack_conditional_dst_format` is
+                // `Tf32` when every buffer is f32 and dest accumulation is on) —
+                // while a `Dst` unpack writes the accumulator's own format, which
+                // is what the packer reads back. `TRANSPOSE` shares that word
+                // (`_llk_unpack_unary_operand_init_`): only a transposing `Src`
+                // unpack sets it.
+                let (field, format) = if to_src {
+                    let field = if u == 0 {
+                        qthcon::THCON_UNPACKER0_REG0_OUT_DATA_FORMAT
+                    } else {
+                        qthcon::THCON_UNPACKER1_REG0_OUT_DATA_FORMAT
+                    };
+                    (field, src_register_format(dtype))
+                } else {
+                    (
+                        qthcon::THCON_UNPACKER0_REG0_OUT_DATA_FORMAT,
+                        dst_format(m.dst_is_16_bit),
+                    )
+                };
+                let transpose = if to_src && haloize {
+                    qthcon::THCON_UNPACKER0_REG0_TRANSPOSE.mask()
+                } else {
+                    0
+                };
+                let word = format | transpose;
+                if state.reg0[u] != Some(word) {
+                    quasar_config(out, &[(field.addr32(), word)])?;
+                    state.reg0[u] = Some(word);
+                }
+            }
+            MirOp::SetUnpackBase { cb, unit } => {
+                if unit > 1 {
+                    return Err(quasar_shape("an unpacker other than 0 or 1"));
+                }
+                let u = usize::from(unit);
+                let info = &m.cbs[cb];
+                let format = l1_format(info.dtype);
+                if state.bd[u] != Some((cb, format)) {
+                    quasar_bd(out, quasar_unpack_bd(unit), info.base, format)?;
+                    state.bd[u] = Some((cb, format));
+                }
+                // The page is a tile index into the descriptor; the engine's own
+                // tile counter carries it (`_llk_unpack_unary_operand_` sets the
+                // source counter to `l1_tile_idx` and the destination counter to
+                // zero before running the MOP).
+                quasar_page(
+                    out,
+                    set_src_tile_word(quasar_engine(unit)?),
+                    cb,
+                    info,
+                    rv::cb::RD_PTR,
+                )?;
+                if state.to_src[u] {
+                    out.push(
+                        qencode::set_dst_tile_face_row_idx(
+                            QUASAR_TILE_SEL,
+                            quasar_engine(unit)?,
+                            0,
+                        )
+                        .map_err(quasar_unusable)?,
+                    );
+                }
+            }
+            MirOp::Unpacr { unit, count, flip } => {
+                if unit > 1 {
+                    return Err(quasar_shape("an unpacker other than 0 or 1"));
+                }
+                let u = usize::from(unit);
+                if state.to_src[u] {
+                    quasar_unpack_src(
+                        out,
+                        unit,
+                        count,
+                        flip,
+                        state.faces[u],
+                        state.src_transpose[u],
+                        state.bd[u].is_some(),
+                    )?;
+                } else {
+                    if unit != 0 || flip || count != QUASAR_TILE_DATUMS {
+                        return Err(quasar_shape("an unpack that is not one tile into `Dst`"));
+                    }
+                    // `_llk_unpack_unary_operand_to_dest_mop_config_`: both the
+                    // L1 and the `Dst` tile counters advance by one, so
+                    // back-to-back runs land consecutive tiles.
+                    out.push(
+                        qencode::unpacr_dest_tile_inc(1, 1, QUASAR_UNPACK_BD, 0)
+                            .map_err(quasar_unusable)?,
+                    );
+                }
+            }
+            MirOp::CbWait { cb, n } => {
+                out.asm(|a| {
+                    rv::cb::wait_front(a, reg::A6, u32::from(cb), n, [reg::T0, reg::T1, reg::T2])
+                })?;
+            }
+            MirOp::CbPop { cb, n } => {
+                out.push(
+                    qbackend::stallwait(qbackend::block::SYNC, idle).map_err(quasar_unusable)?,
+                );
+                out.asm(|a| {
+                    // The ring's pop is a store, which a pushed `STALLWAIT` does
+                    // not hold back: `tensix_sync` retires this hart's queued
+                    // instructions before the page is handed back.
+                    rv::coprocessor_done_quasar(a);
+                    rv::cb::pop_front(
+                        a,
+                        reg::A6,
+                        u32::from(cb),
+                        n,
+                        [reg::T0, reg::T1, reg::T2, reg::T6],
+                    )
+                })?;
+            }
+            MirOp::SemPost { sem } => {
+                out.extend(qbackend::post_after(quasar_semaphore(sem)?, idle));
+            }
+            MirOp::SemWait { sem, .. } => {
+                out.extend(qbackend::take_after(
+                    quasar_semaphore(sem)?,
+                    qbackend::cond::STALL_ON_ZERO,
+                    block,
+                    idle,
+                ));
+            }
+            MirOp::SemWaitNoGet { sem, .. } => {
+                out.extend(qbackend::wait_after(
+                    quasar_semaphore(sem)?,
+                    qbackend::cond::STALL_ON_ZERO,
+                    block,
+                    idle,
+                ));
+            }
+            MirOp::SemGet { sem } => {
+                out.extend(qbackend::get_after(quasar_semaphore(sem)?, idle));
+            }
+            MirOp::SemWaitFree { sem } => {
+                out.extend(qbackend::wait_after(
+                    quasar_semaphore(sem)?,
+                    qbackend::cond::STALL_ON_MAX,
+                    block,
+                    idle,
+                ));
+            }
+            other => return Err(quasar_unsupported(&other)),
+        }
+    }
+    if !loops.is_empty() {
+        return Err(ttStatus::TT_ERROR_ENDLOOP_MACHINE);
+    }
+    Ok(())
+}
+
+/// The math hart's program.
+///
+/// The SFPU reads and writes `Dst` at an address relative to the section base
+/// `DEST_TARGET_REG_CFG_MATH_SEC1_Offset` holds — one section per `Dst` register,
+/// 64 address units apart (`_set_dst_write_addr_`, `cmath_common.h:236-249`,
+/// `64 = tile_index << get_dest_tile_size_log2(Tile32x32)`). Within a section the
+/// SFPU's own counter steps by two per row pair, which is exactly the `at` the
+/// lowering names, so the address the loop below emits is Blackhole's.
+fn encode_math_quasar(m: &MachineKernel, ops: &[MirOp], out: &mut Stream) -> Result<(), ttStatus> {
+    if ops.is_empty() {
+        return Ok(());
+    }
+    quasar_await_ready(out)?;
+    // `_configure_alu_formats_` (`llk_math_common.h:80-115`) writes both width
+    // bits: `Fp32_enabled` for the FPU and `SFPU_Fp32_enabled` for the SFPU's own
+    // view of `Dst`. `MEASURED`: qsr refuses an SFPU `Dst` access with the second
+    // bit clear (`sfpu_dest_mode: SFPU_Fp32_enabled=0`).
+    let mut words = ConfigWords::new();
+    config_set(
+        &mut words,
+        qalu::ALU_ACC_CTRL_Fp32_enabled,
+        u32::from(!m.dst_is_16_bit),
+    )?;
+    config_set(
+        &mut words,
+        qalu::ALU_ACC_CTRL_SFPU_Fp32_enabled,
+        u32::from(!m.dst_is_16_bit),
+    )?;
+    // `ALU_ACC_CTRL_Zero_Flag_disabled_src` (word 3) is *not* written: it resets
+    // to zero, which is the value the comment above requires, and qsr refuses any
+    // store to that word from a TRISC (`tensix_cfg_wr32: reg=3`,
+    // `UnimplementedFunctionality`) — a simulator gap, so a program that writes
+    // the same zero back would be untestable here for no gain.
+    quasar_config_fields(out, &words)?;
+    // `_sfpu_configure_addrmod_` (`ckernel_sfpu.h:32-45`): the SFPU's own
+    // address modifier, `ADDR_MOD_7`, leaves every counter where it is — chosen
+    // there precisely so it does not conflict with the A2D/matmul slots 0 and
+    // 1. Every `Src`/`Dst` access names it, and it is written here rather than
+    // trusted: the FPU's matmul leaves slot 0 stepping `Dst` by a row group,
+    // and a `Config` word outlives the launch that wrote it.
+    for field in [
+        thread::ADDR_MOD_AB_SEC7_SrcAIncr,
+        thread::ADDR_MOD_DST_SEC7_DestIncr,
+    ] {
+        quasar_config(out, &[(quasar_thread_word(field.addr32())?, 0)])?;
+    }
+    let idle = quasar_idle(Core::Math);
+    let block = quasar_block(Core::Math);
+    let mut section: Option<Dst> = None;
+    let mut at = 0usize;
+    let mut loops = Vec::new();
+    while at < ops.len() {
+        if encode_int(&ops[at], out, &mut loops, &COMPUTE_PAIRS)? {
+            at += 1;
+            continue;
+        }
+        match ops[at] {
+            MirOp::Repeat { len, count } => {
+                let body = ops.get(at + 1..at + 1 + len as usize).ok_or({
+                    let _ = at;
+                    ttStatus::TT_ERROR_MATH_REPEAT_BODY
+                })?;
+                for iteration in 0..u32::from(count) {
+                    for op in body {
+                        quasar_math_op(op, iteration * 2, &mut section, out)?;
+                    }
+                }
+                at += 1 + len as usize;
+                continue;
+            }
+            MirOp::Loop { count } => {
+                section = None;
+                open_loop(out, &mut loops, count)?;
+            }
+            MirOp::EndLoop => close_loop(out, &mut loops)?,
+            MirOp::SemPost { sem } => {
+                out.extend(qbackend::post_after(quasar_semaphore(sem)?, idle));
+            }
+            MirOp::SemWait { sem, .. } => {
+                out.extend(qbackend::take_after(
+                    quasar_semaphore(sem)?,
+                    qbackend::cond::STALL_ON_ZERO,
+                    block,
+                    idle,
+                ));
+            }
+            MirOp::SemWaitNoGet { sem, .. } => {
+                out.extend(qbackend::wait_after(
+                    quasar_semaphore(sem)?,
+                    qbackend::cond::STALL_ON_ZERO,
+                    block,
+                    idle,
+                ));
+            }
+            MirOp::SemGet { sem } => {
+                out.extend(qbackend::get_after(quasar_semaphore(sem)?, idle));
+            }
+            MirOp::SemWaitFree { sem } => {
+                out.extend(qbackend::wait_after(
+                    quasar_semaphore(sem)?,
+                    qbackend::cond::STALL_ON_MAX,
+                    block,
+                    idle,
+                ));
+            }
+            op => quasar_math_op(&op, 0, &mut section, out)?,
+        }
+        at += 1;
+    }
+    if !loops.is_empty() {
+        return Err(ttStatus::TT_ERROR_ENDLOOP_MACHINE);
+    }
+    Ok(())
+}
+
+/// Point the math hart's SFPU at `reg`'s section, when it is not there already.
+fn quasar_section(out: &mut Stream, section: &mut Option<Dst>, reg: Dst) -> Result<(), ttStatus> {
+    if *section == Some(reg) {
+        return Ok(());
+    }
+    quasar_config(
+        out,
+        &[(
+            qalu::DEST_TARGET_REG_CFG_MATH_SEC1_Offset.addr32(),
+            u32::from(reg) * Dst::ROWS,
+        )],
+    )?;
+    *section = Some(reg);
+    Ok(())
+}
+
+fn quasar_math_op(
+    op: &MirOp,
+    row_delta: u32,
+    section: &mut Option<Dst>,
+    out: &mut Stream,
+) -> Result<(), ttStatus> {
+    match *op {
+        MirOp::Sfpload {
+            lreg,
+            reg,
+            at,
+            dtype,
+        } => {
+            quasar_section(out, section, reg)?;
+            out.push(
+                qencode::Sfpload::ZERO
+                    .lreg_ind(u32::from(lreg))
+                    .instr_mod0(lane_format(dtype))
+                    .sfpu_addr_mode(QUASAR_SFPU_ADDR_MOD)
+                    .done(0)
+                    .dest_reg_addr(at + row_delta)
+                    .encode()
+                    .map_err(quasar_unusable)?,
+            );
+        }
+        MirOp::Sfpstore {
+            lreg,
+            reg,
+            at,
+            dtype,
+        } => {
+            quasar_section(out, section, reg)?;
+            out.push(
+                qencode::Sfpstore::ZERO
+                    .lreg_ind(u32::from(lreg))
+                    .instr_mod0(lane_format(dtype))
+                    .sfpu_addr_mode(QUASAR_SFPU_ADDR_MOD)
+                    .done(0)
+                    .dest_reg_addr(at + row_delta)
+                    .encode()
+                    .map_err(quasar_unusable)?,
+            );
+        }
+        MirOp::UnarySfp {
+            op: UnarySfpOp::Neg,
+            a,
+            d,
+        } => out.push(qencode::sfpmov(u32::from(a), u32::from(d), 1).map_err(quasar_unusable)?),
+        MirOp::UnarySfp {
+            op: UnarySfpOp::Abs,
+            a,
+            d,
+        } => out.push(qencode::sfpabs(u32::from(a), u32::from(d), 1).map_err(quasar_unusable)?),
+        MirOp::UnarySfp {
+            op: UnarySfpOp::BitNot,
+            a,
+            d,
+        } => out.push(qencode::sfpnot(u32::from(a), u32::from(d)).map_err(quasar_unusable)?),
+        MirOp::LaneConst { lreg, bits } => {
+            for i in tt_isa::arch::quasar::sfpu::load_f32(u32::from(lreg), bits)
+                .map_err(quasar_unusable)?
+            {
+                out.push(i);
+            }
+        }
+        // The lane-register set. tt-metal builds its SFPU elementwise ops from
+        // these, and `SFPMAD` covers add, subtract and multiply too (with `VC`
+        // the constant one, or zero for the product), so these sequences follow
+        // Blackhole's encoder instruction for instruction.
+        MirOp::BinarySfp {
+            op: BinarySfpOp::Add,
+            a,
+            b,
+            d,
+        } => {
+            out.push(qsfpu::add(u32::from(a), u32::from(b), u32::from(d)).map_err(quasar_unusable)?)
+        }
+        MirOp::BinarySfp {
+            op: BinarySfpOp::Sub,
+            a,
+            b,
+            d,
+        } => {
+            out.push(qsfpu::sub(u32::from(a), u32::from(b), u32::from(d)).map_err(quasar_unusable)?)
+        }
+        MirOp::BinarySfp {
+            op: BinarySfpOp::Mul,
+            a,
+            b,
+            d,
+        } => {
+            out.push(qsfpu::mul(u32::from(a), u32::from(b), u32::from(d)).map_err(quasar_unusable)?)
+        }
+        MirOp::BinarySfp {
+            op: BinarySfpOp::BitAnd,
+            a,
+            b,
+            d,
+        } => {
+            // Quasar's `SFPAND` is the in-place form `VD = VD & VC`: move the
+            // first operand in, then and the second into it.
+            out.push(qencode::sfpmov(u32::from(a), u32::from(d), 0).map_err(quasar_unusable)?);
+            out.push(qencode::sfpand(u32::from(b), u32::from(d)).map_err(quasar_unusable)?);
+        }
+        MirOp::BinarySfp {
+            op: BinarySfpOp::BitOr,
+            a,
+            b,
+            d,
+        } => {
+            out.push(qencode::sfpmov(u32::from(a), u32::from(d), 0).map_err(quasar_unusable)?);
+            out.push(qencode::sfpor(u32::from(b), u32::from(d)).map_err(quasar_unusable)?);
+        }
+        MirOp::BinarySfp {
+            op: BinarySfpOp::BitXor,
+            a,
+            b,
+            d,
+        } => {
+            out.push(qencode::sfpmov(u32::from(a), u32::from(d), 0).map_err(quasar_unusable)?);
+            out.push(qencode::sfpxor(u32::from(b), u32::from(d)).map_err(quasar_unusable)?);
+        }
+        MirOp::BinarySfp {
+            op: BinarySfpOp::Shl,
+            a,
+            b,
+            d,
+        } => {
+            out.push(qencode::sfpmov(u32::from(a), u32::from(d), 0).map_err(quasar_unusable)?);
+            out.push(qencode::sfpshft(0, u32::from(b), u32::from(d), 0).map_err(quasar_unusable)?);
+        }
+        MirOp::BinarySfp {
+            op: BinarySfpOp::Shr,
+            a,
+            b,
+            d,
+        } => {
+            out.push(qencode::sfpmov(u32::from(a), u32::from(d), 0).map_err(quasar_unusable)?);
+            // A negative amount is the logical right shift; `SFPIADD`'s
+            // two's-complement form negates the amount in its own lane.
+            out.push(
+                qencode::sfpiadd(0, qsfpu::LREG_ZERO, u32::from(b), 6).map_err(quasar_unusable)?,
+            );
+            out.push(qencode::sfpshft(0, u32::from(b), u32::from(d), 0).map_err(quasar_unusable)?);
+        }
+        MirOp::BinarySfp {
+            op: BinarySfpOp::IAdd,
+            a,
+            b,
+            d,
+        } => {
+            out.push(qencode::sfpmov(u32::from(b), u32::from(d), 0).map_err(quasar_unusable)?);
+            out.push(qencode::sfpiadd(0, u32::from(a), u32::from(d), 4).map_err(quasar_unusable)?);
+        }
+        MirOp::BinarySfp {
+            op: BinarySfpOp::ISub,
+            a,
+            b,
+            d,
+        } => {
+            out.push(qencode::sfpmov(u32::from(a), u32::from(d), 0).map_err(quasar_unusable)?);
+            out.push(qencode::sfpiadd(0, u32::from(b), u32::from(d), 6).map_err(quasar_unusable)?);
+        }
+        MirOp::BinarySfp {
+            op: BinarySfpOp::Setexp,
+            a,
+            b,
+            d,
+        } => {
+            out.push(qencode::sfpmov(u32::from(b), u32::from(d), 0).map_err(quasar_unusable)?);
+            out.push(
+                qencode::sfpsetexp(0, u32::from(a), u32::from(d), 0).map_err(quasar_unusable)?,
+            );
+        }
+        MirOp::SfpMov { a, d } => {
+            out.push(qencode::sfpmov(u32::from(a), u32::from(d), 0).map_err(quasar_unusable)?);
+        }
+        MirOp::SfpAbs { mod1, a, d } => {
+            out.push(qencode::sfpabs(u32::from(a), u32::from(d), mod1).map_err(quasar_unusable)?);
+        }
+        MirOp::SfpCast { mod1, a, d } => {
+            out.push(
+                qencode::sfpcast(u32::from(a), u32::from(d), quasar_cast_mode(mod1))
+                    .map_err(quasar_unusable)?,
+            );
+        }
+        MirOp::SfpGt { mod1, vc, vd } => {
+            // Quasar's `SFPGT` names the `imm12_math` operand Blackhole's does
+            // not; the lowering's comparison uses the register form, so it is
+            // zero.
+            out.push(
+                qencode::sfpgt(0, u32::from(vc), u32::from(vd), mod1).map_err(quasar_unusable)?,
+            );
+        }
+        MirOp::SfpExexp { mod1, a, d } => {
+            out.push(qencode::sfpexexp(u32::from(a), u32::from(d), mod1).map_err(quasar_unusable)?);
+        }
+        MirOp::SfpExman { mod1, a, d } => {
+            out.push(qencode::sfpexman(u32::from(a), u32::from(d), mod1).map_err(quasar_unusable)?);
+        }
+        MirOp::SfpIadd { imm, a, d, mod1 } => {
+            out.push(
+                qencode::sfpiadd(imm, u32::from(a), u32::from(d), mod1).map_err(quasar_unusable)?,
+            );
+        }
+        MirOp::SfpShft { mod1, amount, a, d } => {
+            out.push(qencode::sfpmov(u32::from(a), u32::from(d), 0).map_err(quasar_unusable)?);
+            out.push(
+                qencode::sfpshft(0, u32::from(amount), u32::from(d), mod1)
+                    .map_err(quasar_unusable)?,
+            );
+        }
+        MirOp::SfpSetcc { mod1, a } => {
+            out.push(qencode::sfpsetcc(0, u32::from(a), mod1).map_err(quasar_unusable)?);
+        }
+        MirOp::SfpEncc {
+            first,
+            second,
+            mod1,
+        } => {
+            // Quasar's `SFPENCC` names one 12-bit `imm12_math` where Blackhole
+            // names a 2-bit `Imm2` and a `VD`; the lowering's `second` is the
+            // zero `VD`, so the same bits are written.
+            if second != 0 {
+                return Err(quasar_unsupported(op));
+            }
+            out.push(qencode::sfpencc(first, mod1).map_err(quasar_unusable)?);
+        }
+        // `SFPARECIP` has no Quasar encoding in the LLK's table at all, so a
+        // reciprocal stays refused rather than guessed: `other` below reports it.
+        MirOp::SfpMad { mod1, a, b, c, d } => {
+            out.push(
+                qencode::Sfpmad::ZERO
+                    .lreg_a(u32::from(a))
+                    .lreg_b(u32::from(b))
+                    .lreg_c(u32::from(c))
+                    .lreg_dest(u32::from(d))
+                    .instr_mod1(mod1)
+                    .encode()
+                    .map_err(quasar_unusable)?,
+            );
+        }
+        // The Matrix Unit. `MVMUL` carries the destination row, the
+        // address-modifier index, the `instr_mod19` code and the two
+        // `clear_dvalid` bits, and the lowering's fields map across one for
+        // one. `instr_mod19` is 0 — a full four-row-band write. The *walk* is
+        // Quasar's, and lives in the lowering's Quasar arm (`quasar_matmul`):
+        // one `MVMUL` writes eight `Dst` rows and does not step `Dst` by
+        // itself, so the tile's rows are laid out by address modifiers 0..5
+        // rather than by the `at` the MIR carries.
+        MirOp::Mvmul {
+            reg,
+            at,
+            addr_mod,
+            flip_a,
+            flip_b,
+        } => {
+            let clear = u32::from(flip_a) | (u32::from(flip_b) << 1);
+            out.push(
+                qencode::mvmul(clear, 0, addr_mod, dst_row(reg, at, row_delta))
+                    .map_err(quasar_unusable)?,
+            );
+        }
+        MirOp::Elw {
+            op,
+            bcast,
+            addr_mod,
+            reg,
+            at,
+        } => {
+            // `instr_mod19` is the broadcast code, the same four values as
+            // Blackhole's two broadcast bits (`ELW_ARGS`, `assembly.yaml`):
+            // 0 none, 1 `SrcB` column 0, 2 `SrcB` row 0, 3 both.
+            let code = match bcast {
+                Bcast::None => 0,
+                Bcast::Row => 2,
+                Bcast::Col => 1,
+                Bcast::Scalar => 3,
+            };
+            let row = dst_row(reg, at, row_delta);
+            let encoded = match op {
+                ElwOp::Add => qencode::Elwadd::ZERO
+                    .clear_dvalid(0)
+                    .dest_accum_en(0)
+                    .instr_mod19(code)
+                    .addr_mode(addr_mod)
+                    .dst(row)
+                    .encode(),
+                ElwOp::Sub => qencode::Elwsub::ZERO
+                    .clear_dvalid(0)
+                    .dest_accum_en(0)
+                    .instr_mod19(code)
+                    .addr_mode(addr_mod)
+                    .dst(row)
+                    .encode(),
+                ElwOp::Mul => qencode::Elwmul::ZERO
+                    .clear_dvalid(0)
+                    .dest_accum_en(0)
+                    .instr_mod19(code)
+                    .addr_mode(addr_mod)
+                    .dst(row)
+                    .encode(),
+            };
+            out.push(encoded.map_err(quasar_unusable)?);
+        }
+        MirOp::Gapool {
+            flip_src_b,
+            flip_src_a,
+            addr_mod,
+            reg,
+            at,
+        } => {
+            let clear = u32::from(flip_src_a) | (u32::from(flip_src_b) << 1);
+            out.push(
+                qencode::Gapool::ZERO
+                    .clear_dvalid(clear)
+                    // 1 is the 16x16 pool the reducer uses; Blackhole's encoding
+                    // fixes the same bit (`isa::blackhole::defs::GAPOOL`'s
+                    // constant field at bit 19).
+                    .instr_mod19(1)
+                    .pool_addr_mode(addr_mod)
+                    .rsvd(0)
+                    .dst(dst_row(reg, at, row_delta))
+                    .encode()
+                    .map_err(quasar_unusable)?,
+            );
+        }
+        MirOp::Gmpool {
+            flip_src_b,
+            flip_src_a,
+            addr_mod,
+            arg_max,
+            reg,
+            at,
+        } => {
+            // Quasar's `GMPOOL` has no argument-index field: bit 14 is reserved
+            // and must be zero, where Blackhole carries `ArgMax` there.
+            if arg_max != 0 {
+                return Err(quasar_shape("an arg-max pool"));
+            }
+            let clear = u32::from(flip_src_a) | (u32::from(flip_src_b) << 1);
+            out.push(
+                qencode::Gmpool::ZERO
+                    .clear_dvalid(clear)
+                    .instr_mod19(1)
+                    .pool_addr_mode(addr_mod)
+                    .rsvd(0)
+                    .dst(dst_row(reg, at, row_delta))
+                    .encode()
+                    .map_err(quasar_unusable)?,
+            );
+        }
+        MirOp::Mova2d {
+            use_dst32b_lo,
+            src_row,
+            addr_mod,
+            move8_rows,
+            reg,
+            at,
+        } => {
+            out.push(
+                qencode::Mova2D::ZERO
+                    .dest_32b_lo(u32::from(use_dst32b_lo))
+                    .src(src_row)
+                    .addr_mode(addr_mod)
+                    .instr_mod(quasar_move(MoveKind::EightOrNone, move8_rows))
+                    .dst(dst_row(reg, at, row_delta))
+                    .encode()
+                    .map_err(quasar_unusable)?,
+            );
+        }
+        MirOp::Movd2b {
+            use_dst32b_lo,
+            src_row,
+            addr_mod,
+            move4_rows,
+            reg,
+            at,
+        } => {
+            out.push(
+                qencode::Movd2B::ZERO
+                    .dest_32b_lo(u32::from(use_dst32b_lo))
+                    .src(src_row)
+                    .addr_mode(addr_mod)
+                    .instr_mod(quasar_move(MoveKind::FourOrNone, move4_rows))
+                    .transpose(0)
+                    .dst(dst_row(reg, at, row_delta))
+                    .encode()
+                    .map_err(quasar_unusable)?,
+            );
+        }
+        MirOp::Movb2d {
+            use_dst32b_lo,
+            src_row,
+            addr_mod,
+            move4_rows,
+            reg,
+            at,
+        } => {
+            out.push(
+                qencode::Movb2D::ZERO
+                    .dest_32b_lo(u32::from(use_dst32b_lo))
+                    .src(src_row)
+                    .addr_mode(addr_mod)
+                    .transfer_sz(quasar_move(MoveKind::FourOrNone, move4_rows))
+                    .bcast_datum0(0)
+                    .dst(dst_row(reg, at, row_delta))
+                    .encode()
+                    .map_err(quasar_unusable)?,
+            );
+        }
+        MirOp::Movb2a {
+            src_a_row,
+            addr_mod,
+            move4_rows,
+            src_b_row,
+        } => {
+            out.push(
+                qencode::movb2_a(
+                    src_a_row,
+                    addr_mod,
+                    quasar_move(MoveKind::FourOrNone, move4_rows),
+                    src_b_row,
+                )
+                .map_err(quasar_unusable)?,
+            );
+        }
+        MirOp::Zerosrc {
+            zero_val,
+            write_mode,
+            bank_mask,
+            clear_src_b,
+            clear_src_a,
+        } => {
+            let src_mask = u32::from(clear_src_a) | (u32::from(clear_src_b) << 1);
+            out.push(
+                qencode::Zerosrc::ZERO
+                    // The three format bits only qualify the `-inf` pattern; an
+                    // fp32 `-inf` is the 8-bit-exponent form, which is what
+                    // `zero_val` names here.
+                    .packed_fmt(0)
+                    .int_fmt(0)
+                    .exp_bias(u32::from(zero_val))
+                    .zero_val(u32::from(zero_val))
+                    .write_mode(u32::from(write_mode))
+                    .bank_mask(u32::from(bank_mask))
+                    .src_mask(src_mask)
+                    .encode()
+                    .map_err(quasar_unusable)?,
+            );
+        }
+        MirOp::Setrwc {
+            src_a,
+            src_b,
+            dst,
+            flip_src_a,
+            flip_src_b,
+            dst_cr,
+        } => {
+            // Quasar's `SETRWC` writes one `rwc_val` to *every* counter its
+            // mask names (`SETRWC_ARGS`, `assembly.yaml`), where Blackhole's
+            // carries a separate value per counter. The MIR's three values are
+            // always equal (a reset), and anything else has no encoding here.
+            if src_a != src_b || src_b != dst {
+                let _ = (src_a, src_b, dst);
+                return Err(quasar_shape("a `SETRWC` with per-counter values"));
+            }
+            // `bit_mask` names the counters: `SrcA`, `SrcB`, `Dst` and the
+            // fidelity counter — tt-metal's `p_setrwc::SET_ABD_F`, which is
+            // what `_reset_counters_` and every Blackhole `SETRWC` here set.
+            // `clear_ab_vld` is the pair of data-valid clears, `rwc_cr` names
+            // the Dest carriage return.
+            out.push(
+                qencode::setrwc(
+                    u32::from(flip_src_a) | (u32::from(flip_src_b) << 1),
+                    if dst_cr { 0b0100 } else { 0 },
+                    src_a,
+                    0b1111,
+                )
+                .map_err(quasar_unusable)?,
+            );
+        }
+        MirOp::Incrwc { src_a, src_b, dst } => {
+            out.push(qencode::incrwc(0, src_a, src_b, dst).map_err(quasar_unusable)?);
+        }
+        MirOp::AluAccCtrl {
+            fp32,
+            zero_flag_src,
+        } => {
+            // `_configure_alu_formats_` (`llk_math_common.h:81-116`) writes the
+            // whole ALU block at once, the zero flags included; Quasar's word 3
+            // is not modeled. `MEASURED`: qsr refuses a TRISC store to it
+            // (`tensix_cfg_wr32: reg=3`), so only the width word is written,
+            // which is the field these sequences switch around a `MOVD2B`/
+            // `MOVB2D` pair. The deviation is the simulator's, not a choice:
+            // word 3 is where tt-metal's own block write lands too.
+            let _ = zero_flag_src;
+            quasar_config(
+                out,
+                &[(qalu::ALU_ACC_CTRL_Fp32_enabled.addr32(), u32::from(fp32))],
+            )?;
+        }
+        MirOp::SrcAFormat { format } => {
+            // `ALU_FORMAT_SPEC_REG_SrcA_override`/`_val`: the override is what
+            // makes the manual switch take effect (word 0 on both chips).
+            quasar_config(
+                out,
+                &[
+                    (qalu::ALU_FORMAT_SPEC_REG_SrcA_override.addr32(), 1),
+                    (qalu::ALU_FORMAT_SPEC_REG_SrcA_val.addr32(), format),
+                ],
+            )?;
+        }
+        MirOp::ThreadWord { addr, value } => {
+            let at = quasar_thread_word(addr)?;
+            quasar_config(out, &[(at, u32::from(value))])?;
+        }
+        MirOp::WaitMatrix => {
+            // `STALLWAIT(STALL_SFPU, 0, 0, MATH)`, exactly what
+            // `_llk_math_sfpu_start_` issues before the SFPU touches rows the
+            // Matrix Unit has just written (`ckernel_sfpu.h:49-56`). The class
+            // mask is held back until the unit drains; a semaphore hand-off
+            // after this one adds its own `STALLWAIT(STALL_SYNC, MATH)`.
+            out.push(
+                qbackend::stallwait(qbackend::block::SFPU, &[qbackend::res::MATH])
+                    .map_err(quasar_unusable)?,
+            );
+        }
+        other => return Err(quasar_unsupported(&other)),
+    }
+    Ok(())
+}
+
+/// How many rows a `MOV*` moves, as Quasar's `instr_mod`/`transfer_sz` codes
+/// (0 single row, 1 four rows, 2 eight rows; `assembly.yaml`'s `MOVD_REG`).
+enum MoveKind {
+    /// `MOVA2D`: eight rows when the bit is set, otherwise one.
+    EightOrNone,
+    /// `MOVD2A`/`MOVD2B`/`MOVB2D`: four rows when the bit is set, otherwise one.
+    FourOrNone,
+}
+
+fn quasar_move(kind: MoveKind, wide: bool) -> u32 {
+    match (kind, wide) {
+        (MoveKind::EightOrNone, false) | (MoveKind::FourOrNone, false) => 0,
+        (MoveKind::EightOrNone, true) => 2,
+        (MoveKind::FourOrNone, true) => 1,
+    }
+}
+
+/// The Quasar `instr_mod1` for a cast the lowering spells in Blackhole's
+/// numbering.
+///
+/// `SFPCAST`'s table is the same on both chips for the rounding modes (`0`
+/// int32 to fp32 nearest-even, `1` stochastic) and, `MEASURED` on qsr, carries
+/// the sign-magnitude pair the other way round: Blackhole's `3` (two's
+/// complement to sign-magnitude, `InstrModCast::INT32_2S_COMP_TO_INT_SIGN_MAGN`
+/// is `2` in the enum but the hardware takes `3`, which is what
+/// `lower.rs`'s integer widen uses and what the Blackhole simulator accepts)
+/// is Quasar's `2`.
+fn quasar_cast_mode(mod1: u32) -> u32 {
+    match mod1 {
+        3 => 2,
+        other => other,
+    }
+}
+
+/// The Quasar `Config` word a Blackhole `SETC16` `ThreadConfig` address names,
+/// on the math hart.
+///
+/// The bit layouts are the same on both chips (both tables are generated from
+/// the same field definitions), but the words are not: Blackhole gives the
+/// address modifiers words 12..=19 and 28..=35 in a per-thread bank, while
+/// Quasar lays 64 `ADDR_MOD_AB_SEC*`/`ADDR_MOD_DST_SEC*` words out from 264 and
+/// 328 and gives thread `n` the eight slots at `8n` (`addr_mod_t::set`,
+/// `ckernel_addrmod.h:258-266`: `addr_mod_src_reg_addr[i] + NUM_MATH_ADDR_MODS *
+/// thread_id`). The math hart is TRISC1.
+fn quasar_thread_word(addr: u16) -> Result<u16, ttStatus> {
+    /// The math hart's thread id (`ckernel_trisc_id.h`: 0 unpacks, 1 does the
+    /// math, 2 packs).
+    const MATH: u16 = 1;
+    /// `ADDR_MOD_AB_SEC0`, `ADDR_MOD_DST_SEC0` and one thread's eight slots.
+    const AB0: u16 = 264;
+    const DST0: u16 = 328;
+    const SLOTS: u16 = 8;
+    /// `FIDELITY_BASE_Phase` (`cfg::blackhole::thread`) and Quasar's per-thread
+    /// `FIDELITY_BASE_SEC*`.
+    const BH_FIDELITY: u16 = 11;
+    const QS_FIDELITY: u16 = 260;
+    match addr {
+        BH_FIDELITY => Ok(QS_FIDELITY + MATH),
+        12..=19 => Ok(AB0 + SLOTS * MATH + (addr - 12)),
+        28..=35 => Ok(DST0 + SLOTS * MATH + (addr - 28)),
+        _ => Err(quasar_shape(
+            "a `ThreadConfig` word with no Quasar counterpart",
+        )),
+    }
+}
+
+/// The pack hart's program: one `PACR0_TILE_INC` per tile out of `Dst`
+/// (`_llk_pack_mop_config_`, `llk_pack.h:27-40`).
+fn encode_pack_quasar(m: &MachineKernel, ops: &[MirOp], out: &mut Stream) -> Result<(), ttStatus> {
+    if ops.is_empty() {
+        return Ok(());
+    }
+    out.rv(rv::lw(reg::A6, reg::A0, crate::mover::ARG_IFACE as i32 * 4));
+    quasar_await_ready(out)?;
+    let idle = quasar_idle(Core::Pack);
+    let mut in_format: Option<u32> = None;
+    let mut pack_mask = PackMask::None;
+    let mut bd: Option<(Cb, u32)> = None;
+    let mut loops = Vec::new();
+    for op in ops {
+        if encode_int(op, out, &mut loops, &COMPUTE_PAIRS)? {
+            continue;
+        }
+        match *op {
+            MirOp::Loop { count } => {
+                in_format = None;
+                bd = None;
+                open_loop(out, &mut loops, count)?;
+            }
+            MirOp::EndLoop => close_loop(out, &mut loops)?,
+            MirOp::CbReserve { cb, n } => {
+                out.asm(|a| {
+                    rv::cb::reserve_back(a, reg::A6, u32::from(cb), n, [reg::T0, reg::T1, reg::T2])
+                })?;
+            }
+            MirOp::SetPackBase { cb } => {
+                let info = &m.cbs[cb];
+                let format = l1_format(info.dtype);
+                if bd != Some((cb, format)) {
+                    quasar_bd(out, QUASAR_PACK_BD, info.base, format)?;
+                    bd = Some((cb, format));
+                }
+                quasar_page(
+                    out,
+                    set_dst_tile_word(QUASAR_ENGINE_PACK0),
+                    cb,
+                    info,
+                    rv::cb::WR_PTR,
+                )?;
+            }
+            MirOp::SetPackConfig { dtype, mask } => {
+                // The packer's input is the math `Dst`; its L1 output format is
+                // the descriptor's (`llk_pack_common.h:105-124`). The output is
+                // the `Dst`'s own format for now: a converting pack has no
+                // Quasar arm yet.
+                if l1_format(dtype) != dst_format(m.dst_is_16_bit) {
+                    return Err(quasar_shape("a converting pack"));
+                }
+                let format = dst_format(m.dst_is_16_bit);
+                if in_format != Some(format) {
+                    quasar_config(
+                        out,
+                        &[(qthcon::THCON_PACKER0_REG0_IN_DATA_FORMAT.addr32(), format)],
+                    )?;
+                    in_format = Some(format);
+                }
+                // `_llk_pack_reduce_mask_config_`/`_llk_pack_reduce_mask_clear_`
+                // (`llk_pack_common.h:176-239`): a reduce packs a partial tile by
+                // masking datums to zero. Mask0 covers every datum of a row and
+                // mask1 the datums that survive, selected per face-row by the
+                // two-bit-per-row fields in words 56..59.
+                if pack_mask != mask {
+                    // Words 52 and 54 also hold the pack strides; the pack path
+                    // writes whole words, so the zeros of the untouched fields
+                    // are part of the value written here.
+                    let (mask0, mask1) = match mask {
+                        PackMask::None | PackMask::Col => (0xFFFF, 0x0000),
+                        // `EDGE_MASK_ROW_DATUMS_EXCEPT_0`: column 0 survives.
+                        PackMask::Row => (0xFFFF, 0xFFFE),
+                    };
+                    let select = match mask {
+                        PackMask::None => 0,
+                        // `EDGE_MASK_FACE_ROW0_MASK_1`: row 0 of every face.
+                        PackMask::Col => 0x0000_0001,
+                        // `EDGE_MASK_FACE_ALL_ROWS_MASK_1`: every row.
+                        PackMask::Row => 0x5555_5555,
+                    };
+                    quasar_config(
+                        out,
+                        &[
+                            (52, mask0 | (mask1 << 16)),
+                            // `EDGE_MASK_MODE_ZERO`: masked datums pack as
+                            // zero (`cpack_common.h:55`). The rest of the word
+                            // is the untilize strides, which stay 0.
+                            (54, 0),
+                            (56, select),
+                            (57, select),
+                            (58, select),
+                            (59, select),
+                        ],
+                    )?;
+                    pack_mask = mask;
+                }
+            }
+            MirOp::SetPackOffset { reg, at } => {
+                // The `Dst` tile the packer reads; a partial tile is not lowered.
+                if at != 0 {
+                    return Err(quasar_shape("a pack that starts inside a tile"));
+                }
+                out.push(
+                    qencode::set_src_tile_face_row_idx(
+                        QUASAR_TILE_SEL,
+                        QUASAR_ENGINE_PACK0,
+                        u32::from(reg),
+                    )
+                    .map_err(quasar_unusable)?,
+                );
+            }
+            MirOp::PackRows { rows, .. } => {
+                if rows != Dst::ROWS {
+                    return Err(quasar_shape("a pack shorter than a tile"));
+                }
+                out.push(
+                    qencode::pacr0_tile_inc(1, 0, QUASAR_PACK_BD, 0).map_err(quasar_unusable)?,
+                );
+            }
+            MirOp::CbPush { cb, n } => {
+                out.push(
+                    qbackend::stallwait(qbackend::block::SYNC, idle).map_err(quasar_unusable)?,
+                );
+                out.asm(|a| {
+                    rv::coprocessor_done_quasar(a);
+                    rv::cb::push_back(
+                        a,
+                        reg::A6,
+                        u32::from(cb),
+                        n,
+                        [reg::T0, reg::T1, reg::T2, reg::T6],
+                    )
+                })?;
+            }
+            MirOp::SemPost { sem } => {
+                out.extend(qbackend::post_after(quasar_semaphore(sem)?, idle));
+            }
+            MirOp::SemWait { sem, .. } => {
+                out.extend(qbackend::take_after(
+                    quasar_semaphore(sem)?,
+                    qbackend::cond::STALL_ON_ZERO,
+                    quasar_block(Core::Pack),
+                    idle,
+                ));
+            }
+            MirOp::SemWaitNoGet { sem, .. } => {
+                out.extend(qbackend::wait_after(
+                    quasar_semaphore(sem)?,
+                    qbackend::cond::STALL_ON_ZERO,
+                    quasar_block(Core::Pack),
+                    idle,
+                ));
+            }
+            MirOp::SemGet { sem } => {
+                out.extend(qbackend::get_after(quasar_semaphore(sem)?, idle));
+            }
+            MirOp::SemWaitFree { sem } => {
+                out.extend(qbackend::wait_after(
+                    quasar_semaphore(sem)?,
+                    qbackend::cond::STALL_ON_MAX,
+                    quasar_block(Core::Pack),
+                    idle,
+                ));
+            }
+            other => return Err(quasar_unsupported(&other)),
+        }
+    }
+    if !loops.is_empty() {
+        return Err(ttStatus::TT_ERROR_ENDLOOP_MACHINE);
+    }
+    Ok(())
+}
+
+/// Every program a Quasar launch stages: the two movers and the three compute
+/// harts.
+pub fn quasar_programs(m: &MachineKernel) -> Result<crate::module::QuasarProgram, ttStatus> {
+    let mut out = Words::default();
+    encode_mover(m, Core::Reader, false, &mut out.reader)?;
+    encode_mover(m, Core::Writer, true, &mut out.writer)?;
+    let unpack: Vec<MirOp> = m.stream(Core::Unpack).collect();
+    let math: Vec<MirOp> = m.stream(Core::Math).collect();
+    let pack: Vec<MirOp> = m.stream(Core::Pack).collect();
+    encode_unpack_quasar(m, &unpack, &mut out.t0)?;
+    encode_math_quasar(m, &math, &mut out.t1)?;
+    encode_pack_quasar(m, &pack, &mut out.t2)?;
+    let [reader, t0, t1, t2, writer] = out.words()?;
+    Ok(crate::module::QuasarProgram {
+        reader,
+        writer,
+        unpack: t0,
+        math: t1,
+        pack: t2,
+    })
 }
 
 #[cfg(test)]

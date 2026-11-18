@@ -261,7 +261,8 @@ pub enum ttStatus {
     TT_ERROR_DLSYM = 113,
     /// No chip answers configuration space.
     TT_ERROR_NO_DEVICE = 114,
-    /// The device is not a Blackhole.
+    /// The device is not a chip this build drives (it is neither a Blackhole
+    /// nor a Quasar).
     TT_ERROR_NOT_BLACKHOLE = 115,
     /// The chip has no Tensix tile.
     TT_ERROR_NO_TENSIX_TILE = 116,

@@ -4,11 +4,18 @@
 //! The device: `libttsim` through `dlopen`, one TLB window, DRAM and L1 access,
 //! and starting a core on an image.
 //!
+//! A [`Device`] is opened as whichever architecture the target reports
+//! ([`Architecture`]): the simulator's configuration space names it, and the
+//! card's `GET_DEVICE_INFO` does. Blackhole is brought up completely; Quasar is
+//! recognised with its fixed worker grid and DRAM table, and host bytes reach it
+//! through tile-relative accesses (Quasar has no host TLB window here). The ARC,
+//! mailbox layout, firmware and lowering are still Blackhole's alone.
+//!
 //! `libttsim` is a process-wide singleton with no context handle. Every contract
 //! violation terminates the process (`_Exit`), so nothing here hands it an
 //! address it does not decode: the window geometry is checked before each call,
 //! the TLB configuration is the one the library accepts, and L1 access is
-//! bounded by [`tt_isa::arch::blackhole::Blackhole::L1_SIZE`].
+//! bounded by the open architecture's `L1_SIZE`.
 //!
 //! The simulator is loaded from `$TT_METAL_SIMULATOR` — the name tt-metal's own
 //! runtime and the ttsim project use — or `libttsim_bh.so` in the current
@@ -21,15 +28,20 @@ use std::sync::OnceLock;
 
 use libloading::{Library, Symbol};
 
-use crate::kmd::{DEVICE_ID_BLACKHOLE, Kmd, VENDOR_ID_TENSTORRENT};
+use crate::kmd::{DEVICE_ID_BLACKHOLE, DEVICE_ID_QUASAR, Kmd, VENDOR_ID_TENSTORRENT};
 use crate::status::ttStatus;
 use tt_isa::arch::Arch;
 use tt_isa::arch::blackhole::Blackhole;
-use tt_isa::arch::blackhole::dram::{CHANNEL_BYTES, Dram, DramChannel};
+use tt_isa::arch::blackhole::dram::{
+    CHANNEL_BYTES as BLACKHOLE_CHANNEL_BYTES, Dram as BlackholeDram,
+};
 use tt_isa::arch::blackhole::l1;
 use tt_isa::arch::blackhole::mailbox::{self, status};
 use tt_isa::arch::blackhole::noc::NocCoord;
 use tt_isa::arch::blackhole::noc::niu::Endpoint;
+use tt_isa::arch::quasar::Quasar;
+use tt_isa::arch::quasar::dram::{CHANNEL_BYTES as QUASAR_CHANNEL_BYTES, Dram as QuasarDram};
+use tt_isa::arch::quasar::mailbox as quasar_mailbox;
 use tt_isa::tensix::Core;
 
 /// `RISC_SOFT_RESET_0`: the one register every Blackhole core and the backend
@@ -45,6 +57,134 @@ fn soft_reset_register() -> u64 {
 /// architecture's refusal is unreachable here.
 fn soft_reset_mask(core: Core) -> u32 {
     Blackhole::soft_reset_mask(core).expect("Blackhole's core set is the driver's")
+}
+
+/// The chip architecture a [`Device`] is.
+///
+/// The choice is made once, when the device is opened, from the identity the
+/// target reports: configuration space in the simulator and `GET_DEVICE_INFO`
+/// through tt-kmd on the card. It is an enum rather than a generic parameter
+/// because the C ABI has no place to name a type, and it is not a `&dyn Arch`:
+/// that trait carries associated constants and is deliberately not object-safe
+/// (`tt_isa::arch`).
+///
+/// Only Blackhole is brought up today. A Quasar names itself and its fixed
+/// worker grid, but nothing below the device layer — no ARC, mailbox layout,
+/// TLB window encoding or firmware — is written for it yet, so an operation
+/// that would need one comes back [`ttStatus::TT_ERROR_UNSUPPORTED`] instead
+/// of being run as though the chip were a Blackhole.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Architecture {
+    /// Blackhole: [`DEVICE_ID_BLACKHOLE`].
+    Blackhole,
+    /// Quasar: [`DEVICE_ID_QUASAR`], whose vocabulary lives in
+    /// `tt_isa::arch::quasar`.
+    Quasar,
+}
+
+impl Architecture {
+    /// The architecture a PCI device id names, or `None` if this build does not
+    /// drive that chip.
+    pub const fn from_device_id(id: u16) -> Option<Architecture> {
+        match id {
+            DEVICE_ID_BLACKHOLE => Some(Architecture::Blackhole),
+            DEVICE_ID_QUASAR => Some(Architecture::Quasar),
+            _ => None,
+        }
+    }
+
+    /// The name tt-metal prints for this architecture.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Architecture::Blackhole => "Blackhole",
+            Architecture::Quasar => "Quasar",
+        }
+    }
+
+    /// The size of one tile's L1. Every host L1 access is checked against it,
+    /// and the two architectures do not share the number.
+    const fn l1_size(self) -> u64 {
+        match self {
+            Architecture::Blackhole => Blackhole::L1_SIZE,
+            Architecture::Quasar => Quasar::L1_SIZE,
+        }
+    }
+}
+
+/// The logical grid of a chip whose descriptor lists no harvesting: the fixed
+/// worker table, row-major, and the width of its first row.
+///
+/// Quasar has no ARC to ask and no harvested tile to skip, so its grid is the
+/// descriptor's `functional_workers` table itself
+/// (`tt_isa::arch::quasar::noc::grid::WORKERS`), not something a probe
+/// discovers.
+fn fixed_worker_grid(workers: &[(u8, u8)]) -> (Vec<NocCoord>, usize) {
+    let tiles = workers
+        .iter()
+        .map(|&(x, y)| NocCoord::new(x, y).expect("a worker is a NoC coordinate"))
+        .collect();
+    let first_row = workers.first().map(|&(_, y)| y);
+    let columns = workers
+        .iter()
+        .filter(|(_, y)| Some(*y) == first_row)
+        .count();
+    (tiles, columns)
+}
+
+/// The DRAM model of the open architecture.
+///
+/// The two architectures number their banks and describe their endpoints
+/// differently — Blackhole compacts around a harvested bank and chooses a
+/// port per NoC, Quasar has a fixed two-channel table and one NIU — so the
+/// device holds the architecture's own [`Dram`](tt_isa::arch::blackhole::dram::Dram)
+/// and resolves the few things the host path needs here.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum DramModel {
+    Blackhole(BlackholeDram),
+    Quasar(QuasarDram),
+}
+
+impl DramModel {
+    /// Bytes in one channel of this chip.
+    fn channel_bytes(self) -> u64 {
+        match self {
+            DramModel::Blackhole(_) => BLACKHOLE_CHANNEL_BYTES,
+            DramModel::Quasar(_) => QUASAR_CHANNEL_BYTES,
+        }
+    }
+
+    /// The chip's enabled-channel word, for the mover's `USABLE` mailbox.
+    fn enabled_mask(self) -> u32 {
+        match self {
+            DramModel::Blackhole(dram) => u32::from(dram.enabled_mask()),
+            DramModel::Quasar(dram) => u32::from(dram.enabled_mask()),
+        }
+    }
+
+    /// Every channel's logical index, in logical order.
+    fn channels(self) -> Vec<u8> {
+        match self {
+            DramModel::Blackhole(dram) => dram.channels().map(|ch| ch.index()).collect(),
+            DramModel::Quasar(dram) => dram.channels().map(|ch| ch.index()).collect(),
+        }
+    }
+
+    /// The endpoint channel `index` is reached through from the host.
+    ///
+    /// Blackhole has two NoCs and a preferred endpoint for each; the host path
+    /// here has always used NoC #0, so that is the one named. Quasar has one
+    /// NIU, so its channel has a single endpoint.
+    fn endpoint(self, index: u8) -> Option<NocCoord> {
+        match self {
+            DramModel::Blackhole(dram) => dram
+                .channel(index)
+                .map(|ch| ch.preferred(tt_isa::arch::blackhole::noc::niu::Niu::Noc0)),
+            DramModel::Quasar(dram) => dram.channel(index).map(|ch| {
+                let at = ch.preferred();
+                NocCoord::new(at.x(), at.y()).expect("a DRAM endpoint is a NoC coordinate")
+            }),
+        }
+    }
 }
 
 /// The environment variable that names the simulator's shared object:
@@ -237,6 +377,8 @@ type FnSetDma = unsafe extern "C" fn(DmaRead, DmaWrite);
 type FnConfigRd32 = unsafe extern "C" fn(u32, u32) -> u32;
 type FnMemRd = unsafe extern "C" fn(u64, *mut c_void, u32);
 type FnMemWr = unsafe extern "C" fn(u64, *const c_void, u32);
+type FnTileRd = unsafe extern "C" fn(u32, u32, u64, *mut c_void, u32);
+type FnTileWr = unsafe extern "C" fn(u32, u32, u64, *const c_void, u32);
 type FnClock = unsafe extern "C" fn(u32);
 
 /// The loaded simulator, with the entry points this driver calls.
@@ -244,6 +386,8 @@ struct Lib {
     pci_config_rd32: FnConfigRd32,
     pci_mem_rd_bytes: FnMemRd,
     pci_mem_wr_bytes: FnMemWr,
+    tile_rd_bytes: FnTileRd,
+    tile_wr_bytes: FnTileWr,
     clock: FnClock,
     /// Kept alive alongside the function pointers above.
     _library: Library,
@@ -289,6 +433,8 @@ impl Lib {
             pci_config_rd32: sym!("libttsim_pci_config_rd32"),
             pci_mem_rd_bytes: sym!("libttsim_pci_mem_rd_bytes"),
             pci_mem_wr_bytes: sym!("libttsim_pci_mem_wr_bytes"),
+            tile_rd_bytes: sym!("libttsim_tile_rd_bytes"),
+            tile_wr_bytes: sym!("libttsim_tile_wr_bytes"),
             clock: sym!("libttsim_clock"),
             _library: library,
         };
@@ -321,6 +467,38 @@ impl Lib {
         unsafe { (self.pci_mem_rd_bytes)(paddr, out.as_mut_ptr().cast(), out.len() as u32) };
     }
 
+    /// Write one tile's bytes by NoC coordinate: L1, a tile register or a DRAM
+    /// channel, without a TLB window.
+    fn tile_write(&self, tile: NocCoord, address: u64, bytes: &[u8]) {
+        debug_assert!(!bytes.is_empty() && bytes.len() <= u32::MAX as usize);
+        // SAFETY: the coordinate and address name a tile the model has, and the
+        // buffer is valid for its length.
+        unsafe {
+            (self.tile_wr_bytes)(
+                u32::from(tile.x()),
+                u32::from(tile.y()),
+                address,
+                bytes.as_ptr().cast(),
+                bytes.len() as u32,
+            )
+        };
+    }
+
+    /// Read one tile's bytes by NoC coordinate. See [`Lib::tile_write`].
+    fn tile_read(&self, tile: NocCoord, address: u64, out: &mut [u8]) {
+        debug_assert!(!out.is_empty() && out.len() <= u32::MAX as usize);
+        // SAFETY: as above.
+        unsafe {
+            (self.tile_rd_bytes)(
+                u32::from(tile.x()),
+                u32::from(tile.y()),
+                address,
+                out.as_mut_ptr().cast(),
+                out.len() as u32,
+            )
+        };
+    }
+
     fn clock(&self, n: u32) {
         // SAFETY: the simulator is initialized and calls are serialized.
         unsafe { (self.clock)(n) };
@@ -338,11 +516,13 @@ unsafe extern "C" fn dma_read_unexpected(paddr: u64, _dst: *mut c_void, size: u3
 
 /// Which transport a [`Device`] sits on.
 ///
-/// The two differ in four calls — configuration read, window read, window write
-/// and a clock step — and in nothing else, so the choice is one field rather
-/// than two device types. Each variant is constructed by its own `open`.
+/// The two differ in a handful of calls — configuration read, register and
+/// window access, the tile-relative access Quasar uses, and a clock step — and
+/// in nothing else, so the choice is one field rather than two device types.
+/// Each variant is constructed by its own `open`.
 enum Link {
-    /// The simulator: `dlopen`ed `libttsim_bh.so`, entry points resolved once.
+    /// The simulator: the `dlopen`ed `libttsim` named by `$TT_METAL_SIMULATOR`,
+    /// its entry points resolved once.
     Sim(&'static Lib),
     /// `/dev/tenstorrent/N` through tt-kmd, opened by [`Device::open_hardware`].
     Driver(Kmd),
@@ -398,6 +578,34 @@ impl Link {
         }
     }
 
+    /// One tile's bytes by coordinate, for an architecture with no TLB window
+    /// of its own.
+    ///
+    /// Quasar has no host TLB path (`NUM_NOCS 1` and no `TLB_*` block in
+    /// `tt_isa::arch::quasar`), and tt-umd's Quasar simulator device reaches
+    /// L1 and DRAM through `libttsim_tile_*_bytes`, not through BAR0
+    /// (`tt_sim_tt_device.cpp`, `tile_write_bytes`). Silicon would need a
+    /// driver path that does not exist yet, so the card link refuses.
+    fn tile_write(&self, tile: NocCoord, address: u64, bytes: &[u8]) -> Result<(), ttStatus> {
+        match self {
+            Link::Sim(lib) => {
+                lib.tile_write(tile, address, bytes);
+                Ok(())
+            }
+            Link::Driver(_) => Err(ttStatus::TT_ERROR_UNSUPPORTED),
+        }
+    }
+
+    fn tile_read(&self, tile: NocCoord, address: u64, out: &mut [u8]) -> Result<(), ttStatus> {
+        match self {
+            Link::Sim(lib) => {
+                lib.tile_read(tile, address, out);
+                Ok(())
+            }
+            Link::Driver(_) => Err(ttStatus::TT_ERROR_UNSUPPORTED),
+        }
+    }
+
     /// The wait budget, and how the device advances time.
     ///
     /// The simulator advances only inside [`Link::clock`]; silicon advances on its
@@ -437,6 +645,16 @@ impl Device {
     /// [`crate::module::Module::cores`] on the simulator.
     pub fn is_simulated(&self) -> bool {
         self.link.is_simulated()
+    }
+
+    /// The architecture this device was opened as.
+    pub fn arch(&self) -> Architecture {
+        self.arch
+    }
+
+    /// This chip's DRAM model, if its architecture has one.
+    fn dram(&self) -> Result<DramModel, ttStatus> {
+        self.dram.ok_or(ttStatus::TT_ERROR_UNSUPPORTED)
     }
 }
 
@@ -589,13 +807,17 @@ pub(crate) fn hash_words(words: &[u32]) -> u64 {
     })
 }
 
-/// One Blackhole, reached through a TLB window.
+/// One Tenstorrent chip, reached through a TLB window.
 ///
 /// The transport is one field: [`Link::Sim`] is the `dlopen`ed simulator, and
-/// [`Link::Driver`] will be `/dev/tenstorrent/N`. Everything else here is device
-/// state, discovered through the same window either way.
+/// [`Link::Driver`] is `/dev/tenstorrent/N`. The architecture is another
+/// (`arch`), chosen at open from the identity the target reports; everything
+/// else here is device state, discovered through the same window.
 pub struct Device {
     link: Link,
+    /// Which chip this is. Chosen by [`Device::open`] from the identity the
+    /// target reports, never assumed.
+    arch: Architecture,
     /// The configuration the window is known to hold. The registers are
     /// write-only, so this is the only record of the current mapping.
     shadow: Option<[u32; 3]>,
@@ -607,8 +829,9 @@ pub struct Device {
     tiles: Vec<NocCoord>,
     /// Tensix columns in [`Device::tiles`]: the width of the logical grid.
     columns: usize,
-    /// DRAM channels that can hold data.
-    dram: Dram,
+    /// DRAM channels that can hold data, once the architecture's DRAM model is
+    /// known. `None` until the bring-up fills it.
+    dram: Option<DramModel>,
     /// First byte of each channel this device has not handed out, in logical
     /// channel order.
     dram_used: Vec<u64>,
@@ -658,42 +881,35 @@ pub struct Device {
 }
 
 impl Device {
-    /// Load the simulator if needed and take the device.
+    /// Open whichever target is present.
+    ///
+    /// `$TT_METAL_SIMULATOR` names a simulator shared object and takes
+    /// precedence, exactly as tt-metal's runtime chooses; without it the card
+    /// is opened through tt-kmd. The architecture is then read from the target
+    /// itself — configuration space in the simulator, `GET_DEVICE_INFO` on the
+    /// card — and brought up as that chip.
     pub fn open() -> Result<Device, ttStatus> {
-        let path = std::env::var_os(LIB_PATH_ENV)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("libttsim_bh.so"));
-        let lib = Lib::open(path.as_os_str())?;
-
-        // Chip 0 must answer configuration space, and it must be a Blackhole:
-        // every address constant above is Blackhole's. Only the simulator has a
-        // configuration-space path: tt-kmd exposes no ioctl for it, and the card's
-        // identity check is `GET_DEVICE_INFO` at open (`Kmd::open`).
-        let id = lib.config_rd32(0, 0);
-        if id == u32::MAX {
-            return Err(ttStatus::TT_ERROR_NO_DEVICE);
+        match std::env::var_os(LIB_PATH_ENV).filter(|p| !p.is_empty()) {
+            Some(_) => Self::open_simulator(),
+            None => Self::open_hardware(),
         }
-        let vendor = (id & 0xFFFF) as u16;
-        let device = (id >> 16) as u16;
-        if vendor != VENDOR_ID_TENSTORRENT || device != DEVICE_ID_BLACKHOLE {
-            let _ = (vendor, device);
-            return Err(ttStatus::TT_ERROR_NOT_BLACKHOLE);
-        }
+    }
 
-        let link = Link::Sim(lib);
-
-        // The live Tensix grid comes from the ARC's telemetry, never from the
-        // part's population: ttsim v1.16 (and a harvested chip) refuses accesses
-        // to a fused-off tile's registers, and a guessed full grid writes
-        // exactly there.
-        let mut device = Device {
+    /// Open the device with `arch`'s shared state, before its own bring-up.
+    ///
+    /// Nothing architecture-specific belongs here: `tiles`, `columns` and
+    /// `dram` are empty until the bring-up fills them, and every accessor that
+    /// needs one refuses until it is set.
+    fn new(link: Link, arch: Architecture) -> Device {
+        Device {
             link,
+            arch,
             shadow: None,
-            tile: tt_isa::arch::blackhole::arc::arc_tile(),
+            tile: NocCoord::new(0, 0).expect("(0, 0) is a NoC coordinate"),
             tiles: Vec::new(),
             columns: 0,
-            dram: Dram::FULL,
-            dram_used: vec![DRAM_FIRST; usize::from(Dram::FULL.channels().count())],
+            dram: None,
+            dram_used: Vec::new(),
             dma: None,
             interleaved: Vec::new(),
             exec_started: Vec::new(),
@@ -704,20 +920,67 @@ impl Device {
             backend_released: Vec::new(),
             dram_dirty: false,
             installed: None,
+        }
+    }
+
+    /// Load the simulator and open the chip it presents.
+    fn open_simulator() -> Result<Device, ttStatus> {
+        let path = std::env::var_os(LIB_PATH_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("libttsim_bh.so"));
+        let lib = Lib::open(path.as_os_str())?;
+
+        // Chip 0 must answer configuration space. Only the simulator has a
+        // configuration-space path: tt-kmd exposes no ioctl for it, and the
+        // card's identity check is `GET_DEVICE_INFO` at open (`Kmd::open`).
+        let id = lib.config_rd32(0, 0);
+        if id == u32::MAX {
+            return Err(ttStatus::TT_ERROR_NO_DEVICE);
+        }
+        let vendor = (id & 0xFFFF) as u16;
+        let device = (id >> 16) as u16;
+        if vendor != VENDOR_ID_TENSTORRENT {
+            let _ = (vendor, device);
+            return Err(ttStatus::TT_ERROR_NOT_BLACKHOLE);
+        }
+        // The device id is the whole architecture decision: it chooses both
+        // the grid probe and every address the driver uses below the device.
+        let Some(arch) = Architecture::from_device_id(device) else {
+            let _ = (vendor, device);
+            return Err(ttStatus::TT_ERROR_NOT_BLACKHOLE);
         };
+
+        let device = Device::new(Link::Sim(lib), arch);
+        match arch {
+            Architecture::Blackhole => device.bring_up_blackhole(),
+            Architecture::Quasar => device.bring_up_quasar(),
+        }
+    }
+
+    /// Discover a Blackhole's live grid and leave its cores held.
+    ///
+    /// The live Tensix grid comes from the ARC's telemetry, never from the
+    /// part's population: ttsim v1.16 (and a harvested chip) refuses accesses
+    /// to a fused-off tile's registers, and a guessed full grid writes exactly
+    /// there.
+    fn bring_up_blackhole(mut self) -> Result<Device, ttStatus> {
+        self.tile = tt_isa::arch::blackhole::arc::arc_tile();
+        self.dram = Some(DramModel::Blackhole(BlackholeDram::FULL));
+        self.dram_used = vec![DRAM_FIRST; usize::from(BlackholeDram::FULL.channels().count())];
+
         // Before any tile is named: with translation off, a logical column number
         // is a physical one, and the first n of them are the wrong set.
-        if !device.translation_enabled()? {
+        if !self.translation_enabled()? {
             eprintln!(
                 "libskamandros: the NIU is not translating coordinates; this driver addresses \
                  tensix tiles logically and would name a fused-off column"
             );
             return Err(ttStatus::TT_ERROR_DEVICE);
         }
-        let tensix = device.probe_tensix()?;
-        device.tiles = tensix.tiles().collect();
-        device.columns = tensix.enabled_column_count();
-        device.tile = *device
+        let tensix = self.probe_tensix()?;
+        self.tiles = tensix.tiles().collect();
+        self.columns = tensix.enabled_column_count();
+        self.tile = *self
             .tiles
             .first()
             .ok_or(ttStatus::TT_ERROR_NO_TENSIX_TILE)?;
@@ -726,8 +989,31 @@ impl Device {
         // transition, so it cannot disturb a live caller: hold the five cores
         // and clear the launch state here, making the next launch start from a
         // known tile.
-        device.quiesce()?;
-        Ok(device)
+        self.quiesce()?;
+        Ok(self)
+    }
+
+    /// Name a Quasar's tiles and leave the rest of the device layer for later.
+    ///
+    /// Quasar has no ARC and no harvesting, so there is nothing to probe: its
+    /// functional workers are the fixed table from
+    /// `tt_isa::arch::quasar::noc::grid` (the descriptor's
+    /// `functional_workers`), and its DRAM is the fixed two-channel table from
+    /// `tt_isa::arch::quasar::dram`. Its harts are held and its launch words
+    /// cleared, so a previous process's run cannot leak into this one.
+    fn bring_up_quasar(mut self) -> Result<Device, ttStatus> {
+        use tt_isa::arch::quasar::noc::grid;
+        let (tiles, columns) = fixed_worker_grid(&grid::WORKERS);
+        self.tiles = tiles;
+        self.columns = columns;
+        self.dram = Some(DramModel::Quasar(QuasarDram::FULL));
+        self.dram_used = vec![DRAM_FIRST; usize::from(QuasarDram::FULL.channels().count())];
+        self.tile = *self
+            .tiles
+            .first()
+            .ok_or(ttStatus::TT_ERROR_NO_TENSIX_TILE)?;
+        self.quasar_quiesce()?;
+        Ok(self)
     }
 
     /// Take the card through `/dev/tenstorrent/0`.
@@ -748,30 +1034,14 @@ impl Device {
             return Err(ttStatus::TT_ERROR_DEVICE);
         }
         let kmd = Kmd::open(0)?;
-        let link = Link::Driver(kmd);
+        // `Kmd::open` identifies a Blackhole and maps BAR0 with its geometry;
+        // tt-kmd has no Quasar path this driver could use, so the card link is
+        // Blackhole's by construction.
+        let mut device = Device::new(Link::Driver(kmd), Architecture::Blackhole);
+        device.dram = Some(DramModel::Blackhole(BlackholeDram::FULL));
+        device.dram_used = vec![DRAM_FIRST; usize::from(BlackholeDram::FULL.channels().count())];
+        device.tile = tt_isa::arch::blackhole::arc::arc_tile();
 
-        // The live Tensix grid comes from the ARC's telemetry, never from the
-        // part's population: a harvested chip refuses accesses to a fused-off
-        // tile's registers, and a guessed full grid writes exactly there.
-        let mut device = Device {
-            link,
-            shadow: None,
-            tile: tt_isa::arch::blackhole::arc::arc_tile(),
-            tiles: Vec::new(),
-            columns: 0,
-            dram: Dram::FULL,
-            dram_used: vec![DRAM_FIRST; usize::from(Dram::FULL.channels().count())],
-            dma: None,
-            interleaved: Vec::new(),
-            exec_started: Vec::new(),
-            launch_seq: 0,
-            placed: Vec::new(),
-            staged: std::collections::HashMap::new(),
-            barrier_flag: L1_BARRIER_SET,
-            backend_released: Vec::new(),
-            dram_dirty: false,
-            installed: None,
-        };
         // The ARC publishes every address the rest of this reads, so it is
         // waited for first, as tt-metal waits before it creates its messenger or
         // its telemetry reader.
@@ -790,8 +1060,9 @@ impl Device {
             .tiles
             .first()
             .ok_or(ttStatus::TT_ERROR_NO_TENSIX_TILE)?;
-        device.dram = device.probe_dram()?;
-        device.dram_used = vec![DRAM_FIRST; usize::from(device.dram.channels().count())];
+        let dram = device.probe_dram()?;
+        device.dram = Some(DramModel::Blackhole(dram));
+        device.dram_used = vec![DRAM_FIRST; usize::from(dram.channels().count())];
 
         // Firmware trains each GDDR channel after power-up, and tt-metal waits
         // for every enabled channel before it touches DRAM (`LocalChip`'s
@@ -802,7 +1073,7 @@ impl Device {
         // `TOGGLE_GDDR_RESET`, an ARC message that disturbs the card's DRAM, and
         // this driver sends no reset. tt-metal ends its wait when the tag is
         // absent, and so does this.
-        let enabled = device.dram.enabled_mask();
+        let enabled = dram.enabled_mask();
         let started = std::time::Instant::now();
         loop {
             let Some(status) = device.arc_tag(tt_isa::arch::blackhole::arc::tag::GDDR_STATUS)?
@@ -882,7 +1153,7 @@ impl Device {
             0,
             device.columns,
             device.tiles.len(),
-            device.dram.enabled_mask(),
+            dram.enabled_mask(),
         );
         Ok(device)
     }
@@ -968,7 +1239,7 @@ impl Device {
     /// sysfs cannot answer it, because `tt_telemetry_probe` caches only the tags
     /// that back an attribute. The tag itself is the enabled mask, so this walk
     /// must not invert it again.
-    fn probe_dram(&mut self) -> Result<Dram, ttStatus> {
+    fn probe_dram(&mut self) -> Result<BlackholeDram, ttStatus> {
         use tt_isa::arch::blackhole::arc;
         let arc_tile = arc::arc_tile();
         let table = u64::from(self.arc_word(arc_tile, arc::TELEMETRY_PTR)?);
@@ -1011,7 +1282,7 @@ impl Device {
         // (`blackhole_tt_device.cpp:146-149`) is its own bookkeeping, not this
         // one's.
         let mask = enabled.ok_or(ttStatus::TT_ERROR_TELEMETRY)?;
-        Dram::from_enabled_mask(mask as u8).ok_or(ttStatus::TT_ERROR_TELEMETRY)
+        BlackholeDram::from_enabled_mask(mask as u8).ok_or(ttStatus::TT_ERROR_TELEMETRY)
     }
 
     /// This chip's live Tensix columns, from the ARC's telemetry table.
@@ -1334,33 +1605,38 @@ impl Device {
     }
 
     /// The chip's `ENABLED_GDDR` word, for the data mover's `USABLE` mailbox.
+    ///
+    /// Zero when the architecture's DRAM is not known yet: a mover that reads
+    /// it sees no usable channel instead of a Blackhole mask.
     pub fn dram_mask(&self) -> u32 {
-        u32::from(self.dram.enabled_mask())
+        self.dram.map_or(0, DramModel::enabled_mask)
     }
 
-    /// Every channel, in logical order.
-    pub fn dram_channels(&self) -> Vec<DramChannel> {
-        self.dram.channels().collect()
+    /// Every channel's logical index, in logical order.
+    pub fn dram_channels(&self) -> Vec<u8> {
+        self.dram.map_or_else(Vec::new, DramModel::channels)
     }
 
     /// The channel a flat DRAM address lives on, and its offset inside that
     /// channel.
     ///
-    /// An address is `channel * CHANNEL_BYTES + offset`, the same shape
+    /// An address is `channel * channel_bytes + offset`, the same shape
     /// tt-metal gives a bank: `bank_id * bank_size + offset`, with the bank's
     /// NoC endpoint resolved from the bank id (`get_noc_addr_from_bank_id`,
     /// `dataflow_api_addrgen.h:516-533`). Splitting it needs no table: the
     /// channel is the quotient and the offset the remainder.
-    fn dram_at(&self, address: u64) -> Result<(DramChannel, u64), ttStatus> {
+    fn dram_at(&self, address: u64) -> Result<(u8, u64), ttStatus> {
         if address & INTERLEAVED_TAG != 0 {
             // A striped tensor has no single channel; its pages do.
             return Err(ttStatus::TT_ERROR_DRAM_RANGE);
         }
-        let channel = address / CHANNEL_BYTES;
-        let offset = address % CHANNEL_BYTES;
+        let dram = self.dram()?;
+        let channel_bytes = dram.channel_bytes();
+        let channel = address / channel_bytes;
+        let offset = address % channel_bytes;
         let channel = u8::try_from(channel)
             .ok()
-            .and_then(|index| self.dram.channel(index))
+            .filter(|index| dram.endpoint(*index).is_some())
             .ok_or(ttStatus::TT_ERROR_DRAM_RANGE)?;
         Ok((channel, offset))
     }
@@ -1377,15 +1653,17 @@ impl Device {
             return Err(ttStatus::TT_ERROR_ALLOC_ZERO);
         }
         let bytes = bytes as u64;
+        let dram = self.dram()?;
+        let channel_bytes = dram.channel_bytes();
         let mut best: Option<(u8, u64)> = None;
-        for channel in self.dram.channels() {
-            let used = self.dram_used[usize::from(channel.index())];
+        for index in dram.channels() {
+            let used = self.dram_used[usize::from(index)];
             let at = used.next_multiple_of(64);
             let fits = at
                 .checked_add(bytes)
-                .is_some_and(|end| end <= CHANNEL_BYTES);
+                .is_some_and(|end| end <= channel_bytes);
             if fits && best.is_none_or(|(_, free)| used < free) {
-                best = Some((channel.index(), used));
+                best = Some((index, used));
             }
         }
         let Some((index, used)) = best else {
@@ -1394,7 +1672,7 @@ impl Device {
         };
         let at = used.next_multiple_of(64);
         self.dram_used[usize::from(index)] = at + bytes;
-        Ok(u64::from(index) * CHANNEL_BYTES + at)
+        Ok(u64::from(index) * channel_bytes + at)
     }
 
     /// Reserve a tensor whose pages are striped across the channels, and
@@ -1417,26 +1695,29 @@ impl Device {
         if bytes == 0 || page == 0 {
             return Err(ttStatus::TT_ERROR_ALLOC_ZERO);
         }
-        if page as u64 > CHANNEL_BYTES {
+        let dram = self.dram()?;
+        let channel_bytes = dram.channel_bytes();
+        if page as u64 > channel_bytes {
             return Err(ttStatus::TT_ERROR_DRAM_RANGE);
         }
         let pages = bytes.div_ceil(page);
-        let channels = self.dram.channels().count();
-        let per_channel = pages.div_ceil(channels) * page;
-        let mut base = Vec::with_capacity(channels);
-        for channel in self.dram.channels() {
-            let used = self.dram_used[usize::from(channel.index())].next_multiple_of(64);
+        let channels = dram.channels();
+        let count = channels.len();
+        let per_channel = pages.div_ceil(count) * page;
+        let mut base = Vec::with_capacity(count);
+        for index in &channels {
+            let used = self.dram_used[usize::from(*index)].next_multiple_of(64);
             let end = used
                 .checked_add(per_channel as u64)
                 .ok_or(ttStatus::TT_ERROR_DRAM_ADDRESS_OVERFLOW)?;
-            if end > CHANNEL_BYTES {
+            if end > channel_bytes {
                 let _ = (bytes, page);
                 return Err(ttStatus::TT_ERROR_DRAM_FULL);
             }
             base.push(used);
         }
-        for (channel, at) in self.dram.channels().zip(&base) {
-            self.dram_used[usize::from(channel.index())] = at + per_channel as u64;
+        for (index, at) in channels.iter().zip(&base) {
+            self.dram_used[usize::from(*index)] = at + per_channel as u64;
         }
         let index = self.interleaved.len() as u64;
         self.interleaved.push(Interleaved {
@@ -1461,10 +1742,11 @@ impl Device {
             Some(layout) => (layout.page as usize, layout.base.clone()),
             None => return Err(ttStatus::TT_ERROR_DRAM_RANGE),
         };
+        let channel_bytes = self.dram()?.channel_bytes();
         let channels = base.len();
         for (index, chunk) in bytes.chunks(page).enumerate() {
             let bank = index % channels;
-            let at = u64::from(bank as u32) * CHANNEL_BYTES
+            let at = u64::from(bank as u32) * channel_bytes
                 + base[bank]
                 + (index / channels) as u64 * page as u64;
             self.dram_write(at, chunk)?;
@@ -1478,9 +1760,10 @@ impl Device {
             None => return Err(ttStatus::TT_ERROR_DRAM_RANGE),
         };
         let channels = base.len();
+        let channel_bytes = self.dram()?.channel_bytes();
         for (index, chunk) in out.chunks_mut(page).enumerate() {
             let bank = index % channels;
-            let at = u64::from(bank as u32) * CHANNEL_BYTES
+            let at = u64::from(bank as u32) * channel_bytes
                 + base[bank]
                 + (index / channels) as u64 * page as u64;
             self.dram_read(at, chunk)?;
@@ -1496,19 +1779,40 @@ impl Device {
     /// `bank_to_dram_offset[bank_id]` to the offset and the packed endpoint to
     /// the high word, `dataflow_api_addrgen.h:516-533`). The reader and the
     /// writer use opposite NoCs, and the endpoints differ between them.
+    ///
+    /// Blackhole's two-NoC endpoint word; Quasar's addresses carry the
+    /// coordinate at bit 36 (`tt_isa::arch::quasar::noc`) and no launch builds
+    /// one yet, so a Quasar address is refused rather than packed the wrong way.
     pub fn dram_hi(
         &self,
         address: u64,
         niu: tt_isa::arch::blackhole::noc::niu::Niu,
     ) -> Result<u32, ttStatus> {
-        let (channel, _) = self.dram_at(address)?;
-        let ep = channel.preferred(niu);
-        Ok(Endpoint {
-            x: ep.x(),
-            y: ep.y(),
-            addr: 0,
+        let (index, _) = self.dram_at(address)?;
+        match self.dram()? {
+            DramModel::Blackhole(dram) => {
+                let channel = dram.channel(index).ok_or(ttStatus::TT_ERROR_DRAM_RANGE)?;
+                let ep = channel.preferred(niu);
+                Ok(Endpoint {
+                    x: ep.x(),
+                    y: ep.y(),
+                    addr: 0,
+                }
+                .hi())
+            }
+            // One NIU, one endpoint per channel, and the coordinate is the
+            // transaction's own register (`tt_isa::arch::quasar::noc`).
+            DramModel::Quasar(dram) => {
+                let channel = dram.channel(index).ok_or(ttStatus::TT_ERROR_DRAM_RANGE)?;
+                let ep = channel.preferred();
+                Ok(Endpoint {
+                    x: ep.x(),
+                    y: ep.y(),
+                    addr: 0,
+                }
+                .hi())
+            }
         }
-        .hi())
     }
 
     /// Write `bytes` to DRAM at a flat address.
@@ -1517,27 +1821,31 @@ impl Device {
         if address & INTERLEAVED_TAG != 0 {
             return self.dram_write_interleaved(address, bytes);
         }
-        let (channel, offset) = self.dram_at(address)?;
-        let range = channel.range(offset, bytes.len() as u64).ok_or_else(|| {
+        let dram = self.dram()?;
+        let (index, offset) = self.dram_at(address)?;
+        if offset
+            .checked_add(bytes.len() as u64)
+            .is_none_or(|end| end > dram.channel_bytes())
+        {
             let _ = (bytes.len(), address);
-            ttStatus::TT_ERROR_DRAM_RANGE
-        })?;
-        let ep = channel.preferred(tt_isa::arch::blackhole::noc::niu::Niu::Noc0);
-        if DMA_ENABLED && bytes.len() >= DMA_MIN && self.dma_write(ep, range.offset(), bytes)? {
+            return Err(ttStatus::TT_ERROR_DRAM_RANGE);
+        }
+        let ep = dram.endpoint(index).ok_or(ttStatus::TT_ERROR_DRAM_RANGE)?;
+        if DMA_ENABLED && bytes.len() >= DMA_MIN && self.dma_write(ep, offset, bytes)? {
             // The engine's completion flag is the transfer's witness; the window
             // read is a second one, from the endpoint the data went out of.
             if bytes.len() >= 4 {
-                let last = range.offset() + bytes.len() as u64 - 4;
+                let last = offset + bytes.len() as u64 - 4;
                 let mut word = [0u8; 4];
                 self.window_read(ep, last, &mut word)?;
             }
             return Ok(());
         }
-        self.window_write(ep, range.offset(), bytes)?;
+        self.window_write(ep, offset, bytes)?;
         // A write is visible through the endpoint it went out of: read the last
         // word back through it.
         if bytes.len() >= 4 {
-            let last = range.offset() + bytes.len() as u64 - 4;
+            let last = offset + bytes.len() as u64 - 4;
             let mut word = [0u8; 4];
             self.window_read(ep, last, &mut word)?;
         }
@@ -1560,12 +1868,16 @@ impl Device {
         if address & INTERLEAVED_TAG != 0 {
             return self.dram_read_interleaved(address, out);
         }
-        let (channel, offset) = self.dram_at(address)?;
-        channel.range(offset, out.len() as u64).ok_or_else(|| {
+        let dram = self.dram()?;
+        let (index, offset) = self.dram_at(address)?;
+        if offset
+            .checked_add(out.len() as u64)
+            .is_none_or(|end| end > dram.channel_bytes())
+        {
             let _ = (out.len(), address);
-            ttStatus::TT_ERROR_DRAM_RANGE
-        })?;
-        let ep = channel.preferred(tt_isa::arch::blackhole::noc::niu::Niu::Noc0);
+            return Err(ttStatus::TT_ERROR_DRAM_RANGE);
+        }
+        let ep = dram.endpoint(index).ok_or(ttStatus::TT_ERROR_DRAM_RANGE)?;
         self.window_read(ep, offset, out)
     }
 
@@ -1583,24 +1895,30 @@ impl Device {
     /// The word is [`tt_isa::arch::blackhole::mailbox::BARRIER`], which no core reads: tt-metal's
     /// own `MEM_L1_BARRIER` would land inside this driver's B image.
     pub fn l1_barrier(&mut self) -> Result<(), ttStatus> {
+        // Each architecture keeps the barrier at its own address: Blackhole's
+        // is after the mailbox header, Quasar's `MEM_L1_BARRIER` is at 12,
+        // before it (`tt_isa::arch::{blackhole,quasar}::mailbox`).
+        let barrier = match self.arch {
+            Architecture::Blackhole => mailbox::BARRIER,
+            Architecture::Quasar => quasar_mailbox::BARRIER,
+        };
         let flag = self.barrier_flag;
         self.barrier_flag = if flag == L1_BARRIER_SET {
             L1_BARRIER_RESET
         } else {
             L1_BARRIER_SET
         };
-        self.write32(mailbox::BARRIER, flag)?;
+        self.write32(barrier, flag)?;
         let mut polls = 0u32;
         loop {
-            if self.read32(mailbox::BARRIER)? == flag {
+            if self.read32(barrier)? == flag {
                 break;
             }
             polls += 1;
             if polls == L1_BARRIER_POLLS {
                 eprintln!(
-                    "libskamandros: the L1 barrier word at {:#x} of tile ({}, {}) did not \
+                    "libskamandros: the L1 barrier word at {barrier:#x} of tile ({}, {}) did not \
                      show {flag:#04x}; the host's writes are not reaching the tile",
-                    mailbox::BARRIER,
                     self.tile.x(),
                     self.tile.y()
                 );
@@ -1859,6 +2177,12 @@ impl Device {
     /// Every step is attempted even if one fails, and the first failure is
     /// returned, so a wedged tile is reported rather than hidden.
     pub fn quiesce(&mut self) -> Result<(), ttStatus> {
+        // The mailbox layout and the five cores are Blackhole's. A Quasar
+        // bring-up starts no firmware and writes no mailbox, so there is
+        // nothing held to release and nothing staged to invalidate.
+        if self.arch != Architecture::Blackhole {
+            return Ok(());
+        }
         let mut first: Result<(), ttStatus> = Ok(());
         for i in 0..self.tiles.len() {
             let tile = self.tiles[i];
@@ -2172,9 +2496,252 @@ impl Device {
         self.await_launch(mb, generation)?;
         self.read32(mb.result())
     }
+}
 
+/// The Quasar launch layer.
+///
+/// A Quasar launch has no dispatch firmware between the host and the harts: the
+/// host stages the launch words, points each enabled hart at its image and
+/// releases it. The protocol is skamandros's own, carried in the word layout
+/// `tt_isa::arch::quasar::mailbox` names; the architecture's part is the reset
+/// registers and the boot vectors, both from [`Quasar`].
+///
+/// tt-isa records that a Quasar *mover* boots at L1 word 0, which holds a jump
+/// to `MEM_DM_FIRMWARE_BASE` (`qa_hal_tensix.cpp:109-112`), and that a TRISC has
+/// a reset-PC register and override in its engine window. The qsr simulator was
+/// measured to run both: a DM image at `0xF000` after a jump at 0, and a TRISC
+/// image at `0x12000` with its reset PC and override set. Its movers hold reset
+/// with the bit *clear* and count a set bit as running (`tt_sim_risc_reset.cpp`,
+/// `inverted_reset_polarity`), while a TRISC uses the set-is-held polarity of
+/// the rest of the tile.
+///
+/// Nothing lowers a kernel to this protocol yet, so the layer is exercised by
+/// the device test that drives a hand-encoded mover on the qsr simulator.
+#[allow(dead_code)]
+impl Device {
+    /// Read one 64-bit tile word (a Quasar mover's reset register is read and
+    /// written as 64 bits; `tt_sim_risc_reset.cpp`).
+    pub fn read64(&mut self, address: u64) -> Result<u64, ttStatus> {
+        let mut bytes = [0u8; 8];
+        let tile = self.tile;
+        self.window_read(tile, address, &mut bytes)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+    /// Write one 64-bit tile word. See [`Device::read64`].
+    pub fn write64(&mut self, address: u64, value: u64) -> Result<(), ttStatus> {
+        let tile = self.tile;
+        self.window_write(tile, address, &value.to_le_bytes())
+    }
+
+    /// Hold (`held`) or release one Quasar hart.
+    ///
+    /// The register and bit come from [`Quasar::reset`], which refuses a
+    /// Blackhole core: a Quasar has eight movers (bits 8..=15 of the tile's
+    /// reset register) and four TRISCs per engine (bits 11..=14 of that
+    /// engine's `SOFT_RESET_0`).
+    pub fn quasar_set_reset(&mut self, core: Core, held: bool) -> Result<(), ttStatus> {
+        if self.arch != Architecture::Quasar {
+            return Err(ttStatus::TT_ERROR_UNSUPPORTED);
+        }
+        let (register, bit) = Quasar::reset(core).map_err(|_| ttStatus::TT_ERROR_RESET_PC)?;
+        match core {
+            Core::Dm(_) => {
+                // A mover holds reset with the bit clear and runs with it set.
+                let value = self.read64(register)?;
+                let value = if held {
+                    value & !(1u64 << bit)
+                } else {
+                    value | (1u64 << bit)
+                };
+                self.write64(register, value)
+            }
+            Core::Math { .. } => {
+                let value = self.read32(register)?;
+                let value = if held {
+                    value | (1 << bit)
+                } else {
+                    value & !(1 << bit)
+                };
+                self.write32(register, value)
+            }
+            Core::B | Core::T0 | Core::T1 | Core::T2 | Core::NC => Err(ttStatus::TT_ERROR_RESET_PC),
+        }
+    }
+
+    /// Point `core` at `at`, so releasing it starts that image.
+    ///
+    /// A mover has no reset-PC register: it fetches at L1 word 0, so the jump
+    /// to `at` is written there (`MEM_DM_FIRMWARE_BASE` is the image base,
+    /// `qa_hal_tensix.cpp:109-112`). A TRISC gets its own reset PC and the
+    /// override that makes the core use it (`tt_isa::arch::quasar`'s engine
+    /// registers).
+    pub fn quasar_start_at(&mut self, core: Core, at: u64) -> Result<(), ttStatus> {
+        if self.arch != Architecture::Quasar {
+            return Err(ttStatus::TT_ERROR_UNSUPPORTED);
+        }
+        match core {
+            Core::Dm(_) => {
+                let at = i32::try_from(at).map_err(|_| ttStatus::TT_ERROR_RESET_PC)?;
+                let jump = crate::riscv::jal(0, at);
+                self.l1_write(0, &jump.to_le_bytes())
+            }
+            Core::Math { .. } => {
+                let at = u32::try_from(at).map_err(|_| ttStatus::TT_ERROR_RESET_PC)?;
+                let pc = Quasar::reset_pc_register(core)
+                    .map_err(|_| ttStatus::TT_ERROR_RESET_PC)?
+                    .ok_or(ttStatus::TT_ERROR_RESET_PC)?;
+                self.write32(pc, at)?;
+                let (register, bit) = Quasar::reset_pc_override(core)
+                    .map_err(|_| ttStatus::TT_ERROR_RESET_PC)?
+                    .ok_or(ttStatus::TT_ERROR_RESET_PC)?;
+                let current = self.read32(register)?;
+                self.write32(register, current | bit)
+            }
+            Core::B | Core::T0 | Core::T1 | Core::T2 | Core::NC => Err(ttStatus::TT_ERROR_RESET_PC),
+        }
+    }
+
+    /// Stage a Quasar launch's program address, length and arguments base.
+    pub fn quasar_prepare(&mut self, text: u32, words: u32, args: u32) -> Result<(), ttStatus> {
+        if self.arch != Architecture::Quasar {
+            return Err(ttStatus::TT_ERROR_UNSUPPORTED);
+        }
+        self.stage_words(quasar_mailbox::PROGRAM_ADDR, &[text])?;
+        self.stage_words(quasar_mailbox::PROGRAM_LEN, &[words])?;
+        self.stage_words(quasar_mailbox::ARGS, &[args])?;
+        Ok(())
+    }
+
+    /// Start the staged Quasar launch with a fresh generation, and return it.
+    pub fn quasar_start(&mut self) -> Result<u32, ttStatus> {
+        if self.arch != Architecture::Quasar {
+            return Err(ttStatus::TT_ERROR_UNSUPPORTED);
+        }
+        self.launch_seq = self.launch_seq.wrapping_add(1).max(1);
+        let generation = self.launch_seq;
+        self.write32(quasar_mailbox::GENERATION, generation)?;
+        Ok(generation)
+    }
+
+    /// Stage one Quasar launch and start it: program address, length, arguments
+    /// base, the enabled-hart mask, then a fresh generation.
+    pub fn quasar_launch(
+        &mut self,
+        text: u32,
+        words: u32,
+        args: u32,
+        enables: u32,
+    ) -> Result<u32, ttStatus> {
+        self.quasar_prepare(text, words, args)?;
+        self.stage_words(quasar_mailbox::ENABLES, &[enables])?;
+        self.quasar_start()
+    }
+
+    /// Wait for a Quasar hart to acknowledge `generation`.
+    ///
+    /// The hart writes the generation it finished into `ACK`; a panic is the
+    /// same status word the Blackhole firmware publishes. The budget is
+    /// simulated cycles on the simulator and wall clock on silicon, as
+    /// [`Device::await_launch`] describes.
+    pub fn quasar_await(&mut self, generation: u32) -> Result<(), ttStatus> {
+        let mut waited = 0u64;
+        let started = std::time::Instant::now();
+        let limit = std::time::Duration::from_nanos(BUDGET).max(SILICON_MIN_WAIT);
+        loop {
+            if self.read32(quasar_mailbox::ACK)? == generation {
+                return Ok(());
+            }
+            if self.read32(quasar_mailbox::STATUS)? == status::PANICKED {
+                eprintln!(
+                    "libskamandros: tile ({}, {}) panicked with code {}",
+                    self.tile.x(),
+                    self.tile.y(),
+                    self.read32(quasar_mailbox::PANIC_CODE)?
+                );
+                return Err(ttStatus::TT_ERROR_PROGRAM_REFUSED);
+            }
+            let expired = if self.link.is_simulated() {
+                waited >= BUDGET
+            } else {
+                let elapsed = started.elapsed();
+                if elapsed > POLL_BUSY_WINDOW {
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                elapsed >= limit
+            };
+            if expired {
+                eprintln!(
+                    "libskamandros: tile ({}, {}) did not acknowledge generation {generation}",
+                    self.tile.x(),
+                    self.tile.y()
+                );
+                return Err(ttStatus::TT_ERROR_FIRMWARE_TIMEOUT);
+            }
+            self.clock(CYCLES_PER_POLL);
+            waited += u64::from(CYCLES_PER_POLL);
+        }
+    }
+
+    /// Hold every Quasar hart on every tile and clear the launch words.
+    ///
+    /// The counterpart of [`Device::quiesce`] for this architecture: no
+    /// dispatch firmware runs, so stopping a launch is the host's own sequence.
+    pub fn quasar_quiesce(&mut self) -> Result<(), ttStatus> {
+        if self.arch != Architecture::Quasar {
+            return Err(ttStatus::TT_ERROR_UNSUPPORTED);
+        }
+        let tiles = self.tiles.clone();
+        let mut first: Result<(), ttStatus> = Ok(());
+        for tile in tiles {
+            self.select(tile);
+            for hart in 0..8 {
+                if let Err(e) = self.quasar_set_reset(Core::Dm(hart), true) {
+                    first = first.and(Err(e));
+                }
+            }
+            for engine in 0..4 {
+                for trisc in 0..4 {
+                    let core = Core::Math { engine, trisc };
+                    if let Err(e) = self.quasar_set_reset(core, true) {
+                        first = first.and(Err(e));
+                    }
+                }
+            }
+            for word in [
+                quasar_mailbox::GENERATION,
+                quasar_mailbox::ACK,
+                quasar_mailbox::PROGRAM_ADDR,
+                quasar_mailbox::PROGRAM_LEN,
+                quasar_mailbox::ARGS,
+                quasar_mailbox::ENABLES,
+                quasar_mailbox::STATUS,
+                quasar_mailbox::PANIC_CODE,
+            ] {
+                if let Err(e) = self.write32(word, 0) {
+                    first = first.and(Err(e));
+                }
+            }
+        }
+        // Every staged program and argument block is gone with the harts.
+        self.exec_started.clear();
+        self.placed.clear();
+        self.staged.clear();
+        self.backend_released.clear();
+        self.installed = None;
+        first
+    }
+}
+
+impl Device {
     /// Point the window at `address` in `tile`, unless it already is.
     fn retarget(&mut self, tile: NocCoord, address: u64, write: bool) -> Result<(), ttStatus> {
+        // The window configuration below is Blackhole's: the array's stride,
+        // its bit layout and the aperture's size. Quasar's is not transcribed
+        // yet, so a host access is refused instead of being aimed at an
+        // address the model may not decode.
+        if self.arch != Architecture::Blackhole {
+            return Err(ttStatus::TT_ERROR_UNSUPPORTED);
+        }
         let words = tlb_words(address, tile, write)?;
         if self.shadow == Some(words) {
             return Ok(());
@@ -2194,6 +2761,11 @@ impl Device {
     }
 
     fn window_write(&mut self, tile: NocCoord, address: u64, bytes: &[u8]) -> Result<(), ttStatus> {
+        // Quasar has no host TLB window in this driver (see `Link::tile_write`):
+        // the tile coordinate and the address inside it are the whole access.
+        if self.arch != Architecture::Blackhole {
+            return self.link.tile_write(tile, address, bytes);
+        }
         let mut done = 0usize;
         while done < bytes.len() {
             let at = address + done as u64;
@@ -2216,6 +2788,9 @@ impl Device {
         address: u64,
         out: &mut [u8],
     ) -> Result<(), ttStatus> {
+        if self.arch != Architecture::Blackhole {
+            return self.link.tile_read(tile, address, out);
+        }
         let mut done = 0usize;
         while done < out.len() {
             let at = address + done as u64;
@@ -2333,7 +2908,7 @@ impl Device {
         let end = address
             .checked_add(len as u64)
             .ok_or(ttStatus::TT_ERROR_L1_ADDRESS_OVERFLOW)?;
-        if end > Blackhole::L1_SIZE {
+        if end > self.arch.l1_size() {
             let _ = (address, end);
             return Err(ttStatus::TT_ERROR_L1_ACCESS);
         }
@@ -2459,6 +3034,199 @@ pub const PROGRAM_AREA: u64 = l1::PROGRAM_CACHE.base;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The qsr model is a process-wide singleton, so every ignored test that
+    /// boots a hart on the same tile takes this lock rather than relying on the
+    /// harness's thread count.
+    fn qsr_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn the_device_id_chooses_the_architecture() {
+        assert_eq!(
+            Architecture::from_device_id(DEVICE_ID_BLACKHOLE),
+            Some(Architecture::Blackhole)
+        );
+        assert_eq!(
+            Architecture::from_device_id(DEVICE_ID_QUASAR),
+            Some(Architecture::Quasar)
+        );
+        assert_eq!(Architecture::from_device_id(0x401E), None);
+        assert_eq!(Architecture::Blackhole.name(), "Blackhole");
+        assert_eq!(Architecture::Quasar.name(), "Quasar");
+        // The L1 bound follows the architecture: an access that fits one does
+        // not necessarily fit the other.
+        assert_eq!(Architecture::Blackhole.l1_size(), Blackhole::L1_SIZE);
+        assert_eq!(Architecture::Quasar.l1_size(), Quasar::L1_SIZE);
+        assert_ne!(
+            Architecture::Blackhole.l1_size(),
+            Architecture::Quasar.l1_size()
+        );
+    }
+
+    #[test]
+    fn quasar_names_its_whole_fixed_worker_grid() {
+        use tt_isa::arch::quasar::noc::grid;
+        let (tiles, columns) = fixed_worker_grid(&grid::WORKERS);
+        assert_eq!(tiles.len(), 32);
+        assert_eq!(columns, 8);
+        assert_eq!(tiles.len() / columns, 4);
+        assert_eq!(tiles[0], NocCoord::new(2, 2).unwrap());
+        assert_eq!(tiles[31], NocCoord::new(9, 5).unwrap());
+    }
+
+    #[test]
+    #[ignore = "needs the qsr simulator: TT_METAL_SIMULATOR=vendor/quasar/libttsim_qsr.so"]
+    fn a_quasar_mover_boots_and_acknowledges_a_launch() {
+        quasar_hart_boots_and_acknowledges(Core::Dm(0));
+    }
+
+    #[test]
+    #[ignore = "needs the qsr simulator: TT_METAL_SIMULATOR=vendor/quasar/libttsim_qsr.so"]
+    fn a_quasar_trisc_boots_and_acknowledges_a_launch() {
+        quasar_hart_boots_and_acknowledges(Core::Math {
+            engine: 0,
+            trisc: 0,
+        });
+    }
+
+    /// Boot one Quasar hart on a hand-encoded program that copies the launch
+    /// generation into `ACK` and writes a marker into `RESULT`.
+    ///
+    /// The DM and TRISC paths differ in their reset register (64-bit inverted
+    /// for a mover, 32-bit set-is-held for a TRISC) and their boot vector (a
+    /// jump at L1 word 0 for a mover, a reset PC for a TRISC); the program and
+    /// mailbox words are the same.
+    fn quasar_hart_boots_and_acknowledges(core: Core) {
+        use crate::riscv::{addi, jal, lui, lw, reg, sw};
+        if std::env::var_os(LIB_PATH_ENV).is_none() {
+            return;
+        }
+        let _guard = qsr_lock();
+        let mut device = Device::open().expect("the simulator named by the environment");
+        if device.arch() != Architecture::Quasar {
+            return;
+        }
+        device.select(device.tile_at(0, 0).unwrap());
+        let text = u64::from(Quasar::default_reset_pc(core).unwrap());
+        // RV32's base integer forms, which RV64 also has: copy the generation
+        // to ACK, write a marker to RESULT, spin.
+        let program = [
+            addi(reg::T0, reg::ZERO, quasar_mailbox::GENERATION as i32),
+            lw(reg::T1, reg::T0, 0),
+            addi(reg::T2, reg::ZERO, quasar_mailbox::ACK as i32),
+            sw(reg::T1, reg::T2, 0),
+            addi(reg::T0, reg::ZERO, quasar_mailbox::RESULT as i32),
+            lui(reg::T1, 0xCAFEF),
+            addi(reg::T1, reg::T1, 0x00D),
+            sw(reg::T1, reg::T0, 0),
+            jal(reg::ZERO, 0),
+        ];
+        let bytes: Vec<u8> = program.iter().flat_map(|w| w.to_le_bytes()).collect();
+        device.l1_write(text, &bytes).unwrap();
+        device.quasar_start_at(core, text).unwrap();
+        device
+            .quasar_prepare(text as u32, program.len() as u32, 0)
+            .unwrap();
+        let generation = device.quasar_start().unwrap();
+        device.quasar_set_reset(core, false).unwrap();
+        device.quasar_await(generation).unwrap();
+        assert_eq!(device.read32(quasar_mailbox::RESULT).unwrap(), 0xCAFE_F00D);
+        device.quasar_set_reset(core, true).unwrap();
+    }
+
+    /// The whole movement path on this chip, end to end: a mover reads a DRAM
+    /// page into L1 through the read command buffer, writes it to a second DRAM
+    /// page through the write buffer, waits for both to be acknowledged, and
+    /// publishes the launch generation.
+    ///
+    /// This is what a Quasar reader and writer will be built from; it runs the
+    /// words [`crate::quasar_mover::Mover`] emits, not a hand-written program.
+    #[test]
+    #[ignore = "needs the qsr simulator: TT_METAL_SIMULATOR=vendor/quasar/libttsim_qsr.so"]
+    fn a_quasar_mover_moves_dram_through_l1_with_rocc() {
+        use crate::quasar_mover::{Mover, Target};
+        use tt_isa::arch::quasar::noc::Endpoint;
+        if std::env::var_os(LIB_PATH_ENV).is_none() {
+            return;
+        }
+        let _guard = qsr_lock();
+        let mut device = Device::open().expect("the simulator named by the environment");
+        if device.arch() != Architecture::Quasar {
+            return;
+        }
+        let tile = device.tile_at(0, 0).unwrap();
+        device.select(tile);
+        let input = device.alloc_dram(4096).unwrap();
+        let output = device.alloc_dram(4096).unwrap();
+        let host: Vec<u8> = (0..4096u32)
+            .map(|i| (i.wrapping_mul(29) ^ (i >> 2)) as u8)
+            .collect();
+        device.dram_write(input, &host).unwrap();
+
+        let target = |address: u64| {
+            let channel = u8::try_from(address / QUASAR_CHANNEL_BYTES).unwrap();
+            let offset = address % QUASAR_CHANNEL_BYTES;
+            let endpoint = QuasarDram::FULL.channel(channel).unwrap().preferred();
+            Endpoint {
+                x: endpoint.x(),
+                y: endpoint.y(),
+                addr: offset,
+            }
+        };
+
+        let stage = 0x2000;
+        let mut mover = Mover::new((tile.x(), tile.y()));
+        mover
+            .read(Target::Remote(target(input)), stage, 4096)
+            .unwrap();
+        mover.await_quiet();
+        mover
+            .write(stage, Target::Remote(target(output)), 4096)
+            .unwrap();
+        mover.await_quiet();
+        mover.acknowledge(
+            quasar_mailbox::GENERATION as u32,
+            quasar_mailbox::ACK as u32,
+        );
+        mover.spin();
+
+        let text = u64::from(Quasar::default_reset_pc(Core::Dm(0)).unwrap());
+        let bytes: Vec<u8> = mover.words().iter().flat_map(|w| w.to_le_bytes()).collect();
+        device.l1_write(text, &bytes).unwrap();
+        device.quasar_start_at(Core::Dm(0), text).unwrap();
+        device
+            .quasar_prepare(text as u32, mover.words().len() as u32, 0)
+            .unwrap();
+        let generation = device.quasar_start().unwrap();
+        device.quasar_set_reset(Core::Dm(0), false).unwrap();
+        device.quasar_await(generation).unwrap();
+        device.quasar_set_reset(Core::Dm(0), true).unwrap();
+
+        let mut back = vec![0u8; 4096];
+        device.dram_read(output, &mut back).unwrap();
+        assert_eq!(back, host, "the mover copied the page through L1");
+    }
+
+    #[test]
+    fn each_architecture_resolves_its_dram_table() {
+        let quasar = DramModel::Quasar(QuasarDram::FULL);
+        assert_eq!(quasar.channel_bytes(), 1 << 30);
+        assert_eq!(quasar.enabled_mask(), 0b11);
+        assert_eq!(quasar.channels(), vec![0, 1]);
+        assert_eq!(quasar.endpoint(0), Some(NocCoord::new(2, 7).unwrap()));
+        assert_eq!(quasar.endpoint(1), Some(NocCoord::new(4, 0).unwrap()));
+        assert_eq!(quasar.endpoint(2), None);
+
+        let blackhole = DramModel::Blackhole(BlackholeDram::FULL);
+        assert_eq!(blackhole.channel_bytes(), BLACKHOLE_CHANNEL_BYTES);
+        assert_eq!(blackhole.enabled_mask(), 0xFF);
+        assert_eq!(blackhole.channels(), (0..8).collect::<Vec<u8>>());
+    }
 
     #[test]
     #[cfg(feature = "firmware")]
