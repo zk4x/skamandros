@@ -183,6 +183,8 @@ Working end to end through the C ABI:
 - [x] `matmul`,
 - [x] `transpose` of a bf16 tile, including `q @ kᵀ` (the first GEMM of attention); an `f32` tile is
   `TT_TODO_TRANSPOSE`,
+- [x] interleaved DRAM tensors: `ttMemAllocInterleaved` stripes a tensor's pages across the channels, and a
+  parameter declared `interleaved` resolves each page's channel on the core (tt-metal's `InterleavedAddrGen`),
 - [x] `rms_norm` over two tokens and the real hidden size,
 - [x] a symbolic loop bound,
 - [x] a symbolic grid,

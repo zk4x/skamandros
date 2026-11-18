@@ -4838,6 +4838,16 @@ fn copy_to(
         .get(&buffer)
         .ok_or(ttStatus::TT_ERROR_BUFFER_NOT_PLACED)?;
     let index = *param.get(&argument).ok_or(ttStatus::TT_ERROR_COPY_ENDS)?;
+    // A striped tensor's pages live on different channels, so the request's
+    // address is resolved on the core from the page index rather than added to
+    // one base. See [`emit_request`].
+    let interleaved = matches!(
+        *k.at(argument),
+        Op::Param {
+            interleaved: true,
+            ..
+        }
+    );
     // The index is in access units, so one step is the unit's bytes.
     let bytes = (access[0] * access[1])
         .checked_mul(dtype.bytes())
@@ -4880,7 +4890,17 @@ fn copy_to(
             b: scale,
         });
         pool.give(scale);
-        emit_request(&mut ops, &mut pool, inbound, cb, index, bytes, value, None)?;
+        emit_request(
+            &mut ops,
+            &mut pool,
+            inbound,
+            cb,
+            index,
+            bytes,
+            value,
+            None,
+            interleaved,
+        )?;
     } else {
         let (page, el) = index_page(k, plan, &m.cbs, offset)?;
         // The lane loop is one more nesting level, so it takes the next counter
@@ -4938,6 +4958,7 @@ fn copy_to(
             bytes,
             value,
             Some(counter),
+            interleaved,
         )?;
         ops.push(MirOp::EndLoop);
     }
@@ -4946,6 +4967,125 @@ fn copy_to(
         m.push(core, op);
     }
     Ok(())
+}
+
+/// The address of one request to a striped parameter, resolved on the core.
+///
+/// The block's page size and channel count are read from the launch arguments,
+/// then the byte offset `value` is split the way tt-metal's interleaved address
+/// generator splits it (`InterleavedAddrGen::get_noc_addr`): the page index
+/// picks the channel (`page % channels`), the page's stripe number picks the
+/// offset inside it (`page / channels`), and the byte inside the page is added
+/// unchanged. The `(offset, endpoint)` pair comes from the channel's slot in the
+/// block, which is `get_noc_addr_from_bank_id` reading its bank table.
+fn interleaved_address(
+    ops: &mut Vec<MirOp>,
+    pool: &mut Pool,
+    param: u32,
+    value: u8,
+) -> Result<(u8, u8), ttStatus> {
+    let block = crate::mover::param_block(param as usize);
+    let page = pool.take()?;
+    let banks = pool.take()?;
+    ops.push(MirOp::Lw {
+        reg: page,
+        base: reg::A0,
+        at: block + crate::mover::interleaved_page(),
+    });
+    ops.push(MirOp::Lw {
+        reg: banks,
+        base: reg::A0,
+        at: block + crate::mover::interleaved_banks(),
+    });
+    let index = pool.take()?;
+    ops.push(MirOp::IArith {
+        op: IOp::Div,
+        d: index,
+        a: value,
+        b: page,
+    });
+    let bank = pool.take()?;
+    ops.push(MirOp::IArith {
+        op: IOp::Rem,
+        d: bank,
+        a: index,
+        b: banks,
+    });
+    let off = pool.take()?;
+    ops.push(MirOp::IArith {
+        op: IOp::Mul,
+        d: off,
+        a: index,
+        b: page,
+    });
+    ops.push(MirOp::IArith {
+        op: IOp::Sub,
+        d: off,
+        a: value,
+        b: off,
+    });
+    ops.push(MirOp::IArith {
+        op: IOp::Div,
+        d: index,
+        a: index,
+        b: banks,
+    });
+    ops.push(MirOp::IArith {
+        op: IOp::Mul,
+        d: index,
+        a: index,
+        b: page,
+    });
+    ops.push(MirOp::IArith {
+        op: IOp::Add,
+        d: off,
+        a: off,
+        b: index,
+    });
+    // `index`, `page` and `banks` are spent: the pool holds exactly the
+    // registers the rest of the request needs.
+    pool.give(index);
+    pool.give(banks);
+    pool.give(page);
+    let index = pool.take()?;
+    ops.push(MirOp::Li {
+        reg: index,
+        value: 8,
+    });
+    ops.push(MirOp::IArith {
+        op: IOp::Mul,
+        d: bank,
+        a: bank,
+        b: index,
+    });
+    ops.push(MirOp::IArith {
+        op: IOp::Add,
+        d: bank,
+        a: reg::A0,
+        b: bank,
+    });
+    pool.give(index);
+    let lo = pool.take()?;
+    let hi = pool.take()?;
+    ops.push(MirOp::Lw {
+        reg: lo,
+        base: bank,
+        at: block,
+    });
+    ops.push(MirOp::Lw {
+        reg: hi,
+        base: bank,
+        at: block + 4,
+    });
+    ops.push(MirOp::IArith {
+        op: IOp::Add,
+        d: lo,
+        a: lo,
+        b: off,
+    });
+    pool.give(bank);
+    pool.give(off);
+    Ok((lo, hi))
 }
 
 /// One NoC request as the mover's own program: the parameter's range base plus
@@ -4965,6 +5105,7 @@ fn emit_request(
     bytes: u32,
     value: u8,
     lane: Option<u8>,
+    interleaved: bool,
 ) -> Result<(), ttStatus> {
     use crate::riscv::cb::{RD_PTR, STRIDE, WR_PTR};
     use tt_isa::noc::niu::{CMD_RD, CMD_WR, RESP_MARKED, STATIC_VC_1, initiator, reqs_outstanding};
@@ -4972,23 +5113,28 @@ fn emit_request(
         return Err(ttStatus::TT_ERROR_NOC_REQUEST_BYTES);
     }
     let (lo_arg, hi_arg) = crate::mover::param_arg(param);
-    let lo = pool.take()?;
-    let hi = pool.take()?;
+    let (lo, hi) = if interleaved {
+        interleaved_address(ops, pool, param, value)?
+    } else {
+        let lo = pool.take()?;
+        let hi = pool.take()?;
+        ops.push(MirOp::LoadArg {
+            reg: lo,
+            arg: lo_arg,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Add,
+            d: lo,
+            a: lo,
+            b: value,
+        });
+        ops.push(MirOp::LoadArg {
+            reg: hi,
+            arg: hi_arg,
+        });
+        (lo, hi)
+    };
     let page = pool.take()?;
-    ops.push(MirOp::LoadArg {
-        reg: lo,
-        arg: lo_arg,
-    });
-    ops.push(MirOp::IArith {
-        op: IOp::Add,
-        d: lo,
-        a: lo,
-        b: value,
-    });
-    ops.push(MirOp::LoadArg {
-        reg: hi,
-        arg: hi_arg,
-    });
     // A read from DRAM publishes into the ring (its write pointer); a write to
     // DRAM drains the page the ring's read pointer names.
     let field = if inbound { WR_PTR } else { RD_PTR };

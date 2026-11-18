@@ -118,6 +118,11 @@ pub fn alloc(bytes: usize) -> Result<u64, ttStatus> {
     with_device(|d| d.alloc_dram(bytes))
 }
 
+/// Reserve a tensor striped across the DRAM channels and return its handle.
+pub fn alloc_interleaved(bytes: usize, page: usize) -> Result<u64, ttStatus> {
+    with_device(|d| d.alloc_interleaved(bytes, page))
+}
+
 /// Copy host bytes into DRAM at `address`.
 pub fn h2d(address: u64, bytes: &[u8]) -> Result<(), ttStatus> {
     with_device(|d| d.dram_write(address, bytes))
@@ -258,6 +263,25 @@ fn args_for(
         *args = vec![grid[0], grid[1], module.iface, me_hi(tile)];
         for (index, kind) in module.params.iter().enumerate() {
             let word = params[index];
+            let channel_bytes = tt_isa::dram::CHANNEL_BYTES;
+            if let Some(layout) = device.interleaved_at(word) {
+                // A striped tensor: a pair per channel, then the count and the
+                // page, exactly what the mover's address arithmetic reads.
+                let mut pairs = 0u32;
+                for (bank, base) in layout.base.iter().enumerate() {
+                    let flat = u64::from(bank as u32) * channel_bytes + base;
+                    args.push((flat % channel_bytes) as u32);
+                    args.push(device.dram_hi(flat, *niu)?);
+                    pairs += 1;
+                }
+                for _ in pairs..crate::mover::MAX_BANKS as u32 {
+                    args.push(0);
+                    args.push(0);
+                }
+                args.push(pairs as u32);
+                args.push(layout.page);
+                continue;
+            }
             let (low, high) = match kind {
                 crate::compile::ParamKind::Scalar => (word as u32, 0),
                 // A tensor names its channel's endpoint in the high word and
@@ -265,14 +289,21 @@ fn args_for(
                 // `get_noc_addr_from_bank_id` does: the endpoint comes from the
                 // bank, the address is the bank-local offset
                 // (`dataflow_api_addrgen.h:516-533`).
-                crate::compile::ParamKind::Tensor => {
+                crate::compile::ParamKind::Tensor | crate::compile::ParamKind::Interleaved => {
                     let hi = device.dram_hi(word, *niu)?;
-                    let channel_bytes = tt_isa::dram::CHANNEL_BYTES;
                     ((word % channel_bytes) as u32, hi)
                 }
             };
+            // The plain pair, then the unused channels and the "one channel,
+            // no page" count the block's fixed width expects.
             args.push(low);
             args.push(high);
+            for _ in 1..crate::mover::MAX_BANKS {
+                args.push(0);
+                args.push(0);
+            }
+            args.push(1);
+            args.push(0);
         }
         if (args_at(*niu) as u64) + 4 * args.len() as u64 > tt_isa::l1::PROGRAM_CACHE.end {
             let _ = args.len();

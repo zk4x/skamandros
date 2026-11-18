@@ -96,6 +96,7 @@ type Free = unsafe extern "C" fn(*mut c_void);
 type Init = unsafe extern "C" fn(*mut *mut c_char) -> c_int;
 type Release = unsafe extern "C" fn(*mut *mut c_char) -> c_int;
 type MemAlloc = unsafe extern "C" fn(usize, *mut u64, *mut *mut c_char) -> c_int;
+type MemAllocInterleaved = unsafe extern "C" fn(usize, usize, *mut u64, *mut *mut c_char) -> c_int;
 type MemcpyH2D = unsafe extern "C" fn(u64, *const u8, usize, *mut *mut c_char) -> c_int;
 type MemcpyD2H = unsafe extern "C" fn(*mut u8, u64, usize, *mut *mut c_char) -> c_int;
 type Launch = unsafe extern "C" fn(*mut c_void, *const u64, usize, *mut *mut c_char) -> c_int;
@@ -1555,6 +1556,18 @@ fn run_kernel_scalars(
     inputs: &[&[u8]],
     out_bytes: usize,
 ) -> Vec<u8> {
+    run_kernel_scalars_paged(program, scalars, inputs, &[], out_bytes)
+}
+
+/// The same launch, with the inputs that name a page striped across the
+/// channels: `pages[i]` is input `i`'s page size, or 0 for a contiguous tensor.
+fn run_kernel_scalars_paged(
+    program: &str,
+    scalars: &[u64],
+    inputs: &[&[u8]],
+    pages: &[usize],
+    out_bytes: usize,
+) -> Vec<u8> {
     let _device = device();
     let lib = library();
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
@@ -1563,6 +1576,10 @@ fn run_kernel_scalars(
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
     let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
     let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
+    let alloc_interleaved: Symbol<MemAllocInterleaved> = unsafe {
+        lib.get(b"ttMemAllocInterleaved\0")
+            .expect("ttMemAllocInterleaved")
+    };
     let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
     let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
     let launch: Symbol<Launch> = unsafe { lib.get(b"ttLaunch\0") }.expect("ttLaunch");
@@ -1577,12 +1594,22 @@ fn run_kernel_scalars(
     let mut tensors: Vec<u64> = Vec::new();
     for (i, input) in inputs.iter().enumerate() {
         let mut at = 0u64;
-        assert_eq!(
-            unsafe { alloc(input.len(), &mut at, &mut err) },
-            TT_OK,
-            "input {i}: {}",
-            take_error(&free, err)
-        );
+        let page = pages.get(i).copied().unwrap_or(0);
+        if page == 0 {
+            assert_eq!(
+                unsafe { alloc(input.len(), &mut at, &mut err) },
+                TT_OK,
+                "input {i}: {}",
+                take_error(&free, err)
+            );
+        } else {
+            assert_eq!(
+                unsafe { alloc_interleaved(input.len(), page, &mut at, &mut err) },
+                TT_OK,
+                "interleaved input {i}: {}",
+                take_error(&free, err)
+            );
+        }
         assert_eq!(
             unsafe { h2d(at, input.as_ptr(), input.len(), &mut err) },
             TT_OK,
@@ -4534,6 +4561,83 @@ fn gate_proj_runs_over_a_full_grid() {
                     tile_rc(i)
                 );
             }
+        }
+    }
+}
+
+/// A weight tile whose pages are striped across the DRAM channels: the kernel
+/// resolves each page's channel from the page index (tt-metal's interleaved
+/// address generator), so the four weight pages land on four different banks
+/// and the four GEMMs must still see the pages the host wrote.
+#[test]
+fn an_interleaved_tensor_is_read_page_by_page() {
+    const INTERLEAVED: &str = "\
+version 9
+grid 1,1
+%pa = param bf16 1024
+%pw = param bf16 4096 interleaved
+%pc = param f32 4096
+%ba = buffer bf16 32,32
+%bw = buffer bf16 32,32
+%bc = buffer f32 32,32
+%acc = acc f32 32,32
+%zero = const f32 0
+%one = const i32 1
+%n = const i32 4
+%i = loop %n
+%off = mul %i %one
+copy 32,32 %ba [0] = %pa [0]
+copy 32,32 %bw [0] = %pw [%off]
+load 32,32 %a = %ba [0]
+load 32,32 %b = %bw [0]
+store 32,32 %acc = %zero
+matmul %acc %a %b
+store 32,32 %bc [0] = %acc
+copy 32,32 %pc [%off] = %bc [0]
+endloop
+";
+    // Small integers: exact in bf16, and the product and its f32 sum are exact.
+    let a_vals: Vec<f32> = (0..1024)
+        .map(|i| {
+            let (row, column) = tile_rc(i);
+            ((row as i32 * 3 + column as i32 * 5) % 7 - 3) as f32
+        })
+        .collect();
+    let w_vals: Vec<f32> = (0..4 * 1024)
+        .map(|i| {
+            let (page, at) = (i / 1024, i % 1024);
+            let (row, column) = tile_rc(at);
+            ((page as i32 * 11 + row as i32 * 2 + column as i32) % 5 - 2) as f32
+        })
+        .collect();
+    let to_bf16 = |v: &[f32]| -> Vec<u16> { v.iter().map(|x| truncate_to_bf16(*x)).collect() };
+    let a = to_bf16(&a_vals);
+    let w = to_bf16(&w_vals);
+    let a_w: Vec<f32> = a.iter().map(|h| widen_bf16(*h)).collect();
+    let w_w: Vec<f32> = w.iter().map(|h| widen_bf16(*h)).collect();
+    let bytes = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|h| h.to_le_bytes()).collect() };
+    // The weight's page is one 32x32 bf16 tile: 2048 bytes.
+    let out = run_kernel_scalars_paged(
+        INTERLEAVED,
+        &[],
+        &[&bytes(&a), &bytes(&w)],
+        &[0, 2048],
+        4 * 4096,
+    );
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for page in 0..4 {
+        let want = tile_matmul(&a_w, &w_w[page * 1024..][..1024]);
+        for i in 0..1024 {
+            let at = page * 1024 + i;
+            assert_eq!(
+                got[at],
+                want[i],
+                "page {page}, datum {i} at {:?}",
+                tile_rc(i)
+            );
         }
     }
 }

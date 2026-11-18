@@ -198,8 +198,42 @@ pub unsafe extern "C" fn ttMemAlloc(
     }
 }
 
-/// Copy `len` host bytes into DRAM at `dst`.
+/// Reserve a tensor whose pages are striped across the DRAM channels.
 ///
+/// Page `p` lives on channel `p % channels`; the split is invisible to the
+/// caller, which copies the tensor page by page (`page` bytes each, the last
+/// one short) and passes the handle to a parameter declared `interleaved`. The
+/// program resolves each page's channel itself, so a tensor's reads are spread
+/// over every bank instead of one.
+///
+/// # Safety
+///
+/// `addr` and `err` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ttMemAllocInterleaved(
+    bytes: usize,
+    page: usize,
+    addr: *mut u64,
+    err: *mut *mut c_char,
+) -> ttStatus {
+    clear(err);
+    if addr.is_null() {
+        return fail(ttStatus::TT_ERROR_ARGUMENT, err);
+    }
+    unsafe { *addr = 0 };
+    if bytes == 0 || page == 0 {
+        return fail(ttStatus::TT_ERROR_ARGUMENT, err);
+    }
+    match runtime::alloc_interleaved(bytes, page) {
+        Ok(at) => {
+            unsafe { *addr = at };
+            ttStatus::TT_OK
+        }
+        Err(e) => fail(e, err),
+    }
+}
+
+/// Copy `len` host bytes into DRAM at `dst`.
 /// # Safety
 ///
 /// `src` must be readable for `len` bytes; `err` writable.

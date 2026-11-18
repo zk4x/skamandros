@@ -146,7 +146,6 @@ const L1_BARRIER_RESET: u32 = 0xBB;
 const L1_BARRIER_POLLS: u32 = 1000;
 
 /// First DRAM byte this driver hands out.
-///
 /// tt-metal reserves the bottom of every channel for the DRAM barrier (one
 /// alignment word at offset 0), the profiler block (empty in a build without
 /// Tracy) and the device-print dispatch region (`DRAM_ALIGNMENT + 1 MiB`), so
@@ -155,6 +154,21 @@ const L1_BARRIER_POLLS: u32 = 1000;
 /// but starting above them keeps its data out of anything the card's own
 /// dispatch would touch.
 const DRAM_FIRST: u64 = 0x10_0080;
+
+/// Bit 63 of a handle: a striped tensor, not a DRAM address.
+///
+/// A DRAM address is `channel * CHANNEL_BYTES + offset` with at most eight
+/// channels of 4 GiB, so bit 63 is never set on a real address.
+const INTERLEAVED_TAG: u64 = 1 << 63;
+
+/// A tensor whose pages are striped across the DRAM channels. See
+/// [`Device::alloc_interleaved`].
+pub struct Interleaved {
+    /// Bytes in one page.
+    pub page: u32,
+    /// The first page's offset in each channel, in channel order.
+    pub base: Vec<u64>,
+}
 
 /// The most one PCIe DMA transfer moves: UMD's "512KB is the empirical sweet
 /// spot for per-chunk DMA throughput" (`pci_device.cpp:1045-1050`).
@@ -570,6 +584,9 @@ pub struct Device {
     /// has needed one. `None` on the simulator, whose transfers go through the
     /// window like a register access.
     dma: Option<crate::kmd::DmaBuffer>,
+    /// Tensors whose pages are striped across the channels, in allocation
+    /// order. A tagged address names one of these.
+    interleaved: Vec<Interleaved>,
     /// Is `exec_b` resident and looping on the tile?
     exec_started: Vec<NocCoord>,
     /// The last generation handed to any core. Device-wide, so a value a core
@@ -620,6 +637,7 @@ impl Device {
             dram: Dram::FULL,
             dram_used: vec![DRAM_FIRST; usize::from(Dram::FULL.channels().count())],
             dma: None,
+            interleaved: Vec::new(),
             exec_started: Vec::new(),
             launch_seq: 0,
             placed: Vec::new(),
@@ -681,6 +699,7 @@ impl Device {
             dram: Dram::FULL,
             dram_used: vec![DRAM_FIRST; usize::from(Dram::FULL.channels().count())],
             dma: None,
+            interleaved: Vec::new(),
             exec_started: Vec::new(),
             launch_seq: 0,
             placed: Vec::new(),
@@ -1264,6 +1283,10 @@ impl Device {
     /// `dataflow_api_addrgen.h:516-533`). Splitting it needs no table: the
     /// channel is the quotient and the offset the remainder.
     fn dram_at(&self, address: u64) -> Result<(DramChannel, u64), ttStatus> {
+        if address & INTERLEAVED_TAG != 0 {
+            // A striped tensor has no single channel; its pages do.
+            return Err(ttStatus::TT_ERROR_DRAM_RANGE);
+        }
         let channel = address / CHANNEL_BYTES;
         let offset = address % CHANNEL_BYTES;
         let channel = u8::try_from(channel)
@@ -1276,7 +1299,6 @@ impl Device {
     /// Reserve `bytes` of DRAM, 64-byte aligned, and return its flat address
     /// (`channel * CHANNEL_BYTES + offset`). This is what a caller passes back
     /// to `ttMemcpy` and `ttLaunch`.
-    ///
     /// The channel is the one with the most free space, as tt-metal's
     /// `ChannelAllocator` picks a bank — `free_size` per bank and the largest
     /// first (`allocator.cpp:57-100`, `bank_manager.cpp:417-446`). No range is
@@ -1306,6 +1328,97 @@ impl Device {
         Ok(u64::from(index) * CHANNEL_BYTES + at)
     }
 
+    /// Reserve a tensor whose pages are striped across the channels, and
+    /// return its handle.
+    ///
+    /// Page `p` lives on channel `p % channels` at
+    /// `base[channel] + (p / channels) * page`, which is tt-metal's
+    /// interleaved layout: the allocator gives every bank
+    /// `ceil(pages / num_banks)` pages and the page's bank is its index modulo
+    /// the bank count (`AllocatorImpl::allocate` for an interleaved buffer, and
+    /// the matching address generator on the core,
+    /// `dataflow_api_addrgen.h:516-533`). Each channel's share comes from that
+    /// channel's cursor, so a striped tensor is spread over every bank the chip
+    /// has.
+    ///
+    /// The handle is a tag and an index: no DRAM address has bit 63 set, so a
+    /// handle can be told from one, and [`Device::dram_write`] and the launch
+    /// read the layout back from it.
+    pub fn alloc_interleaved(&mut self, bytes: usize, page: usize) -> Result<u64, ttStatus> {
+        if bytes == 0 || page == 0 {
+            return Err(ttStatus::TT_ERROR_ALLOC_ZERO);
+        }
+        if page as u64 > CHANNEL_BYTES {
+            return Err(ttStatus::TT_ERROR_DRAM_RANGE);
+        }
+        let pages = bytes.div_ceil(page);
+        let channels = self.dram.channels().count();
+        let per_channel = pages.div_ceil(channels) * page;
+        let mut base = Vec::with_capacity(channels);
+        for channel in self.dram.channels() {
+            let used = self.dram_used[usize::from(channel.index())].next_multiple_of(64);
+            let end = used
+                .checked_add(per_channel as u64)
+                .ok_or(ttStatus::TT_ERROR_DRAM_ADDRESS_OVERFLOW)?;
+            if end > CHANNEL_BYTES {
+                let _ = (bytes, page);
+                return Err(ttStatus::TT_ERROR_DRAM_FULL);
+            }
+            base.push(used);
+        }
+        for (channel, at) in self.dram.channels().zip(&base) {
+            self.dram_used[usize::from(channel.index())] = at + per_channel as u64;
+        }
+        let index = self.interleaved.len() as u64;
+        self.interleaved.push(Interleaved {
+            page: page as u32,
+            base,
+        });
+        Ok(INTERLEAVED_TAG | index)
+    }
+
+    /// The layout a striped tensor's handle names, if `address` is a handle.
+    pub fn interleaved_at(&self, address: u64) -> Option<&Interleaved> {
+        if address & INTERLEAVED_TAG == 0 {
+            return None;
+        }
+        self.interleaved.get((address & !INTERLEAVED_TAG) as usize)
+    }
+
+    /// One striped tensor's pages, host side: page `p` goes to channel
+    /// `p % channels`, as the core's address arithmetic expects.
+    fn dram_write_interleaved(&mut self, handle: u64, bytes: &[u8]) -> Result<(), ttStatus> {
+        let (page, base) = match self.interleaved_at(handle) {
+            Some(layout) => (layout.page as usize, layout.base.clone()),
+            None => return Err(ttStatus::TT_ERROR_DRAM_RANGE),
+        };
+        let channels = base.len();
+        for (index, chunk) in bytes.chunks(page).enumerate() {
+            let bank = index % channels;
+            let at = u64::from(bank as u32) * CHANNEL_BYTES
+                + base[bank]
+                + (index / channels) as u64 * page as u64;
+            self.dram_write(at, chunk)?;
+        }
+        Ok(())
+    }
+
+    fn dram_read_interleaved(&mut self, handle: u64, out: &mut [u8]) -> Result<(), ttStatus> {
+        let (page, base) = match self.interleaved_at(handle) {
+            Some(layout) => (layout.page as usize, layout.base.clone()),
+            None => return Err(ttStatus::TT_ERROR_DRAM_RANGE),
+        };
+        let channels = base.len();
+        for (index, chunk) in out.chunks_mut(page).enumerate() {
+            let bank = index % channels;
+            let at = u64::from(bank as u32) * CHANNEL_BYTES
+                + base[bank]
+                + (index / channels) as u64 * page as u64;
+            self.dram_read(at, chunk)?;
+        }
+        Ok(())
+    }
+
     /// The endpoint high word a program names for the channel `address` lives
     /// on.
     ///
@@ -1327,6 +1440,9 @@ impl Device {
 
     /// Write `bytes` to DRAM at a flat address.
     pub fn dram_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), ttStatus> {
+        if address & INTERLEAVED_TAG != 0 {
+            return self.dram_write_interleaved(address, bytes);
+        }
         let (channel, offset) = self.dram_at(address)?;
         let range = channel.range(offset, bytes.len() as u64).ok_or_else(|| {
             let _ = (bytes.len(), address);
@@ -1356,6 +1472,9 @@ impl Device {
 
     /// Read DRAM at a flat address.
     pub fn dram_read(&mut self, address: u64, out: &mut [u8]) -> Result<(), ttStatus> {
+        if address & INTERLEAVED_TAG != 0 {
+            return self.dram_read_interleaved(address, out);
+        }
         let (channel, offset) = self.dram_at(address)?;
         channel.range(offset, out.len() as u64).ok_or_else(|| {
             let _ = (out.len(), address);

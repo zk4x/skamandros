@@ -36,6 +36,11 @@ const DECLARATIONS: &[(&str, &str, &str)] = &[
         "size_t bytes, uint64_t *addr, char **err",
     ),
     (
+        "ttMemAllocInterleaved",
+        "ttStatus",
+        "size_t bytes, size_t page, uint64_t *addr, char **err",
+    ),
+    (
         "ttMemcpyH2D",
         "ttStatus",
         "uint64_t dst, const uint8_t *src, size_t len, char **err",

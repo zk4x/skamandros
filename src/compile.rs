@@ -104,7 +104,11 @@ pub fn parameter_kinds(k: &Kernel) -> Vec<ParamKind> {
     let mut kinds = Vec::new();
     for (_, op) in k.ops() {
         match *op {
-            crate::ir::Op::Param { .. } => kinds.push(ParamKind::Tensor),
+            crate::ir::Op::Param { interleaved, .. } => kinds.push(if interleaved {
+                ParamKind::Interleaved
+            } else {
+                ParamKind::Tensor
+            }),
             crate::ir::Op::Variable { .. } => kinds.push(ParamKind::Scalar),
             _ => {}
         }

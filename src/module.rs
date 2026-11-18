@@ -12,6 +12,12 @@ pub enum ParamKind {
     Scalar,
     /// A tensor parameter: the argument is its DRAM address.
     Tensor,
+    /// A tensor parameter whose pages are striped across the DRAM channels.
+    /// Its argument block is the per-channel page bases, the channel count and
+    /// the page size, so the program can resolve a page's channel itself — the
+    /// device-side half of tt-metal's interleaved address generator
+    /// (`InterleavedAddrGen` / `get_noc_addr_from_bank_id`).
+    Interleaved,
 }
 
 /// One grid extent, resolved at launch from the scalar arguments. A `Dim` is a

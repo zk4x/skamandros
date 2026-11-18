@@ -39,11 +39,41 @@ pub const ARG_HEAD: usize = 4;
 /// The launch argument word that holds the CB interface table's address.
 pub const ARG_IFACE: usize = 2;
 
-/// The byte offsets of the launch-argument pair a parameter's address occupies,
-/// after [`ARG_HEAD`] words.
-pub const fn param_arg(param: u32) -> (i32, i32) {
-    let lo = (ARG_HEAD + 2 * param as usize) * 4;
-    (lo as i32, lo as i32 + 4)
+/// The byte offsets of the launch-argument block a parameter occupies.
+///
+/// Every parameter's block is [`INTERLEAVED_WORDS`] wide, whatever its kind:
+/// one `(offset, endpoint)` pair per DRAM channel, then the channel count and
+/// the page size. A scalar or a contiguous tensor uses the first pair and a
+/// count of one; an interleaved tensor lets the mover resolve a page's channel
+/// on the core, which is tt-metal's `InterleavedAddrGen` /
+/// `get_noc_addr_from_bank_id`. A fixed width keeps the layout a function of
+/// the parameter's index alone, on both the compiler's side and the runtime's.
+pub fn param_arg(param: u32) -> (i32, i32) {
+    let lo = param_block(param as usize);
+    (lo, lo + 4)
+}
+
+/// The most channels a parameter can be striped over: every channel a
+/// Blackhole can have.
+pub const MAX_BANKS: usize = tt_isa::dram::CHANNELS as usize;
+
+/// Words a parameter's block occupies: a pair per channel, then the channel
+/// count and the page size.
+pub const INTERLEAVED_WORDS: usize = 2 * MAX_BANKS + 2;
+
+/// The byte offset of parameter `index`'s block in the launch arguments.
+pub fn param_block(index: usize) -> i32 {
+    ((ARG_HEAD + INTERLEAVED_WORDS * index) * 4) as i32
+}
+
+/// The byte offset, inside a parameter's block, of its channel count and its
+/// page size.
+pub const fn interleaved_banks() -> i32 {
+    (2 * MAX_BANKS * 4) as i32
+}
+
+pub const fn interleaved_page() -> i32 {
+    interleaved_banks() + 4
 }
 
 /// One operand of a copy, with the loops it lives under.

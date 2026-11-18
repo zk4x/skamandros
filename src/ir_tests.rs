@@ -234,6 +234,33 @@ grid 1,1
     assert!(m.cores.iter().all(Vec::is_empty), "no compute");
 }
 
+/// An interleaved tensor: the declaration round-trips, and the compiled module
+/// labels the parameter so the runtime hands it a per-channel block.
+#[test]
+fn an_interleaved_parameter_round_trips() {
+    const PROGRAM: &str = "\
+version 9
+%in = param f32 1024
+%w = param f32 4096 interleaved
+%out = param f32 1024
+%b0 = buffer f32 32,32
+copy 32,32 %b0 [0] = %in [0]
+copy 32,32 %out [0] = %b0 [0]
+grid 1,1
+";
+    let k = Kernel::parse(PROGRAM).expect("an interleaved parameter parses");
+    let text = k.to_string();
+    assert!(
+        text.contains("%w = param f32 4096 interleaved"),
+        "the layout round-trips: {text}"
+    );
+    let m = compile::compile(&k).expect("it compiles");
+    assert_eq!(
+        m.params,
+        vec![ParamKind::Tensor, ParamKind::Interleaved, ParamKind::Tensor]
+    );
+}
+
 /// Load, compute, store: the same unified program produces the three compute
 /// programs as well as the two mover ones.
 #[test]

@@ -336,7 +336,15 @@ pub enum Op {
     /// is fixed (a tile, a ring page) is a `[Dim; 2]` on the op that owns it.
     Shape(Box<[OpId]>),
     /// A tensor parameter in DRAM, with its logical shape.
-    Param { dtype: DType, shape: OpId },
+    /// A tensor parameter: `shape` is its element count, which the caller's
+    /// DRAM buffer holds. `interleaved` is the buffer's layout: its pages are
+    /// striped across the device's DRAM channels (tt-metal's interleaved
+    /// buffer, `InterleavedBuffer`), instead of lying in one channel.
+    Param {
+        dtype: DType,
+        shape: OpId,
+        interleaved: bool,
+    },
     /// A scalar parameter: one word in DRAM, the value a launch argument
     /// carries (the shape `0` in the text form). Its shape is the empty one.
     Variable { dtype: DType },
@@ -1073,7 +1081,7 @@ impl Kernel {
                         self.expect_index_scalar(*term, at)?;
                     }
                 }
-                Op::Param { dtype, shape } => {
+                Op::Param { dtype, shape, .. } => {
                     if dtype == DType::Bool {
                         return Err(ttStatus::TT_TODO_BOOL_PARAMETER);
                     }
@@ -1809,13 +1817,21 @@ impl Parser {
                     }
                     self.push(Op::Shape(terms.into_boxed_slice()))
                 };
+                let interleaved = t.peek_word() == Some("interleaved");
+                if interleaved {
+                    t.word();
+                }
                 t.end()?;
                 let id = self.ops.len();
                 self.define(name, id)?;
                 if scalar {
                     self.push(Op::Variable { dtype });
                 } else {
-                    self.push(Op::Param { dtype, shape });
+                    self.push(Op::Param {
+                        dtype,
+                        shape,
+                        interleaved,
+                    });
                 }
             }
             "buffer" => {
@@ -1961,14 +1977,23 @@ impl Printer<'_, '_> {
                     Err(_) => return Err(fmt::Error),
                 }
             ),
-            Op::Param { dtype, shape } => {
+            Op::Param {
+                dtype,
+                shape,
+                interleaved,
+            } => {
                 write!(self.f, "{} = param {} ", self.name(id), dtype.name())?;
                 let terms: Vec<OpId> = match *k.at(shape) {
                     Op::Shape(ref ops) => ops.to_vec(),
                     _ => Vec::new(),
                 };
                 let text: Vec<String> = terms.iter().map(|t| self.name(*t)).collect();
-                writeln!(self.f, "{}", text.join(","))
+                writeln!(
+                    self.f,
+                    "{}{}",
+                    text.join(","),
+                    if interleaved { " interleaved" } else { "" }
+                )
             }
             Op::Variable { dtype } => {
                 writeln!(self.f, "{} = param {} 0", self.name(id), dtype.name())
