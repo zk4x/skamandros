@@ -2069,6 +2069,32 @@ fn truncate_to_bf16(value: f32) -> u16 {
     (value.to_bits() >> 16) as u16
 }
 
+/// Quasar cannot transpose a `Dst` row on this simulator, so the reduce is
+/// skipped there and run on every other target.
+///
+/// tt-metal's `_llk_math_reduce_row_max_mop_config_`
+/// (`tt_llk_quasar/llk_lib/llk_math_reduce.h:183-190`) turns the fold's row into
+/// the result's column with `MOVD2B`'s `transpose` bit; Quasar's ISA table has
+/// no `TRNSPSRCB`, so that bit is the only mechanism. The Quasar simulator
+/// decodes the bit and drops it — `TENSIX_EXECUTE_MOVD2B` in `ttsim/src/
+/// tensix.cpp` (v1.11.2) moves `n_rows` rows and never swaps a row for a
+/// column — so the column comes back as the untransposed row. Nothing else on
+/// the chip transposes a computed `Dst` row (the unpacker's `TRANSPOSE` works
+/// on a page being unpacked, not on `Dst`), which makes this the simulator's
+/// gap rather than the lowering's. Reported in zyx2's TODO.md; the lowering is
+/// tt-metal's sequence and runs on silicon.
+fn quasar_row_reduce_skip(what: &str) -> bool {
+    if !on_quasar() {
+        return false;
+    }
+    eprintln!(
+        "{what}: SKIPPED on the Quasar simulator — it drops MOVD2B's transpose bit \
+         (ttsim/src/tensix.cpp, TENSIX_EXECUTE_MOVD2B), which is how tt-metal's \
+         row-max MOP transposes the fold's row"
+    );
+    true
+}
+
 /// A bf16 datum widened into the 32-bit lane. The SFPU flushes a datum whose
 /// exponent is zero (a subnormal, or a zero of either sign).
 fn widen_bf16(bits: u16) -> f32 {
@@ -3479,6 +3505,9 @@ fn bf16_pages(bytes: &[u8]) -> Vec<u16> {
 
 #[test]
 fn bf16_reduces_run_on_the_simulator() {
+    if quasar_row_reduce_skip("bf16_reduces") {
+        return;
+    }
     let count = 1024usize;
     let x: Vec<u16> = (0..count)
         .map(|i| truncate_to_bf16((i % 23) as f32 - 11.0))
@@ -3639,6 +3668,9 @@ fn max_col_runs_on_the_simulator() {
 
 #[test]
 fn max_row_runs_on_the_simulator() {
+    if quasar_row_reduce_skip("max_row") {
+        return;
+    }
     // Fractional magnitudes: below 1, so every value is exact in TF32 (the
     // format the unpacker puts into `Src`), and the low half of each f32 word
     // carries real mantissa bits, so the hi/lo transposes are not a no-op.

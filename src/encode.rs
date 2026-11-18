@@ -1729,6 +1729,8 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), tt
             src_row,
             addr_mod,
             move4_rows,
+            // Blackhole transposes with `TRNSPSRCB`, not on the move.
+            transpose: _,
             reg,
             at,
         } => {
@@ -1747,6 +1749,8 @@ fn encode_math_op(op: &MirOp, row_delta: u32, out: &mut Stream) -> Result<(), tt
             use_dst32b_lo,
             src_row,
             addr_mod,
+            // Blackhole's move is one row or four; eight is Quasar's.
+            move8_rows: _,
             move4_rows,
             reg,
             at,
@@ -3508,6 +3512,7 @@ fn quasar_math_op(
             src_row,
             addr_mod,
             move4_rows,
+            transpose,
             reg,
             at,
         } => {
@@ -3517,7 +3522,7 @@ fn quasar_math_op(
                     .src(src_row)
                     .addr_mode(addr_mod)
                     .instr_mod(quasar_move(MoveKind::FourOrNone, move4_rows))
-                    .transpose(0)
+                    .transpose(u32::from(transpose))
                     .dst(dst_row(reg, at, row_delta))
                     .encode()
                     .map_err(quasar_unusable)?,
@@ -3527,6 +3532,7 @@ fn quasar_math_op(
             use_dst32b_lo,
             src_row,
             addr_mod,
+            move8_rows,
             move4_rows,
             reg,
             at,
@@ -3536,7 +3542,11 @@ fn quasar_math_op(
                     .dest_32b_lo(u32::from(use_dst32b_lo))
                     .src(src_row)
                     .addr_mode(addr_mod)
-                    .transfer_sz(quasar_move(MoveKind::FourOrNone, move4_rows))
+                    .transfer_sz(if move8_rows {
+                        2
+                    } else {
+                        quasar_move(MoveKind::FourOrNone, move4_rows)
+                    })
                     .bcast_datum0(0)
                     .dst(dst_row(reg, at, row_delta))
                     .encode()

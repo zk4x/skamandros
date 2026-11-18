@@ -369,14 +369,37 @@ copy 32,32 %out [0] = %bo [0]
         assert!(module.quasar_refusal.is_none());
     }
 
-    /// A shape the Quasar datapath cannot express yet leaves the module with no
-    /// Quasar program and a launch on that chip refused, rather than run with the
-    /// wrong program.
+    /// A row reduce transposes through `TRNSPSRCB` on Blackhole; Quasar has no
+    /// such instruction and transposes inside `MOVD2B` instead, so the module
+    /// carries a Quasar program where it used to be refused.
+    #[test]
+    fn a_row_reduce_carries_a_quasar_program() {
+        let module = compiled(REDUCE_ROW);
+        let quasar = module.quasar.as_ref().expect("a Quasar program");
+        assert!(!quasar.math.is_empty(), "the math hart's program");
+        assert!(module.quasar_refusal.is_none());
+    }
+
+    /// A pack that would convert between formats has no Quasar arm (the
+    /// packer's input format is the `Dst` bank's), so the module carries no
+    /// Quasar program and a launch on that chip is refused with the reason
+    /// rather than run with the wrong one.
     #[test]
     fn an_unlowered_shape_carries_no_quasar_program() {
-        // A row reduce transposes through `TRNSPSRCB`, which Quasar does not
-        // have: its row fold transposes inside `MOVD2B` instead.
-        let module = compiled(REDUCE_ROW);
+        const WIDENING_PACK: &str = "\
+version 9
+grid 1,1
+%in = param f32 1024
+%out = param bf16 1024
+%bi = buffer f32 32,32
+%bo = buffer bf16 32,32
+copy 32,32 %bi [0] = %in [0]
+load 32,32 %x = %bi [0]
+%c = cast %x to bf16
+store 32,32 %bo [0] = %c
+copy 32,32 %out [0] = %bo [0]
+";
+        let module = compiled(WIDENING_PACK);
         assert!(module.quasar.is_none());
         assert_eq!(
             module.quasar_refusal,

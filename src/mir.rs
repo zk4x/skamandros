@@ -425,6 +425,10 @@ pub enum MirOp {
         src_row: u32,
         addr_mod: u32,
         move4_rows: bool,
+        /// Quasar's `transpose` bit: write the `Dst` rows into `SrcB` columns.
+        /// Blackhole has no such field — it transposes with `TRNSPSRCB` — so
+        /// that encoder ignores it.
+        transpose: bool,
         reg: Dst,
         at: u32,
     },
@@ -433,6 +437,10 @@ pub enum MirOp {
         use_dst32b_lo: bool,
         src_row: u32,
         addr_mod: u32,
+        /// Eight rows (`MOVB2D`'s `transfer_sz` 2). Quasar's row-reduce copy
+        /// uses it; Blackhole's field is one bit (`Move4Rows`), so only Quasar
+        /// emits it.
+        move8_rows: bool,
         move4_rows: bool,
         reg: Dst,
         at: u32,
@@ -1072,26 +1080,30 @@ fn write_op(f: &mut dyn fmt::Write, op: &MirOp) -> fmt::Result {
             src_row,
             addr_mod,
             move4_rows,
+            transpose,
             reg,
             at,
         } => write!(
             f,
-            "movd2b {} -> srcb[{src_row}], am{addr_mod}{}{}",
+            "movd2b {} -> srcb[{src_row}], am{addr_mod}{}{}{}",
             dst_addr(reg, at),
             if move4_rows { " 4rows" } else { "" },
-            if use_dst32b_lo { " lo" } else { "" }
+            if use_dst32b_lo { " lo" } else { "" },
+            if transpose { " transpose" } else { "" }
         ),
         MirOp::Movb2d {
             use_dst32b_lo,
             src_row,
             addr_mod,
+            move8_rows,
             move4_rows,
             reg,
             at,
         } => write!(
             f,
-            "movb2d srcb[{src_row}] -> {}, am{addr_mod}{}{}",
+            "movb2d srcb[{src_row}] -> {}, am{addr_mod}{}{}{}",
             dst_addr(reg, at),
+            if move8_rows { " 8rows" } else { "" },
             if move4_rows { " 4rows" } else { "" },
             if use_dst32b_lo { " lo" } else { "" }
         ),

@@ -2068,7 +2068,49 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                         // denormals stay enabled in `Src` so the low halves
                         // survive the moves. The sequence never touches `SrcA`,
                         // so there is no format switch here either.
-                        if wide {
+                        if target == Target::Quasar {
+                            // tt-metal's `_llk_math_reduce_row_max_mop_config_`
+                            // (`llk_math_reduce.h:183-190`): the fold's row goes
+                            // into `SrcB` rows 32..47 transposed — Quasar has no
+                            // `TRNSPSRCB`, the transpose is `MOVD2B`'s own bit —
+                            // and comes back into the `Dst` rows whose first
+                            // column the pack keeps. tt-metal's MOP follows the
+                            // transpose with an untransposed `MOVD2B` for its
+                            // multi-tile accumulation; this lowering accumulates
+                            // in `Dst` itself, so only the transpose is needed.
+                            //
+                            // `MEASURED` on qsr: the simulator drops the
+                            // transpose bit (`ttsim/src/tensix.cpp`,
+                            // `TENSIX_EXECUTE_MOVD2B`), so a row reduce is
+                            // skipped there rather than
+                            // compared (`tests/e2e.rs`, `quasar_row_reduce_skip`).
+                            m.push(
+                                Core::Math,
+                                MirOp::Movd2b {
+                                    use_dst32b_lo: false,
+                                    src_row: 32,
+                                    addr_mod: 0,
+                                    move4_rows: false,
+                                    transpose: true,
+                                    reg: base,
+                                    at: dst_off,
+                                },
+                            );
+                            for chunk in 0..2u32 {
+                                m.push(
+                                    Core::Math,
+                                    MirOp::Movb2d {
+                                        use_dst32b_lo: false,
+                                        src_row: 32 + 8 * chunk,
+                                        addr_mod: 0,
+                                        move8_rows: true,
+                                        move4_rows: false,
+                                        reg: base,
+                                        at: dst_off + 8 * chunk,
+                                    },
+                                );
+                            }
+                        } else if wide {
                             m.push(
                                 Core::Math,
                                 MirOp::AluAccCtrl {
@@ -2091,6 +2133,7 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                                     src_row: 16,
                                     addr_mod: 0,
                                     move4_rows: false,
+                                    transpose: false,
                                     reg: base,
                                     at: dst_off,
                                 },
@@ -2103,6 +2146,7 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                                     src_row: 16,
                                     addr_mod: 0,
                                     move4_rows: false,
+                                    transpose: false,
                                     reg: base,
                                     at: dst_off,
                                 },
@@ -2115,6 +2159,7 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                                         src_row: 16 + 4 * chunk,
                                         addr_mod: 0,
                                         move4_rows: true,
+                                        move8_rows: false,
                                         reg: base,
                                         at: dst_off + 4 * chunk,
                                     },
@@ -2142,6 +2187,7 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                                     src_row: 16,
                                     addr_mod: 0,
                                     move4_rows: false,
+                                    transpose: false,
                                     reg: base,
                                     at: dst_off,
                                 },
@@ -2159,6 +2205,7 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                                     src_row: 16,
                                     addr_mod: 0,
                                     move4_rows: false,
+                                    transpose: false,
                                     reg: base,
                                     at: dst_off,
                                 },
@@ -2601,6 +2648,7 @@ fn transpose_dst(m: &mut MachineKernel, reg: Dst) -> Result<(), ttStatus> {
                     src_row: src,
                     addr_mod: hold,
                     move4_rows: true,
+                    transpose: false,
                     reg,
                     at: face * 16 + 4 * i as u32,
                 },
@@ -2632,6 +2680,7 @@ fn transpose_dst(m: &mut MachineKernel, reg: Dst) -> Result<(), ttStatus> {
                     src_row: src,
                     addr_mod: hold,
                     move4_rows: true,
+                    transpose: false,
                     reg,
                     at: face * 16 + 4 * i as u32,
                 },
@@ -2656,6 +2705,7 @@ fn transpose_dst(m: &mut MachineKernel, reg: Dst) -> Result<(), ttStatus> {
                 src_row: 28,
                 addr_mod: hold,
                 move4_rows: true,
+                move8_rows: false,
                 reg,
                 at: face * 16 + 12,
             },
