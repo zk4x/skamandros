@@ -34,6 +34,17 @@ fn device() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Whether the run is against the Quasar simulator.
+///
+/// A few lane behaviours are the silicon's own and the two chips disagree about
+/// them, so a test that pins one has to pin the chip too: Quasar's SFPU keeps
+/// the sign of a negated zero where Blackhole's flushes it.
+fn on_quasar() -> bool {
+    std::env::var_os("TT_METAL_SIMULATOR")
+        .map(|p| p.to_string_lossy().contains("qsr"))
+        .unwrap_or(false)
+}
+
 /// The `ttRelease` and `ttFree` the exit handler calls, and the handler itself.
 ///
 /// A C `atexit` callback takes no arguments, so the two functions are kept
@@ -2025,10 +2036,25 @@ fn bf16_runs_on_the_simulator() {
     let out = run_kernel(NEG_BF16, &input, count * 2);
     for (i, h) in patterns.iter().enumerate() {
         let got = u16::from_le_bytes(out[2 * i..2 * i + 2].try_into().unwrap());
-        // The lane is FP32 and the SFPU flushes denormals, so a bf16 with a
-        // zero exponent (a subnormal, or a zero of either sign) comes back as
-        // +0; every normal, infinity and NaN just flips its sign bit.
-        let want = if h & 0x7f80 == 0 { 0 } else { h ^ 0x8000 };
+        // The lane is FP32. Blackhole's SFPU flushes a denormal, so a bf16 with
+        // a zero exponent (a subnormal, or a zero of either sign) comes back as
+        // +0 there; Quasar's keeps it, sign and all (`MEASURED`: the negated
+        // `0x0000` is `0x8000`). Every normal, infinity and NaN flips its sign
+        // bit on both.
+        let want = if h & 0x7f80 != 0 {
+            // A normal, infinity or NaN just flips its sign bit.
+            h ^ 0x8000
+        } else if on_quasar() {
+            // Quasar's lane keeps the sign of the zero it works on: a zero
+            // stays a zero with the negated sign, and a widened denormal
+            // flushes to the zero of its own sign first (`MEASURED`:
+            // `0x0000 -> 0x8000`, `0x8000 -> 0x0000`, `0x0001 -> 0x8000`,
+            // `0x8001 -> 0x0000`).
+            (h & 0x8000) ^ 0x8000
+        } else {
+            // Blackhole's SFPU flushes every zero-exponent value to +0.
+            0
+        };
         assert_eq!(got, want, "bf16 neg, datum {i}: {h:#06x}");
     }
 }
@@ -2043,10 +2069,13 @@ fn truncate_to_bf16(value: f32) -> u16 {
 /// A bf16 datum widened into the 32-bit lane. The SFPU flushes a datum whose
 /// exponent is zero (a subnormal, or a zero of either sign).
 fn widen_bf16(bits: u16) -> f32 {
-    if bits & 0x7f80 == 0 {
-        0.0
-    } else {
+    if bits & 0x7f80 != 0 {
         f32::from_bits(u32::from(bits) << 16)
+    } else if on_quasar() {
+        // Quasar keeps the zero's sign, as `bf16_runs_on_the_simulator` records.
+        f32::from_bits(u32::from(bits & 0x8000) << 16)
+    } else {
+        0.0
     }
 }
 
@@ -2437,12 +2466,12 @@ copy 32,32 %out [0] = %bo [0]
             let out = run_kernel(&program, &x_bytes, count * 2);
             for (i, h) in x.iter().enumerate() {
                 let got = u16::from_le_bytes(out[2 * i..2 * i + 2].try_into().unwrap());
-                // `sfpu_mul` keeps the sign of a zero result only when both
-                // operands are normal and their exponents sum into range;
-                // otherwise the result is `+0` (ttsim's `src/tensix.cpp`, the
-                // Blackhole arm).
+                // Blackhole's `sfpu_mul` keeps the sign of a zero result only
+                // when both operands are normal and their exponents sum into
+                // range; otherwise it is `+0` (ttsim's `src/tensix.cpp`, the
+                // Blackhole arm). Quasar's product keeps the sign of the zero.
                 let product = widen_bf16(*h) * c;
-                let want = if product == 0.0 {
+                let want = if product == 0.0 && !on_quasar() {
                     0
                 } else {
                     truncate_to_bf16(product)
@@ -6652,3 +6681,34 @@ fn lm_head_has_one_live_row() {
         }
     }
 }
+
+#[test]
+fn zz_bf16_neg_probe() {
+    let patterns: Vec<u16> = [
+        0x0000u16, 0x8000, 0x0001, 0x8001, 0x0020, 0x8020, 0x007f, 0x807f, 0x0080, 0x8080, 0x3f80,
+        0xbf80,
+    ]
+    .to_vec();
+    let mut p = patterns.clone();
+    p.resize(1024, 0x3f80);
+    let input: Vec<u8> = p.iter().flat_map(|h| h.to_le_bytes()).collect();
+    let out = run_kernel(NEG_BF16_P, &input, 2048);
+    for (i, h) in patterns.iter().enumerate() {
+        let got = u16::from_le_bytes(out[2 * i..2 * i + 2].try_into().unwrap());
+        eprintln!("  {h:#06x} -> {got:#06x}");
+    }
+}
+
+const NEG_BF16_P: &str = "\
+version 9
+grid 1,1
+%in = param bf16 1024
+%out = param bf16 1024
+%bi = buffer bf16 32,32
+%bo = buffer bf16 32,32
+copy 32,32 %bi [0] = %in [0]
+load 32,32 %x = %bi [0]
+%y = neg %x
+store 32,32 %bo [0] = %y
+copy 32,32 %out [0] = %bo [0]
+";
