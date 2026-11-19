@@ -415,7 +415,10 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
     // Consumer hand-offs. A page produced at the same depth is waited for and
     // released per read; a page produced *outside* the reading loops is hoisted
     // to the producer's scope and shared by the whole loop.
-    let mut hoisted: BTreeMap<OpId, OpId> = BTreeMap::new();
+    // A ring whose block is read across a nest of loops below the loop that
+    // produces it: where its one wait/pop pair sits, and how many pages it
+    // hands off.
+    let mut hoisted: BTreeMap<OpId, (OpId, u32)> = BTreeMap::new();
     for consumer in &consumers {
         let Some(depths) = producer_depths.get(&consumer.ring) else {
             eprintln!(
@@ -487,7 +490,20 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
                 ));
             }
         } else if depth > producer_depth {
-            if writes.get(&consumer.ring) != Some(&1) {
+            // A block handed off once per iteration of the producer's loop and
+            // read across a nest of loops below it -- tt-metal's compute waits
+            // for the whole operand block once per k block and then walks its
+            // subblocks (`in0_dfb.wait_front(in0_block_num_tiles)`, then the
+            // `in0_subblock`/`in1_subblock` loops). The wait belongs before the
+            // outermost of those loops and the release after it, once per
+            // hand-off: a hand-off per read would pop pages the producer never
+            // published, and the ring's two pointers would drift apart.
+            //
+            // A ring without a block can be written in more than one place (a
+            // page before a loop and a page in it), so its publish count says
+            // nothing about one hand-off; only a stated block may span the nest.
+            let pages = block.get(&consumer.ring).copied();
+            if pages.is_none() && writes.get(&consumer.ring) != Some(&1) {
                 return Err(ttStatus::TT_TODO_RING_MULTI_WRITE_OUTSIDE_LOOP);
             }
             let Some(&outer) = consumer.stack.get(producer_depth) else {
@@ -497,8 +513,9 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
                 );
                 return Err(ttStatus::TT_INTERNAL_BUG);
             };
-            match hoisted.insert(consumer.ring, outer) {
-                Some(previous) if previous != outer => {
+            let n = pages.unwrap_or(1);
+            match hoisted.insert(consumer.ring, (outer, n)) {
+                Some((previous, _)) if previous != outer => {
                     return Err(ttStatus::TT_TODO_RING_TWO_LOOPS);
                 }
                 _ => {}
@@ -507,13 +524,13 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
             return Err(ttStatus::TT_TODO_RING_READ_OUTSIDE_LOOP);
         }
     }
-    for (ring, outer) in hoisted {
+    for (ring, (outer, n)) in hoisted {
         let Some(&end) = end_of.get(&outer) else {
             eprintln!("libskamandros: sync_cbs: loop {outer} has no end");
             return Err(ttStatus::TT_INTERNAL_BUG);
         };
-        edits.push((outer, Op::Wait { cb: ring, n: 1 }, true));
-        edits.push((end, Op::Pop { cb: ring, n: 1 }, false));
+        edits.push((outer, Op::Wait { cb: ring, n }, true));
+        edits.push((end, Op::Pop { cb: ring, n }, false));
     }
 
     for (at, op, before) in edits {
