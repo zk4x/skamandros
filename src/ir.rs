@@ -1786,11 +1786,28 @@ fn is_value(info: &ValueInfo) -> bool {
     }
 }
 
-/// An accumulator's shape and dtype, checked: the four shapes the hardware
-/// has, and a float datum.
+/// How many 32x32 tiles an accumulator's shape covers: `acc f32 64,64` is a
+/// 2x2 block of tiles. A row, a column and a scalar are one tile's worth of
+/// accumulator in the other layouts.
+pub(crate) fn acc_tiles(shape: [Dim; 2]) -> u32 {
+    match shape {
+        [1, _] | [_, 1] => 1,
+        [m, n] => (m / 32) * (n / 32),
+    }
+}
+
+/// An accumulator's shape and dtype, checked.
+///
+/// A `Dst` region is a tile, and a block of tiles is a block of `Dst` regions:
+/// `acc f32 64,64` is a 2x2 block, which is what tt-metal names
+/// `out_subblock_h x out_subblock_w` and tt-lang a `ttl.block`. The block must
+/// fit the file the accumulator lives in -- eight `Dst` slots in 32-bit mode,
+/// sixteen in 16-bit -- so a larger band is the program's spill across
+/// `interm`, not one accumulator.
 fn acc_reg_shape_checked(shape: [Dim; 2], at: usize, dtype: DType) -> Result<RegShape, ttStatus> {
     let reg = match shape {
         [1, 32] | [32, 1] | [1, 1] | [32, 32] => acc_reg_shape(shape),
+        [m, n] if m % 32 == 0 && n % 32 == 0 && m > 0 && n > 0 => RegShape::Tile,
         _ => {
             let _ = at;
             return Err(ttStatus::TT_ERROR_ACC_SHAPE);
@@ -1799,6 +1816,11 @@ fn acc_reg_shape_checked(shape: [Dim; 2], at: usize, dtype: DType) -> Result<Reg
     if !matches!(dtype, DType::F32 | DType::Bf16) {
         let _ = (at, dtype);
         return Err(ttStatus::TT_ERROR_ACC_DTYPE);
+    }
+    let slots = if dtype == DType::F32 { 8 } else { 16 };
+    if acc_tiles(shape) > slots {
+        let _ = at;
+        return Err(ttStatus::TT_ERROR_DST_SLOTS_EXHAUSTED);
     }
     Ok(reg)
 }

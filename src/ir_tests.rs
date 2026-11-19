@@ -1595,18 +1595,24 @@ grid 4,2
 }
 
 #[test]
-fn an_accumulator_is_one_tile_and_a_larger_block_is_refused() {
-    // What the IR accepts today: `acc_reg_shape_checked` in `src/ir.rs` allows
-    // `[1,32]`, `[32,1]`, `[1,1]` and `[32,32]` only. A block accumulator --
-    // `acc f32 64,64`, four tiles -- is `TT_ERROR_ACC_SHAPE`. The band programs
-    // spell that block as four named accumulators instead.
-    for shape in ["32,32", "1,32", "32,1", "1,1"] {
+fn an_accumulator_is_a_tile_or_a_block_of_tiles() {
+    // A `Dst` region is one tile; a block of tiles is a block of regions, which
+    // is what `out_subblock_h x out_subblock_w` and tt-lang's `ttl.block` are.
+    for shape in ["32,32", "1,32", "32,1", "1,1", "64,64", "64,32", "32,64", "96,64"] {
         let text = format!("version 9\n%a = acc f32 {shape}\ngrid 1,1\n");
-        Kernel::parse(&text).unwrap_or_else(|e| panic!("{shape} is a tile accumulator: {e}"));
+        Kernel::parse(&text).unwrap_or_else(|e| panic!("{shape} is an accumulator: {e}"));
     }
-    for shape in ["64,64", "64,32", "32,64", "16,16"] {
+    // Not tiles: not a multiple of 32, or a shape that is not tile-aligned.
+    for shape in ["16,16", "33,32", "32,33"] {
         let text = format!("version 9\n%a = acc f32 {shape}\ngrid 1,1\n");
         let err = Kernel::parse(&text).expect_err(shape);
         assert_eq!(err, ttStatus::TT_ERROR_ACC_SHAPE, "{shape}");
+    }
+    // More tiles than the 32-bit `Dst` file holds: a band, spilled by the
+    // program into `interm`, not one accumulator.
+    for shape in ["128,128", "64,160"] {
+        let text = format!("version 9\n%a = acc f32 {shape}\ngrid 1,1\n");
+        let err = Kernel::parse(&text).expect_err(shape);
+        assert_eq!(err, ttStatus::TT_ERROR_DST_SLOTS_EXHAUSTED, "{shape}");
     }
 }
