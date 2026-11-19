@@ -48,8 +48,20 @@ fn dispatch_disabled() -> bool {
 
 /// First byte of `l1::PROGRAM_CACHE`, where every program is placed once.
 const PROGRAM_AREA: u32 = crate::device::PROGRAM_AREA as u32;
-/// Bytes in one program-cache slot: `mailbox::MAX_WORDS` words.
-const SLOT_BYTES: u32 = 0x8000;
+/// Last byte of the program cache: the top of L1.
+const CACHE_END: u32 = tt_isa::arch::blackhole::l1::PROGRAM_CACHE.end as u32;
+/// Bytes reserved for one mover's argument array, and for the writer's.
+const ARGS_BLOCK: u32 = 0x400;
+/// Bytes reserved above the arguments for the fan-out lists.
+const GROUPS_BYTES: u32 = 0x2000;
+/// The fan-out lists sit at the top of the program cache, at a fixed address:
+/// a repeat launch writes only the arguments and the dispatcher's generation,
+/// and it must know where they are without rebuilding the program layout.
+const GROUPS_AT: u32 = CACHE_END - GROUPS_BYTES;
+/// The reader's argument array, and the writer's (its DRAM endpoints are NoC
+/// #1's).
+const ARGS_WRITER: u32 = GROUPS_AT - ARGS_BLOCK;
+const ARGS_AT: u32 = ARGS_WRITER - ARGS_BLOCK;
 /// The barrier word of a GDDR channel: offset 0, as tt-metal's
 /// `DRAM_BARRIER_BASE` (`bh_hal.cpp:34-37`, `DRAM_BARRIER_SIZE` = 64 bytes).
 /// It lies below [`crate::device`]'s first allocation, so a launch never reads
@@ -70,24 +82,18 @@ const BARRIER_RESET: u32 = 0xBB;
 /// rather than spun on.
 const BARRIER_POLLS: u32 = 1000;
 
-/// Slot 0 and 1: RISCV B's reader and writer. 3..6: T0/T1/T2. The arguments
-/// follow the last slot.
+/// Slot 0 and 1: RISCV B's reader and writer. 3..6: T0/T1/T2.
 const SLOT_READER: u32 = 0;
 const SLOT_WRITER: u32 = 1;
 /// The setup program's slot. It is not one of the role slots: T0 runs both, and
 /// sharing a slot would evict the role program every launch.
 const SLOT_SETUP: u32 = 2;
 const ROLE_SLOT: [u32; 3] = [3, 4, 5];
-const ARGS_AT: u32 = PROGRAM_AREA + 6 * SLOT_BYTES;
-/// The writer's array, one kilobyte after the reader's: its DRAM endpoints are
-/// NoC #1's.
-const ARGS_WRITER: u32 = ARGS_AT + 0x400;
-
 /// The fan-out lists, which the tree in `launch_steps` stages: the root's
 /// (every other column leader, then its own column's workers) and one per
 /// column leader (its column's other tiles). One packed endpoint per word
 /// (`endpoint_of`), `GROUPS_STRIDE` bytes apart.
-const GROUPS_AT: u32 = ARGS_WRITER + 0x400;
+
 /// Bytes per fan-out list: sixty-four endpoints of room. The root's is the
 /// widest (every other column leader plus its own column), and the slots must
 /// not overlap: an 0x40 stride truncated the root's list and started the wrong
@@ -139,9 +145,50 @@ fn endpoint_of(tile: NocCoord) -> u32 {
     u32::from(tile.x()) | (u32::from(tile.y()) << 8)
 }
 
-/// `index`'s slot in the program cache.
-const fn slot(index: u32) -> u32 {
-    PROGRAM_AREA + index * SLOT_BYTES
+/// This launch's program slots, packed from the bottom of the program cache.
+///
+/// The address goes through the role's launch message, so a slot need not be
+/// fixed or of a fixed size: each program gets the room it actually needs, and
+/// the five together may use the whole cache below the arguments. tt-metal has
+/// no per-role slot either — a kernel binary is bounded by the L1 program
+/// region (`MEM_MAX_KERNEL_SIZE` is 1497 KiB on Blackhole,
+/// `dev_mem_map.h:79-80`) and shares L1 with the CBs at run time — so a fixed
+/// 32 KiB slot would be a limit of this driver, not of the hardware.
+struct Slots {
+    at: [u32; 6],
+}
+
+impl Slots {
+    /// Pack the six programs (reader, writer, setup, T0, T1, T2) in that
+    /// order, each at the next 16-byte boundary, and refuse a launch whose
+    /// programs would run into the arguments.
+    fn new(module: &Module, cores: &[Vec<u32>; 3]) -> Result<Self, ttStatus> {
+        let sizes = [
+            module.reader.len(),
+            module.writer.len(),
+            module.setup.len(),
+            cores[0].len(),
+            cores[1].len(),
+            cores[2].len(),
+        ];
+        let mut at = [0u32; 6];
+        let mut next = PROGRAM_AREA;
+        for (slot, words) in at.iter_mut().zip(sizes) {
+            *slot = next;
+            let bytes = u32::try_from(words)
+                .ok()
+                .and_then(|n| n.checked_mul(4))
+                .ok_or(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE)?;
+            next = next
+                .checked_add(bytes)
+                .map(|end| end.div_ceil(16) * 16)
+                .ok_or(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE)?;
+            if next > ARGS_AT {
+                return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
+            }
+        }
+        Ok(Self { at })
+    }
 }
 
 /// Open the device. Idempotent; the simulator is initialized once per process.
@@ -459,15 +506,6 @@ fn launch_steps(
             tiles.push(((x, y), device.tile_at(x, y)?));
         }
     }
-    for (name, words) in [("reader", &module.reader), ("writer", &module.writer)] {
-        if words.is_empty() {
-            continue;
-        }
-        if 4 * words.len() as u32 > SLOT_BYTES {
-            let _ = (name, words.len());
-            return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
-        }
-    }
     // Which programs this target can run: the card writes the unpacker's
     // tile-descriptor tail, which `ttsim` refuses, so the compiler emitted both
     // sets and the launch picks one (`Module::silicon_cores`).
@@ -477,6 +515,8 @@ fn launch_steps(
         &module.silicon_cores
     };
     let compute = cores.iter().any(|words| !words.is_empty());
+    // Where this launch's programs go: packed, at their own sizes.
+    let slots = Slots::new(module, cores)?;
     // Which processors the launch starts. Only RISCV B reads it: it starts the
     // reader's and the writer's cores and the three Tensors threads itself.
     let mut enables = 0u32;
@@ -596,8 +636,7 @@ fn launch_steps(
             device.release_tensix_backend()?;
         }
         device.start_executors()?;
-        let [args, writer_args] =
-            args_for(device, module, params, grid, *tile)?.map(|(_, v)| v);
+        let [args, writer_args] = args_for(device, module, params, grid, *tile)?.map(|(_, v)| v);
         // Both arrays before the first core starts, not only as a side effect of
         // a mover run. Staged: a repeat launch writes only the words that differ.
         device.stage_words(u64::from(ARGS_AT), &args)?;
@@ -611,7 +650,7 @@ fn launch_steps(
         // kernel ~20% slower, as well as relying on an end state no code
         // guarantees).
         if compute && !module.setup.is_empty() {
-            device.place(slot(SLOT_SETUP), &module.setup)?;
+            device.place(slots.at[SLOT_SETUP as usize], &module.setup)?;
         }
 
         // The descriptor: the tiles this one fans out to, the width of the
@@ -626,7 +665,7 @@ fn launch_steps(
             Some(&lists[list_slot])
         };
         let setup = if compute && !module.setup.is_empty() {
-            (slot(SLOT_SETUP), module.setup.len() as u32)
+            (slots.at[SLOT_SETUP as usize], module.setup.len() as u32)
         } else {
             (0, 0)
         };
@@ -694,19 +733,19 @@ fn launch_steps(
         // the enabled cores itself; the reader on B and the writer on NC
         // therefore run with the compute cores, not before or after them.
         if !module.reader.is_empty() {
-            device.place(slot(SLOT_READER), &module.reader)?;
+            device.place(slots.at[SLOT_READER as usize], &module.reader)?;
             device.prepare(
                 mailbox::launch::Mailbox::b(),
-                slot(SLOT_READER),
+                slots.at[SLOT_READER as usize],
                 module.reader.len() as u32,
                 ARGS_AT,
             )?;
         }
         if !module.writer.is_empty() {
-            device.place(slot(SLOT_WRITER), &module.writer)?;
+            device.place(slots.at[SLOT_WRITER as usize], &module.writer)?;
             device.prepare(
                 mailbox::launch::Mailbox::nc(),
-                slot(SLOT_WRITER),
+                slots.at[SLOT_WRITER as usize],
                 module.writer.len() as u32,
                 ARGS_WRITER,
             )?;
@@ -715,7 +754,13 @@ fn launch_steps(
             if words.is_empty() {
                 continue;
             }
-            stage_role(device, thread, words, ARGS_AT)?;
+            stage_role(
+                device,
+                thread,
+                slots.at[ROLE_SLOT[thread] as usize],
+                words,
+                ARGS_AT,
+            )?;
         }
         // B's launch message, on every tile: the host names the reader here,
         // and the generation below is the only word a launch writes. The
@@ -725,7 +770,7 @@ fn launch_steps(
         let (text, words) = if module.reader.is_empty() {
             (0, 0)
         } else {
-            (slot(SLOT_READER), module.reader.len() as u32)
+            (slots.at[SLOT_READER as usize], module.reader.len() as u32)
         };
         device.prepare(mb, text, words, ARGS_AT)?;
         device.stage_words(mb.enables(), &[enables])?;
@@ -800,8 +845,7 @@ fn dispatch_launch(
             grid[0] * grid[1]
         );
     }
-    let [args, writer_args] =
-        args_for(device, module, params, grid, dispatcher)?.map(|(_, v)| v);
+    let [args, writer_args] = args_for(device, module, params, grid, dispatcher)?.map(|(_, v)| v);
     device.stage_words(u64::from(ARGS_AT), &args)?;
     device.stage_words(u64::from(ARGS_WRITER), &writer_args)?;
     // The generation is the store that lets B read what the host staged.
@@ -829,31 +873,35 @@ const ROLE_ENABLE: [u32; 3] = [
 fn stage_role(
     device: &mut Device,
     thread: usize,
+    at: u32,
     words: &[u32],
     args_at: u32,
 ) -> Result<(), ttStatus> {
-    stage_at(device, thread, ROLE_SLOT[thread], words, args_at)
+    stage_at(device, thread, at, words, args_at)
 }
 
-/// [`stage_role`], in an explicit program-cache slot: the setup program runs on
-/// T0 too, but out of a slot of its own.
+/// [`stage_role`], at an explicit program-cache address.
 fn stage_at(
     device: &mut Device,
     thread: usize,
-    slot_index: u32,
+    text: u32,
     words: &[u32],
     args_at: u32,
 ) -> Result<(), ttStatus> {
-    if words.is_empty() || words.len() as u32 > mailbox::MAX_WORDS {
-        let _ = (thread, words.len());
+    // The only limit is the program cache: a role's program may use every byte
+    // between its address and the launch arguments.
+    let room = u64::from(CACHE_END - text);
+    if words.is_empty() || 4 * words.len() as u64 > room {
+        if std::env::var_os("SKAM_DEBUG").is_some() {
+            eprintln!(
+                "stage: thread {thread} program is {} words ({:#x} bytes), {room:#x} bytes of room",
+                words.len(),
+                4 * words.len() as u32
+            );
+        }
         return Err(ttStatus::TT_ERROR_ROLE_PROGRAM_SIZE);
     }
-    if 4 * words.len() as u32 > SLOT_BYTES {
-        let _ = (thread, words.len());
-        return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
-    }
     let mb = mailbox::launch::Mailbox::of(thread as u32);
-    let text = slot(slot_index);
     device.place(text, words)?;
     // The role's configuration words are host state the executor never
     // touches, so staging them costs nothing on a repeat launch.

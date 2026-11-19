@@ -2003,7 +2003,10 @@ impl Device {
         if words.is_empty() {
             return Err(ttStatus::TT_ERROR_EMPTY_PROGRAM);
         }
-        if words.len() as u64 > u64::from(mailbox::MAX_WORDS) {
+        // A program is bounded by the L1 program cache, not by a fixed slot:
+        // its address is named by the launch message. tt-metal's bound is the
+        // same region (`MEM_MAX_KERNEL_SIZE`, 1497 KiB).
+        if 4 * words.len() as u64 > Blackhole::L1_SIZE - u64::from(at) {
             let _ = words.len();
             return Err(ttStatus::TT_ERROR_PROGRAM_TOO_LONG);
         }
@@ -2114,10 +2117,12 @@ impl Device {
             if expired {
                 if debug {
                     eprintln!(
-                        "libskamandros: tile ({}, {}) launch timeout: gen {} ack {} status {} \
+                        "libskamandros: tile ({}, {}) reset {:#x} enables {:#x} launch timeout: gen {} ack {} status {} \
                          program {:#x} len {} args {:#x} enables {:#x} desc {:#x?}",
                         self.tile.x(),
                         self.tile.y(),
+                        self.read32(soft_reset_register())?,
+                        self.read32(mb.enables())?,
                         self.read32(mb.generation())?,
                         self.read32(mb.ack())?,
                         self.read32(mb.status())?,
@@ -2133,6 +2138,18 @@ impl Device {
                             d
                         }
                     );
+                    // Every core's own launch mailbox: which subordinate is
+                    // holding the join, and what it thinks it is doing.
+                    for other in Self::launch_mailboxes() {
+                        eprintln!(
+                            "  mailbox {:#x}: gen {} ack {} status {:#x} panic {}",
+                            other.generation(),
+                            self.read32(other.generation())?,
+                            self.read32(other.ack())?,
+                            self.read32(other.status())?,
+                            self.read32(other.panic_code())?,
+                        );
+                    }
                 }
                 return Err(ttStatus::TT_ERROR_FIRMWARE_TIMEOUT);
             }

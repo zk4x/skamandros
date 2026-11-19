@@ -246,6 +246,7 @@ impl Mover<'_> {
                     dst_offset,
                     src_offset,
                     shape,
+                    span,
                 } => {
                     let reader = self.old.info(src).kind == ValueKind::Param;
                     let writer = self.old.info(dst).kind == ValueKind::Param;
@@ -261,6 +262,7 @@ impl Mover<'_> {
                             dst_offset,
                             src_offset,
                             shape,
+                            span,
                         },
                         reader,
                     });
@@ -268,10 +270,20 @@ impl Mover<'_> {
                 // A collective is a reader-segment move: it publishes a page
                 // the segment filled, or hands one on. It is copied into the
                 // segment with the loops it lives under, exactly as a copy is.
-                Op::Expand { src, span, from } => {
+                Op::Expand {
+                    src,
+                    pages,
+                    span,
+                    from,
+                } => {
                     self.copies.push(Copy {
                         path: self.loops.clone(),
-                        op: Op::Expand { src, span, from },
+                        op: Op::Expand {
+                            src,
+                            pages,
+                            span,
+                            from,
+                        },
                         reader: true,
                     });
                 }
@@ -286,6 +298,7 @@ impl Mover<'_> {
                     buffer,
                     offset,
                     shape,
+                    ..
                 } if self.old.info(buffer).kind == ValueKind::Param => {
                     // A lane's own index is an assembly, which fills the tile's
                     // rows; a single unit an `Src` reader consumes keeps the
@@ -305,6 +318,7 @@ impl Mover<'_> {
                             dst_offset: zero,
                             src_offset: offset,
                             shape,
+                            span: crate::ir::Span::WHOLE,
                         },
                         reader: true,
                     });
@@ -314,6 +328,7 @@ impl Mover<'_> {
                             buffer: ring,
                             offset: zero,
                             shape,
+                            into: None,
                         },
                     ));
                 }
@@ -337,6 +352,7 @@ impl Mover<'_> {
                             dst_offset: offset,
                             src_offset: zero,
                             shape,
+                            span: crate::ir::Span::WHOLE,
                         },
                         reader: false,
                     });
@@ -376,6 +392,8 @@ impl Mover<'_> {
                 dtype: info.dtype,
                 page,
                 len: 1,
+                // The compiler's staged page is handed off one at a time.
+                block: None,
             },
         ));
         self.names.push((ring, name));
@@ -497,12 +515,23 @@ impl Mover<'_> {
     fn bodies(&mut self, into: &mut Kernel, group: &[Copy]) -> Result<(), ttStatus> {
         for copy in group {
             match copy.op.clone() {
-                Op::Expand { src, span, from } => {
+                Op::Expand {
+                    src,
+                    pages,
+                    span,
+                    from,
+                } => {
                     self.new_ring(src)?;
                     let src = self.clone_value(into, src)?;
+                    let pages = self.clone_value(into, pages)?;
                     let span = self.clone_span(into, span)?;
                     let from = self.clone_span(into, from)?;
-                    into.push(Op::Expand { src, span, from });
+                    into.push(Op::Expand {
+                        src,
+                        pages,
+                        span,
+                        from,
+                    });
                     continue;
                 }
                 Op::Roll { src, span, by } => {
@@ -526,6 +555,7 @@ impl Mover<'_> {
                 dst_offset,
                 src_offset,
                 shape,
+                span,
             } = copy.op
             else {
                 return Err(crate::status::internal_bug(
@@ -538,6 +568,7 @@ impl Mover<'_> {
             let src = self.clone_value(into, src)?;
             let dst_offset = self.clone_value(into, dst_offset)?;
             let src_offset = self.clone_value(into, src_offset)?;
+            let span = self.clone_span(into, span)?;
             // The producer reserves a free page and publishes it; the consumer
             // waits for a published page and releases it (tt-metal's
             // `writer_unary_1.cpp` is `cb_wait_front`/`cb_pop_front`). Those
@@ -548,13 +579,18 @@ impl Mover<'_> {
                 dst_offset,
                 src_offset,
                 shape,
+                span,
             });
         }
         Ok(())
     }
 
     /// Rebuild a span inside the segment being built.
-    fn clone_span(&mut self, into: &mut Kernel, span: crate::ir::Span) -> Result<crate::ir::Span, ttStatus> {
+    fn clone_span(
+        &mut self,
+        into: &mut Kernel,
+        span: crate::ir::Span,
+    ) -> Result<crate::ir::Span, ttStatus> {
         Ok(crate::ir::Span {
             x: self.clone_extent(into, span.x)?,
             y: self.clone_extent(into, span.y)?,
@@ -569,10 +605,9 @@ impl Mover<'_> {
         Ok(match extent {
             crate::ir::Extent::Whole => crate::ir::Extent::Whole,
             crate::ir::Extent::At(a) => crate::ir::Extent::At(self.clone_value(into, a)?),
-            crate::ir::Extent::Range(a, b) => crate::ir::Extent::Range(
-                self.clone_value(into, a)?,
-                self.clone_value(into, b)?,
-            ),
+            crate::ir::Extent::Range(a, b) => {
+                crate::ir::Extent::Range(self.clone_value(into, a)?, self.clone_value(into, b)?)
+            }
         })
     }
 
@@ -646,6 +681,7 @@ impl Mover<'_> {
                 buffer,
                 offset,
                 shape,
+                ..
             } => {
                 let buffer = self.clone_value(into, buffer)?;
                 let offset = self.clone_value(into, offset)?;
@@ -653,6 +689,7 @@ impl Mover<'_> {
                     buffer,
                     offset,
                     shape,
+                    into: None,
                 }))
             }
             other => {

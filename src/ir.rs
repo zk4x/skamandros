@@ -160,6 +160,19 @@ pub struct Span {
     pub y: Extent,
 }
 
+impl Span {
+    /// Every core on both axes: `[.., ..]`.
+    pub const WHOLE: Span = Span {
+        x: Extent::Whole,
+        y: Extent::Whole,
+    };
+
+    /// Is this the whole grid, so naming it adds nothing?
+    pub const fn is_whole(self) -> bool {
+        matches!((self.x, self.y), (Extent::Whole, Extent::Whole))
+    }
+}
+
 /// The coordinate values a span names, in field order: `x`'s operands then
 /// `y`'s, with `At` contributing one and `Range` two.
 fn span_operands(span: Span) -> [Option<OpId>; 4] {
@@ -406,6 +419,18 @@ pub enum Op {
         page: [Dim; 2],
         /// Pages in the ring.
         len: Dim,
+        /// Pages handed off together: the ring's block, when the program states
+        /// one (`%bi = buffer f32 32,64 block 4`).
+        ///
+        /// A hand-off is the compiler's, but its *size* is not: `load %ba [p]`
+        /// and `store %ba [p]` name a page inside the block the program is
+        /// walking, and the base the page is added to is the block's first
+        /// page. When every page index is a constant the block is read off
+        /// them (`max p + 1`). A page index that is a loop value names no
+        /// maximum, so the program states the block instead of the compiler
+        /// guessing -- tt-metal's reader passes `in0_block_num_tiles` the same
+        /// way (`reader_bmm_tile_layout.cpp`).
+        block: Option<u32>,
     },
     /// A named accumulator: one `Dst` region that `matmul`, `sum`/`max` and
     /// `store_to` write, read back by `store_to` into a buffer. It is mutable —
@@ -444,6 +469,13 @@ pub enum Op {
         dst_offset: OpId,
         src_offset: OpId,
         shape: [Dim; 2],
+        /// Which cores issue the request: `in [.., ..]` is every core, the
+        /// default when the clause is absent. A narrower span is how a program
+        /// says that only the group's leaders read the parameter, so the rest of
+        /// the group gets the page from an `expand` instead of from DRAM. The
+        /// lowering never infers this: a copy the program wrote for every core
+        /// reads on every core.
+        span: Span,
     },
     /// `expand %a [span] from [pick]`: every core in `span` ends with the page
     /// the `pick` cores hold, the pick cores being the group's leaders.
@@ -462,9 +494,22 @@ pub enum Op {
     /// of its group), and it must be narrower than `span` on at least one axis
     /// (else the op is an identity).
     ///
+    /// `pages` is how many pages of the buffer's reservation are sent, from
+    /// its write pointer up: `expand %ba [4] [.., ..] from [0, ..]` fans out the
+    /// four pages the block reserved, the way tt-metal's reader multicasts a
+    /// whole block in one `send` (`in0_block_size_bytes`,
+    /// `reader_bmm_tile_layout_in0_sender_padding_metal2.cpp:407`). Every core's
+    /// ring advances in step, so the block starts at the same address on the
+    /// sender and on all its receivers.
+    ///
     /// Both sides are the same buffer, so no destination is named; a fan-out
     /// that has to land in a different buffer aliases it first.
-    Expand { src: OpId, span: Span, from: Span },
+    Expand {
+        src: OpId,
+        pages: OpId,
+        span: Span,
+        from: Span,
+    },
     /// `roll %a [span] by [dx, dy]`: the page each core in `span` holds moves
     /// to `core + (dx, dy)`. One unicast per cell.
     ///
@@ -478,16 +523,28 @@ pub enum Op {
     /// page its write pointer: they coincide for a one-page ring and differ by
     /// the ring depth when a pipeline forwards a page it received while
     /// receiving the next one.
-    Roll { src: OpId, span: Span, by: [OpId; 2] },
+    Roll {
+        src: OpId,
+        span: Span,
+        by: [OpId; 2],
+    },
     /// L1 buffer into a register value. `shape` is the unit the index's base
     /// names; the result has that shape. The offset counts units of that shape
     /// — a page for a tile, a row for `1,32`, a column for `32,1`, a datum for
     /// `1,1` — so a narrow access names one unit of a tiled page without a
     /// second index.
+    /// `load` into a fresh register, or into an accumulator when `into` is
+    /// set: `load 32,32 %acc = %interm [p]` is tt-metal's `copy_tile` — the
+    /// page is unpacked into the accumulator's `Dst` rows, so the Matrix
+    /// Unit's next `matmul` accumulates onto the running total a previous
+    /// k-block left in L1 (`bmm_large_block_zm.cpp:56-68`). The page is a
+    /// value's worth of `Dst`, exactly as a fresh load's is.
     Load {
         buffer: OpId,
         offset: OpId,
         shape: [Dim; 2],
+        /// The accumulator the page seeds, when it is not a fresh value.
+        into: Option<OpId>,
     },
     /// A register value into an L1 buffer. The offset counts units of `shape`,
     /// as in [`Op::Load`].
@@ -588,14 +645,46 @@ impl Op {
                 src,
                 dst_offset,
                 src_offset,
-                shape: _,
-            } => [dst, src, dst_offset, src_offset].get(idx).copied(),
+                span,
+                ..
+            } => {
+                let p = span_operands(span);
+                [
+                    Some(dst),
+                    Some(src),
+                    Some(dst_offset),
+                    Some(src_offset),
+                    p[0],
+                    p[1],
+                    p[2],
+                    p[3],
+                ]
+                .get(idx)
+                .copied()
+                .flatten()
+            }
             // The coordinates a span names are values like any other, so they
             // are walked in field order after the buffer.
-            Op::Expand { src, span, from } => {
+            Op::Expand {
+                src,
+                pages,
+                span,
+                from,
+            } => {
                 let s = span_operands(span);
                 let f = span_operands(from);
-                [Some(src), s[0], s[1], s[2], s[3], f[0], f[1], f[2], f[3]]
+                [
+                    Some(src),
+                    Some(pages),
+                    s[0],
+                    s[1],
+                    s[2],
+                    s[3],
+                    f[0],
+                    f[1],
+                    f[2],
+                    f[3],
+                ]
                     .get(idx)
                     .copied()
                     .flatten()
@@ -607,7 +696,21 @@ impl Op {
                     .copied()
                     .flatten()
             }
-            Op::Load { buffer, offset, .. } => [buffer, offset].get(idx).copied(),
+            Op::Load {
+                buffer,
+                offset,
+                into,
+                ..
+            } => [buffer, offset].get(idx).copied().or_else(|| {
+                // The seeded accumulator is an operand too: the load writes it,
+                // so a pass that asks what a value's users are must see this
+                // one.
+                if idx == 2 {
+                    into
+                } else {
+                    None
+                }
+            }),
             Op::Store {
                 src,
                 buffer,
@@ -669,7 +772,12 @@ impl Op {
             // A collective's span coordinates are names, not operands: the reuse
             // pass renames buffers, and nothing here may be rebound.
             Op::Expand { .. } | Op::Roll { .. } => ParamsMut::Empty,
-            Op::Load { buffer, offset, .. } => ParamsMut::Two(Some(buffer), Some(offset)),
+            Op::Load {
+                buffer,
+                offset,
+                into,
+                ..
+            } => ParamsMut::Three(Some(buffer), Some(offset), into.as_mut()),
             Op::Store {
                 src,
                 buffer,
@@ -1203,7 +1311,12 @@ impl Kernel {
                         return Err(ttStatus::TT_TODO_BOOL_PARAMETER);
                     }
                 }
-                Op::Cb { dtype, page, len } => {
+                Op::Cb {
+                    dtype,
+                    page,
+                    len,
+                    block,
+                } => {
                     if dtype == DType::Bool {
                         return Err(ttStatus::TT_TODO_BOOL_BUFFER);
                     }
@@ -1211,6 +1324,13 @@ impl Kernel {
                         return Err(ttStatus::TT_ERROR_ZERO_DIMENSION);
                     }
                     unit_of(page, dtype)?;
+                    match block {
+                        Some(0) => return Err(ttStatus::TT_ERROR_ZERO_DIMENSION),
+                        // A block larger than the ring could never be handed
+                        // off.
+                        Some(n) if n > len => return Err(ttStatus::TT_ERROR_CB_BLOCK),
+                        _ => {}
+                    }
                 }
                 Op::Acc { dtype, shape } => {
                     acc_reg_shape_checked(shape, at, dtype)?;
@@ -1247,6 +1367,9 @@ impl Kernel {
                     dst_offset,
                     src_offset,
                     shape,
+                    // A copy's span is a plain core rectangle: every extent form
+                    // is meaningful, and one that pins no axis is every core.
+                    span: _,
                 } => {
                     let d = self.info(dst);
                     let s = self.info(src);
@@ -1297,6 +1420,7 @@ impl Kernel {
                     buffer,
                     offset,
                     shape,
+                    ..
                 } => {
                     let b = self.info(buffer);
                     // The unit is checked for both ends: against the ring the
@@ -1470,7 +1594,15 @@ impl Kernel {
                 Op::Max { acc, x } => {
                     self.expect_reduce(acc, x, at)?;
                 }
-                Op::Expand { src, span, from } => {
+                Op::Expand {
+                    src,
+                    pages,
+                    span,
+                    from,
+                } => {
+                    // The count is a plain scalar, like a `copy`'s ring side: a
+                    // count of pages, not a buffer.
+                    let _ = pages;
                     if !matches!(*self.at(src), Op::Cb { .. }) {
                         return Err(ttStatus::TT_ERROR_NOT_A_BUFFER);
                     }
@@ -1774,6 +1906,14 @@ impl Parser {
                         } else {
                             dst_offset
                         };
+                        // `in [span]` is optional: without it the copy runs on
+                        // every core, which is the whole-grid span.
+                        let span = if t.peek_word() == Some("in") {
+                            t.word();
+                            t.span(self)?
+                        } else {
+                            Span::WHOLE
+                        };
                         t.end()?;
                         self.push(Op::Copy {
                             dst,
@@ -1781,19 +1921,28 @@ impl Parser {
                             dst_offset,
                             src_offset,
                             shape,
+                            span,
                         });
                         continue;
                     }
                     "expand" => {
                         t.word();
                         let src = self.value(&mut t)?;
+                        // The count, as on a `copy`'s ring side: one bracket
+                        // of its own, before the span.
+                        let pages = t.bracket(self)?;
                         let span = t.span(self)?;
                         if t.word() != Some("from") {
                             return Err(ttStatus::TT_ERROR_PARSE);
                         }
                         let from = t.span(self)?;
                         t.end()?;
-                        self.push(Op::Expand { src, span, from });
+                        self.push(Op::Expand {
+                            src,
+                            pages,
+                            span,
+                            from,
+                        });
                         continue;
                     }
                     "roll" => {
@@ -1844,12 +1993,28 @@ impl Parser {
                         let buffer = self.value(&mut t)?;
                         let offset = t.bracket(self)?;
                         t.end()?;
-                        let id = self.ops.len();
-                        self.define(name, id)?;
+                        // A name that is already an accumulator seeds it: the
+                        // page lands in the accumulator's own `Dst` rows, which
+                        // is how a k-block resumes the total the one before it
+                        // packed to L1.
+                        let into = match self.symbols.get(&name).copied() {
+                            Some(existing)
+                            if matches!(self.ops[usize::from(existing)], Op::Acc { .. }) =>
+                        {
+                                Some(existing)
+                            }
+                            Some(_) => return Err(ttStatus::TT_ERROR_NAME_DUPLICATE),
+                            None => None,
+                        };
+                        if into.is_none() {
+                            let id = self.ops.len();
+                            self.define(name, id)?;
+                        }
                         self.push(Op::Load {
                             buffer,
                             offset,
                             shape,
+                            into,
                         });
                         continue;
                     }
@@ -2064,11 +2229,24 @@ impl Parser {
                 let a = t.number()?;
                 t.comma()?;
                 let b = t.number()?;
+                // An optional `block n`: the pages one hand-off moves. Only a
+                // program whose page index is a loop value has to state it.
+                let block = if t.peek_word() == Some("block") {
+                    let _ = t.word();
+                    Some(t.number()?)
+                } else {
+                    None
+                };
                 t.end()?;
                 let (page, len) = cb_ring([a, b], dtype)?;
                 let id = self.ops.len();
                 self.define(name, id)?;
-                self.push(Op::Cb { dtype, page, len });
+                self.push(Op::Cb {
+                    dtype,
+                    page,
+                    len,
+                    block,
+                });
             }
             "acc" => {
                 let dtype = t.dtype()?;
@@ -2235,14 +2413,25 @@ impl Printer<'_, '_> {
             Op::Variable { dtype } => {
                 writeln!(self.f, "{} = param {} 0", self.name(id), dtype.name())
             }
-            Op::Cb { dtype, page, len } => writeln!(
-                self.f,
-                "{} = buffer {} {},{}",
-                self.name(id),
-                dtype.name(),
-                page[0],
-                page[1] * len
-            ),
+            Op::Cb {
+                dtype,
+                page,
+                len,
+                block,
+            } => {
+                write!(
+                    self.f,
+                    "{} = buffer {} {},{}",
+                    self.name(id),
+                    dtype.name(),
+                    page[0],
+                    page[1] * len
+                )?;
+                match block {
+                    Some(n) => writeln!(self.f, " block {n}"),
+                    None => writeln!(self.f),
+                }
+            }
             Op::Acc { dtype, shape } => writeln!(
                 self.f,
                 "{} = acc {} {},{}",
@@ -2278,20 +2467,34 @@ impl Printer<'_, '_> {
                 dst_offset,
                 src_offset,
                 shape,
+                span,
             } => writeln!(
                 self.f,
-                "copy {},{} {} [{}] = {} [{}]",
+                "copy {},{} {} [{}] = {} [{}]{}",
                 shape[0],
                 shape[1],
                 self.name(dst),
                 self.name(dst_offset),
                 self.name(src),
-                self.name(src_offset)
+                self.name(src_offset),
+                // `[.., ..]` is every core, so it is left implicit; any other
+                // span is printed because it changes which cores read.
+                if span.is_whole() {
+                    String::new()
+                } else {
+                    format!(" in {}", self.span(span))
+                }
             ),
-            Op::Expand { src, span, from } => writeln!(
+            Op::Expand {
+                src,
+                pages,
+                span,
+                from,
+            } => writeln!(
                 self.f,
-                "expand {} {} from {}",
+                "expand {} [{}] {} from {}",
                 self.name(src),
+                self.name(pages),
                 self.span(span),
                 self.span(from)
             ),
@@ -2307,12 +2510,15 @@ impl Printer<'_, '_> {
                 buffer,
                 offset,
                 shape,
+                into,
             } => writeln!(
                 self.f,
                 "load {},{} {} = {} [{}]",
                 shape[0],
                 shape[1],
-                self.name(id),
+                // A seed names the accumulator it writes; a fresh load names
+                // its own value.
+                self.name(into.unwrap_or(id)),
                 self.name(buffer),
                 self.name(offset)
             ),

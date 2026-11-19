@@ -13,6 +13,7 @@ pub mod abi;
 
 mod alloc;
 mod compile;
+mod debug;
 mod device;
 mod encode;
 mod ir;

@@ -532,7 +532,14 @@ pub enum MirOp {
     /// The base `Dst` register an unpack writes to.
     Setdst { reg: Dst },
     /// The packer's L1 destination: the page [`MirOp::CbReserve`] reserved.
-    SetPackBase { cb: Cb },
+    SetPackBase {
+        cb: Cb,
+        /// The page's byte offset from the ring's write pointer, as on
+        /// [`MirOp::SetUnpackBase`].
+        offset: u32,
+        /// A run-time page index, already scaled to the interface's units.
+        extra: Option<u8>,
+    },
     /// The packer's `Config` bank: the fields a pack's formats and edge mask
     /// decide.
     SetPackConfig { dtype: DType, mask: PackMask },
@@ -541,8 +548,18 @@ pub enum MirOp {
     SetPackOffset { reg: Dst, at: u32 },
     /// `PACR` per four `Dst` rows.
     PackRows { rows: u32, last: bool },
-    /// The unpacker's L1 source: the page [`MirOp::CbWait`] waited for.
-    SetUnpackBase { cb: Cb, unit: u8 },
+    /// The unpacker's L1 source: the page [`MirOp::CbWait`] waited for, at
+    /// `offset` bytes past the ring's read pointer, plus `extra` 16-byte units
+    /// the RISC-V program computed. The offset names which page of a block this
+    /// unpack reads -- tt-metal's `get_tile_l1_byte_address`, `fifo_rd_ptr +
+    /// fifo_page_size * tile_index` (`cb_api.h:143-151`), where `tile_index` is
+    /// `matmul_tiles`' run-time argument, not a constant.
+    SetUnpackBase {
+        cb: Cb,
+        unit: u8,
+        offset: u32,
+        extra: Option<u8>,
+    },
     /// `cb_wait_front`: wait for `n` pages to be published on this ring.
     CbWait { cb: Cb, n: u32 },
     /// `cb_pop_front`: release the `n` pages [`MirOp::CbWait`] waited for.
@@ -1179,7 +1196,13 @@ fn write_op(f: &mut dyn fmt::Write, op: &MirOp) -> fmt::Result {
         }
         MirOp::WaitMatrix => write!(f, "wait_matrix"),
         MirOp::Setdst { reg } => write!(f, "setdst dst{}", reg.0),
-        MirOp::SetPackBase { cb } => write!(f, "setpackbase {}", cb_name(cb)),
+        MirOp::SetPackBase { cb, offset, extra } => {
+            write!(f, "setpackbase {} +{offset}", cb_name(cb))?;
+            match extra {
+                Some(reg) => write!(f, " +r{reg}"),
+                None => Ok(()),
+            }
+        }
         MirOp::SetPackConfig { dtype, mask } => {
             write!(f, "setpackconfig {} {}", dtype.name(), mask_name(mask))
         }
@@ -1187,8 +1210,17 @@ fn write_op(f: &mut dyn fmt::Write, op: &MirOp) -> fmt::Result {
         MirOp::PackRows { rows, last } => {
             write!(f, "packrows {rows}{}", if last { " last" } else { "" })
         }
-        MirOp::SetUnpackBase { cb, unit } => {
-            write!(f, "setunpackbase {} u{unit}", cb_name(cb))
+        MirOp::SetUnpackBase {
+            cb,
+            unit,
+            offset,
+            extra,
+        } => {
+            write!(f, "setunpackbase {} u{unit} +{offset}", cb_name(cb))?;
+            match extra {
+                Some(reg) => write!(f, " +r{reg}"),
+                None => Ok(()),
+            }
         }
         MirOp::CbWait { cb, n } => write!(f, "cbwait {} {}", cb_name(cb), n),
         MirOp::CbPop { cb, n } => write!(f, "cbpop {} {}", cb_name(cb), n),

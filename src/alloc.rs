@@ -818,12 +818,15 @@ fn alloc_dsts(m: &mut MachineKernel) -> Result<(), ttStatus> {
     let mut rename: BTreeMap<Dst, Dst> = BTreeMap::new();
     // Each physical register's end of life, by physical id.
     let mut ends: Vec<Option<usize>> = vec![None; slots];
+    let all = order.clone();
     for (id, (first, last)) in order {
         let free = ends
             .iter()
             .position(|end| end.map(|end| end < first).unwrap_or(true));
         let Some(slot) = free else {
-            let _ = (id, first);
+            if std::env::var_os("SKAM_DEBUG").is_some() {
+                eprintln!("alloc: dst {id:?} {first}..{last} has no slot; live = {all:?}");
+            }
             return Err(ttStatus::TT_ERROR_DST_SLOTS_EXHAUSTED);
         };
         ends[slot] = Some(last);

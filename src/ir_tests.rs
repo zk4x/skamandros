@@ -223,7 +223,7 @@ version 9
 copy 32,32 %b0 [0] = %in [0]
 copy 32,32 %b0 [1] = %in [1]
 copy 32,32 %out [0] = %b0 [0]
-copy 32,32 %out [1] = %b0 [0]
+copy 32,32 %out [1] = %b0 [1]
 grid 1,1
 ";
     let k = Kernel::parse(COPY).expect("the copy kernel parses");
@@ -713,11 +713,11 @@ version 9
 %step = const i32 1
 %i = loop %two
 %o = mul %i %step
-copy 32,32 %bi [%o] = %in [%o]
-load 32,32 %x = %bi [%o]
+copy 32,32 %bi [0] = %in [%o]
+load 32,32 %x = %bi [0]
 %y = neg %x
-store 32,32 %bo [%o] = %y
-copy 32,32 %out [%o] = %bo [%o]
+store 32,32 %bo [0] = %y
+copy 32,32 %out [%o] = %bo [0]
 endloop
 grid 1,1
 ";
@@ -1487,7 +1487,8 @@ version 9
 %neg = const i32 -2
 %gx = const i32 8
 %gy = const i32 8
-expand %a [%five..%seven, ..] from [%six, ..]
+%zero = const i32 0
+expand %a [%one] [%five..%seven, ..] from [%six, ..]
 roll %a [.., %two..%six] by [%one, %neg]
 grid %gx,%gy
 ";
@@ -1531,19 +1532,19 @@ fn a_collective_that_moves_nothing_is_refused() {
     // `..` on every axis is the receiver's own page: the pick is not narrower
     // than the span, so no axis fans out.
     assert_eq!(
-        refused(&program("expand %a [5..7, ..] from [.., ..]")),
+        refused(&program("expand %a [1] [5..7, ..] from [.., ..]")),
         S::TT_ERROR_EXPAND_PICK,
         "a pick that is `..` everywhere is not a leader set"
     );
     // A range in the pick has no meaning: a pick axis is one cell or `..`.
     assert_eq!(
-        refused(&program("expand %a [5..7, ..] from [5..7, ..]")),
+        refused(&program("expand %a [1] [5..7, ..] from [5..7, ..]")),
         S::TT_ERROR_EXPAND_PICK,
         "a pick is a cell or the receiver's own, never a run"
     );
     // A pinned axis names one cell, so both sides must name the same one.
     assert_eq!(
-        refused(&program("expand %a [5..7, 6] from [6, 8]")),
+        refused(&program("expand %a [1] [5..7, 6] from [6, 8]")),
         S::TT_ERROR_EXPAND_PICK,
         "the pick must lie in the span"
     );
@@ -1555,7 +1556,7 @@ fn a_collective_that_moves_nothing_is_refused() {
     );
     // Both collectives move a buffer: a parameter has no cores to fan out from.
     assert_eq!(
-        refused(&program("expand %p [.., ..] from [0, 0]")),
+        refused(&program("expand %p [1] [.., ..] from [0, 0]")),
         S::TT_ERROR_NOT_A_BUFFER,
         "a parameter is not an L1 buffer"
     );
@@ -1566,3 +1567,29 @@ fn a_collective_that_moves_nothing_is_refused() {
     );
 }
 
+/// A copy's span says which cores issue the request, and it round-trips: the
+/// whole-grid form is implicit, every narrower one is printed.
+#[test]
+fn a_copy_span_round_trips() {
+    const PROGRAM: &str = "\
+version 9
+%in = param f32 1024
+%b0 = buffer f32 32,32
+%x = grid.x
+%y = grid.y
+copy 32,32 %b0 [0] = %in [%x] in [0, ..]
+copy 32,32 %b0 [0] = %in [%x] in [1..3, %y]
+copy 32,32 %b0 [0] = %in [%x]
+grid 4,2
+";
+    let k = Kernel::parse(PROGRAM).expect("a spanned copy parses");
+    let text = k.to_string();
+    assert!(
+        text.contains("in [0, ..]") && text.contains("in [1..3, %"),
+        "a narrowed span round-trips: {text}"
+    );
+    // The whole-grid span is every core, so it is left implicit: exactly two
+    // of the three copies print an `in` clause.
+    assert_eq!(text.matches(" in [").count(), 2, "{text}");
+    k.verify().expect("a spanned copy verifies");
+}

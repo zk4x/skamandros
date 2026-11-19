@@ -43,7 +43,7 @@ pub const PACK_ADDR_MOD_NEXT_GROUP: u32 = 1;
 /// A role is RISC-V code with the Tensix words inline, so a program that has to
 /// read a ring pointer or run a CB sync mixes the two in one stream.
 #[derive(Debug, Clone, Copy)]
-enum Elem {
+pub(crate) enum Elem {
     Tensix(Instruction),
     Riscv(u32),
 }
@@ -51,10 +51,23 @@ enum Elem {
 /// A role's program under construction.
 #[derive(Debug, Clone, Default)]
 pub struct Stream {
-    elems: Vec<Elem>,
+    pub(crate) elems: Vec<Elem>,
+    /// The callee-saved pair this program took as its third loop counters, when
+    /// it nests three loops. The executor calls a program as a function and
+    /// keeps its own frame in `s0`/`s1`, so a program that uses them saves and
+    /// restores them around its body, exactly as a compiled callee would.
+    saved: Option<(u8, u8)>,
 }
 
 impl Stream {
+    /// Take the callee-saved pair from the third loop level on, so [`words`]
+    /// brackets the program with the save and the restore.
+    fn save_if_callee(&mut self, pair: (u8, u8), depth: usize) {
+        if depth >= 2 {
+            self.saved = Some(pair);
+        }
+    }
+
     fn push(&mut self, instruction: Instruction) {
         self.elems.push(Elem::Tensix(instruction));
     }
@@ -104,24 +117,41 @@ impl Stream {
         self.rv(rv::addi(rd, rd, lo));
     }
 
+    /// The program as the core executes it: the ABI bracket a third loop level
+    /// needs, the ops, the closing restore and `ret`. One list, so the debug
+    /// listing and the encoded words can never show different programs.
+    pub(crate) fn rendered(&self) -> Vec<Elem> {
+        let mut out = Vec::with_capacity(self.elems.len() + 8);
+        // The save goes in front and the restore at the end, where every
+        // forward skip already lands: branches were patched with relative
+        // distances, so shifting the whole body stays correct.
+        if let Some((first, second)) = self.saved {
+            out.extend(crate::riscv::callee_save(first, second).map(Elem::Riscv));
+        }
+        out.extend_from_slice(&self.elems);
+        if let Some((first, second)) = self.saved {
+            out.extend(crate::riscv::callee_restore(first, second).map(Elem::Riscv));
+        }
+        out.push(Elem::Riscv(crate::riscv::ret()));
+        out
+    }
+
     /// The encoded words, ending in `ret`. An empty program stays empty: it is
     /// not started, and a lone `ret` would make it look non-empty.
     fn words(&self) -> Result<Vec<u32>, ttStatus> {
         if self.elems.is_empty() {
             return Ok(Vec::new());
         }
-        let mut out = Vec::with_capacity(self.elems.len() + 1);
-        for elem in &self.elems {
-            out.push(match *elem {
+        self.rendered()
+            .into_iter()
+            .map(|elem| match elem {
                 Elem::Tensix(i) => i.ttinsn_word().ok_or_else(|| {
                     let _ = i;
                     ttStatus::TT_ERROR_INSTRUCTION_NOT_INLINE
-                })?,
-                Elem::Riscv(w) => w,
-            });
-        }
-        out.push(crate::riscv::ret());
-        Ok(out)
+                }),
+                Elem::Riscv(w) => Ok(w),
+            })
+            .collect()
     }
 }
 
@@ -135,11 +165,11 @@ struct OpenLoop {
     skip: usize,
 }
 
-/// A loop's `(index, limit)` pair per nesting level: the compute roles count in
-/// `t4` against `t5`, then `a7` against `a1`; the movers in `a1`/`a2` then
-/// `a3`/`a4` (their `t5` is the NIU base).
-const COMPUTE_PAIRS: [(u8, u8); 2] = [(reg::T4, reg::T5), (reg::A7, reg::A1)];
-const MOVER_PAIRS: [(u8, u8); 2] = [(reg::A1, reg::A2), (reg::A3, reg::A4)];
+/// A loop's `(index, limit)` pair per nesting level, shared with the lowering so
+/// the two can never disagree: the compute roles count in `t4`/`t5`, then
+/// `a7`/`a1`, then `s0`/`s1`; the movers in `a1`/`a2`, `a3`/`a4`, `s0`/`s1`
+/// (their `t5` is the NIU base).
+use crate::lower::{COMPUTE_PAIRS, MOVER_PAIRS};
 
 /// Open a loop: `reg = count; if reg == 0 goto end; top:`.
 ///
@@ -159,7 +189,9 @@ fn open_loop_with(
     count: u32,
     pairs: &[(u8, u8)],
 ) -> Result<(), ttStatus> {
-    let (index, limit) = *pairs.get(loops.len()).ok_or(ttStatus::TT_TODO_LOOP_DEPTH)?;
+    let depth = loops.len();
+    let (index, limit) = *pairs.get(depth).ok_or(ttStatus::TT_TODO_LOOP_DEPTH)?;
+    out.save_if_callee((index, limit), depth);
     out.li(index, 0);
     out.li(limit, count);
     let skip = out.len();
@@ -205,7 +237,9 @@ fn open_loop_reg(
     reg: u8,
     pairs: &[(u8, u8)],
 ) -> Result<(), ttStatus> {
-    let (index, limit) = *pairs.get(loops.len()).ok_or(ttStatus::TT_TODO_LOOP_DEPTH)?;
+    let depth = loops.len();
+    let (index, limit) = *pairs.get(depth).ok_or(ttStatus::TT_TODO_LOOP_DEPTH)?;
+    out.save_if_callee((index, limit), depth);
     if reg != limit {
         out.rv(rv::addi(limit, reg, 0));
     }
@@ -305,6 +339,19 @@ pub struct Words {
 }
 
 impl Words {
+    /// The five encoded programs, in [`crate::mir::Core`] order, for a debug
+    /// listing: each keeps the tag that says whether a word is a Tensix
+    /// instruction or RISC-V, which the raw words lose.
+    pub(crate) fn programs(&self) -> [(&'static str, &Stream); 5] {
+        [
+            ("reader", &self.reader),
+            ("unpack", &self.t0),
+            ("math", &self.t1),
+            ("pack", &self.t2),
+            ("writer", &self.writer),
+        ]
+    }
+
     /// The five encoded programs, in [`crate::mir::Core`] order.
     pub fn words(&self) -> Result<[Vec<u32>; 5], ttStatus> {
         Ok([
@@ -387,9 +434,9 @@ fn encode_mover(
                 out.rv(rv::jal(reg::ZERO, 0));
             }
             MirOp::EndIf => {
-                let at = ifs.pop().ok_or_else(|| {
-                    crate::status::internal_bug("encode: an endif has no if")
-                })?;
+                let at = ifs
+                    .pop()
+                    .ok_or_else(|| crate::status::internal_bug("encode: an endif has no if"))?;
                 let forward = ((out.len() as i32) - (at as i32)) * 4;
                 out.patch(at, rv::jal(reg::ZERO, forward));
             }
@@ -576,6 +623,13 @@ struct UnpackState {
     x1: [u32; 2],
     /// Per unpacker: the `Config` bank in effect.
     cfg: [Option<UnpackCfg>; 2],
+    /// Per unpacker: the page the base-address word holds, as `(ring, offset,
+    /// extra)`. `UNPACR` reads the word; it does not move it, so a second read
+    /// of the same page needs no new write -- tt-metal's `llk_unpack_AB_matmul`
+    /// configures both operand addresses once and then issues its `TTI_UNPACR`s
+    /// (`llk_unpack_AB_matmul.h:374-379`). A hand-off moves a pointer, so every
+    /// `cb_wait`/`cb_pop` forgets it.
+    base: [Option<(Cb, u32, Option<u8>)>; 2],
     /// The `SRCA_SET_SetOvrdWithAddr` word as last written. It is its own
     /// runtime state, not part of an unpacker's config bank: a `Dst` unpack
     /// clears it, so a `Src` unpack that reuses a cached config still has to
@@ -623,9 +677,22 @@ fn encode_unpack(
                 // the same runtime state, so it is forgotten with the bank.
                 state.cfg = [None, None];
                 state.override_set = None;
+                state.base = [None, None];
                 open_loop(out, &mut loops, count)?;
             }
-            MirOp::EndLoop => close_loop(out, &mut loops)?,
+            MirOp::EndLoop => {
+                // The loop may run zero times, so nothing its body configured
+                // is in effect after it: the bank, the `Src` override and the
+                // base address are all forgotten. A zero-trip loop whose body
+                // configured `SrcB` and a peeled tail that reads `SrcB` right
+                // after it is how this went wrong -- the tail's `UnpackConfig`
+                // was elided and ttsim refused the `UNPACR` with
+                // `is_uncompressed=0`.
+                state.cfg = [None, None];
+                state.override_set = None;
+                state.base = [None, None];
+                close_loop(out, &mut loops)?;
+            }
             MirOp::Setdst { reg } => state.dst_row = u32::from(reg) * Dst::ROWS,
             MirOp::Setadcx { unit, first, count } => {
                 if count == 0 {
@@ -738,11 +805,38 @@ fn encode_unpack(
                 state.cfg[u] = Some(cfg);
                 continue;
             }
-            MirOp::SetUnpackBase { cb, unit } => {
+            MirOp::SetUnpackBase {
+                cb,
+                unit,
+                offset,
+                extra,
+            } => {
                 // The page is at the ring's read pointer, not a compile-time L1
                 // address: write that pointer into the unpacker's base register
-                // after draining the previous unpack.
-                cb_base_unpack(out, cb, unit)?;
+                // after draining the previous unpack. `offset` is the page's
+                // byte offset past the pointer, tt-metal's
+                // `get_tile_l1_byte_address` (`cb_api.h:143-151`).
+                //
+                // The drain is unconditional; the write is not. `UNPACR` reads
+                // the base word without moving it (the face walk is the address
+                // counters'), so several unpacks of one page share it -- tt-metal
+                // configures the addresses once per `llk_unpack_AB_matmul` and
+                // issues its `TTI_UNPACR`s after (`llk_unpack_AB_matmul.h`).
+                cb_base_wait(out, unit)?;
+                let slot = usize::from(unit);
+                if state.base[slot] == Some((cb, offset, extra)) {
+                    continue;
+                }
+                let config = match unit {
+                    0 => thcon::THCON_SEC0_REG3_Base_address.addr32(),
+                    1 => thcon::THCON_SEC1_REG3_Base_address.addr32(),
+                    _ => {
+                        let _ = unit;
+                        return Err(ttStatus::TT_ERROR_UNPACR);
+                    }
+                };
+                cb_base(out, cb, rv::cb::RD_PTR, config, offset, extra)?;
+                state.base[slot] = Some((cb, offset, extra));
             }
             MirOp::Unpacr { unit, count, flip } => {
                 if count == 0 {
@@ -758,11 +852,15 @@ fn encode_unpack(
                 out.push(unpack_instruction(unit, flip)?);
             }
             MirOp::CbWait { cb, n } => {
+                // A hand-off can move a ring's pointer; the base words no longer
+                // name the pages they were computed from.
+                state.base = [None, None];
                 out.asm(|a| {
                     rv::cb::wait_front(a, reg::A6, u32::from(cb), n, [reg::T0, reg::T1, reg::T2])
                 })?;
             }
             MirOp::CbPop { cb, n } => {
+                state.base = [None, None];
                 // The page is only free once both unpackers have read it.
                 out.push(
                     wait_for_unpacker0(Before::EVERYTHING)
@@ -835,10 +933,13 @@ const SETDMAREG: u32 = 0x4500_0000;
 /// (`PushTensixInstruction.md`); a `.ttinsn` is the same store.
 const INSTRN_BUF: u32 = Blackhole::INSTRN_BUF_BASE as u32;
 
-/// The unpacker's read base: the ring's read pointer in 16-byte units, minus the
-/// header unit the unpacker adds (`UNPACR_Regular.md`: `InAddr = (Base_address +
-/// 1 + DigestSize) * 16`).
-fn cb_base_unpack(out: &mut Stream, cb: Cb, unit: u8) -> Result<(), ttStatus> {
+/// Drain an unpacker before its next base write or read: every earlier
+/// `UNPACR` of this thread must have left the pipeline.
+fn cb_base_wait(out: &mut Stream, unit: u8) -> Result<(), ttStatus> {
+    if unit > 1 {
+        let _ = unit;
+        return Err(ttStatus::TT_ERROR_UNPACR);
+    }
     out.push(wait_for_unpacker0(Before::EVERYTHING).map_err(|_| ttStatus::TT_ERROR_STALLWAIT)?);
     if unit == 1 {
         out.push(
@@ -846,25 +947,25 @@ fn cb_base_unpack(out: &mut Stream, cb: Cb, unit: u8) -> Result<(), ttStatus> {
                 .map_err(|_| ttStatus::TT_ERROR_STALLWAIT)?,
         );
     }
-    let config = match unit {
-        0 => thcon::THCON_SEC0_REG3_Base_address.addr32(),
-        1 => thcon::THCON_SEC1_REG3_Base_address.addr32(),
-        _ => {
-            let _ = unit;
-            return Err(ttStatus::TT_ERROR_UNPACR);
-        }
-    };
-    cb_base(out, cb, rv::cb::RD_PTR, config)
+    Ok(())
 }
 
-/// The packer's output base: the ring's write pointer, same 16-byte conversion.
-fn cb_base_pack(out: &mut Stream, cb: Cb) -> Result<(), ttStatus> {
+/// The packer's output base: the ring's write pointer plus the page's byte
+/// offset, same 16-byte conversion as the unpacker's read side.
+fn cb_base_pack(
+    out: &mut Stream,
+    cb: Cb,
+    offset: u32,
+    extra: Option<u8>,
+) -> Result<(), ttStatus> {
     out.push(wait_for_packer(Before::EVERYTHING).map_err(|_| ttStatus::TT_ERROR_STALLWAIT)?);
     cb_base(
         out,
         cb,
         rv::cb::WR_PTR,
         thcon::THCON_SEC0_REG1_L1_Dest_addr.addr32(),
+        offset,
+        extra,
     )
 }
 
@@ -872,18 +973,35 @@ fn cb_base_pack(out: &mut Stream, cb: Cb) -> Result<(), ttStatus> {
 /// RISC-V `sw` into `Config`.
 ///
 /// A plain `sw` to `Config` is processed by the LSU, not the Tensix instruction
-/// FIFO, so it overtakes the `UNPACR`/`PACR` already reading the same word; the
-/// role's per-iteration page then lags by one (`firmware/src/ttinsn.rs`,
-/// `STEP_STORE`). The write has to be a pushed Tensix instruction:
-/// `SETDMAREG` stages the dynamic value, then `WRCFG` copies it, in FIFO order
-/// with the backend. This is tt-metal's `program_packer_destination`
-/// (`SETDMAREG` × 2, `STALLWAIT(STALL_CFG, THCON)`, `WRCFG`, `DMANOP`) and
-/// `_llk_unpack_configure_addresses_`' ordering requirement.
+/// FIFO, so it overtakes the `UNPACR`/`PACR` already reading the same word.
+/// tt-metal's own unpacker writes the base that way
+/// (`_llk_unpack_configure_addresses_`) and holds the unpacker with
+/// `TTI_STALLWAIT(STALL_UNPACK, TRISC_CFG)` (C10, "the RISC-V core's `Config`
+/// write has not been processed"); on this card that store still overtakes the
+/// `UNPACR` and the page lags by one, so the write is a pushed instruction
+/// instead: `SETDMAREG` stages the dynamic value, then `WRCFG` copies it, in
+/// FIFO order with the backend. This is tt-metal's `program_packer_destination`
+/// (`SETDMAREG` x 2, `STALLWAIT(STALL_CFG, THCON)`, `WRCFG`, `DMANOP`).
 ///
 /// The caller's `wait_for_unpacker0`/`wait_for_packer` now reaches the write:
 /// because the write is a pushed instruction, `STALLWAIT`'s CONFIG block holds
 /// it until the previous unit has drained.
-fn cb_base(out: &mut Stream, cb: Cb, field: i32, config: u16) -> Result<(), ttStatus> {
+fn cb_base(
+    out: &mut Stream,
+    cb: Cb,
+    field: i32,
+    config: u16,
+    offset: u32,
+    extra: Option<u8>,
+) -> Result<(), ttStatus> {
+    // The config word is in 16-byte units, and so is the page offset the caller
+    // named: tt-metal's `get_tile_l1_byte_address` adds `fifo_page_size *
+    // tile_index` to `fifo_rd_ptr` before the whole address is shifted into the
+    // interface's units.
+    if offset % 16 != 0 {
+        return Err(ttStatus::TT_ERROR_BUFFER_OFFSET_OVERFLOW);
+    }
+    let offset = (offset / 16) as i32;
     out.asm(|a| {
         a.word(rv::lw(
             reg::T0,
@@ -892,6 +1010,25 @@ fn cb_base(out: &mut Stream, cb: Cb, field: i32, config: u16) -> Result<(), ttSt
         ));
         a.word(rv::srli(reg::T0, reg::T0, 4));
         a.word(rv::addi(reg::T0, reg::T0, -1));
+        if offset != 0 {
+            // `ADDI`'s immediate is twelve *signed* bits, so a page further than
+            // 32 KiB into its ring does not fit: `(32 KiB / 16)` is 2048, one
+            // past the largest positive immediate, and the encoder's mask would
+            // wrap it to -2048. A 24-page f32 ring names page 8 at exactly
+            // 2048, which put the unpacker a whole 64 KiB below the page it
+            // meant (into the operand ring's data).
+            if (-2048..=2047).contains(&offset) {
+                a.word(rv::addi(reg::T0, reg::T0, offset));
+            } else {
+                a.li(reg::T2, offset as u32);
+                a.word(rv::add(reg::T0, reg::T0, reg::T2));
+            }
+        }
+        // A run-time page index (tt-metal's `matmul_tiles` argument) has already
+        // been scaled to the word's 16-byte units by the lowering.
+        if let Some(index) = extra {
+            a.word(rv::add(reg::T0, reg::T0, index));
+        }
         // `SETDMAREG` with a run-time immediate: the word is built here and
         // pushed through the instruction FIFO, exactly as tt-metal's
         // `TT_SETDMAREG` macro does (`instrn_buffer[0] = ...`).
@@ -1953,10 +2090,10 @@ fn encode_pack(ops: &[MirOp], out: &mut Stream, dst_is_16_bit: bool) -> Result<(
                     )
                 })?;
             }
-            MirOp::SetPackBase { cb } => {
+            MirOp::SetPackBase { cb, offset, extra } => {
                 // The destination is the ring's write pointer, converted to
                 // 16-byte units minus the header unit the packer adds.
-                cb_base_pack(out, cb)?;
+                cb_base_pack(out, cb, offset, extra)?;
             }
             MirOp::SetPackConfig { dtype, mask } => {
                 // A bf16 page out of a 32-bit `Dst` is the packer's own early
@@ -2226,7 +2363,14 @@ mod tests {
         for pack in 0..count {
             let at = u32::from(pack) * 2;
             m.push(Core::Pack, MirOp::CbReserve { cb: Cb(0), n: 1 });
-            m.push(Core::Pack, MirOp::SetPackBase { cb: Cb(0) });
+            m.push(
+                Core::Pack,
+                MirOp::SetPackBase {
+                    cb: Cb(0),
+                    offset: 0,
+                    extra: None,
+                },
+            );
             m.push(
                 Core::Pack,
                 MirOp::SetPackConfig {

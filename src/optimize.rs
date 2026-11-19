@@ -35,8 +35,32 @@ struct Access {
 }
 
 /// An ordered `(producer, consumer)` role edge: one Sync Unit semaphore carries
-/// every seam between those two roles.
-type Edge = (Core, Core);
+/// every seam between those two roles of one kind.
+///
+/// `kind` separates the two kinds of reuse seam a role pair can have. A *loop
+/// wrap* seam's take is the first write of a loop body and its post the last
+/// read, so its semaphore starts with one credit per hand-off the bodies
+/// perform: the first iteration overwrites nothing. That credit is fungible
+/// with any token on the same counter, and a straight-line seam's take would
+/// spend it: the peeled last block's second subblock then skipped waiting for
+/// its own first subblock's pack, and the packer read an accumulator the
+/// unpacker had already reseeded. Those credits must therefore never share a
+/// counter with a seam that has none, so the wrap seams of a role pair get
+/// their own semaphore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Edge {
+    producer: Core,
+    consumer: Core,
+    kind: EdgeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum EdgeKind {
+    /// A data or straight-line reuse seam, which starts at zero.
+    Seam,
+    /// A loop-wrap seam, whose semaphore starts with the hand-off credit.
+    Wrap,
+}
 
 /// The role hand-offs over the `Dst` slots.
 ///
@@ -126,8 +150,16 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
             MirOp::Sfpstore { reg, .. } => touched.push((reg, true)),
             MirOp::Sfpload { reg, .. } => touched.push((reg, false)),
             // The Matrix Unit's accumulator: `MVMUL` carries the register it
-            // accumulates into.
-            MirOp::Mvmul { reg, .. } => touched.push((reg, true)),
+            // accumulates into. It reads the rows it writes -- that is what
+            // `accumulate` means, and it is how a page the unpacker seeded into
+            // `Dst` (tt-metal's `copy_tile` reload of the partial sum,
+            // `bmm_large_block_zm.cpp:56-68`) reaches the unit: the read comes
+            // before the write, so the hand-off is the seed's write edge, not
+            // the unit's own.
+            MirOp::Mvmul { reg, .. } => {
+                touched.push((reg, false));
+                touched.push((reg, true));
+            }
             MirOp::Elw { reg, .. }
             | MirOp::Gapool { reg, .. }
             | MirOp::Gmpool { reg, .. }
@@ -267,7 +299,11 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
         for (n, ((writer, write_at), readers)) in epochs.iter().enumerate() {
             for &(reader, first, _) in readers {
                 data.push((
-                    (*writer, reader),
+                    Edge {
+                        producer: *writer,
+                        consumer: reader,
+                        kind: EdgeKind::Seam,
+                    },
                     hoist_end(*write_at, first),
                     hoist_begin(*write_at, first),
                     *write_at,
@@ -280,7 +316,15 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
             if let Some(((next_writer, next_write), _)) = epochs.get(n + 1) {
                 for &(reader, _, last) in readers {
                     if reader != *next_writer && scope(last) == scope(*next_write) {
-                        seams.push(((reader, *next_writer), last + 1, *next_write));
+                        seams.push((
+                            Edge {
+                                producer: reader,
+                                consumer: *next_writer,
+                                kind: EdgeKind::Seam,
+                            },
+                            last + 1,
+                            *next_write,
+                        ));
                     }
                 }
             }
@@ -299,13 +343,15 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
             if w.role == r.role {
                 continue;
             }
-            seams.push(((r.role, w.role), r.at + 1, w.at));
-            match reuse
-                .iter_mut()
-                .find(|(edge, body, _)| *edge == (r.role, w.role) && *body == *start)
-            {
+            let edge = Edge {
+                producer: r.role,
+                consumer: w.role,
+                kind: EdgeKind::Wrap,
+            };
+            seams.push((edge, r.at + 1, w.at));
+            match reuse.iter_mut().find(|(e, _, _)| *e == edge) {
                 Some(count) => count.2 += 1,
-                None => reuse.push(((r.role, w.role), *start, 1)),
+                None => reuse.push((edge, *start, 1)),
             }
         }
     }
@@ -330,6 +376,17 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
             edges.len(),
             tt_isa::arch::blackhole::sync::Semaphore::COUNT
         )));
+    }
+    if std::env::var("SKAM_EDGES").is_ok() {
+        for (i, e) in edges.iter().enumerate() {
+            eprintln!("SKAM_EDGES sem{i} = {e:?}");
+        }
+        for (edge, post, take) in &seams {
+            eprintln!("SKAM_EDGES seam {edge:?} post@{post} take@{take}");
+        }
+        for (edge, post, take, epoch) in &data {
+            eprintln!("SKAM_EDGES data {edge:?} post@{post} take@{take} epoch@{epoch}");
+        }
     }
     let sem = |edge: Edge| -> Result<u8, ttStatus> {
         match edges.iter().position(|e| *e == edge) {
@@ -395,7 +452,7 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
             inserts.push((
                 take_at(*take),
                 (
-                    edge.1,
+                    edge.consumer,
                     MirOp::SemWait {
                         sem: sem(*edge)?,
                         before: 0,
@@ -460,7 +517,7 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
             inserts.push((
                 take_at(take),
                 (
-                    edge.1,
+                    edge.consumer,
                     MirOp::SemWait {
                         sem: sem(edge)?,
                         before: 0,
@@ -475,14 +532,14 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
         // front of what is already there: the post goes in first, so the guard
         // ends up before it.
         let at = post_at(at);
-        inserts.push((at, (edge.0, MirOp::SemPost { sem: sem(edge)? })));
-        inserts.push((at, (edge.0, MirOp::SemWaitFree { sem: sem(edge)? })));
+        inserts.push((at, (edge.producer, MirOp::SemPost { sem: sem(edge)? })));
+        inserts.push((at, (edge.producer, MirOp::SemWaitFree { sem: sem(edge)? })));
     }
     // Each data post is one token, guarded like every other post.
     for (edge, post, _, _) in &data {
         let post = post_at(*post);
-        inserts.push((post, (edge.0, MirOp::SemPost { sem: sem(*edge)? })));
-        inserts.push((post, (edge.0, MirOp::SemWaitFree { sem: sem(*edge)? })));
+        inserts.push((post, (edge.producer, MirOp::SemPost { sem: sem(*edge)? })));
+        inserts.push((post, (edge.producer, MirOp::SemWaitFree { sem: sem(*edge)? })));
     }
     // Apply from the back, so the earlier positions stay valid.
     inserts.sort_by(|a, b| b.0.cmp(&a.0));
@@ -493,13 +550,18 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
     // the run's semaphore inits, before any role is released.
     let mut inits: Vec<(Core, MirOp)> = Vec::new();
     for (index, edge) in edges.iter().enumerate() {
-        let value = reuse
+        // One token per hand-off the *whole* program performs before it posts:
+        // every nested body that paces on this edge contributes its own, and a
+        // single iteration takes all of them before the first post. Taking the
+        // largest body alone under-counts a nested program and deadlocks on its
+        // first iteration (a two-deep body takes two tokens and a one-token
+        // semaphore has one).
+        let value: u32 = reuse
             .iter()
             .filter(|(e, _, _)| e == edge)
-            .map(|(_, _, count)| *count)
-            .max()
-            .unwrap_or(0);
-        if value > tt_isa::arch::blackhole::sync::MAX_VALUE {
+            .map(|(_, _, count)| u32::from(*count))
+            .sum();
+        if value > u32::from(tt_isa::arch::blackhole::sync::MAX_VALUE) {
             return Err(crate::status::internal_bug(format_args!(
                 "reg_sync: edge {edge:?} performs {value} loop hand-offs per iteration, more than the {} a semaphore can start with",
                 tt_isa::arch::blackhole::sync::MAX_VALUE
@@ -509,7 +571,7 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
             Core::Unpack,
             MirOp::Semset {
                 sem: index as u8,
-                value,
+                value: value as u8,
             },
         ));
     }
@@ -755,7 +817,7 @@ pub fn verify(m: &MachineKernel) -> Result<(), ttStatus> {
                     }
                 }
                 MirOp::SetUnpackBase { cb, .. }
-                | MirOp::SetPackBase { cb }
+                | MirOp::SetPackBase { cb, .. }
                 | MirOp::CbWait { cb, .. }
                 | MirOp::CbPop { cb, .. }
                 | MirOp::CbReserve { cb, .. }
@@ -910,7 +972,7 @@ pub fn verify(m: &MachineKernel) -> Result<(), ttStatus> {
                 MirOp::Loop { count } => {
                     let _ = count;
                     depth += 1;
-                    if depth > 2 {
+                    if depth > 3 {
                         let _ = (name, at, depth);
                         return Err(ttStatus::TT_TODO_LOOP_DEPTH);
                     }
@@ -918,7 +980,7 @@ pub fn verify(m: &MachineKernel) -> Result<(), ttStatus> {
                 MirOp::LoopReg { reg } => {
                     let _ = reg;
                     depth += 1;
-                    if depth > 2 {
+                    if depth > 3 {
                         let _ = (name, at, depth);
                         return Err(ttStatus::TT_TODO_LOOP_DEPTH);
                     }

@@ -54,15 +54,22 @@ pub fn compile(k: &Kernel) -> Result<Module, ttStatus> {
 /// `render` is read-only: everything that had to be decided (the rings' places,
 /// the registers, the grid and the parameters) was decided before it.
 pub fn render(m: &MachineKernel) -> Result<Module, ttStatus> {
-    if std::env::var_os("SKAM_IR").is_some() {
-        eprintln!("--- machine kernel ---\n{m}");
-    }
-    let words = encode::encode(m, false)?.words()?;
+    crate::debug::machine(m);
+    let sim = encode::encode(m, false)?;
     // The card's variant: the unpacker's tile-descriptor tail written. Only
     // the unpack program (T0) can differ; the other two are encoded anyway and
     // discarded so the two sets are produced by one function.
-    let silicon = encode::encode(m, true)?.words()?;
-    if std::env::var_os("SKAM_IR").is_some() {
+    let card = encode::encode(m, true)?;
+    let words = sim.words()?;
+    crate::debug::programs(&sim);
+    // The raw words, for comparing this core's encoding with another's; the
+    // listing above is what to read.
+    let card_words = card.words()?;
+    if std::env::var_os("SKAM_WORDS").is_some() {
+        let silicon = &card_words;
+        for (i, w) in words.iter().enumerate() {
+            eprintln!("role {i}: {} words", w.len());
+        }
         for core in 0..3 {
             eprintln!("core {core} sim:  {:08x?}", words[core + 1]);
             eprintln!("core {core} card: {:08x?}", silicon[core + 1]);
@@ -99,7 +106,11 @@ pub fn render(m: &MachineKernel) -> Result<Module, ttStatus> {
         reader: words[0].clone(),
         writer: words[4].clone(),
         cores: [words[1].clone(), words[2].clone(), words[3].clone()],
-        silicon_cores: [silicon[1].clone(), silicon[2].clone(), silicon[3].clone()],
+        silicon_cores: [
+            card_words[1].clone(),
+            card_words[2].clone(),
+            card_words[3].clone(),
+        ],
         setup,
         iface,
         cbs,

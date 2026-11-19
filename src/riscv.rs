@@ -10,8 +10,14 @@
 use tt_isa::arch::blackhole::Blackhole;
 use tt_isa::arch::{Arch, Specials};
 
-/// Register numbers of the caller-saved set the programs use. A program is a
-/// leaf: no `sp`, `gp`, `tp`, `ra`, `s0..s11`.
+/// Register numbers the programs use.
+///
+/// The executor calls a program as a function and promises it only the
+/// caller-saved registers (`firmware/src/bin/exec_b.rs`), so `gp`, `tp`, `ra`
+/// and `s2`..`s11` are off limits. `s0`/`s1` are the third loop counter pair
+/// (the caller-saved set is spent on the launch arguments, the CB table, the
+/// two inner counters and the expression pool), and a program that takes them
+/// saves and restores them on the executor's stack, as [`callee_save`] does.
 pub mod reg {
     pub const ZERO: u8 = 0;
     pub const A0: u8 = 10;
@@ -29,6 +35,10 @@ pub mod reg {
     pub const T4: u8 = 29;
     pub const T5: u8 = 30;
     pub const T6: u8 = 31;
+    pub const S0: u8 = 8;
+    pub const S1: u8 = 9;
+    /// The caller's stack pointer, used only to bracket a callee-saved pair.
+    pub const SP: u8 = 2;
 }
 
 fn r_type(funct7: u32, rs2: u8, rs1: u8, funct3: u32, rd: u8, opcode: u32) -> u32 {
@@ -208,6 +218,30 @@ pub fn min(rd: u8, rs1: u8, rs2: u8) -> u32 {
 /// `ret`: `jalr x0, 0(x1)`.
 pub fn ret() -> u32 {
     0x0000_8067
+}
+
+/// Save the callee-saved pair a role program takes as its third loop counters:
+/// `addi sp, sp, -8; sw first, 4(sp); sw second, 0(sp)`.
+///
+/// The executor calls a program as a function (`firmware/src/bin/exec_b.rs`:
+/// "It may use the caller-saved registers only"), so the pair it keeps its own
+/// frame in belongs to the caller. `sp` is valid because that call is an
+/// ordinary Rust call with a stack in the core's local data RAM.
+pub fn callee_save(first: u8, second: u8) -> [u32; 3] {
+    [
+        addi(reg::SP, reg::SP, -8),
+        sw(first, reg::SP, 4),
+        sw(second, reg::SP, 0),
+    ]
+}
+
+/// Undo [`callee_save`]: `lw second, 0(sp); lw first, 4(sp); addi sp, sp, 8`.
+pub fn callee_restore(first: u8, second: u8) -> [u32; 3] {
+    [
+        lw(second, reg::SP, 0),
+        lw(first, reg::SP, 4),
+        addi(reg::SP, reg::SP, 8),
+    ]
 }
 
 /// Block this core until the Tensix coprocessor has finished every instruction

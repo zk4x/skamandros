@@ -41,6 +41,10 @@ struct Consumer {
     stack: Vec<OpId>,
     /// A copy out of the ring (the writer) rather than a `load` (the unpack).
     writer: bool,
+    /// The page the read names inside the ring's block (`load ... = %ba [3]`:
+    /// page 3), when that is a constant. The pages one loop body's reads name
+    /// are the block the consumer waits for and releases together.
+    page: Option<u32>,
 }
 
 /// Insert the ring hand-offs into `k`, which must be a program `add_movers`
@@ -71,6 +75,12 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
     // How many writes each ring has: a hoisted page must be produced exactly
     // once.
     let mut writes: BTreeMap<OpId, usize> = BTreeMap::new();
+    // Every write to a ring: its ring, the loop stack it sits in, and the page
+    // it names (`copy 32,32 %ba [3]`: page 3), when that is a constant. The
+    // pages one loop body's writes name are the block the ring must hold.
+    // The `bool` says the write is a `copy` into the ring (the mover's NoC read)
+    // rather than a `store` (the packer's L1 write).
+    let mut write_info: BTreeMap<OpId, (OpId, Vec<OpId>, Option<u32>, bool)> = BTreeMap::new();
     // The loads whose page a later `Src` reader still needs, that reader, and
     // the loop stack the reader sits in (so a read that repeats is released
     // after its loop, not once per iteration).
@@ -111,34 +121,62 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
                 let opened = loops.pop().ok_or(ttStatus::TT_ERROR_ENDLOOP_WITHOUT_LOOP)?;
                 end_of.insert(opened, at);
             }
-            Op::Copy { dst, src, .. } => {
+            Op::Copy {
+                dst,
+                src,
+                dst_offset,
+                src_offset,
+                ..
+            } => {
                 if rings.contains(&src) {
                     consumers.push(Consumer {
                         ring: src,
                         at,
                         stack: loops.clone(),
                         writer: true,
+                        page: k.const_i32(src_offset).and_then(|n| u32::try_from(n).ok()),
                     });
                 } else if rings.contains(&dst) {
                     producer_depths.entry(dst).or_default().insert(loops.len());
                     *writes.entry(dst).or_default() += 1;
+                    let page = k.const_i32(dst_offset).and_then(|n| u32::try_from(n).ok());
+                    write_info.insert(at, (dst, loops.clone(), page, true));
                 }
             }
-            Op::Load { buffer, .. } if section == 1 && rings.contains(&buffer) => {
+            // An `expand` publishes a page of the ring it fans out: the page
+            // the leader's `copy` filled travels to every core in the span, so
+            // the fan-out is the write on the receiver as much as on the
+            // sender. Its page joins the block for the same reason a copy's
+            // does.
+            Op::Expand { src, pages, .. } if rings.contains(&src) => {
+                producer_depths.entry(src).or_default().insert(loops.len());
+                *writes.entry(src).or_default() += 1;
+                // The fan-out publishes the whole reservation, so the block it
+                // names is `pages` long: the last page is `pages - 1`.
+                let page = k
+                    .const_i32(pages)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .and_then(|n| n.checked_sub(1));
+                write_info.insert(at, (src, loops.clone(), page, true));
+            }
+            Op::Load { buffer, offset, .. } if section == 1 && rings.contains(&buffer) => {
                 consumers.push(Consumer {
                     ring: buffer,
                     at,
                     stack: loops.clone(),
                     writer: false,
+                    page: k.const_i32(offset).and_then(|n| u32::try_from(n).ok()),
                 });
                 pending.push((at, section));
             }
-            Op::Store { buffer, .. } if rings.contains(&buffer) => {
+            Op::Store { buffer, offset, .. } if rings.contains(&buffer) => {
                 producer_depths
                     .entry(buffer)
                     .or_default()
                     .insert(loops.len());
                 *writes.entry(buffer).or_default() += 1;
+                let page = k.const_i32(offset).and_then(|n| u32::try_from(n).ok());
+                write_info.insert(at, (buffer, loops.clone(), page, false));
             }
             _ => {}
         }
@@ -146,13 +184,23 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
     }
 
     // A load whose page is still needed by a `Src` reader cannot have another
-    // read of the same ring in between: that read would take the same page.
+    // read of *the same page* in between: that read would take the page the
+    // first one is still using. A read of a different page is the whole point
+    // of a block -- tt-metal's compute waits for the block and walks its tiles
+    // (`matmul_tiles(in0_cb, in1_cb, in0_index, in1_index, ...)`,
+    // `bmm_large_block_zm.cpp`) -- so only a read that names the same page (or
+    // names none) is refused.
+    let page_of: BTreeMap<OpId, Option<u32>> = consumers
+        .iter()
+        .map(|consumer| (consumer.at, consumer.page))
+        .collect();
     for (load, (reader, _)) in &last_src {
         let ring = consumer_ring(&consumers, *load)?;
         let (Some(&from), Some(&to)) = (position.get(load), position.get(reader)) else {
             eprintln!("libskamandros: sync_cbs: a load or its `Src` reader has no position");
             return Err(ttStatus::TT_INTERNAL_BUG);
         };
+        let load_page = page_of.get(load).copied().flatten();
         for consumer in &consumers {
             if consumer.ring != ring {
                 continue;
@@ -162,7 +210,15 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
                 return Err(ttStatus::TT_INTERNAL_BUG);
             };
             if at > from && at < to {
-                return Err(ttStatus::TT_TODO_RING_READ_BEFORE_RELEASE);
+                let same_page = match (load_page, consumer.page) {
+                    (Some(a), Some(b)) => a == b,
+                    // A read that names no page takes the read pointer's, which
+                    // is the page the first read still holds.
+                    _ => true,
+                };
+                if same_page {
+                    return Err(ttStatus::TT_TODO_RING_READ_BEFORE_RELEASE);
+                }
             }
         }
     }
@@ -174,6 +230,99 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
     // publishes the page the copy before it reserved rather than a new one, so
     // it takes no `Reserve` and the copy it follows leaves the `Push` to it: the
     // page is only complete once the fan-out has landed.
+    // The block: the pages one hand-off of a ring moves. Both sides name it the
+    // same way -- `copy 32,32 %ba [3]` fills page 3, `load ... = %ba [3]` reads
+    // it -- and the pages between one `reserve`/`wait` and one `push`/`pop` are
+    // the block. tt-metal's reader reserves a block, issues every read of it,
+    // barriers once and pushes once (`reader_bmm_tile_layout.cpp:76-113`), and
+    // its compute waits the same block and walks the tiles by index
+    // (`bmm_large_block_zm.cpp:46-126`).
+    //
+    // The block is one number for the ring, not one per side: the write pointer
+    // and the read pointer only stay in step if both advance the same amount per
+    // hand-off. It is the highest page either side names; a program that states
+    // one (`buffer ... block n`) overrides that. A page index that is a loop
+    // value names no maximum, so such a ring *must* state its block -- otherwise
+    // the hand-off count would be a guess, and the page offset would be added on
+    // top of a pointer that already moved.
+    let mut stated: BTreeMap<OpId, u32> = BTreeMap::new();
+    for (id, op) in k.ops() {
+        if let Op::Cb {
+            block: Some(n), ..
+        } = *op
+        {
+            stated.insert(id, n);
+        }
+    }
+    // The highest page a side names, `None` when any of its pages is a loop
+    // value (no maximum).
+    let named_pages = |pages: &[(OpId, Option<u32>)]| -> BTreeMap<OpId, Option<u32>> {
+        let mut named: BTreeMap<OpId, Option<u32>> = BTreeMap::new();
+        for (ring, page) in pages {
+            let entry = named.entry(*ring).or_insert(Some(0));
+            match (page, *entry) {
+                (Some(p), Some(n)) => *entry = Some(n.max(p + 1)),
+                _ => *entry = None,
+            }
+        }
+        named
+    };
+    let write_pages = named_pages(
+        &write_info
+            .values()
+            .map(|(ring, _, page, _)| (*ring, *page))
+            .collect::<Vec<_>>(),
+    );
+    let read_pages = named_pages(
+        &consumers
+            .iter()
+            .map(|consumer| (consumer.ring, consumer.page))
+            .collect::<Vec<_>>(),
+    );
+    let mut block: BTreeMap<OpId, u32> = BTreeMap::new();
+    {
+        let rings: BTreeSet<OpId> = write_pages
+            .keys()
+            .chain(read_pages.keys())
+            .copied()
+            .collect();
+        for ring in rings {
+            let written = write_pages.get(&ring).copied().flatten();
+            let read = read_pages.get(&ring).copied().flatten();
+            let pages = match (stated.get(&ring).copied(), written, read) {
+                (Some(n), _, _) => n,
+                // Both sides name pages: the same block on both, or the two
+                // pointers would advance by different amounts.
+                (None, Some(a), Some(b)) if a != b => {
+                    let _ = (ring, a, b);
+                    return Err(ttStatus::TT_ERROR_CB_BLOCK);
+                }
+                (None, Some(a), Some(b)) => a.max(b),
+                // One side names no page (its index is a loop value): the other
+                // side's block is the ring's.
+                (None, Some(a), None) | (None, None, Some(a)) => a,
+                // Neither side names a page and the program states no block:
+                // the hand-off count would be a guess.
+                (None, None, None) => {
+                    let _ = ring;
+                    return Err(ttStatus::TT_ERROR_CB_BLOCK);
+                }
+            };
+            if pages > 1 {
+                block.insert(ring, pages);
+            }
+        }
+    }
+    // The first and last write of each block, so its `reserve` and `push` sit at
+    // the edges of the run rather than around every page.
+    let mut first_of: BTreeMap<(OpId, Vec<OpId>), OpId> = BTreeMap::new();
+    let mut last_of: BTreeMap<(OpId, Vec<OpId>), OpId> = BTreeMap::new();
+    for (at, (ring, stack, _, _)) in &write_info {
+        if block.contains_key(ring) {
+            first_of.entry((*ring, stack.clone())).or_insert(*at);
+            last_of.insert((*ring, stack.clone()), *at);
+        }
+    }
     let writes_in_order: Vec<(OpId, Op)> = k.ops().map(|(at, op)| (at, op.clone())).collect();
     for (i, (at, op)) in writes_in_order.iter().enumerate() {
         let Some(ring) = write_ring(op, &rings) else {
@@ -197,11 +346,70 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
                 }
             }
         }
-        if !expand_publishes {
-            edits.push((*at, Op::Reserve { cb: ring, n: 1 }, true));
+        // A block's pages are reserved once and published once; a ring without
+        // one keeps a hand-off per write.
+        let n = block.get(&ring).copied().unwrap_or(1);
+        // A ring with a block gets one hand-off at the run's edges; one without
+        // keeps a hand-off around every write, as it always had.
+        let (reserve, push) = match block.get(&ring) {
+            Some(_) => write_info.get(at).map_or((true, true), |(_, stack, _, _)| {
+                let key = (ring, stack.clone());
+                (
+                    first_of.get(&key) == Some(at),
+                    last_of.get(&key) == Some(at),
+                )
+            }),
+            None => (true, true),
+        };
+        // An `expand` reserves nothing: the pages it fans out are the ones the
+        // copies before it reserved. It publishes the *block* when it is the
+        // last write of the run, so a block of pages goes out one request at a
+        // time and is published once, as tt-metal's reader does
+        // (`dfb_in0.push_back(in0_block_num_tiles)` after every multicast).
+        if !expand_publishes && reserve {
+            edits.push((*at, Op::Reserve { cb: ring, n }, true));
         }
-        if !next_publishes_it {
-            edits.push((*at, Op::Push { cb: ring, n: 1 }, false));
+        if !next_publishes_it && push {
+            edits.push((*at, Op::Push { cb: ring, n }, false));
+        }
+    }
+    // The read side waits and releases the same block the producer hands off
+    // (`block`, derived above from both sides): every reader of the ring counts,
+    // the writer's copies out included, because a block the packer published as
+    // a whole is released as a whole.
+    // The first read of each block and the op after which its pages are free:
+    // the block's last `Src` reader (or the end of the loop it sits in, so a
+    // reader that repeats is released once).
+    let mut read_first: BTreeMap<(OpId, Vec<OpId>), OpId> = BTreeMap::new();
+    let mut read_last: BTreeMap<(OpId, Vec<OpId>), OpId> = BTreeMap::new();
+    let mut read_pop: BTreeMap<(OpId, Vec<OpId>), (usize, OpId)> = BTreeMap::new();
+    for consumer in consumers.iter() {
+        let Some(_) = block.get(&consumer.ring) else {
+            continue;
+        };
+        let key = (consumer.ring, consumer.stack.clone());
+        read_first.entry(key.clone()).or_insert(consumer.at);
+        read_last.insert(key.clone(), consumer.at);
+        let pop_at = match last_src.get(&consumer.at) {
+            Some((reader, stack)) => match stack.get(consumer.stack.len()) {
+                Some(outer) => {
+                    let Some(&end) = end_of.get(outer) else {
+                        eprintln!("libskamandros: sync_cbs: loop {outer} has no end");
+                        return Err(ttStatus::TT_INTERNAL_BUG);
+                    };
+                    end
+                }
+                None => *reader,
+            },
+            None => consumer.at,
+        };
+        let at = position
+            .get(&pop_at)
+            .copied()
+            .ok_or(ttStatus::TT_INTERNAL_BUG)?;
+        let entry = read_pop.entry(key).or_insert((at, pop_at));
+        if at > entry.0 {
+            *entry = (at, pop_at);
         }
     }
     // Consumer hand-offs. A page produced at the same depth is waited for and
@@ -228,40 +436,56 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
             if hoisted.contains_key(&consumer.ring) {
                 return Err(ttStatus::TT_TODO_RING_IN_AND_OUT_OF_LOOP);
             }
-            edits.push((
-                consumer.at,
-                Op::Wait {
-                    cb: consumer.ring,
-                    n: 1,
-                },
-                true,
-            ));
+            // A block is waited for at its first read and released after its
+            // last `Src` reader; a ring without one keeps a hand-off per read.
+            let key = (consumer.ring, consumer.stack.clone());
+            let pages = block.get(&consumer.ring).copied();
+            let n = pages.unwrap_or(1);
+            let first = pages.map_or(true, |_| read_first.get(&key) == Some(&consumer.at));
+            let last = pages.map_or(true, |_| read_last.get(&key) == Some(&consumer.at));
+            if first {
+                edits.push((
+                    consumer.at,
+                    Op::Wait {
+                        cb: consumer.ring,
+                        n,
+                    },
+                    true,
+                ));
+            }
             // A page produced at the same depth is released after its last
             // reader. When that reader sits inside a loop the load is outside
             // of, the read repeats, so the release belongs after the loop.
-            let pop_at = if consumer.writer || !last_src.contains_key(&consumer.at) {
-                consumer.at
-            } else {
-                let (reader, stack) = &last_src[&consumer.at];
-                match stack.get(depth) {
-                    Some(outer) => {
-                        let Some(&end) = end_of.get(outer) else {
-                            eprintln!("libskamandros: sync_cbs: loop {outer} has no end");
-                            return Err(ttStatus::TT_INTERNAL_BUG);
-                        };
-                        end
+            let pop_at = match pages {
+                Some(_) => read_pop[&key].1,
+                None => {
+                    if consumer.writer || !last_src.contains_key(&consumer.at) {
+                        consumer.at
+                    } else {
+                        let (reader, stack) = &last_src[&consumer.at];
+                        match stack.get(depth) {
+                            Some(outer) => {
+                                let Some(&end) = end_of.get(outer) else {
+                                    eprintln!("libskamandros: sync_cbs: loop {outer} has no end");
+                                    return Err(ttStatus::TT_INTERNAL_BUG);
+                                };
+                                end
+                            }
+                            None => *reader,
+                        }
                     }
-                    None => *reader,
                 }
             };
-            edits.push((
-                pop_at,
-                Op::Pop {
-                    cb: consumer.ring,
-                    n: 1,
-                },
-                false,
-            ));
+            if last {
+                edits.push((
+                    pop_at,
+                    Op::Pop {
+                        cb: consumer.ring,
+                        n,
+                    },
+                    false,
+                ));
+            }
         } else if depth > producer_depth {
             if writes.get(&consumer.ring) != Some(&1) {
                 return Err(ttStatus::TT_TODO_RING_MULTI_WRITE_OUTSIDE_LOOP);

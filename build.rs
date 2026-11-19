@@ -106,6 +106,13 @@ fn main() {
         // `rerun-if-changed` does not reliably notice an edit to a file nested inside
         // it, which showed up here as firmware changes that never rebuilt.
         track_sources(&firmware_dir);
+        // The firmware links the sibling `tt-isa`, and its source is not under
+        // `firmware/`: a constant raised there (the program-size bound, an L1
+        // region) must rebuild the images that use it.
+        let isa_src = manifest.join("../tt-isa/src");
+        if isa_src.is_dir() {
+            track_sources(&isa_src);
+        }
 
         // The firmware sources ship inside this crate but are not a package of
         // their own in the tree (`Cargo.toml.in`, not `Cargo.toml`): cargo refuses

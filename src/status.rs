@@ -508,6 +508,11 @@ pub enum ttStatus {
     /// reader filled, and `roll` moves one, so both belong where the movers'
     /// copies are; anywhere else there is no page for them to move.
     TT_ERROR_COLLECTIVE_PLACEMENT = 195,
+    /// A ring's stated block (`buffer ... block n`) is larger than the ring, or
+    /// a page index the program names does not fit the block it is handed off
+    /// in. The block is the pages one hand-off moves, so a page outside it has
+    /// no address.
+    TT_ERROR_CB_BLOCK = 196,
 }
 
 impl ttStatus {
@@ -704,6 +709,7 @@ impl ttStatus {
             ttStatus::TT_ERROR_ROLL_SHIFT => "TT_ERROR_ROLL_SHIFT",
             ttStatus::TT_TODO_COLLECTIVE => "TT_TODO_COLLECTIVE",
             ttStatus::TT_ERROR_COLLECTIVE_PLACEMENT => "TT_ERROR_COLLECTIVE_PLACEMENT",
+            ttStatus::TT_ERROR_CB_BLOCK => "TT_ERROR_CB_BLOCK",
         }
     }
 }
