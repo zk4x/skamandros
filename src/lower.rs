@@ -734,7 +734,13 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     || non_matmul_use.contains(&value)
                     || !matmul_use.contains(&value);
                 let page_shape = unit_of(page, dtype)?.0;
-                if page_shape != unit_shape && !(page_shape == RegShape::Tile && !lands_in_dst) {
+                // A block is `m * n` tile pages, whatever it lands in.
+                let block_on_tiles =
+                    page_shape == RegShape::Tile && matches!(unit_shape, RegShape::Block { .. });
+                if page_shape != unit_shape
+                    && !block_on_tiles
+                    && !(page_shape == RegShape::Tile && !lands_in_dst)
+                {
                     let _ = (at, access, page);
                     return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
                 }
@@ -742,7 +748,6 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     Some(regs) => regs,
                     None => dst_regs(alloc, owner(k, value))?,
                 };
-                let reg = regs[0];
                 // A narrow access that only an `Src` reader consumes needs no
                 // unpack at all: that op reads the page's own layout. A narrow
                 // value that lands in `Dst` is one x-run of its own datum count,

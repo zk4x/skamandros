@@ -473,19 +473,25 @@ impl Mover<'_> {
     /// One mover segment: its copies, each inside a copy of the loops it lived
     /// under, with the ring hand-offs around it.
     fn segment(&mut self, into: &mut Kernel, reader: bool) -> Result<(), ttStatus> {
-        let mut groups: BTreeMap<Vec<(OpId, OpId)>, Vec<Copy>> = BTreeMap::new();
-        for copy in &self.copies {
-            if copy.reader != reader {
-                continue;
+        // A maximal run of copies at one loop path, in program order. Not
+        // grouped by path across the whole program: a peeled prologue and a
+        // peeled epilogue share the empty path, and the k loop must sit between
+        // them or the epilogue's block is written before the blocks it follows.
+        let moves: Vec<Copy> = self
+            .copies
+            .iter()
+            .filter(|copy| copy.reader == reader)
+            .cloned()
+            .collect();
+        let mut at = 0usize;
+        while at < moves.len() {
+            let path = moves[at].path.clone();
+            let start = at;
+            while at < moves.len() && moves[at].path == path {
+                at += 1;
             }
-            groups
-                .entry(copy.path.clone())
-                .or_default()
-                .push(copy.clone());
-        }
-        for (path, group) in groups {
             self.map.clear();
-            self.nest(into, &path, &group)?;
+            self.nest(into, &path, &moves[start..at])?;
         }
         Ok(())
     }

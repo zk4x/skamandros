@@ -183,6 +183,19 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
         pending.retain(|(_, load_section)| *load_section == section);
     }
 
+    // The scope of every write, as the folded bound of each enclosing loop
+    // (`None` for a run-time bound). A read pairs with the writer scope that
+    // encloses it: the k loop on both sides folds to the same `None`, while the
+    // peel and the subblock loops name their constants. Positions say nothing
+    // -- `add_movers` emits all reader copies before all compute ops.
+    let mut producer_paths: BTreeMap<OpId, Vec<Vec<Option<i32>>>> = BTreeMap::new();
+    for (_, (ring, stack, _, _)) in &write_info {
+        let path = stack
+            .iter()
+            .map(|loop_op| scope_key(k, *loop_op))
+            .collect::<Result<Vec<Option<i32>>, ttStatus>>()?;
+        producer_paths.entry(*ring).or_default().push(path);
+    }
     // A load whose page is still needed by a `Src` reader cannot have another
     // read of *the same page* in between: that read would take the page the
     // first one is still using. A read of a different page is the whole point
@@ -323,14 +336,33 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
             }
         }
     }
-    // The first and last write of each block, so its `reserve` and `push` sit at
-    // the edges of the run rather than around every page.
-    let mut first_of: BTreeMap<(OpId, Vec<OpId>), OpId> = BTreeMap::new();
-    let mut last_of: BTreeMap<(OpId, Vec<OpId>), OpId> = BTreeMap::new();
+    // A hand-off run is a straight-line stretch of a ring's writes at one loop
+    // depth. The peeled prologue and the peeled epilogue are both depth 0, but
+    // the k loop sits between them, so they are two blocks, not one: tt-metal's
+    // reader reserves and pushes each block it reads (`reader_bmm_tile_layout.
+    // cpp`), and the peeled first/last blocks are separate reads.
+    // `region` advances at every structural op, so writes on either side of a
+    // loop are never merged.
+    let mut region_of: BTreeMap<OpId, u32> = BTreeMap::new();
+    let mut region = 0u32;
+    for (at, op) in k.ops() {
+        region_of.insert(at, region);
+        if matches!(
+            *op,
+            Op::Loop { .. } | Op::EndLoop | Op::EndReader | Op::EndCompute
+        ) {
+            region += 1;
+        }
+    }
+    // The first and last write of each run, so its `reserve` and `push` sit at
+    // the edges rather than around every page.
+    let mut first_of: BTreeMap<(OpId, Vec<OpId>, u32), OpId> = BTreeMap::new();
+    let mut last_of: BTreeMap<(OpId, Vec<OpId>, u32), OpId> = BTreeMap::new();
     for (at, (ring, stack, _, _)) in &write_info {
         if block.contains_key(ring) {
-            first_of.entry((*ring, stack.clone())).or_insert(*at);
-            last_of.insert((*ring, stack.clone()), *at);
+            let key = (*ring, stack.clone(), region_of[at]);
+            first_of.entry(key.clone()).or_insert(*at);
+            last_of.insert(key, *at);
         }
     }
     let writes_in_order: Vec<(OpId, Op)> = k.ops().map(|(at, op)| (at, op.clone())).collect();
@@ -362,13 +394,14 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
         // A ring with a block gets one hand-off at the run's edges; one without
         // keeps a hand-off around every write, as it always had.
         let (reserve, push) = match block.get(&ring) {
-            Some(_) => write_info.get(at).map_or((true, true), |(_, stack, _, _)| {
-                let key = (ring, stack.clone());
+            Some(_) => {
+                let stack = write_info.get(at).map(|(_, s, _, _)| s.clone()).unwrap_or_default();
+                let key = (ring, stack, region_of[at]);
                 (
                     first_of.get(&key) == Some(at),
                     last_of.get(&key) == Some(at),
                 )
-            }),
+            }
             None => (true, true),
         };
         // An `expand` reserves nothing: the pages it fans out are the ones the
@@ -433,7 +466,7 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
     // each of those is its own wait/release with the same block.
     let mut hoisted: BTreeMap<(OpId, OpId), u32> = BTreeMap::new();
     for consumer in &consumers {
-        let Some(depths) = producer_depths.get(&consumer.ring) else {
+        let Some(_depths) = producer_depths.get(&consumer.ring) else {
             eprintln!(
                 "libskamandros: sync_cbs: ring {} is read at {} but never written",
                 consumer.ring, consumer.at
@@ -441,35 +474,54 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
             return Err(ttStatus::TT_INTERNAL_BUG);
         };
         let depth = consumer.stack.len();
-        // The write this read takes its page from: the last one before it. A
-        // ring read in a peeled prologue, in a loop and in a peeled epilogue is
-        // three hand-off streams on one name, and each pairs with its own
-        // producer -- pairing every read with the deepest write would put the
-        // prologue's wait and release around the wrong loop.
-        let producer_depth = write_info
-            .iter()
-            .filter(|(_, (ring, _, _, _))| *ring == consumer.ring)
-            .filter_map(|(at, (_, stack, _, _))| {
-                position.get(at).map(|p| (*p, stack.len()))
-            })
-            .filter(|(p, _)| *p < position[&consumer.at])
-            .max_by_key(|(p, _)| *p)
-            .map(|(_, d)| d);
-        let Some(producer_depth) = producer_depth else {
-            eprintln!(
-                "libskamandros: sync_cbs: ring {} is read before it is written",
-                consumer.ring
-            );
-            return Err(ttStatus::TT_INTERNAL_BUG);
-        };
         // A write of this ring at the read's own depth anywhere in the program
         // is a hand-off at that scope (a peeled tail reads what the loop's last
-        // iteration wrote); otherwise the read is inside a deeper nest than the
-        // write before it, and the pair is hoisted to that write's scope.
+        // iteration wrote; a spill and the reload that follows it in the same
+        // subblock nest are one hand-off per subblock).
         let same_depth_write = producer_depths
             .get(&consumer.ring)
             .is_some_and(|d| d.contains(&depth));
-        if same_depth_write {
+        if !same_depth_write {
+            // The read is inside a deeper nest than the writer's: hoist its
+            // hand-off to the writer scope that encloses it.
+            let read_keys = consumer
+                .stack
+                .iter()
+                .map(|loop_op| scope_key(k, *loop_op))
+                .collect::<Result<Vec<Option<i32>>, ttStatus>>()?;
+            let producer_depth = (0..=read_keys.len()).rev().find(|depth| {
+                producer_paths
+                    .get(&consumer.ring)
+                    .is_some_and(|paths| {
+                        paths
+                            .iter()
+                            .any(|path| path.len() == *depth && path[..] == read_keys[..*depth])
+                    })
+            });
+            let Some(producer_depth) = producer_depth else {
+                eprintln!(
+                    "libskamandros: sync_cbs: ring {} is read before it is written",
+                    consumer.ring
+                );
+                return Err(ttStatus::TT_INTERNAL_BUG);
+            };
+            // A ring without a block can be written in more than one place, so
+            // its publish count says nothing about one hand-off; only a stated
+            // block may span the nest.
+            let pages = block.get(&consumer.ring).copied();
+            if pages.is_none() && writes.get(&consumer.ring) != Some(&1) {
+                return Err(ttStatus::TT_TODO_RING_MULTI_WRITE_OUTSIDE_LOOP);
+            }
+            let n = pages.unwrap_or(1);
+            match hoisted.insert((consumer.ring, consumer.stack[producer_depth]), n) {
+                Some(previous) if previous != n => {
+                    return Err(ttStatus::TT_ERROR_CB_BLOCK);
+                }
+                _ => {}
+            }
+            continue;
+        }
+        {
             // A block is waited for at its first read and released after its
             // last `Src` reader; a ring without one keeps a hand-off per read.
             let key = (consumer.ring, consumer.stack.clone());
@@ -520,39 +572,6 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
                     false,
                 ));
             }
-        } else if depth > producer_depth {
-            // A block handed off once per iteration of the producer's loop and
-            // read across a nest of loops below it -- tt-metal's compute waits
-            // for the whole operand block once per k block and then walks its
-            // subblocks (`in0_dfb.wait_front(in0_block_num_tiles)`, then the
-            // `in0_subblock`/`in1_subblock` loops). The wait belongs before the
-            // outermost of those loops and the release after it, once per
-            // hand-off: a hand-off per read would pop pages the producer never
-            // published, and the ring's two pointers would drift apart.
-            //
-            // A ring without a block can be written in more than one place (a
-            // page before a loop and a page in it), so its publish count says
-            // nothing about one hand-off; only a stated block may span the nest.
-            let pages = block.get(&consumer.ring).copied();
-            if pages.is_none() && writes.get(&consumer.ring) != Some(&1) {
-                return Err(ttStatus::TT_TODO_RING_MULTI_WRITE_OUTSIDE_LOOP);
-            }
-            let Some(&outer) = consumer.stack.get(producer_depth) else {
-                eprintln!(
-                    "libskamandros: sync_cbs: ring {} has a producer depth past its stack",
-                    consumer.ring
-                );
-                return Err(ttStatus::TT_INTERNAL_BUG);
-            };
-            let n = pages.unwrap_or(1);
-            match hoisted.insert((consumer.ring, outer), n) {
-                Some(previous) if previous != n => {
-                    return Err(ttStatus::TT_ERROR_CB_BLOCK);
-                }
-                _ => {}
-            }
-        } else {
-            return Err(ttStatus::TT_TODO_RING_READ_OUTSIDE_LOOP);
         }
     }
     for ((ring, outer), n) in hoisted {
@@ -810,6 +829,17 @@ fn consumer_ring(consumers: &[Consumer], load: OpId) -> Result<OpId, ttStatus> {
             eprintln!("libskamandros: sync_cbs: load {load} is not a consumer");
             ttStatus::TT_INTERNAL_BUG
         })
+}
+
+/// A loop's scope key: its bound's folded value, or `None` when the bound is
+/// run-time. Two spellings that fold alike are the same scope; the clones the
+/// mover makes of a run-time bound are the same `None`.
+fn scope_key(k: &Kernel, loop_op: OpId) -> Result<Option<i32>, ttStatus> {
+    let Op::Loop { bound } = *k.at(loop_op) else {
+        eprintln!("libskamandros: sync_cbs: {loop_op} is not a loop");
+        return Err(ttStatus::TT_INTERNAL_BUG);
+    };
+    Ok(k.const_i32(bound))
 }
 
 /// The ring an op writes, if it writes one.

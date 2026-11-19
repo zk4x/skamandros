@@ -5476,10 +5476,15 @@ fn tt_metal_bmm(obh: u32, obw: u32, sbh: u32, sbw: u32, kb: u32) -> String {
     // `intermed0`: one band of partials, handed off a subblock at a time.
     s.push_str(&format!("%interm = buffer f32 32,{} block {nacc}\n", 32 * 2 * band));
     // `out_dfb`: handed off a subblock at a time (`out_subblock_num_tiles`).
-    s.push_str(&format!("%bc = buffer f32 32,{}\n", 32 * 2 * nacc));
-    for i in 0..nacc {
-        s.push_str(&format!("%acc{i} = acc f32 32,32\n"));
-    }
+    // The store names the block, so the ring states its hand-off.
+    s.push_str(&format!(
+        "%bc = buffer f32 32,{} block {nacc}\n",
+        32 * 2 * nacc
+    ));
+    // One accumulator block: tt-metal's `out_subblock_h x out_subblock_w`
+    // `Dst` region, tt-lang's `ttl.block`. The ops that use it name the block,
+    // not its tiles.
+    s.push_str(&format!("%acc = acc f32 {},{} \n", sbh * 32, sbw * 32));
     s.push_str("%zero = const f32 0\n%izero = const i32 0\n%tile = const i32 1\n");
     s.push_str(&format!(
         "%kb = const i32 {kb}\n%nisub = const i32 {nisub}\n%njsub = const i32 {njsub}\n"
@@ -5539,61 +5544,62 @@ fn tt_metal_bmm(obh: u32, obw: u32, sbh: u32, sbw: u32, kb: u32) -> String {
                 s.push_str(&format!(
                     "%r{tag}bk{w}_{inner} = add %r{tag}b{w}_{inner} {kbase}\n"
                 ));
+                // B's ring layout is the program's: subblock-major, so the
+                // `k x out_subblock_w` block a subblock's compute reads is
+                // dense (`page = jsub*kb*sbw + inner*sbw + w`). tt-metal's own
+                // `inner*obw + w` order is what its per-tile index needs.
+                let dst_page = (w / sbw) * (kb * sbw) + inner * sbw + (w % sbw);
                 s.push_str(&format!(
                     "copy 32,32 %bb [{}] = %pw [%r{tag}bk{w}_{inner}]\n",
-                    inner * obw + w
+                    dst_page
                 ));
             }
         }
     };
 
-    // The compute: the subblock nest, the reload, the products, the pack.
+    // The compute: the subblock nest, the reload, the products, the pack. The
+    // accumulators, operands and hand-offs are blocks; the per-tile walk is the
+    // lowering's, not the program's.
     let compute = |s: &mut String, tag: &str, reload: bool, out: bool| {
         s.push_str(&format!("%si{tag} = loop %nisub\n"));
+        // A's block is `obh x kb` row-major, so a subblock's `sbh x kb` block is
+        // `si * sbh * kb` pages in.
         s.push_str(&format!("%as{tag} = mul %si{tag} %c{}\n", sbh * kb));
         s.push_str(&format!("%sj{tag} = loop %njsub\n"));
-        s.push_str(&format!("%bs{tag} = mul %sj{tag} %c{sbw}\n"));
+        // B's ring is subblock-major: `sj * kb * sbw` pages in.
+        s.push_str(&format!("%bs{tag} = mul %sj{tag} %c{}\n", kb * sbw));
+        // intermed0/out_dfb are subblock-major as tt-metal writes them:
+        // `subblock * out_subblock_num_tiles`.
+        s.push_str(&format!("%sub{tag}a = mul %si{tag} %c{njsub}\n"));
+        s.push_str(&format!("%sub{tag} = add %sub{tag}a %sj{tag}\n"));
+        s.push_str(&format!("%rel{tag} = mul %sub{tag} %c{nacc}\n"));
         if reload {
-            for i in 0..nacc {
-                s.push_str(&format!("load 32,32 %acc{i} = %interm [{i}]\n"));
-            }
+            s.push_str(&format!(
+                "load {},{} %acc = %interm [%rel{tag}]\n",
+                sbh * 32,
+                sbw * 32
+            ));
+        } else {
+            // `enable_reload = false`: the first block starts from zero.
+            s.push_str(&format!("store {},{} %acc = %zero\n", sbh * 32, sbw * 32));
         }
-        for h in 0..sbh {
-            for inner in 0..kb {
-                s.push_str(&format!(
-                    "%av{tag}{h}_{inner} = add %as{tag} %c{}\n",
-                    h * kb + inner
-                ));
-                s.push_str(&format!(
-                    "load 32,32 %a{tag}{h}_{inner} = %ba [%av{tag}{h}_{inner}]\n"
-                ));
-            }
-        }
-        for w in 0..sbw {
-            for inner in 0..kb {
-                s.push_str(&format!(
-                    "%bv{tag}{w}_{inner} = add %bs{tag} %c{}\n",
-                    inner * obw + w
-                ));
-                s.push_str(&format!(
-                    "load 32,32 %b{tag}{w}_{inner} = %bb [%bv{tag}{w}_{inner}]\n"
-                ));
-            }
-        }
-        for h in 0..sbh {
-            for w in 0..sbw {
-                for inner in 0..kb {
-                    s.push_str(&format!(
-                        "matmul %acc{} %a{tag}{h}_{inner} %b{tag}{w}_{inner}\n",
-                        h * sbw + w
-                    ));
-                }
-            }
-        }
+        s.push_str(&format!(
+            "load {},{} %a{tag} = %ba [%as{tag}]\n",
+            sbh * 32,
+            kb * 32
+        ));
+        s.push_str(&format!(
+            "load {},{} %b{tag} = %bb [%bs{tag}]\n",
+            kb * 32,
+            sbw * 32
+        ));
+        s.push_str(&format!("matmul %acc %a{tag} %b{tag}\n"));
         let ring = if out { "%bc" } else { "%interm" };
-        for i in 0..nacc {
-            s.push_str(&format!("store 32,32 {ring} [{i}] = %acc{i}\n"));
-        }
+        s.push_str(&format!(
+            "store {},{} {ring} [%rel{tag}] = %acc\n",
+            sbh * 32,
+            sbw * 32
+        ));
         s.push_str("endloop\nendloop\n");
     };
 
