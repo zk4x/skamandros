@@ -5495,8 +5495,14 @@ fn tt_metal_bmm(obh: u32, obw: u32, sbh: u32, sbw: u32, kb: u32) -> String {
     for i in 0..=top {
         s.push_str(&format!("%c{i} = const i32 {i}\n"));
     }
+    // tt-metal's `for block in 0..num_blocks` with `enable_reload = false` on
+    // the first block and `last_out` on the last. Both ends are peeled (a
+    // runtime `if` is a branch no lowering here carries), so the loop covers
+    // the blocks *between* them: 1 .. num_blocks-2, and `%kmid` is the last
+    // block's index.
     s.push_str("%kblocks = div %kt %kb\n");
-    s.push_str("%kmid = sub %kblocks %tile\n%klast = mul %kmid %kb\n");
+    s.push_str("%kmid = sub %kblocks %tile\n");
+    s.push_str("%kloop = sub %kmid %tile\n%klast = mul %kmid %kb\n");
     s.push_str("%x = grid.x\n%y = grid.y\n");
     s.push_str(&format!(
         "%m0 = mul %y %c{obh}\n%n0 = mul %x %c{obw}\n%arow = mul %m0 %kt\n%brow = mul %n0 %kt\n"
@@ -5568,14 +5574,15 @@ fn tt_metal_bmm(obh: u32, obw: u32, sbh: u32, sbw: u32, kb: u32) -> String {
         s.push_str(&format!("%sj{tag} = loop %njsub\n"));
         // B's ring is subblock-major: `sj * kb * sbw` pages in.
         s.push_str(&format!("%bs{tag} = mul %sj{tag} %c{}\n", kb * sbw));
-        // intermed0/out_dfb are subblock-major as tt-metal writes them:
-        // `subblock * out_subblock_num_tiles`.
-        s.push_str(&format!("%sub{tag}a = mul %si{tag} %c{njsub}\n"));
-        s.push_str(&format!("%sub{tag} = add %sub{tag}a %sj{tag}\n"));
-        s.push_str(&format!("%rel{tag} = mul %sub{tag} %c{nacc}\n"));
+        // A spill is one block hand-off (`block out_subblock_num_tiles`), and
+        // a block access names the pages of that hand-off: the ring's write
+        // pointer is the section's, so every subblock writes page 0 of its own
+        // reservation, exactly tt-metal's `pack_tile(i, dfb)` with `i` inside
+        // `reserve_back(out_subblock_num_tiles)`.
+        let rel = "%izero";
         if reload {
             s.push_str(&format!(
-                "load {},{} %acc = %interm [%rel{tag}]\n",
+                "load {},{} %acc = %interm [{rel}]\n",
                 sbh * 32,
                 sbw * 32
             ));
@@ -5596,7 +5603,7 @@ fn tt_metal_bmm(obh: u32, obw: u32, sbh: u32, sbw: u32, kb: u32) -> String {
         s.push_str(&format!("matmul %acc %a{tag} %b{tag}\n"));
         let ring = if out { "%bc" } else { "%interm" };
         s.push_str(&format!(
-            "store {},{} {ring} [%rel{tag}] = %acc\n",
+            "store {},{} {ring} [{rel}] = %acc\n",
             sbh * 32,
             sbw * 32
         ));
@@ -5607,8 +5614,8 @@ fn tt_metal_bmm(obh: u32, obw: u32, sbh: u32, sbw: u32, kb: u32) -> String {
     reader(&mut s, "", "%izero");
     compute(&mut s, "", false, false);
     // Blocks 1 .. n-2: reload, accumulate, spill.
-    s.push_str("%k = loop %kmid\n");
-    s.push_str("%k8 = mul %k %kb\n");
+    s.push_str("%k = loop %kloop\n");
+    s.push_str("%kn = add %k %tile\n%k8 = mul %kn %kb\n");
     reader(&mut s, "m", "%k8");
     compute(&mut s, "m", true, false);
     s.push_str("endloop\n");
@@ -5648,18 +5655,38 @@ fn tt_metal_bmm(obh: u32, obw: u32, sbh: u32, sbw: u32, kb: u32) -> String {
 /// middle blocks through the loop, and the peeled `last_out` block.
 #[test]
 fn a_tt_metal_kernel_matmuls_one_band() {
-    const OBH: u32 = 4;
-    const OBW: u32 = 4;
-    const SBH: u32 = 2;
-    const SBW: u32 = 2;
-    const KB: u32 = 2;
-    const KBLOCKS: u32 = 4;
-    let (m, n, k) = (32 * OBH as usize, 32 * OBW as usize, 32 * KB as usize * KBLOCKS as usize);
+    // The band is a shape, not a fact: `SKAM_OBH`/`SKAM_KBLOCKS`/... run the
+    // same program at another size while a lowering is being pinned down.
+    let env = |name: &str, default: u32| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let obh: u32 = env("SKAM_OBH", 4);
+    let obw: u32 = env("SKAM_OBW", 4);
+    let sbh: u32 = env("SKAM_SBH", 2);
+    let sbw: u32 = env("SKAM_SBW", 2);
+    let kb: u32 = env("SKAM_KB", 2);
+    let kblocks: u32 = env("SKAM_KBLOCKS", 4);
+    let (OBH, OBW, SBH, SBW, KB, KBLOCKS) = (obh, obw, sbh, sbw, kb, kblocks);
+    let (m, n, k) = (32 * OBH as usize, 32 * OBW as usize, 32 * KB as usize * kblocks as usize);
     let kt = k / 32;
 
     const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
-    let a: Vec<u8> = ONE_BF16.iter().cycle().take(m * k * 2).copied().collect();
+    // A's k tile `j` of every row is the bf16 value `j+1`, so each k block
+    // contributes a different amount: a block that is lost, doubled or read
+    // from the wrong page cannot add up to the answer. B is all ones, so an
+    // output datum is `32 * sum(j+1)`, the whole K sum.
+    let mut a: Vec<u8> = Vec::with_capacity(m * k * 2);
+    for page in 0..m * k / 1024 {
+        let bits = (((page % kt) + 1) as f32).to_bits() >> 16;
+        for _ in 0..1024 {
+            a.extend_from_slice(&(bits as u16).to_le_bytes());
+        }
+    }
     let b: Vec<u8> = ONE_BF16.iter().cycle().take(n * k * 2).copied().collect();
+    let expected = 32.0 * (1..=kt).map(|j| j as f32).sum::<f32>();
 
     let program = tt_metal_bmm(OBH, OBW, SBH, SBW, KB)
         .replace("%pa = param bf16 16384", &format!("%pa = param bf16 {}", m * k))
@@ -5675,7 +5702,7 @@ fn a_tt_metal_kernel_matmuls_one_band() {
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect();
     for (row, column) in (0..m).flat_map(|r| (0..n).map(move |c| (r, c))) {
-        assert_eq!(got[row * n + column], k as f32, "({row}, {column})");
+        assert_eq!(got[row * n + column], expected, "({row}, {column})");
     }
 }
 
@@ -8631,6 +8658,68 @@ load 32,32 %r = %interm [0]
 store 32,32 %bc [0] = %r
 copy 32,32 %out [0] = %bc [0]
 ";
+
+/// The block accumulator crossing a k loop through L1: the same spill as
+/// [`a_spilled_accumulator_keeps_the_whole_k_sum`], with `acc f32 64,64` and
+/// block operands. The four tiles are one section, so the reload, the math and
+/// the pack move them as one hand-off per iteration.
+const BLOCK_SPILL_K_LOOP: &str = "\
+version 9
+grid 1,1
+%in = param bf16 16384
+%w = param bf16 16384
+%out = param f32 4096
+%ba = buffer bf16 32,128 block 4
+%bb = buffer bf16 32,128 block 4
+%interm = buffer f32 32,128 block 4
+%bc = buffer f32 32,128 block 4
+%acc = acc f32 64,64
+%zero = const f32 0
+%izero = const i32 0
+%four = const i32 4
+store 64,64 %acc = %zero
+store 64,64 %interm [0] = %acc
+%k = loop %four
+copy 32,32 %ba [0] = %in [%k]
+copy 32,32 %ba [1] = %in [%k]
+copy 32,32 %ba [2] = %in [%k]
+copy 32,32 %ba [3] = %in [%k]
+copy 32,32 %bb [0] = %w [%k]
+copy 32,32 %bb [1] = %w [%k]
+copy 32,32 %bb [2] = %w [%k]
+copy 32,32 %bb [3] = %w [%k]
+%off = mul %k %izero
+load 64,64 %acc = %interm [0]
+load 64,64 %a = %ba [%off]
+load 64,64 %b = %bb [%off]
+matmul %acc %a %b
+store 64,64 %interm [0] = %acc
+endloop
+load 64,64 %r = %interm [0]
+store 64,64 %bc [0] = %r
+copy 32,32 %out [0] = %bc [0]
+copy 32,32 %out [1] = %bc [1]
+copy 32,32 %out [2] = %bc [2]
+copy 32,32 %out [3] = %bc [3]
+";
+
+#[test]
+fn a_block_accumulator_crosses_a_k_loop() {
+    const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
+    let bytes: Vec<u8> = ONE_BF16.iter().cycle().take(16384 * 2).copied().collect();
+    let out = run_kernel_scalars(BLOCK_SPILL_K_LOOP, &[], &[&bytes, &bytes], 4096 * 4);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let nz = got.iter().filter(|v| **v != 0.0).count();
+    let distinct: std::collections::BTreeSet<u32> = got.iter().map(|v| v.to_bits()).collect();
+    eprintln!("block spill: {nz}/{} nonzero, distinct {:?}", got.len(), distinct);
+    eprintln!("first 8: {:?}", &got[..8]);
+    for (i, datum) in got.iter().enumerate() {
+        assert_eq!(*datum, 256.0, "datum {i} is the whole K sum");
+    }
+}
 
 #[test]
 fn a_spilled_accumulator_keeps_the_whole_k_sum() {

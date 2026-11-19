@@ -222,6 +222,11 @@ fn prepare(k: &Kernel) -> Result<(Plan, MachineKernel, Alloc), ttStatus> {
         }
         lreg.insert(id, (LReg(0), LReg(1)));
     }
+    // A block value's tiles are one `Dst` section: the math and pack hand the
+    // whole thing over, the way tt-metal brackets a subblock with
+    // `tile_regs_acquire`/`commit`/`wait`/`release`. A tile is a section of its
+    // own and is not listed.
+    m.sections = block.values().cloned().collect();
     // One datum width for the whole bank: a value that needs more than 16 bits
     // forces 32-bit mode, which tt-metal calls `DST_ACCUM_MODE`.
     let wide = place
@@ -779,6 +784,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     // cannot simply take the read pointer's page. It is
                     // tt-metal's `fifo_page_size * tile_index`, and the index
                     // may be a loop value.
+                    let mut scratch = Pool::new(&SCRATCH);
                     let (page_offset, page_extra) = page_offset(
                         &mut m,
                         k,
@@ -789,6 +795,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                         Core::Unpack,
                         buffer,
                         offset,
+                        &mut scratch,
                     )?;
                     // A block is one unpack per tile: the pages after the
                     // first, each into its own `Dst` region. tt-metal reloads
@@ -803,15 +810,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     let (_, _, page_bytes) = unit_of(page, dtype)?;
                     for t in 0..bm * bn {
                         let reg = regs[usize::from(t as u16)];
-                        let (po, pe) = tile_page(
-                            &mut m,
-                            Core::Unpack,
-                            page_offset,
-                            page_extra,
-                            t,
-                            page_bytes,
-                            reg::T6,
-                        );
+                        let (po, pe) = tile_page(page_offset, page_extra, t, page_bytes);
                         if wide && dtype == crate::ir::DType::Bf16 {
                             widen_tile(&mut m, cb, dtype, per_tile, po, pe, reg);
                         } else {
@@ -942,6 +941,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                 // The page the store names inside the ring's block: the
                 // packer's base is the write pointer, and a block's pages are
                 // contiguous from it, exactly as the unpacker's read side is.
+                let mut scratch = Pool::new(&SCRATCH);
                 let (page_offset, page_extra) = page_offset(
                     &mut m,
                     k,
@@ -952,6 +952,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     Core::Pack,
                     buffer,
                     offset,
+                    &mut scratch,
                 )?;
                 m.push(
                     Core::Pack,
@@ -967,15 +968,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                 let regs = dst_regs(alloc, owner(k, src))?;
                 let (_, _, page_bytes) = unit_of(page, dtype)?;
                 for t in 0..bm * bn {
-                    let (po, pe) = tile_page(
-                        &mut m,
-                        Core::Pack,
-                        page_offset,
-                        page_extra,
-                        t,
-                        page_bytes,
-                        reg::T6,
-                    );
+                    let (po, pe) = tile_page(page_offset, page_extra, t, page_bytes);
                     m.push(
                         Core::Pack,
                         MirOp::SetPackBase {
@@ -1465,6 +1458,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                 let out = dst_reg(alloc, owner(k, value))?;
                 // The page the tile comes from: a `load`'s own, or the
                 // compiler's staged copy of a computed value.
+                let mut scratch = Pool::new(&SCRATCH);
                 let (cb, staged, page, page_extra) = fpu_page(
                     &mut m,
                     k,
@@ -1475,6 +1469,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     src,
                     at,
                     ttStatus::TT_ERROR_TRANSPOSE_OPERAND,
+                    &mut scratch,
                 )?;
                 if staged {
                     stage(&mut m, k, &types, alloc, &acc_mask, src, cb)?;
@@ -1685,6 +1680,9 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     let _ = at;
                     return Err(ttStatus::TT_ERROR_MATMUL_ACCUM_WIDE);
                 }
+                // Both operands' run-time page indices are live together, so
+                // they come from one pool and land in distinct registers.
+                let mut scratch = Pool::new(&SCRATCH);
                 let (cb_a, stage_a, page_a, extra_a) = fpu_page(
                     &mut m,
                     k,
@@ -1695,6 +1693,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     a,
                     at,
                     ttStatus::TT_ERROR_MATMUL_OPERAND,
+                    &mut scratch,
                 )?;
                 let (cb_b, stage_b, page_b, extra_b) = fpu_page(
                     &mut m,
@@ -1706,6 +1705,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     b,
                     at,
                     ttStatus::TT_ERROR_MATMUL_OPERAND,
+                    &mut scratch,
                 )?;
                 // A computed operand has no page: the compiler packs it into its
                 // own and the Matrix Unit reads that.
@@ -1743,24 +1743,10 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                         for kk in 0..a_k {
                             // A block's pages are its tiles, row-major: `a`'s
                             // row is `a_k` tiles wide and `b`'s `b_n`.
-                            let (pa, ea) = tile_page(
-                                &mut m,
-                                Core::Unpack,
-                                page_a,
-                                extra_a,
-                                i * a_k + kk,
-                                page_bytes_a,
-                                reg::T6,
-                            );
-                            let (pb, eb) = tile_page(
-                                &mut m,
-                                Core::Unpack,
-                                page_b,
-                                extra_b,
-                                kk * b_n + j,
-                                page_bytes_b,
-                                reg::T0,
-                            );
+                            let (pa, ea) =
+                                tile_page(page_a, extra_a, i * a_k + kk, page_bytes_a);
+                            let (pb, eb) =
+                                tile_page(page_b, extra_b, kk * b_n + j, page_bytes_b);
                             matmul_tile(
                                 &mut m,
                                 cb_a,
@@ -1809,6 +1795,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     let _ = at;
                     return Err(ttStatus::TT_ERROR_MATMUL_ACCUM_WIDE);
                 }
+                let mut scratch = Pool::new(&SCRATCH);
                 let (cb_x, stage_x, page_x, extra_x) = fpu_page(
                     &mut m,
                     k,
@@ -1819,6 +1806,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     x,
                     at,
                     ttStatus::TT_ERROR_REDUCE_OPERAND,
+                    &mut scratch,
                 )?;
                 let (cb_b, stage_b, page_b, extra_b, dt_b) = match scaler {
                     Some(scaler) => {
@@ -1837,6 +1825,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                             scaler,
                             at,
                             ttStatus::TT_ERROR_REDUCE_OPERAND,
+                            &mut scratch,
                         )?;
                         (cb, staged, page, extra, dt_s)
                     }
@@ -2710,6 +2699,7 @@ fn fpu_page(
     value: crate::ir::OpId,
     at: OpId,
     err: ttStatus,
+    scratch: &mut Pool,
 ) -> Result<(Cb, bool, u32, Option<u8>), ttStatus> {
     let id = owner(k, value);
     if k.op(id).is_none() {
@@ -2729,8 +2719,9 @@ fn fpu_page(
                 ));
             }
         };
-        let (offset, extra) =
-            page_offset(m, k, types, plan, param, loops, Core::Unpack, buffer, page)?;
+        let (offset, extra) = page_offset(
+            m, k, types, plan, param, loops, Core::Unpack, buffer, page, scratch,
+        )?;
         return Ok((cb, false, offset, extra));
     }
     // Not a `load`: the value lives in `Dst` and the `Src` path reads L1, so
@@ -2771,6 +2762,7 @@ fn page_offset(
     core: Core,
     buffer: OpId,
     offset: OpId,
+    scratch: &mut Pool,
 ) -> Result<(u32, Option<u8>), ttStatus> {
     let (dtype, page) = match *k.at(buffer) {
         Op::Cb { dtype, page, .. } => (dtype, page),
@@ -2795,7 +2787,8 @@ fn page_offset(
         _ => {
             // A run-time index: `tile_index * page_units`, in the unpack role, as
             // tt-metal's `get_tile_l1_byte_address` does for its own argument.
-            let mut scratch = Pool::new(&SCRATCH);
+            // The index register stays taken: two operands of one op need two
+            // distinct pages, and the caller's pool is what keeps them apart.
             let index = scratch.take()?;
             let mut ops = Vec::new();
             scalar_with(
@@ -2806,7 +2799,7 @@ fn page_offset(
                 loops,
                 offset,
                 index,
-                &mut scratch,
+                scratch,
                 &COMPUTE_INDEX,
                 plan,
                 &m.cbs,
@@ -2828,6 +2821,7 @@ fn page_offset(
             for op in ops {
                 m.push(core, op);
             }
+            scratch.give(scale);
             Ok((0, Some(index)))
         }
     }
@@ -2859,6 +2853,7 @@ fn fpu_broadcast(
     bcast: Bcast,
     at: OpId,
 ) -> Result<(), ttStatus> {
+    let mut scratch = Pool::new(&SCRATCH);
     let (cb_a, stage_a, page_a, extra_a) = fpu_page(
         m,
         k,
@@ -2869,6 +2864,7 @@ fn fpu_broadcast(
         tile,
         at,
         ttStatus::TT_TODO_BROADCAST,
+        &mut scratch,
     )?;
     let (cb_b, stage_b, page_b, extra_b) = fpu_page(
         m,
@@ -2880,6 +2876,7 @@ fn fpu_broadcast(
         narrow,
         at,
         ttStatus::TT_TODO_BROADCAST,
+        &mut scratch,
     )?;
     if stage_a {
         stage(m, k, types, alloc, acc_mask, tile, cb_a)?;
@@ -7657,39 +7654,13 @@ fn cb_page_bytes(m: &MachineKernel, cb: Cb) -> Result<u32, ttStatus> {
 /// or, for a page index the program computes at run time, the same step added
 /// into the index register the unpacker already holds. `tmp` is the compute
 /// role's own scratch (the three threads have separate register files).
-fn tile_page(
-    m: &mut MachineKernel,
-    core: Core,
-    base: u32,
-    extra: Option<u8>,
-    tiles: u32,
-    page_bytes: u32,
-    tmp: u8,
-) -> (u32, Option<u8>) {
-    match extra {
-        None => (base + tiles * page_bytes, None),
-        Some(index) => {
-            // `SETUNPACKBASE` scales a run-time index by 16-byte units, like
-            // the base it is added to.
-            m.push(
-                core,
-                MirOp::Li {
-                    reg: tmp,
-                    value: tiles * (page_bytes / 16),
-                },
-            );
-            m.push(
-                core,
-                MirOp::IArith {
-                    op: IOp::Add,
-                    d: tmp,
-                    a: index,
-                    b: tmp,
-                },
-            );
-            (0, Some(tmp))
-        }
-    }
+fn tile_page(base: u32, extra: Option<u8>, tile: u32, page_bytes: u32) -> (u32, Option<u8>) {
+    // A block's pages are consecutive from the first: the tile's page is a
+    // constant byte offset past it, which `SETUNPACKBASE`/`SETPACKBASE` add to
+    // the ring's page pointer. The run-time page index, when there is one,
+    // stays the register `page_offset` computed -- one register for the whole
+    // block, never a per-tile accumulation in a register the encoder owns.
+    (base + tile * page_bytes, extra)
 }
 
 /// One tile page into a `Dst` region: the unpacker's destination, its `Z`

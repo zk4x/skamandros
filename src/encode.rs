@@ -824,7 +824,10 @@ fn encode_unpack(
                 // issues its `TTI_UNPACR`s after (`llk_unpack_AB_matmul.h`).
                 cb_base_wait(out, unit)?;
                 let slot = usize::from(unit);
-                if state.base[slot] == Some((cb, offset, extra)) {
+                // A register-valued page offset may hold a *different* value
+                // than it did at the previous call even though the op names the
+                // same register, so only a constant offset may be elided.
+                if extra.is_none() && state.base[slot] == Some((cb, offset, extra)) {
                     continue;
                 }
                 let config = match unit {
@@ -1003,6 +1006,14 @@ fn cb_base(
     }
     let offset = (offset / 16) as i32;
     out.asm(|a| {
+        // The address is built in `T0`, and a caller may have named `T0` as the
+        // page register itself (the lowering's per-tile offsets use `T0`/`T6`).
+        // Stage the index first, or `add T0, T0, T0` would double the base
+        // instead of adding the page.
+        let extra = extra.map(|index| {
+            a.word(rv::addi(reg::T1, index, 0));
+            reg::T1
+        });
         a.word(rv::lw(
             reg::T0,
             reg::A6,

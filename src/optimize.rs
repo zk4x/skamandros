@@ -12,6 +12,8 @@
 //! row-address modifier execute. The hand-offs between the three roles are
 //! derived here too ([`reg_sync`]), from the accesses themselves.
 
+use std::collections::BTreeMap;
+
 use crate::mir::{Core, Dst, MachineKernel, MirOp};
 use crate::status::ttStatus;
 
@@ -127,9 +129,30 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
     // `Src`: an `UNPACR` writes `Dst` only when its unit is on the `Dst` path.
     let mut target: Option<Dst> = None;
     let mut to_src = [false; 2];
-    // One bucket per `Dst` the lowering minted: before `alloc` an id is a name,
-    // not a hardware register, so the slab's length is the right size.
-    let mut touches: Vec<Vec<Access>> = vec![Vec::new(); usize::from(m.dsts.len())];
+    // The hand-off is per `Dst` section, not per register: a block value's
+    // tiles are one unit, so math and pack hand the whole section over with one
+    // pair of hand-offs, exactly tt-metal's `tile_regs_commit` and
+    // `tile_regs_wait` around a whole `out_subblock_num_tiles`
+    // (`bmm_large_block_zm.cpp:55-110`). A register that is not part of a block
+    // is a section of its own.
+    let mut section_of: BTreeMap<Dst, usize> = BTreeMap::new();
+    let mut sections: Vec<Vec<Dst>> =
+        Vec::with_capacity(usize::from(m.dsts.len()) + m.sections.len());
+    for group in &m.sections {
+        let index = sections.len();
+        sections.push(group.clone());
+        for reg in group {
+            section_of.insert(*reg, index);
+        }
+    }
+    for (reg, _) in m.dsts.iter() {
+        if !section_of.contains_key(&reg) {
+            section_of.insert(reg, sections.len());
+            sections.push(vec![reg]);
+        }
+    }
+    // One bucket per section, filled in program order.
+    let mut touches: Vec<Vec<Access>> = vec![Vec::new(); sections.len()];
     for (at, (role, op)) in ops.iter().enumerate() {
         let mut touched: Vec<(Dst, bool)> = Vec::new();
         match *op {
@@ -183,7 +206,12 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
             _ => {}
         }
         for (reg, write) in touched {
-            touches[usize::from(reg.0)].push(Access {
+            let section = *section_of.get(&reg).ok_or_else(|| {
+                crate::status::internal_bug(format_args!(
+                    "reg_sync: `Dst` {reg:?} is in no section"
+                ))
+            })?;
+            touches[section].push(Access {
                 at,
                 role: *role,
                 write,
@@ -277,9 +305,6 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
     // `(edge, post position, take position)`: a post after the slot's last
     // reader and the take before the same slot's next writer.
     let mut seams: Vec<(Edge, usize, usize)> = Vec::new();
-    // Loop-pacing edges, counted per body: the semaphore starts with one token
-    // per hand-off the body performs.
-    let mut reuse: Vec<(Edge, usize, u8)> = Vec::new();
     for events in &touches {
         // One epoch per write: the data an epoch publishes is what the reads
         // that follow it (before the next write) consume.
@@ -349,10 +374,36 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
                 kind: EdgeKind::Wrap,
             };
             seams.push((edge, r.at + 1, w.at));
-            match reuse.iter_mut().find(|(e, _, _)| *e == edge) {
-                Some(count) => count.2 += 1,
-                None => reuse.push((edge, *start, 1)),
-            }
+        }
+    }
+    // One hand-off, however many bodies name it. Nested loops report the same
+    // first write and last read for each level that contains the section, and
+    // only the innermost body actually runs the hand-off; counting the levels
+    // separately started the semaphore with tokens no post would ever match,
+    // and the consumer then ran a whole section ahead of its producer.
+    seams.sort_unstable();
+    seams.dedup();
+    // A pacing semaphore starts with exactly the tokens the program takes
+    // before its first post: a take whose position is past the edge's first
+    // post needs no credit, because at runtime it finds that post's token. A
+    // token too many is not a deadlock but worse -- the consumer runs a whole
+    // section ahead and overwrites `Dst` while the producer still reads it,
+    // and only some of the tiles are lost.
+    let mut first_post: BTreeMap<Edge, usize> = BTreeMap::new();
+    for &(edge, post, _) in &seams {
+        first_post
+            .entry(edge)
+            .and_modify(|first| *first = (*first).min(post))
+            .or_insert(post);
+    }
+    let mut reuse: Vec<(Edge, usize, u8)> = Vec::new();
+    for &(edge, post, take) in &seams {
+        if edge.kind != EdgeKind::Wrap || take >= first_post[&edge] {
+            continue;
+        }
+        match reuse.iter_mut().find(|(e, _, _)| *e == edge) {
+            Some(count) => count.2 = count.2.saturating_add(1),
+            None => reuse.push((edge, post, 1)),
         }
     }
     if data.is_empty() && seams.is_empty() {

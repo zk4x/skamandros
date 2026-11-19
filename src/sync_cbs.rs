@@ -712,11 +712,6 @@ fn check_rings_balanced(k: &Kernel) -> Result<(), ttStatus> {
     for (cb, monomials) in traffic {
         let depth = depth.get(&cb).copied().unwrap_or(0);
         for (monomial, left) in monomials {
-            if std::env::var_os("SKAM_EDGES").is_some() {
-                eprintln!(
-                    "SKAM_EDGES ring {cb} len {depth} monomial {monomial:?} left {left}"
-                );
-            }
             let holds = if monomial.is_empty() {
                 // Pages no loop multiplies can only be a constant, and only a
                 // pipeline's leftover is allowed: never more than the ring
@@ -729,12 +724,6 @@ fn check_rings_balanced(k: &Kernel) -> Result<(), ttStatus> {
             };
             if !holds {
                 let _ = (cb, left);
-                if std::env::var_os("SKAM_EDGES").is_some() {
-                    eprintln!(
-                        "SKAM_EDGES ring {cb} ({:?}) monomial {monomial:?} left {left} depth {depth}",
-                        k.names.get(&cb)
-                    );
-                }
                 return Err(ttStatus::TT_ERROR_RING_UNBALANCED);
             }
         }

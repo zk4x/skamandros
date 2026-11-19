@@ -756,6 +756,17 @@ pub struct MachineKernel {
     pub cbs: Slab<Cb, CbInfo>,
     /// The `Dst` registers the ops name.
     pub dsts: Slab<Dst, DstInfo>,
+    /// The `Dst` sections the lowering minted: a block value's `m * n` tiles,
+    /// handed over by math and pack as one unit. tt-metal's `tile_regs_acquire`
+    /// and `tile_regs_commit` bracket the whole section's math and
+    /// `tile_regs_wait`/`tile_regs_release` its whole pack
+    /// (`bmm_large_block_zm.cpp:55-110`), so [`crate::optimize::reg_sync`] syncs
+    /// per section rather than per tile. Every register not named here is a
+    /// section of its own.
+    ///
+    /// Only meaningful before [`MachineKernel::alloc`]: the section ids are
+    /// names, and `alloc` is what gives them physical places and clears this.
+    pub sections: Vec<Vec<Dst>>,
     /// The lane registers the ops name.
     pub lregs: Slab<LReg, DType>,
     /// Is the `Dst` bank in 16-bit mode? One mode for the whole kernel.

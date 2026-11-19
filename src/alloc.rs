@@ -853,6 +853,9 @@ fn alloc_dsts(m: &mut MachineKernel) -> Result<(), ttStatus> {
         fresh.push(info);
     }
     m.dsts = fresh;
+    // The sections named virtual `Dst` ids; the physical slab is a different
+    // space, and the hand-offs they described were derived before allocation.
+    m.sections.clear();
     Ok(())
 }
 
