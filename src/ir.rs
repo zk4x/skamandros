@@ -200,6 +200,10 @@ pub enum RegShape {
     Row,
     /// A 32x32 tile.
     Tile,
+    /// A block of `m` x `n` tiles: tt-metal's `out_subblock_h x
+    /// out_subblock_w`, tt-lang's `ttl.block`. The shape is the block's tile
+    /// counts, not datums.
+    Block { m: Dim, n: Dim },
 }
 
 impl RegShape {
@@ -209,6 +213,17 @@ impl RegShape {
             RegShape::Scalar => 1,
             RegShape::Column | RegShape::Row => 32,
             RegShape::Tile => 32 * 32,
+            RegShape::Block { m, n } => 32 * 32 * m * n,
+        }
+    }
+
+    /// The block's tile counts: one by one for a tile, so the callers that
+    /// repeat a per-tile sequence need no special case.
+    pub const fn tiles(self) -> (Dim, Dim) {
+        match self {
+            RegShape::Tile => (1, 1),
+            RegShape::Block { m, n } => (m, n),
+            _ => (1, 1),
         }
     }
 }
@@ -236,7 +251,7 @@ impl ReduceDim {
             RegShape::Row => ReduceDim::Col,
             RegShape::Column => ReduceDim::Row,
             RegShape::Scalar => ReduceDim::Scalar,
-            RegShape::Tile => return None,
+            RegShape::Tile | RegShape::Block { .. } => return None,
         })
     }
 }
@@ -1027,18 +1042,17 @@ pub fn unit_of(shape: [Dim; 2], dtype: DType) -> Result<(RegShape, u32, u32), tt
         RegShape::Row
     } else if b == 1 {
         RegShape::Column
-    } else if a % 32 == 0 && b % 32 == 0 {
+    } else if a == 32 && b == 32 {
         RegShape::Tile
+    } else if a % 32 == 0 && b % 32 == 0 {
+        RegShape::Block {
+            m: a / 32,
+            n: b / 32,
+        }
     } else {
         return Err(ttStatus::TT_ERROR_BUFFER_SHAPE);
     };
-    let datums = if reg == RegShape::Scalar {
-        1
-    } else if reg == RegShape::Tile {
-        32 * 32
-    } else {
-        32
-    };
+    let datums = reg.datums();
     let units = (a * b) / datums;
     let bytes = a * b * dtype.bytes();
     Ok((reg, units, bytes))
@@ -1053,6 +1067,11 @@ fn cb_ring(shape: [Dim; 2], dtype: DType) -> Result<([Dim; 2], Dim), ttStatus> {
         RegShape::Row => [1, 32],
         RegShape::Column => [32, 1],
         RegShape::Tile => [32, 32],
+        // A buffer is a list of tile pages, however its block is shaped: a
+        // shape of `m x n` tiles is `m * n` pages.
+        RegShape::Block { m, n } => {
+            return Ok(([32, 32], m.checked_mul(n).ok_or(ttStatus::TT_ERROR_ZERO_DIMENSION)?));
+        }
     };
     if units == 0 {
         return Err(ttStatus::TT_ERROR_ZERO_DIMENSION);
@@ -1069,6 +1088,10 @@ pub(crate) fn access_shape(shape: [Dim; 2]) -> Result<RegShape, ttStatus> {
         (1, _) if b == 32 => RegShape::Row,
         (_, 1) if a == 32 => RegShape::Column,
         _ if a == 32 && b == 32 => RegShape::Tile,
+        _ if a % 32 == 0 && b % 32 == 0 => RegShape::Block {
+            m: a / 32,
+            n: b / 32,
+        },
         _ => return Err(ttStatus::TT_ERROR_ACCESS_SHAPE),
     })
 }
@@ -1442,12 +1465,22 @@ impl Kernel {
                         if b.kind != ValueKind::Buffer {
                             return Err(ttStatus::TT_ERROR_NOT_A_BUFFER);
                         }
-                        let (page, _) = match *self.at(buffer) {
+                        let (page, len) = match *self.at(buffer) {
                             Op::Cb { page, len, .. } => (page, len),
                             _ => return Err(ttStatus::TT_ERROR_NOT_A_BUFFER),
                         };
+                        // A tile is one page and a block is `m * n` of them: a
+                        // block load moves the pages after the one it names.
                         let (unit_shape, _, _) = unit_of(page, b.dtype)?;
-                        if unit_shape.datums() < datums {
+                        let pages = match access_shape(shape)? {
+                            RegShape::Block { m, n } => m * n,
+                            _ => 1,
+                        };
+                        if unit_shape != RegShape::Tile && pages > 1 {
+                            return Err(ttStatus::TT_ERROR_ACCESS_SHAPE);
+                        }
+                        if pages > len {
+                            let _ = datums;
                             return Err(ttStatus::TT_ERROR_ACCESS_SHAPE);
                         }
                     }
@@ -1466,7 +1499,14 @@ impl Kernel {
                     }
                     let datums = shape[0] * shape[1];
                     if b.kind == ValueKind::Acc {
-                        if unit != RegShape::Tile {
+                        // A narrow accumulator still occupies a whole `Dst` tile
+                        // region, and a block names its tiles: a block `m x n`
+                        // is filled by `store m,n`, everything else by `32,32`.
+                        let wanted = match b.shape {
+                            RegShape::Block { .. } => b.shape,
+                            _ => RegShape::Tile,
+                        };
+                        if unit != wanted {
                             return Err(ttStatus::TT_ERROR_ACC_SHAPE);
                         }
                         if self.const_i32(offset) != Some(0) {
@@ -1501,15 +1541,32 @@ impl Kernel {
                     if v.dtype != b.dtype {
                         return Err(ttStatus::TT_ERROR_STORE_BUFFER_CAST);
                     }
-                    let (page, _) = match *self.at(buffer) {
+                    let (page, len) = match *self.at(buffer) {
                         Op::Cb { page, len, .. } => (page, len),
                         _ => return Err(ttStatus::TT_ERROR_NOT_A_BUFFER),
                     };
                     let (unit_shape, _, _) = unit_of(page, b.dtype)?;
-                    if unit_shape.datums() < datums {
+                    let pages = match unit {
+                        RegShape::Block { m, n } => m * n,
+                        _ => 1,
+                    };
+                    if unit_shape != RegShape::Tile && pages > 1 {
                         return Err(ttStatus::TT_ERROR_ACCESS_SHAPE);
                     }
-                    if v.shape != unit && v.kind != ValueKind::Acc {
+                    if pages > len {
+                        let _ = datums;
+                        return Err(ttStatus::TT_ERROR_ACCESS_SHAPE);
+                    }
+                    // A narrow accumulator is a whole tile's region, so it
+                    // packs as one tile whatever its fold; a block names its
+                    // `m x n` pages.
+                    let narrow_acc = v.kind == ValueKind::Acc
+                        && matches!(
+                            v.shape,
+                            RegShape::Row | RegShape::Column | RegShape::Scalar
+                        )
+                        && unit == RegShape::Tile;
+                    if v.shape != unit && !narrow_acc {
                         return Err(ttStatus::TT_ERROR_STORE_BUFFER_SHAPE);
                     }
                 }
@@ -1569,13 +1626,26 @@ impl Kernel {
                     }
                 }
                 Op::Matmul { acc, a, b } => {
+                    let (acc_shape, a_shape, b_shape) =
+                        (self.info(acc).shape, self.info(a).shape, self.info(b).shape);
                     if self.info(acc).kind != ValueKind::Acc
-                        || self.info(acc).shape != RegShape::Tile
+                        || !matches!(acc_shape, RegShape::Tile | RegShape::Block { .. })
                     {
                         return Err(ttStatus::TT_ERROR_MATMUL_ACC);
                     }
-                    if self.info(a).shape != RegShape::Tile || self.info(b).shape != RegShape::Tile
+                    if !matches!(a_shape, RegShape::Tile | RegShape::Block { .. })
+                        || !matches!(b_shape, RegShape::Tile | RegShape::Block { .. })
                     {
+                        return Err(ttStatus::TT_ERROR_MATMUL_OPERAND);
+                    }
+                    // The shapes are the product's: `acc` is `m x n`, `a` is
+                    // `m x k`, `b` is `k x n`. A tile is the `1 x 1` case, so a
+                    // block matmul and a tile matmul are one op.
+                    let (m, n) = acc_shape.tiles();
+                    let (am, ak) = a_shape.tiles();
+                    let (bk, bn) = b_shape.tiles();
+                    if am != m || bn != n || ak != bk {
+                        let _ = (m, n, am, ak, bk, bn);
                         return Err(ttStatus::TT_ERROR_MATMUL_OPERAND);
                     }
                     // The operands share a dtype; the accumulator may be wider
@@ -1714,6 +1784,8 @@ impl Kernel {
             RegShape::Scalar => 1,
             RegShape::Row | RegShape::Column => 32,
             RegShape::Tile => 1024,
+            // An index is one page or one lane, never a whole block.
+            RegShape::Block { .. } => return Err(ttStatus::TT_ERROR_OFFSET_NOT_INDEX),
         })
     }
 
@@ -1807,7 +1879,7 @@ pub(crate) fn acc_tiles(shape: [Dim; 2]) -> u32 {
 fn acc_reg_shape_checked(shape: [Dim; 2], at: usize, dtype: DType) -> Result<RegShape, ttStatus> {
     let reg = match shape {
         [1, 32] | [32, 1] | [1, 1] | [32, 32] => acc_reg_shape(shape),
-        [m, n] if m % 32 == 0 && n % 32 == 0 && m > 0 && n > 0 => RegShape::Tile,
+        [m, n] if m % 32 == 0 && n % 32 == 0 && m > 0 && n > 0 => acc_reg_shape(shape),
         _ => {
             let _ = at;
             return Err(ttStatus::TT_ERROR_ACC_SHAPE);
@@ -1831,7 +1903,11 @@ fn acc_reg_shape(shape: [Dim; 2]) -> RegShape {
         [1, 32] => RegShape::Row,
         [32, 1] => RegShape::Column,
         [1, 1] => RegShape::Scalar,
-        _ => RegShape::Tile,
+        [32, 32] => RegShape::Tile,
+        [m, n] => RegShape::Block {
+            m: m / 32,
+            n: n / 32,
+        },
     }
 }
 

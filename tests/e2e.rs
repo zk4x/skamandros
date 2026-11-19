@@ -5788,6 +5788,74 @@ fn a_block_matmul_is_the_same_product() {
     }
 }
 
+
+/// One `acc f32 64,64` block: the accumulator, the operand loads and the spill
+/// are block ops, repeated per tile in `lower` (a tile is the 1x1 case). A
+/// 2x2-tile product with `in0_block_w = 4`, every datum checked.
+#[test]
+fn a_block_accumulator_matmuls_two_by_two() {
+    const M: usize = 64;
+    const N: usize = 64;
+    const K: usize = 128;
+    const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
+    let a: Vec<u8> = ONE_BF16.iter().cycle().take(M * K * 2).copied().collect();
+    let b: Vec<u8> = ONE_BF16.iter().cycle().take(N * K * 2).copied().collect();
+
+    // A's block is `m x k` row-major (`page = r * 4 + kk`), which is also the
+    // parameter's tiled order, so the copy is the identity. B's is a dense
+    // `k x n` block (`page = kk * 2 + c`) gathered from the parameter's
+    // `n * Kt + k` order; the ring's layout is the program's, and a dense block
+    // is what lets the compute name it as one block.
+    let program = "\
+version 9
+%pa = param bf16 8192 interleaved
+%pw = param bf16 8192 interleaved
+%pc = param f32 4096
+%ba = buffer bf16 32,256 block 8
+%bb = buffer bf16 32,256 block 8
+%bc = buffer f32 32,128 block 4
+%acc = acc f32 64,64
+%zero = const f32 0
+store 64,64 %acc = %zero
+copy 32,32 %ba [0] = %pa [0]
+copy 32,32 %ba [1] = %pa [1]
+copy 32,32 %ba [2] = %pa [2]
+copy 32,32 %ba [3] = %pa [3]
+copy 32,32 %ba [4] = %pa [4]
+copy 32,32 %ba [5] = %pa [5]
+copy 32,32 %ba [6] = %pa [6]
+copy 32,32 %ba [7] = %pa [7]
+copy 32,32 %bb [0] = %pw [0]
+copy 32,32 %bb [1] = %pw [4]
+copy 32,32 %bb [2] = %pw [1]
+copy 32,32 %bb [3] = %pw [5]
+copy 32,32 %bb [4] = %pw [2]
+copy 32,32 %bb [5] = %pw [6]
+copy 32,32 %bb [6] = %pw [3]
+copy 32,32 %bb [7] = %pw [7]
+load 64,128 %a = %ba [0]
+load 128,64 %b = %bb [0]
+matmul %acc %a %b
+store 64,64 %bc [0] = %acc
+copy 32,32 %pc [0] = %bc [0]
+copy 32,32 %pc [1] = %bc [1]
+copy 32,32 %pc [2] = %bc [2]
+copy 32,32 %pc [3] = %bc [3]
+grid 1,1
+";
+    if std::env::var_os("SKAM_PROGRAM").is_some() {
+        println!("{program}");
+    }
+    let out = run_kernel_scalars_paged(program, &[], &[&a, &b], &[2048, 2048], M * N * 4);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (row, column) in (0..M).flat_map(|r| (0..N).map(move |c| (r, c))) {
+        assert_eq!(got[row * N + column], K as f32, "({row}, {column})");
+    }
+}
+
 /// The 1x1 blocked program on one tile, the control for
 /// [`a_block_matmul_runs_on_one_tile`]: same grid, same launch path, one output
 /// tile. If this runs and the 2x2 does not, the difference is the block.

@@ -131,9 +131,9 @@ fn page_of(shape: [crate::ir::Dim; 2], src_only: bool) -> Result<[crate::ir::Dim
     match crate::ir::access_shape(shape)? {
         crate::ir::RegShape::Tile => Ok([32, 32]),
         crate::ir::RegShape::Row => Ok(if src_only { [32, 32] } else { shape }),
-        crate::ir::RegShape::Column | crate::ir::RegShape::Scalar => {
-            Err(ttStatus::TT_TODO_ACCESS_SHAPE)
-        }
+        crate::ir::RegShape::Column
+        | crate::ir::RegShape::Scalar
+        | crate::ir::RegShape::Block { .. } => Err(ttStatus::TT_TODO_ACCESS_SHAPE),
     }
 }
 

@@ -117,6 +117,9 @@ impl Types<'_> {
 /// pair per value, minted in program order with no reuse.
 struct Alloc {
     place: BTreeMap<OpId, Dst>,
+    /// A block value's tiles, in row-major order. A tile value has none: its
+    /// one home is `place`.
+    block: BTreeMap<OpId, Vec<Dst>>,
     lreg: BTreeMap<OpId, (LReg, LReg)>,
 }
 
@@ -124,6 +127,20 @@ impl Alloc {
     fn place_of(&self, value: OpId) -> Option<Dst> {
         self.place.get(&value).copied()
     }
+}
+
+/// Every `Dst` a value occupies: one for a tile, `m * n` for a block. Each has
+/// its own liveness, so `alloc` can place them independently.
+fn dst_regs(alloc: &Alloc, value: OpId) -> Result<Vec<Dst>, ttStatus> {
+    if let Some(regs) = alloc.block.get(&value) {
+        return Ok(regs.clone());
+    }
+    alloc
+        .place_of(value)
+        .map(|reg| vec![reg])
+        .ok_or_else(|| {
+            crate::status::internal_bug(format_args!("lower: value {value} has no `Dst`"))
+        })
 }
 
 /// The compiler's own rings: the 1.0 page a `max` needs, and a staging page for
@@ -159,6 +176,7 @@ fn prepare(k: &Kernel) -> Result<(Plan, MachineKernel, Alloc), ttStatus> {
     use crate::mir::{CbInfo, DstInfo};
     let mut m = MachineKernel::default();
     let mut place: BTreeMap<OpId, Dst> = BTreeMap::new();
+    let mut block: BTreeMap<OpId, Vec<Dst>> = BTreeMap::new();
     let mut lreg: BTreeMap<OpId, (LReg, LReg)> = BTreeMap::new();
     for (id, op) in k.ops() {
         let homes = matches!(
@@ -182,11 +200,20 @@ fn prepare(k: &Kernel) -> Result<(Plan, MachineKernel, Alloc), ttStatus> {
             continue;
         }
         let dtype = k.info(id).dtype;
-        let reg = m.dsts.push(DstInfo {
-            dtype,
-            shape: [32, 32],
-        });
-        place.insert(id, reg);
+        // A block is `m * n` tile regions, each with its own liveness.
+        let (tm, tn) = k.info(id).shape.tiles();
+        let count = (tm * tn) as usize;
+        let mut regs: Vec<Dst> = Vec::with_capacity(count);
+        for _ in 0..count {
+            regs.push(m.dsts.push(DstInfo {
+                dtype,
+                shape: [32, 32],
+            }));
+        }
+        place.insert(id, regs[0]);
+        if count > 1 {
+            block.insert(id, regs);
+        }
         // A body's lanes are the hardware's own: lane 0 is the input and lane 1
         // the output of every row body, with 2..7 as the scratch the bodies
         // name (an `exp2` or a reciprocal needs all six).
@@ -259,7 +286,15 @@ fn prepare(k: &Kernel) -> Result<(Plan, MachineKernel, Alloc), ttStatus> {
     // ring set is already final — the program's rings, the ones page and the
     // staging pages are all minted above.
     m.plan_cbs()?;
-    Ok((plan, m, Alloc { place, lreg }))
+    Ok((
+        plan,
+        m,
+        Alloc {
+            place,
+            block,
+            lreg,
+        },
+    ))
 }
 
 /// The values one op reads from an L1 page because its `Src` banks are filled
@@ -651,8 +686,12 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                 into,
             } => {
                 // A seed writes an accumulator, not a value of its own: it
-                // always lands in `Dst`, in the accumulator's own rows.
-                let seed = into.map(|acc| dst_reg(alloc, acc)).transpose()?;
+                // always lands in `Dst`, in the accumulator's own rows. A block
+                // accumulator has one region per tile.
+                let seed = match into {
+                    Some(acc) => Some(dst_regs(alloc, acc)?),
+                    None => None,
+                };
                 if into.is_none() {
                     // A scalar load is an index read: the mover evaluates it
                     // from the page it copied, in RISC-V (see
@@ -699,10 +738,11 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     let _ = (at, access, page);
                     return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
                 }
-                let reg = match seed {
-                    Some(reg) => reg,
-                    None => dst_reg(alloc, owner(k, value))?,
+                let regs = match seed {
+                    Some(regs) => regs,
+                    None => dst_regs(alloc, owner(k, value))?,
                 };
+                let reg = regs[0];
                 // A narrow access that only an `Src` reader consumes needs no
                 // unpack at all: that op reads the page's own layout. A narrow
                 // value that lands in `Dst` is one x-run of its own datum count,
@@ -712,7 +752,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     let _ = (at, access);
                     return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
                 }
-                if unit_shape != RegShape::Tile
+                if !matches!(unit_shape, RegShape::Tile | RegShape::Block { .. })
                     && lands_in_dst
                     && wide
                     && dtype == crate::ir::DType::Bf16
@@ -745,153 +785,33 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                         buffer,
                         offset,
                     )?;
-                    // A bf16 page cannot enter a 32-bit `Dst` through the
-                    // unpacker: `BF16 -> BF16` is its only Dst-path conversion
-                    // for that datum, and the `Dst` is one width for the whole
-                    // kernel. It goes through `SrcA` instead, which is what
-                    // tt-lang's `copy_tile` does for `typecast bf16 -> f32`
-                    // (`llk_math_eltwise_unary_sfpu_typecast` has "no SFPU
-                    // kernel needed" for that pair): the unpacker writes the
-                    // page into `SrcA` as bf16, and a 32-bit `Dst` reads it back
-                    // through `MOVA2D`, which treats the `SrcA` lane as TF32 and
-                    // writes the full 32-bit datum. A bf16 datum widens exactly
-                    // on that move (7 mantissa bits of 10, the exponent and
-                    // sign unchanged), so the `cast` that follows is a rename.
-                    if wide && dtype == crate::ir::DType::Bf16 {
-                        // The whole page at once: one `Z` plane per face, the
-                        // descriptor's four faces, 64 `SrcA` rows.
-                        m.push(
+                    // A block is one unpack per tile: the pages after the
+                    // first, each into its own `Dst` region. tt-metal reloads
+                    // its partial band exactly this way (`load` a page of
+                    // `interm0` per tile of the subblock).
+                    // One page per tile of the access: a block reloads its
+                    // `m * n` pages, a tile one, a narrow unit its own page.
+                    // Each tile is the same sequence, so the block case is the
+                    // tile case repeated.
+                    let (bm, bn) = unit_shape.tiles();
+                    let per_tile = unit_shape.datums() / (bm * bn);
+                    let (_, _, page_bytes) = unit_of(page, dtype)?;
+                    for t in 0..bm * bn {
+                        let reg = regs[usize::from(t as u16)];
+                        let (po, pe) = tile_page(
+                            &mut m,
                             Core::Unpack,
-                            MirOp::Setadczw {
-                                u0: true,
-                                u1: false,
-                                z0: Some(0),
-                                z1: None,
-                            },
+                            page_offset,
+                            page_extra,
+                            t,
+                            page_bytes,
+                            reg::T6,
                         );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::UnpackConfig {
-                                unit: 0,
-                                to_src: true,
-                                dtype,
-                                haloize: false,
-                                add_dest_cntr: false,
-                                ch1_z_stride: 0,
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::SetUnpackBase {
-                                cb,
-                                unit: 0,
-                                offset: page_offset,
-                                extra: page_extra,
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::Unpacr {
-                                unit: 0,
-                                count: unit_shape.datums(),
-                                // `UNPACR`'s bit 6: `Set_Data_Valid` on
-                                // Blackhole (ttsim's schema and tt-metal's LLK
-                                // argument), the bank handover the math's
-                                // `MOVA2D` waits for. Without it the Matrix
-                                // Unit stalls forever on an invalid bank.
-                                flip: true,
-                            },
-                        );
-                        // The `Src` row counter starts at zero, as the unpack's
-                        // own destination does.
-                        m.push(
-                            Core::Math,
-                            MirOp::Setrwc {
-                                src_a: 0,
-                                src_b: 0,
-                                dst: 0,
-                                flip_src_a: false,
-                                flip_src_b: false,
-                                dst_cr: false,
-                            },
-                        );
-                        // `MOVA2D` moves eight rows per instruction, and a
-                        // 32-bit `Dst` holds a tile's 1024 datums in 64 rows.
-                        for band in 0..(DST_ROWS / 8) {
-                            m.push(
-                                Core::Math,
-                                MirOp::Mova2d {
-                                    use_dst32b_lo: false,
-                                    src_row: 8 * band,
-                                    addr_mod: 0,
-                                    move8_rows: true,
-                                    reg,
-                                    at: 8 * band,
-                                },
-                            );
+                        if wide && dtype == crate::ir::DType::Bf16 {
+                            widen_tile(&mut m, cb, dtype, per_tile, po, pe, reg);
+                        } else {
+                            unpack_tile(&mut m, cb, dtype, per_tile, po, pe, reg);
                         }
-                        // `SETRWC(CLR_A)`: the `SrcA` bank goes back to the
-                        // unpacker now that the Matrix Unit has read it.
-                        m.push(
-                            Core::Math,
-                            MirOp::Setrwc {
-                                src_a: 0,
-                                src_b: 0,
-                                dst: 0,
-                                flip_src_a: true,
-                                flip_src_b: false,
-                                dst_cr: false,
-                            },
-                        );
-                    } else {
-                        // The page's wait and release are the `wait`/`pop` ops
-                        // `add_movers` placed around this load.
-                        m.push(Core::Unpack, MirOp::Setdst { reg });
-                        m.push(
-                            Core::Unpack,
-                            MirOp::Setadczw {
-                                u0: true,
-                                u1: false,
-                                z0: Some(0),
-                                z1: None,
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::Setadcx {
-                                unit: 0,
-                                first: 0,
-                                count: unit_shape.datums(),
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::UnpackConfig {
-                                unit: 0,
-                                to_src: false,
-                                dtype,
-                                haloize: false,
-                                add_dest_cntr: false,
-                                ch1_z_stride: 0,
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::SetUnpackBase {
-                                cb,
-                                unit: 0,
-                                offset: page_offset,
-                                extra: page_extra,
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::Unpacr {
-                                unit: 0,
-                                count: unit_shape.datums(),
-                                flip: false,
-                            },
-                        );
                     }
                 }
                 // A `matmul` operand's page is waited for and released by its
@@ -911,9 +831,14 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                 // the accumulator's own dtype, and the SFPU writes it row by
                 // row.
                 if types.of(buffer).kind == crate::ir::ValueKind::Acc {
-                    // The accumulator's region is a whole tile; a narrow one
-                    // would be filled with a tile's rows.
-                    if access_shape(access)? != RegShape::Tile {
+                    // A narrow accumulator still fills a whole tile region; a
+                    // block names its `m x n` tiles and is filled tile by tile.
+                    let acc_shape = types.of(buffer).shape;
+                    let wanted = match acc_shape {
+                        RegShape::Block { .. } => acc_shape,
+                        _ => RegShape::Tile,
+                    };
+                    if access_shape(access)? != wanted {
                         let _ = (at, access);
                         return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
                     }
@@ -931,9 +856,8 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     }
                     // The lane is one 32-bit image: a bf16 datum widens to it.
                     let bits = lane_image(from, bits);
-                    let (unit_shape, _, _) = unit_of([32, 32], acc_dtype)?;
-                    let rows = rows_of(unit_shape, at)?;
-                    let reg = dst_reg(alloc, buffer)?;
+                    let rows = rows_of(RegShape::Tile, at)?;
+                    let regs = dst_regs(alloc, buffer)?;
                     // The fill writes `Dst` rows; `reg_sync` places the wait
                     // for a packer that still reads them.
                     m.push(
@@ -945,16 +869,18 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     );
                     // An SFPU store covers a row pair (`SFPSTORE` refuses an odd
                     // row and writes two), the same step the datapath uses.
-                    for row in (0..rows).step_by(2) {
-                        m.push(
-                            Core::Math,
-                            MirOp::Sfpstore {
-                                lreg: LReg(0),
-                                reg,
-                                at: row,
-                                dtype: acc_dtype,
-                            },
-                        );
+                    for reg in regs {
+                        for row in (0..rows).step_by(2) {
+                            m.push(
+                                Core::Math,
+                                MirOp::Sfpstore {
+                                    lreg: LReg(0),
+                                    reg,
+                                    at: row,
+                                    dtype: acc_dtype,
+                                },
+                            );
+                        }
                     }
                     let _ = (offset, src);
                     // An accumulator store never reads a CB page, but a page
@@ -975,7 +901,18 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                     Op::Cb { page, .. } => page,
                     _ => return Err(ttStatus::TT_ERROR_NOT_A_BUFFER),
                 };
-                if unit_of(page, dtype)?.0 != unit_shape {
+                // A block accumulator spills as its `m * n` pages: one pack
+                // per tile, the ring's hand-off stated by the buffer's `block`.
+                // tt-metal's `interm0`/`out_dfb` band is written the same way
+                // (`pack_tile` per tile of `out_subblock_num_tiles`).
+                // A ring's page is one unit; a block access names `m * n` of
+                // them, so a block stores into tile pages whatever the ring's
+                // own page shape.
+                let (bm, bn) = unit_shape.tiles();
+                let block = matches!(unit_shape, RegShape::Block { .. });
+                if unit_of(page, dtype)?.0 != unit_shape
+                    && !(block && unit_of(page, dtype)?.0 == RegShape::Tile)
+                {
                     let _ = (at, access, page);
                     return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
                 }
@@ -1013,14 +950,6 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                 )?;
                 m.push(
                     Core::Pack,
-                    MirOp::SetPackBase {
-                        cb,
-                        offset: page_offset,
-                        extra: page_extra,
-                    },
-                );
-                m.push(
-                    Core::Pack,
                     MirOp::SetPackConfig {
                         dtype,
                         // A pack of a reduced accumulator carries the reduce's
@@ -1028,14 +957,37 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                         mask: acc_mask[&owner(k, src)],
                     },
                 );
-                m.push(
-                    Core::Pack,
-                    MirOp::SetPackOffset {
-                        reg: dst_reg(alloc, owner(k, src))?,
-                        at: 0,
-                    },
-                );
-                m.push(Core::Pack, MirOp::PackRows { rows, last: true });
+                // One page per tile of the access: `m * n` pages for a block,
+                // one for a tile or a narrow unit.
+                let regs = dst_regs(alloc, owner(k, src))?;
+                let (_, _, page_bytes) = unit_of(page, dtype)?;
+                for t in 0..bm * bn {
+                    let (po, pe) = tile_page(
+                        &mut m,
+                        Core::Pack,
+                        page_offset,
+                        page_extra,
+                        t,
+                        page_bytes,
+                        reg::T6,
+                    );
+                    m.push(
+                        Core::Pack,
+                        MirOp::SetPackBase {
+                            cb,
+                            offset: po,
+                            extra: pe,
+                        },
+                    );
+                    m.push(
+                        Core::Pack,
+                        MirOp::SetPackOffset {
+                            reg: regs[usize::from(t as u16)],
+                            at: 0,
+                        },
+                    );
+                    m.push(Core::Pack, MirOp::PackRows { rows, last: true });
+                }
             }
             Op::Cast { src, dtype } => {
                 let from = types.of(src).dtype;
@@ -1216,7 +1168,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                         RegShape::Row => Bcast::Row,
                         RegShape::Column => Bcast::Col,
                         RegShape::Scalar => Bcast::Scalar,
-                        RegShape::Tile => {
+                        RegShape::Tile | RegShape::Block { .. } => {
                             return Err(crate::status::internal_bug(
                                 "lower: a broadcast with two tile operands",
                             ));
@@ -1758,243 +1710,69 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
                 if stage_b {
                     stage(&mut m, k, &types, alloc, &acc_mask, b, cb_b)?;
                 }
-                let base = dst_reg(alloc, acc)?;
-                // Scratch for `mvmul_group`, which emits a run of math ops: the
-                // run is appended to the one IR as it is produced.
-                let mut math_scratch: Vec<MirOp> = Vec::new();
-                // The Matrix Unit writes the accumulator's rows; `reg_sync`
-                // places the wait for a packer that still reads them.
-                // The Matrix Unit's address modifiers, fidelity phase and row
-                // counters are this thread's `ThreadConfig` and RWC state. Every
-                // word goes out as a whole `SETC16`, so an entry carrying several
-                // fields of one word is composed here.
-                for entry in [
-                    vec![(thread::ADDR_MOD_AB_SEC0_SrcAIncr, 0u16)],
-                    vec![(thread::ADDR_MOD_DST_SEC0_DestIncr, 0)],
-                    vec![(thread::ADDR_MOD_AB_SEC1_SrcAIncr, 0)],
-                    vec![(thread::ADDR_MOD_DST_SEC1_FidelityIncr, 1)],
-                    // End of a group's first `SrcB` half: `SrcB` on eight rows,
-                    // phase back to 0.
-                    vec![
-                        (thread::ADDR_MOD_AB_SEC2_SrcBIncr, 8),
-                        (thread::ADDR_MOD_AB_SEC2_SrcBClear, 0),
-                    ],
-                    vec![
-                        (thread::ADDR_MOD_DST_SEC2_DestIncr, 0),
-                        (thread::ADDR_MOD_DST_SEC2_DestCR, 0),
-                        (thread::ADDR_MOD_DST_SEC2_FidelityClear, 1),
-                    ],
-                    // End of a group that is not the `fi`'s last: phase and
-                    // `SrcB` back to 0.
-                    vec![
-                        (thread::ADDR_MOD_AB_SEC3_SrcBIncr, 0),
-                        (thread::ADDR_MOD_AB_SEC3_SrcBClear, 1),
-                    ],
-                    vec![
-                        (thread::ADDR_MOD_DST_SEC3_DestIncr, 0),
-                        (thread::ADDR_MOD_DST_SEC3_DestCR, 0),
-                        (thread::ADDR_MOD_DST_SEC3_FidelityClear, 1),
-                    ],
-                    // End of an `fi`: as 3, and the `Dst` base on 32 rows for
-                    // the next `fi`.
-                    vec![
-                        (thread::ADDR_MOD_AB_SEC4_SrcBIncr, 0),
-                        (thread::ADDR_MOD_AB_SEC4_SrcBClear, 1),
-                    ],
-                    vec![
-                        (thread::ADDR_MOD_DST_SEC4_DestIncr, 32),
-                        (thread::ADDR_MOD_DST_SEC4_DestCR, 0),
-                        (thread::ADDR_MOD_DST_SEC4_FidelityClear, 1),
-                    ],
-                    vec![(thread::FIDELITY_BASE_Phase, 0)],
-                ] {
-                    m.push(Core::Math, thread_word(&entry)?);
+                // The accumulator's block: a tile is the `1 x 1` case, so
+                // this per-tile sequence is emitted once per tile of the block.
+                // The operands are blocks too -- `a` is `m x k`, `b` is `k x n`
+                // -- and their shapes are the pairing. tt-metal's compute kernel
+                // runs the same nest over its subblock (`bmm_large_block_zm.cpp`
+                // `for i in out_subblock_h: for j in out_subblock_w: for kt in
+                // in0_block_w: matmul_tiles(...)`).
+                let acc_regs = dst_regs(alloc, acc)?;
+                let (m_tiles, n_tiles) = types.of(acc).shape.tiles();
+                let (a_m, a_k) = types.of(a).shape.tiles();
+                let (b_k, b_n) = types.of(b).shape.tiles();
+                if a_m != m_tiles || b_n != n_tiles || a_k != b_k {
+                    let _ = (a_m, a_k, b_k, b_n);
+                    return Err(ttStatus::TT_ERROR_MATMUL_OPERAND);
                 }
-                // Src rows and the `Dst` counter start at 0.
-                m.push(
-                    Core::Math,
-                    MirOp::Setrwc {
-                        src_a: 0,
-                        src_b: 0,
-                        dst: 0,
-                        flip_src_a: false,
-                        flip_src_b: false,
-                        dst_cr: false,
-                    },
-                );
-                // The accumulator's rows are added to, never cleared: an `acc`
-                // holds whatever the program last put there, and zeroing it is a
-                // `store_to %acc from %zero` the program writes itself.
-                // One `(fi, k)` group: A's face `(fi, k)` into `SrcB`, B's two
-                // faces `(k, 0)` and `(k, 1)` into `SrcA`. The unpacker and the
-                // Matrix Unit alternate through the bank handover, so the two
-                // roles interleave by ownership, not by instruction position.
-                // A staged operand's page is published by the packer (T2) before
-                // the unpacker reads it, and released after the last face.
-                for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
-                    if staged {
-                        m.push(Core::Unpack, MirOp::CbWait { cb, n: 1 });
-                    }
+                // A computed block operand would have to be staged once per
+                // tile; the staging path packs one page.
+                if (stage_a && (a_m > 1 || a_k > 1)) || (stage_b && (b_k > 1 || b_n > 1)) {
+                    let _ = (stage_a, stage_b);
+                    return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
                 }
-                for fi in 0..2u32 {
-                    for kk in 0..2u32 {
-                        m.push(
-                            Core::Unpack,
-                            MirOp::Setadczw {
-                                u0: false,
-                                u1: true,
-                                z0: Some(2 * fi + kk),
-                                z1: None,
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::UnpackConfig {
-                                unit: 1,
-                                to_src: true,
-                                dtype: dt_a,
-                                haloize: false,
-                                add_dest_cntr: false,
-                                ch1_z_stride: 0,
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::SetUnpackBase {
-                                cb: cb_a,
-                                unit: 1,
-                                offset: page_a,
-                                extra: extra_a,
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::Unpacr {
-                                unit: 1,
-                                count: FACE_DATUMS,
-                                flip: true,
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::Setadczw {
-                                u0: true,
-                                u1: false,
-                                z0: Some(2 * kk),
-                                z1: None,
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::UnpackConfig {
-                                unit: 0,
-                                to_src: true,
-                                dtype: dt_b,
-                                haloize: false,
-                                add_dest_cntr: false,
-                                ch1_z_stride: 0,
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::SetUnpackBase {
-                                cb: cb_b,
-                                unit: 0,
-                                offset: page_b,
-                                extra: extra_b,
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::Unpacr {
-                                unit: 0,
-                                count: FACE_DATUMS,
-                                flip: true,
-                            },
-                        );
-                        mvmul_group(&mut math_scratch, base, 0);
-                        for op in math_scratch.drain(..) {
-                            m.push(Core::Math, op);
+                let page_bytes_a = cb_page_bytes(&m, cb_a)?;
+                let page_bytes_b = cb_page_bytes(&m, cb_b)?;
+                for i in 0..m_tiles {
+                    for j in 0..n_tiles {
+                        for kk in 0..a_k {
+                            // A block's pages are its tiles, row-major: `a`'s
+                            // row is `a_k` tiles wide and `b`'s `b_n`.
+                            let (pa, ea) = tile_page(
+                                &mut m,
+                                Core::Unpack,
+                                page_a,
+                                extra_a,
+                                i * a_k + kk,
+                                page_bytes_a,
+                                reg::T6,
+                            );
+                            let (pb, eb) = tile_page(
+                                &mut m,
+                                Core::Unpack,
+                                page_b,
+                                extra_b,
+                                kk * b_n + j,
+                                page_bytes_b,
+                                reg::T0,
+                            );
+                            matmul_tile(
+                                &mut m,
+                                cb_a,
+                                stage_a,
+                                pa,
+                                ea,
+                                cb_b,
+                                stage_b,
+                                pb,
+                                eb,
+                                acc_regs[usize::from((i * n_tiles + j) as u16)],
+                                dt_a,
+                                dt_b,
+                            )?;
                         }
-                        m.push(
-                            Core::Math,
-                            MirOp::Mvmul {
-                                reg: base,
-                                at: 8,
-                                addr_mod: MATMUL_AM_GROUP,
-                                flip_a: true,
-                                flip_b: false,
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::Setadczw {
-                                u0: true,
-                                u1: false,
-                                z0: Some(2 * kk + 1),
-                                z1: None,
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::SetUnpackBase {
-                                cb: cb_b,
-                                unit: 0,
-                                offset: page_b,
-                                extra: extra_b,
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::Unpacr {
-                                unit: 0,
-                                count: FACE_DATUMS,
-                                flip: true,
-                            },
-                        );
-                        mvmul_group(&mut math_scratch, base, 16);
-                        for op in math_scratch.drain(..) {
-                            m.push(Core::Math, op);
-                        }
-                        let end = if kk == 0 {
-                            MATMUL_AM_GROUP
-                        } else {
-                            MATMUL_AM_FI
-                        };
-                        m.push(
-                            Core::Math,
-                            MirOp::Mvmul {
-                                reg: base,
-                                at: 24,
-                                addr_mod: end,
-                                flip_a: true,
-                                flip_b: true,
-                            },
-                        );
                     }
                 }
-                // The Matrix Unit advanced the thread's `Dst` counter as it
-                // walked the accumulator, and an `SFPLOAD`/`SFPSTORE` address is
-                // relative to it, so the counter goes back to 0. Its writes are
-                // still in flight, so the accumulator is not readable (the pack
-                // follows on T2) until the unit drains.
-                m.push(Core::Math, MirOp::WaitMatrix);
-                for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
-                    if staged {
-                        m.push(Core::Unpack, MirOp::CbPop { cb, n: 1 });
-                    }
-                }
-                m.push(
-                    Core::Math,
-                    MirOp::Setrwc {
-                        src_a: 0,
-                        src_b: 0,
-                        dst: 0,
-                        flip_src_a: false,
-                        flip_src_b: false,
-                        dst_cr: false,
-                    },
-                );
             }
             // `sum col`/`max col`: `GAPOOL`/`GMPOOL` fold each 16x16 face over
             // its rows into the destination row, one value per column, and the
@@ -5204,6 +4982,12 @@ fn sfp_rows(shape: RegShape, at: OpId) -> Result<Vec<u32>, ttStatus> {
             let _ = at;
             return Err(ttStatus::TT_ERROR_SCALAR_NO_ROWS);
         }
+        // A lane body walks one tile; a block is a repeat of tile bodies, which
+        // its own caller emits.
+        RegShape::Block { .. } => {
+            let _ = at;
+            return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
+        }
     })
 }
 
@@ -5215,6 +4999,8 @@ fn rows_of(shape: RegShape, at: OpId) -> Result<u32, ttStatus> {
         }
         RegShape::Row | RegShape::Column => Ok(2),
         RegShape::Tile => Ok(DST_ROWS),
+        // A block's pages are tiles: one page per call.
+        RegShape::Block { .. } => Ok(DST_ROWS),
     }
 }
 
@@ -5289,6 +5075,9 @@ fn copy_to(
         RegShape::Scalar => 1,
         RegShape::Row | RegShape::Column => 32,
         RegShape::Tile => 1024,
+        // A copy's index names one lane; a block index would be a page list,
+        // which a copy's `block n` states instead.
+        RegShape::Block { .. } => return Err(ttStatus::TT_TODO_MULTI_LANE),
     };
     // A row unit is narrower than the parameter's page, so the copy gathers it
     // from (or scatters it to) the two face rows it occupies. See
@@ -5406,7 +5195,7 @@ fn copy_to(
             // `noc_async_read_page` per tile of `cb_reserve_back`'s block
             // (`reader_bmm_tile_layout.cpp`).
             let mut ring_page_reg = None;
-            if page_index.is_none()
+            if k.const_i32(page_offset).is_none()
                 && matches!(*k.at(buffer), Op::Cb { block: Some(_), .. })
             {
                 let off = pool.take()?;
@@ -7592,4 +7381,467 @@ copy 32,32 %po [0] = %bo [0]
             ttStatus::TT_TODO_BROADCAST_SFPU
         );
     }
+}
+
+/// One `32x32` tile's product, tt-metal's `matmul_tiles`: A's four faces and
+/// B's, the Matrix Unit's fidelity phases, and the accumulator tile the result
+/// is added into. A block matmul is this sequence repeated per tile.
+#[allow(clippy::too_many_arguments)]
+fn matmul_tile(
+    m: &mut MachineKernel,
+    cb_a: Cb,
+    stage_a: bool,
+    page_a: u32,
+    extra_a: Option<u8>,
+    cb_b: Cb,
+    stage_b: bool,
+    page_b: u32,
+    extra_b: Option<u8>,
+    acc_reg: Dst,
+    dt_a: DType,
+    dt_b: DType,
+) -> Result<(), ttStatus> {
+        // Scratch for `mvmul_group`, which emits a run of math ops: the
+        // run is appended to the one IR as it is produced.
+        let mut math_scratch: Vec<MirOp> = Vec::new();
+        // The Matrix Unit writes the accumulator's rows; `reg_sync`
+        // places the wait for a packer that still reads them.
+        // The Matrix Unit's address modifiers, fidelity phase and row
+        // counters are this thread's `ThreadConfig` and RWC state. Every
+        // word goes out as a whole `SETC16`, so an entry carrying several
+        // fields of one word is composed here.
+        for entry in [
+            vec![(thread::ADDR_MOD_AB_SEC0_SrcAIncr, 0u16)],
+            vec![(thread::ADDR_MOD_DST_SEC0_DestIncr, 0)],
+            vec![(thread::ADDR_MOD_AB_SEC1_SrcAIncr, 0)],
+            vec![(thread::ADDR_MOD_DST_SEC1_FidelityIncr, 1)],
+            // End of a group's first `SrcB` half: `SrcB` on eight rows,
+            // phase back to 0.
+            vec![
+                (thread::ADDR_MOD_AB_SEC2_SrcBIncr, 8),
+                (thread::ADDR_MOD_AB_SEC2_SrcBClear, 0),
+            ],
+            vec![
+                (thread::ADDR_MOD_DST_SEC2_DestIncr, 0),
+                (thread::ADDR_MOD_DST_SEC2_DestCR, 0),
+                (thread::ADDR_MOD_DST_SEC2_FidelityClear, 1),
+            ],
+            // End of a group that is not the `fi`'s last: phase and
+            // `SrcB` back to 0.
+            vec![
+                (thread::ADDR_MOD_AB_SEC3_SrcBIncr, 0),
+                (thread::ADDR_MOD_AB_SEC3_SrcBClear, 1),
+            ],
+            vec![
+                (thread::ADDR_MOD_DST_SEC3_DestIncr, 0),
+                (thread::ADDR_MOD_DST_SEC3_DestCR, 0),
+                (thread::ADDR_MOD_DST_SEC3_FidelityClear, 1),
+            ],
+            // End of an `fi`: as 3, and the `Dst` acc_reg on 32 rows for
+            // the next `fi`.
+            vec![
+                (thread::ADDR_MOD_AB_SEC4_SrcBIncr, 0),
+                (thread::ADDR_MOD_AB_SEC4_SrcBClear, 1),
+            ],
+            vec![
+                (thread::ADDR_MOD_DST_SEC4_DestIncr, 32),
+                (thread::ADDR_MOD_DST_SEC4_DestCR, 0),
+                (thread::ADDR_MOD_DST_SEC4_FidelityClear, 1),
+            ],
+            vec![(thread::FIDELITY_BASE_Phase, 0)],
+        ] {
+            m.push(Core::Math, thread_word(&entry)?);
+        }
+        // Src rows and the `Dst` counter start at 0.
+        m.push(
+            Core::Math,
+            MirOp::Setrwc {
+                src_a: 0,
+                src_b: 0,
+                dst: 0,
+                flip_src_a: false,
+                flip_src_b: false,
+                dst_cr: false,
+            },
+        );
+        // The accumulator's rows are added to, never cleared: an `acc`
+        // holds whatever the program last put there, and zeroing it is a
+        // `store_to %acc from %zero` the program writes itself.
+        // One `(fi, k)` group: A's face `(fi, k)` into `SrcB`, B's two
+        // faces `(k, 0)` and `(k, 1)` into `SrcA`. The unpacker and the
+        // Matrix Unit alternate through the bank handover, so the two
+        // roles interleave by ownership, not by instruction position.
+        // A staged operand's page is published by the packer (T2) before
+        // the unpacker reads it, and released after the last face.
+        for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
+            if staged {
+                m.push(Core::Unpack, MirOp::CbWait { cb, n: 1 });
+            }
+        }
+        for fi in 0..2u32 {
+            for kk in 0..2u32 {
+                m.push(
+                    Core::Unpack,
+                    MirOp::Setadczw {
+                        u0: false,
+                        u1: true,
+                        z0: Some(2 * fi + kk),
+                        z1: None,
+                    },
+                );
+                m.push(
+                    Core::Unpack,
+                    MirOp::UnpackConfig {
+                        unit: 1,
+                        to_src: true,
+                        dtype: dt_a,
+                        haloize: false,
+                        add_dest_cntr: false,
+                        ch1_z_stride: 0,
+                    },
+                );
+                m.push(
+                    Core::Unpack,
+                    MirOp::SetUnpackBase {
+                        cb: cb_a,
+                        unit: 1,
+                        offset: page_a,
+                        extra: extra_a,
+                    },
+                );
+                m.push(
+                    Core::Unpack,
+                    MirOp::Unpacr {
+                        unit: 1,
+                        count: FACE_DATUMS,
+                        flip: true,
+                    },
+                );
+                m.push(
+                    Core::Unpack,
+                    MirOp::Setadczw {
+                        u0: true,
+                        u1: false,
+                        z0: Some(2 * kk),
+                        z1: None,
+                    },
+                );
+                m.push(
+                    Core::Unpack,
+                    MirOp::UnpackConfig {
+                        unit: 0,
+                        to_src: true,
+                        dtype: dt_b,
+                        haloize: false,
+                        add_dest_cntr: false,
+                        ch1_z_stride: 0,
+                    },
+                );
+                m.push(
+                    Core::Unpack,
+                    MirOp::SetUnpackBase {
+                        cb: cb_b,
+                        unit: 0,
+                        offset: page_b,
+                        extra: extra_b,
+                    },
+                );
+                m.push(
+                    Core::Unpack,
+                    MirOp::Unpacr {
+                        unit: 0,
+                        count: FACE_DATUMS,
+                        flip: true,
+                    },
+                );
+                mvmul_group(&mut math_scratch, acc_reg, 0);
+                for op in math_scratch.drain(..) {
+                    m.push(Core::Math, op);
+                }
+                m.push(
+                    Core::Math,
+                    MirOp::Mvmul {
+                        reg: acc_reg,
+                        at: 8,
+                        addr_mod: MATMUL_AM_GROUP,
+                        flip_a: true,
+                        flip_b: false,
+                    },
+                );
+                m.push(
+                    Core::Unpack,
+                    MirOp::Setadczw {
+                        u0: true,
+                        u1: false,
+                        z0: Some(2 * kk + 1),
+                        z1: None,
+                    },
+                );
+                m.push(
+                    Core::Unpack,
+                    MirOp::SetUnpackBase {
+                        cb: cb_b,
+                        unit: 0,
+                        offset: page_b,
+                        extra: extra_b,
+                    },
+                );
+                m.push(
+                    Core::Unpack,
+                    MirOp::Unpacr {
+                        unit: 0,
+                        count: FACE_DATUMS,
+                        flip: true,
+                    },
+                );
+                mvmul_group(&mut math_scratch, acc_reg, 16);
+                for op in math_scratch.drain(..) {
+                    m.push(Core::Math, op);
+                }
+                let end = if kk == 0 {
+                    MATMUL_AM_GROUP
+                } else {
+                    MATMUL_AM_FI
+                };
+                m.push(
+                    Core::Math,
+                    MirOp::Mvmul {
+                        reg: acc_reg,
+                        at: 24,
+                        addr_mod: end,
+                        flip_a: true,
+                        flip_b: true,
+                    },
+                );
+            }
+        }
+        // The Matrix Unit advanced the thread's `Dst` counter as it
+        // walked the accumulator, and an `SFPLOAD`/`SFPSTORE` address is
+        // relative to it, so the counter goes back to 0. Its writes are
+        // still in flight, so the accumulator is not readable (the pack
+        // follows on T2) until the unit drains.
+        m.push(Core::Math, MirOp::WaitMatrix);
+        for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
+            if staged {
+                m.push(Core::Unpack, MirOp::CbPop { cb, n: 1 });
+            }
+        }
+        m.push(
+            Core::Math,
+            MirOp::Setrwc {
+                src_a: 0,
+                src_b: 0,
+                dst: 0,
+                flip_src_a: false,
+                flip_src_b: false,
+                dst_cr: false,
+            },
+        );
+    Ok(())
+}
+
+/// The bytes of one page of a ring, for a block's per-tile page step.
+fn cb_page_bytes(m: &MachineKernel, cb: Cb) -> Result<u32, ttStatus> {
+    m.cbs
+        .get(cb)
+        .map(|info| info.page_bytes)
+        .ok_or(ttStatus::TT_ERROR_BUFFER_NOT_PLACED)
+}
+
+/// A tile's place inside a block: the block's base page plus `tiles` pages,
+/// or, for a page index the program computes at run time, the same step added
+/// into the index register the unpacker already holds. `tmp` is the compute
+/// role's own scratch (the three threads have separate register files).
+fn tile_page(
+    m: &mut MachineKernel,
+    core: Core,
+    base: u32,
+    extra: Option<u8>,
+    tiles: u32,
+    page_bytes: u32,
+    tmp: u8,
+) -> (u32, Option<u8>) {
+    match extra {
+        None => (base + tiles * page_bytes, None),
+        Some(index) => {
+            // `SETUNPACKBASE` scales a run-time index by 16-byte units, like
+            // the base it is added to.
+            m.push(
+                core,
+                MirOp::Li {
+                    reg: tmp,
+                    value: tiles * (page_bytes / 16),
+                },
+            );
+            m.push(
+                core,
+                MirOp::IArith {
+                    op: IOp::Add,
+                    d: tmp,
+                    a: index,
+                    b: tmp,
+                },
+            );
+            (0, Some(tmp))
+        }
+    }
+}
+
+/// One tile page into a `Dst` region: the unpacker's destination, its `Z`
+/// plane, its datum run and the page, then the request. The seed and the
+/// block reload share it; tt-metal's `unpack_tile<...>` is the same sequence.
+fn unpack_tile(
+    m: &mut MachineKernel,
+    cb: Cb,
+    dtype: DType,
+    datums: u32,
+    page_offset: u32,
+    page_extra: Option<u8>,
+    reg: Dst,
+) {
+    m.push(Core::Unpack, MirOp::Setdst { reg });
+    m.push(
+        Core::Unpack,
+        MirOp::Setadczw {
+            u0: true,
+            u1: false,
+            z0: Some(0),
+            z1: None,
+        },
+    );
+    m.push(
+        Core::Unpack,
+        MirOp::Setadcx {
+            unit: 0,
+            first: 0,
+            count: datums,
+        },
+    );
+    m.push(
+        Core::Unpack,
+        MirOp::UnpackConfig {
+            unit: 0,
+            to_src: false,
+            dtype,
+            haloize: false,
+            add_dest_cntr: false,
+            ch1_z_stride: 0,
+        },
+    );
+    m.push(
+        Core::Unpack,
+        MirOp::SetUnpackBase {
+            cb,
+            unit: 0,
+            offset: page_offset,
+            extra: page_extra,
+        },
+    );
+    m.push(
+        Core::Unpack,
+        MirOp::Unpacr {
+            unit: 0,
+            count: datums,
+            flip: false,
+        },
+    );
+}
+
+/// A bf16 tile into a 32-bit `Dst`: the page enters `SrcA` as bf16 and
+/// `MOVA2D` widens it. tt-lang's `copy_tile` casts the same way
+/// (`llk_math_eltwise_unary_sfpu_typecast` has no SFPU kernel for that pair).
+fn widen_tile(
+    m: &mut MachineKernel,
+    cb: Cb,
+    dtype: DType,
+    datums: u32,
+    page_offset: u32,
+    page_extra: Option<u8>,
+    reg: Dst,
+) {
+    // The whole page at once: one `Z` plane per face, the
+    // descriptor's four faces, 64 `SrcA` rows.
+    m.push(
+        Core::Unpack,
+        MirOp::Setadczw {
+            u0: true,
+            u1: false,
+            z0: Some(0),
+            z1: None,
+        },
+    );
+    m.push(
+        Core::Unpack,
+        MirOp::UnpackConfig {
+            unit: 0,
+            to_src: true,
+            dtype,
+            haloize: false,
+            add_dest_cntr: false,
+            ch1_z_stride: 0,
+        },
+    );
+    m.push(
+        Core::Unpack,
+        MirOp::SetUnpackBase {
+            cb,
+            unit: 0,
+            offset: page_offset,
+            extra: page_extra,
+        },
+    );
+    m.push(
+        Core::Unpack,
+        MirOp::Unpacr {
+            unit: 0,
+            count: datums,
+            // `UNPACR`'s bit 6: `Set_Data_Valid` on
+            // Blackhole (ttsim's schema and tt-metal's LLK
+            // argument), the bank handover the math's
+            // `MOVA2D` waits for. Without it the Matrix
+            // Unit stalls forever on an invalid bank.
+            flip: true,
+        },
+    );
+    // The `Src` row counter starts at zero, as the unpack's
+    // own destination does.
+    m.push(
+        Core::Math,
+        MirOp::Setrwc {
+            src_a: 0,
+            src_b: 0,
+            dst: 0,
+            flip_src_a: false,
+            flip_src_b: false,
+            dst_cr: false,
+        },
+    );
+    // `MOVA2D` moves eight rows per instruction, and a
+    // 32-bit `Dst` holds a tile's 1024 datums in 64 rows.
+    for band in 0..(DST_ROWS / 8) {
+        m.push(
+            Core::Math,
+            MirOp::Mova2d {
+                use_dst32b_lo: false,
+                src_row: 8 * band,
+                addr_mod: 0,
+                move8_rows: true,
+                reg,
+                at: 8 * band,
+            },
+        );
+    }
+    // `SETRWC(CLR_A)`: the `SrcA` bank goes back to the
+    // unpacker now that the Matrix Unit has read it.
+    m.push(
+        Core::Math,
+        MirOp::Setrwc {
+            src_a: 0,
+            src_b: 0,
+            dst: 0,
+            flip_src_a: true,
+            flip_src_b: false,
+            dst_cr: false,
+        },
+    );
 }
