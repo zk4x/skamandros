@@ -5421,256 +5421,26 @@ version 9
         .replace("KB", &kb.to_string())
 }
 
-/// tt-metal's matmul kernel, transcribed: `bmm_large_block_zm.cpp`
-/// (`ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/`), with the reader
-/// and writer of `reader_bmm_tile_layout_in0_in1_mcast` /
-/// `writer_bmm_tile_layout`.
+/// tt-metal's large-block kernel, the program as text: `programs/tt_metal_bmm.ir`.
 ///
-/// One core owns an `obh x obw` band of output tiles and walks it exactly as
-/// tt-metal does:
-///
-/// ```text
-/// for block in 0 .. K/in0_block_w:              // k block, runtime bound
-///     wait the whole in0 block: obh*in0_block_w pages
-///     wait the whole in1 block: in0_block_w*obw pages
-///     for in0_subblock in 0 .. obh/out_subblock_h
-///         for in1_subblock in 0 .. obw/out_subblock_w
-///             if not the first block: reload intermed0 into Dst
-///             for h, w, inner: matmul_tiles(in0, in1, ..., dst)
-///             if the last block: pack out  else: pack to intermed0
-///     pop both operand blocks
-/// ```
-///
-/// `intermed0` is the partial-sum ring: the band's partial products stay in L1
-/// between k blocks, so no accumulator lives in `Dst` across the k loop and the
-/// band may be larger than the eight slots. The first block is peeled because
-/// tt-metal's `enable_reload` is false for it, and the last because its pack
-/// goes to the output ring instead of the partials -- tt-metal's `last_out`
-/// (`block == num_blocks - 1`). Peeled, both are program-visible; the emitted
-/// sequence is the kernel's.
-///
-/// Page formulas, from `bmm_large_block_zm.cpp`:
-/// - `in0_index = in0_subblock*out_subblock_h*in0_block_w + h*in0_block_w +
-///   inner` (A's block is `obh x in0_block_w`, row-major);
-/// - `in1_index = in1_subblock*out_subblock_w + inner*obw + w`
-///   (`in1_per_core_w == obw`);
-/// - `dst_index = h*out_subblock_w + w` (the subblock's accumulator).
-fn tt_metal_bmm(obh: u32, obw: u32, sbh: u32, sbw: u32, kb: u32) -> String {
-    let nisub = obh / sbh;
-    let njsub = obw / sbw;
-    let nacc = sbh * sbw;
-    let ablock = obh * kb;
-    let bblock = obw * kb;
-    let band = nisub * njsub * nacc;
-    let mut s = String::from("version 9\n");
-    s.push_str("%nx = param i32 0\n%ny = param i32 0\n");
-    s.push_str("%kt = param i32 0\n%ncols = param i32 0\n");
-    s.push_str("%pa = param bf16 16384 interleaved\n");
-    s.push_str("%pw = param bf16 245760 interleaved\n");
-    s.push_str("%pc = param f32 245760\n");
-    // An operand ring is a block hand-off (`block <obh*in0_block_w>`) two blocks
-    // deep: `MCAST_INPUT_BUFFERING_DEPTH = 2`
-    // (`matmul_multicore_reuse_mcast_2d_program_factory.cpp`).
-    s.push_str(&format!("%ba = buffer bf16 32,{} block {ablock}\n", 32 * 2 * ablock));
-    s.push_str(&format!("%bb = buffer bf16 32,{} block {bblock}\n", 32 * 2 * bblock));
-    // `intermed0`: one band of partials, handed off a subblock at a time.
-    s.push_str(&format!("%interm = buffer f32 32,{} block {nacc}\n", 32 * 2 * band));
-    // `out_dfb`: handed off a subblock at a time (`out_subblock_num_tiles`).
-    // The store names the block, so the ring states its hand-off.
-    s.push_str(&format!(
-        "%bc = buffer f32 32,{} block {nacc}\n",
-        32 * 2 * nacc
-    ));
-    // One accumulator block: tt-metal's `out_subblock_h x out_subblock_w`
-    // `Dst` region, tt-lang's `ttl.block`. The ops that use it name the block,
-    // not its tiles.
-    s.push_str(&format!("%acc = acc f32 {},{} \n", sbh * 32, sbw * 32));
-    s.push_str("%zero = const f32 0\n%izero = const i32 0\n%tile = const i32 1\n");
-    s.push_str(&format!(
-        "%kb = const i32 {kb}\n%nisub = const i32 {nisub}\n%njsub = const i32 {njsub}\n"
-    ));
-    // An operand of an arithmetic op is a value, not a literal: one `const` per
-    // number the body names.
-    let top = *[obh, obw, sbh * kb, kb * obw, sbh, sbw].iter().max().unwrap();
-    for i in 0..=top {
-        s.push_str(&format!("%c{i} = const i32 {i}\n"));
-    }
-    // tt-metal's `for block in 0..num_blocks` with `enable_reload = false` on
-    // the first block and `last_out` on the last. Both ends are peeled (a
-    // runtime `if` is a branch no lowering here carries), so the loop covers
-    // the blocks *between* them: 1 .. num_blocks-2, and `%kmid` is the last
-    // block's index.
-    s.push_str("%kblocks = div %kt %kb\n");
-    s.push_str("%kmid = sub %kblocks %tile\n");
-    s.push_str("%kloop = sub %kmid %tile\n%klast = mul %kmid %kb\n");
-    s.push_str("%x = grid.x\n%y = grid.y\n");
-    s.push_str(&format!(
-        "%m0 = mul %y %c{obh}\n%n0 = mul %x %c{obw}\n%arow = mul %m0 %kt\n%brow = mul %n0 %kt\n"
-    ));
-    for h in 1..obh {
-        s.push_str(&format!("%ahr{h} = mul %kt %c{h}\n"));
-    }
-    for w in 1..obw {
-        s.push_str(&format!("%bcw{w} = mul %kt %c{w}\n"));
-    }
-    for h in 1..obh {
-        s.push_str(&format!("%ar{h} = add %arow %ahr{h}\n"));
-    }
-    for w in 1..obw {
-        s.push_str(&format!("%br{w} = add %brow %bcw{w}\n"));
-    }
-
-    // The reader: every page of one operand block, `kbase` tiles into K.
-    let reader = |s: &mut String, tag: &str, kbase: &str| {
-        for h in 0..obh {
-            let row = if h == 0 {
-                "%arow".to_string()
-            } else {
-                format!("%ar{h}")
-            };
-            for inner in 0..kb {
-                s.push_str(&format!("%r{tag}a{h}_{inner} = add {row} %c{inner}\n"));
-                s.push_str(&format!(
-                    "%r{tag}ak{h}_{inner} = add %r{tag}a{h}_{inner} {kbase}\n"
-                ));
-                s.push_str(&format!(
-                    "copy 32,32 %ba [{}] = %pa [%r{tag}ak{h}_{inner}]\n",
-                    h * kb + inner
-                ));
-            }
-        }
-        for w in 0..obw {
-            let col = if w == 0 {
-                "%brow".to_string()
-            } else {
-                format!("%br{w}")
-            };
-            for inner in 0..kb {
-                s.push_str(&format!("%r{tag}b{w}_{inner} = add {col} %c{inner}\n"));
-                s.push_str(&format!(
-                    "%r{tag}bk{w}_{inner} = add %r{tag}b{w}_{inner} {kbase}\n"
-                ));
-                // B's ring layout is the program's: subblock-major, so the
-                // `k x out_subblock_w` block a subblock's compute reads is
-                // dense (`page = jsub*kb*sbw + inner*sbw + w`). tt-metal's own
-                // `inner*obw + w` order is what its per-tile index needs.
-                let dst_page = (w / sbw) * (kb * sbw) + inner * sbw + (w % sbw);
-                s.push_str(&format!(
-                    "copy 32,32 %bb [{}] = %pw [%r{tag}bk{w}_{inner}]\n",
-                    dst_page
-                ));
-            }
-        }
-    };
-
-    // The compute: the subblock nest, the reload, the products, the pack. The
-    // accumulators, operands and hand-offs are blocks; the per-tile walk is the
-    // lowering's, not the program's.
-    let compute = |s: &mut String, tag: &str, reload: bool, out: bool| {
-        s.push_str(&format!("%si{tag} = loop %nisub\n"));
-        // A's block is `obh x kb` row-major, so a subblock's `sbh x kb` block is
-        // `si * sbh * kb` pages in.
-        s.push_str(&format!("%as{tag} = mul %si{tag} %c{}\n", sbh * kb));
-        s.push_str(&format!("%sj{tag} = loop %njsub\n"));
-        // B's ring is subblock-major: `sj * kb * sbw` pages in.
-        s.push_str(&format!("%bs{tag} = mul %sj{tag} %c{}\n", kb * sbw));
-        // A spill is one block hand-off (`block out_subblock_num_tiles`), and
-        // a block access names the pages of that hand-off: the ring's write
-        // pointer is the section's, so every subblock writes page 0 of its own
-        // reservation, exactly tt-metal's `pack_tile(i, dfb)` with `i` inside
-        // `reserve_back(out_subblock_num_tiles)`.
-        let rel = "%izero";
-        if reload {
-            s.push_str(&format!(
-                "load {},{} %acc = %interm [{rel}]\n",
-                sbh * 32,
-                sbw * 32
-            ));
-        } else {
-            // `enable_reload = false`: the first block starts from zero.
-            s.push_str(&format!("store {},{} %acc = %zero\n", sbh * 32, sbw * 32));
-        }
-        s.push_str(&format!(
-            "load {},{} %a{tag} = %ba [%as{tag}]\n",
-            sbh * 32,
-            kb * 32
-        ));
-        s.push_str(&format!(
-            "load {},{} %b{tag} = %bb [%bs{tag}]\n",
-            kb * 32,
-            sbw * 32
-        ));
-        s.push_str(&format!("matmul %acc %a{tag} %b{tag}\n"));
-        let ring = if out { "%bc" } else { "%interm" };
-        s.push_str(&format!(
-            "store {},{} {ring} [{rel}] = %acc\n",
-            sbh * 32,
-            sbw * 32
-        ));
-        s.push_str("endloop\nendloop\n");
-    };
-
-    // Block 0: no partial to reload (`enable_reload = false`).
-    reader(&mut s, "", "%izero");
-    compute(&mut s, "", false, false);
-    // Blocks 1 .. n-2: reload, accumulate, spill.
-    s.push_str("%k = loop %kloop\n");
-    s.push_str("%kn = add %k %tile\n%k8 = mul %kn %kb\n");
-    reader(&mut s, "m", "%k8");
-    compute(&mut s, "m", true, false);
-    s.push_str("endloop\n");
-    // Block n-1: the answer, packed to the output ring (tt-metal's `last_out`).
-    reader(&mut s, "l", "%klast");
-    compute(&mut s, "l", true, true);
-    // The writer: `out_dfb` a subblock at a time, at the same trip counts.
-    s.push_str("%wsi = loop %nisub\n");
-    s.push_str(&format!("%ws = mul %wsi %c{sbh}\n"));
-    s.push_str("%wsj = loop %njsub\n");
-    s.push_str(&format!("%wn = mul %wsj %c{sbw}\n"));
-    for w in 0..sbw {
-        s.push_str(&format!("%wc{w} = add %wn %c{w}\n"));
-        s.push_str(&format!("%wcol{w} = add %n0 %wc{w}\n"));
-    }
-    for h in 0..sbh {
-        s.push_str(&format!("%wr{h} = add %ws %c{h}\n"));
-        s.push_str(&format!("%wrow{h} = add %m0 %wr{h}\n"));
-        s.push_str(&format!("%wrp{h} = mul %wrow{h} %ncols\n"));
-        for w in 0..sbw {
-            s.push_str(&format!("%widx{h}_{w} = add %wrp{h} %wcol{w}\n"));
-            s.push_str(&format!(
-                "copy 32,32 %pc [%widx{h}_{w}] = %bc [{}]\n",
-                h * sbw + w
-            ));
-        }
-    }
-    s.push_str("endloop\nendloop\n");
-    s.push_str("grid %nx,%ny\n");
-    s
-}
-
-/// The kernel above on one tile, checked datum by datum.
-///
-/// A 4x4-tile band with 2x2 subblocks and `in0_block_w = 2`, so there are four
-/// 2x2 subblocks per band and four k blocks: the peeled first block, two
-/// middle blocks through the loop, and the peeled `last_out` block.
+/// One core owns a 4x4 band of output tiles walked in 2x2 subblocks with
+/// `in0_block_w = 2`. The k blocks are the peeled first (no reload), the loop
+/// between, and the peeled `last_out`; K comes from the `%kt` launch scalar, so
+/// the same text runs any number of k blocks.
 #[test]
 fn a_tt_metal_kernel_matmuls_one_band() {
-    // The band is a shape, not a fact: `SKAM_OBH`/`SKAM_KBLOCKS`/... run the
-    // same program at another size while a lowering is being pinned down.
-    let env = |name: &str, default: u32| {
-        std::env::var(name)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(default)
-    };
-    let obh: u32 = env("SKAM_OBH", 4);
-    let obw: u32 = env("SKAM_OBW", 4);
-    let sbh: u32 = env("SKAM_SBH", 2);
-    let sbw: u32 = env("SKAM_SBW", 2);
-    let kb: u32 = env("SKAM_KB", 2);
-    let kblocks: u32 = env("SKAM_KBLOCKS", 4);
-    let (OBH, OBW, SBH, SBW, KB, KBLOCKS) = (obh, obw, sbh, sbw, kb, kblocks);
-    let (m, n, k) = (32 * OBH as usize, 32 * OBW as usize, 32 * KB as usize * kblocks as usize);
+    const OBH: u32 = 4;
+    const OBW: u32 = 4;
+    const KB: u32 = 2;
+    let kblocks: u32 = std::env::var("SKAM_KBLOCKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let (m, n, k) = (
+        32 * OBH as usize,
+        32 * OBW as usize,
+        32 * KB as usize * kblocks as usize,
+    );
     let kt = k / 32;
 
     const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
@@ -5688,13 +5458,10 @@ fn a_tt_metal_kernel_matmuls_one_band() {
     let b: Vec<u8> = ONE_BF16.iter().cycle().take(n * k * 2).copied().collect();
     let expected = 32.0 * (1..=kt).map(|j| j as f32).sum::<f32>();
 
-    let program = tt_metal_bmm(OBH, OBW, SBH, SBW, KB)
+    let program = include_str!("../programs/tt_metal_bmm.ir")
         .replace("%pa = param bf16 16384", &format!("%pa = param bf16 {}", m * k))
         .replace("%pw = param bf16 245760", &format!("%pw = param bf16 {}", n * k))
         .replace("%pc = param f32 245760", &format!("%pc = param f32 {}", m * n));
-    if std::env::var_os("SKAM_PROGRAM").is_some() {
-        println!("{program}");
-    }
     let scalars = [1u64, 1u64, kt as u64, (n / 32) as u64];
     let out = run_kernel_launches(&program, &scalars, &[&a, &b], &[2048, 2048], m * n * 4, 1).0;
     let got: Vec<f32> = out

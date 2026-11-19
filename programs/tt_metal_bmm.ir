@@ -1,0 +1,295 @@
+# tt-metal's large-block matmul, transcribed into skamandros IR.
+#
+# The compute kernel is `bmm_large_block_zm.cpp` (ttnn/cpp/ttnn/operations/
+# matmul/device/kernels/compute/), the reader `reader_bmm_tile_layout.cpp` and
+# the writer `writer_bmm_tile_layout.cpp` from the same device's kernels/
+# dataflow/.  One core owns a 4x4 band of output tiles (`obh`/`obw`), walked in
+# 2x2 subblocks (`out_subblock_h`/`out_subblock_w`), with `in0_block_w = 2`
+# tiles of K per k block.
+#
+# The shape this text holds is the program's: the grid scales the band over the
+# chip (`grid.x`/`grid.y` place the core's `m0`/`n0`), `%kt`/`%ncols` are launch
+# scalars, and K is whatever `%kt` says.  The three `param` sizes are the
+# buffers the launch hands over; the test substitutes the real sizes, exactly
+# as tt-metal's tensors arrive as launch arguments.
+#
+# Rings and why they are laid out this way:
+#
+# - `%ba` is A's `obh x in0_block_w` block, row-major (`h*kb + inner`), which is
+#   tt-metal's `in0_index`; a subblock's `sbh x kb` block is then dense.
+# - `%bb` is B's block written **subblock-major**
+#   (`jsub*kb*sbw + inner*sbw + w`), so a subblock's `kb x sbw` block is dense
+#   too.  tt-metal's own `inner*obw + w` order is what its per-tile index
+#   needs; our `load` names a block, and a block is its tiles row-major.
+# - `%interm` (tt-metal's `intermed0`) and `%bc` (`out_dfb`) are handed off one
+#   subblock at a time, `block out_subblock_num_tiles` pages, and a store or
+#   reload names page 0 of that hand-off -- `pack_tile(i, dfb)`/`copy_tile(i, i)`
+#   with `i` inside `reserve_back(out_subblock_num_tiles)`.
+#
+# Two ends are peeled because this IR has no runtime `if`, and tt-metal's kernel
+# branches on the block index twice: `enable_reload = false` for block 0, and
+# `last_out` for block `num_blocks - 1`.  The peeled first block computes into
+# `interm` without a reload; the peeled last block reloads and packs to the
+# output ring.  The loop between them covers `1 .. num_blocks-2`, and the reader
+# mirrors that structure so a ring's hand-off is one block per body.
+#
+# Every tile of the band is walked by the codes as tt-metal walks it: the
+# subblock nest (`in0_subblock`/`in1_subblock`) is the `%si`/`%sj` loop pair,
+# the accumulator is one `acc f32 64,64` block (tt-metal's `out_subblock_h x
+# out_subblock_w` `Dst` region), and the operand loads name blocks, not tiles.
+version 9
+%nx = param i32 0
+%ny = param i32 0
+%kt = param i32 0
+%ncols = param i32 0
+%pa = param bf16 16384 interleaved
+%pw = param bf16 245760 interleaved
+%pc = param f32 245760
+%ba = buffer bf16 32,512 block 8
+%bb = buffer bf16 32,512 block 8
+%interm = buffer f32 32,1024 block 4
+%bc = buffer f32 32,256 block 4
+%acc = acc f32 64,64 
+%zero = const f32 0
+%izero = const i32 0
+%tile = const i32 1
+%kb = const i32 2
+%nisub = const i32 2
+%njsub = const i32 2
+%c0 = const i32 0
+%c1 = const i32 1
+%c2 = const i32 2
+%c3 = const i32 3
+%c4 = const i32 4
+%c5 = const i32 5
+%c6 = const i32 6
+%c7 = const i32 7
+%c8 = const i32 8
+%kblocks = div %kt %kb
+%kmid = sub %kblocks %tile
+%kloop = sub %kmid %tile
+%klast = mul %kmid %kb
+%x = grid.x
+%y = grid.y
+%m0 = mul %y %c4
+%n0 = mul %x %c4
+%arow = mul %m0 %kt
+%brow = mul %n0 %kt
+%ahr1 = mul %kt %c1
+%ahr2 = mul %kt %c2
+%ahr3 = mul %kt %c3
+%bcw1 = mul %kt %c1
+%bcw2 = mul %kt %c2
+%bcw3 = mul %kt %c3
+%ar1 = add %arow %ahr1
+%ar2 = add %arow %ahr2
+%ar3 = add %arow %ahr3
+%br1 = add %brow %bcw1
+%br2 = add %brow %bcw2
+%br3 = add %brow %bcw3
+%ra0_0 = add %arow %c0
+%rak0_0 = add %ra0_0 %izero
+copy 32,32 %ba [0] = %pa [%rak0_0]
+%ra0_1 = add %arow %c1
+%rak0_1 = add %ra0_1 %izero
+copy 32,32 %ba [1] = %pa [%rak0_1]
+%ra1_0 = add %ar1 %c0
+%rak1_0 = add %ra1_0 %izero
+copy 32,32 %ba [2] = %pa [%rak1_0]
+%ra1_1 = add %ar1 %c1
+%rak1_1 = add %ra1_1 %izero
+copy 32,32 %ba [3] = %pa [%rak1_1]
+%ra2_0 = add %ar2 %c0
+%rak2_0 = add %ra2_0 %izero
+copy 32,32 %ba [4] = %pa [%rak2_0]
+%ra2_1 = add %ar2 %c1
+%rak2_1 = add %ra2_1 %izero
+copy 32,32 %ba [5] = %pa [%rak2_1]
+%ra3_0 = add %ar3 %c0
+%rak3_0 = add %ra3_0 %izero
+copy 32,32 %ba [6] = %pa [%rak3_0]
+%ra3_1 = add %ar3 %c1
+%rak3_1 = add %ra3_1 %izero
+copy 32,32 %ba [7] = %pa [%rak3_1]
+%rb0_0 = add %brow %c0
+%rbk0_0 = add %rb0_0 %izero
+copy 32,32 %bb [0] = %pw [%rbk0_0]
+%rb0_1 = add %brow %c1
+%rbk0_1 = add %rb0_1 %izero
+copy 32,32 %bb [2] = %pw [%rbk0_1]
+%rb1_0 = add %br1 %c0
+%rbk1_0 = add %rb1_0 %izero
+copy 32,32 %bb [1] = %pw [%rbk1_0]
+%rb1_1 = add %br1 %c1
+%rbk1_1 = add %rb1_1 %izero
+copy 32,32 %bb [3] = %pw [%rbk1_1]
+%rb2_0 = add %br2 %c0
+%rbk2_0 = add %rb2_0 %izero
+copy 32,32 %bb [4] = %pw [%rbk2_0]
+%rb2_1 = add %br2 %c1
+%rbk2_1 = add %rb2_1 %izero
+copy 32,32 %bb [6] = %pw [%rbk2_1]
+%rb3_0 = add %br3 %c0
+%rbk3_0 = add %rb3_0 %izero
+copy 32,32 %bb [5] = %pw [%rbk3_0]
+%rb3_1 = add %br3 %c1
+%rbk3_1 = add %rb3_1 %izero
+copy 32,32 %bb [7] = %pw [%rbk3_1]
+%si = loop %nisub
+%as = mul %si %c4
+%sj = loop %njsub
+%bs = mul %sj %c4
+store 64,64 %acc = %zero
+load 64,64 %a = %ba [%as]
+load 64,64 %b = %bb [%bs]
+matmul %acc %a %b
+store 64,64 %interm [%izero] = %acc
+endloop
+endloop
+%k = loop %kloop
+%kn = add %k %tile
+%k8 = mul %kn %kb
+%rma0_0 = add %arow %c0
+%rmak0_0 = add %rma0_0 %k8
+copy 32,32 %ba [0] = %pa [%rmak0_0]
+%rma0_1 = add %arow %c1
+%rmak0_1 = add %rma0_1 %k8
+copy 32,32 %ba [1] = %pa [%rmak0_1]
+%rma1_0 = add %ar1 %c0
+%rmak1_0 = add %rma1_0 %k8
+copy 32,32 %ba [2] = %pa [%rmak1_0]
+%rma1_1 = add %ar1 %c1
+%rmak1_1 = add %rma1_1 %k8
+copy 32,32 %ba [3] = %pa [%rmak1_1]
+%rma2_0 = add %ar2 %c0
+%rmak2_0 = add %rma2_0 %k8
+copy 32,32 %ba [4] = %pa [%rmak2_0]
+%rma2_1 = add %ar2 %c1
+%rmak2_1 = add %rma2_1 %k8
+copy 32,32 %ba [5] = %pa [%rmak2_1]
+%rma3_0 = add %ar3 %c0
+%rmak3_0 = add %rma3_0 %k8
+copy 32,32 %ba [6] = %pa [%rmak3_0]
+%rma3_1 = add %ar3 %c1
+%rmak3_1 = add %rma3_1 %k8
+copy 32,32 %ba [7] = %pa [%rmak3_1]
+%rmb0_0 = add %brow %c0
+%rmbk0_0 = add %rmb0_0 %k8
+copy 32,32 %bb [0] = %pw [%rmbk0_0]
+%rmb0_1 = add %brow %c1
+%rmbk0_1 = add %rmb0_1 %k8
+copy 32,32 %bb [2] = %pw [%rmbk0_1]
+%rmb1_0 = add %br1 %c0
+%rmbk1_0 = add %rmb1_0 %k8
+copy 32,32 %bb [1] = %pw [%rmbk1_0]
+%rmb1_1 = add %br1 %c1
+%rmbk1_1 = add %rmb1_1 %k8
+copy 32,32 %bb [3] = %pw [%rmbk1_1]
+%rmb2_0 = add %br2 %c0
+%rmbk2_0 = add %rmb2_0 %k8
+copy 32,32 %bb [4] = %pw [%rmbk2_0]
+%rmb2_1 = add %br2 %c1
+%rmbk2_1 = add %rmb2_1 %k8
+copy 32,32 %bb [6] = %pw [%rmbk2_1]
+%rmb3_0 = add %br3 %c0
+%rmbk3_0 = add %rmb3_0 %k8
+copy 32,32 %bb [5] = %pw [%rmbk3_0]
+%rmb3_1 = add %br3 %c1
+%rmbk3_1 = add %rmb3_1 %k8
+copy 32,32 %bb [7] = %pw [%rmbk3_1]
+%sim = loop %nisub
+%asm = mul %sim %c4
+%sjm = loop %njsub
+%bsm = mul %sjm %c4
+load 64,64 %acc = %interm [%izero]
+load 64,64 %am = %ba [%asm]
+load 64,64 %bm = %bb [%bsm]
+matmul %acc %am %bm
+store 64,64 %interm [%izero] = %acc
+endloop
+endloop
+endloop
+%rla0_0 = add %arow %c0
+%rlak0_0 = add %rla0_0 %klast
+copy 32,32 %ba [0] = %pa [%rlak0_0]
+%rla0_1 = add %arow %c1
+%rlak0_1 = add %rla0_1 %klast
+copy 32,32 %ba [1] = %pa [%rlak0_1]
+%rla1_0 = add %ar1 %c0
+%rlak1_0 = add %rla1_0 %klast
+copy 32,32 %ba [2] = %pa [%rlak1_0]
+%rla1_1 = add %ar1 %c1
+%rlak1_1 = add %rla1_1 %klast
+copy 32,32 %ba [3] = %pa [%rlak1_1]
+%rla2_0 = add %ar2 %c0
+%rlak2_0 = add %rla2_0 %klast
+copy 32,32 %ba [4] = %pa [%rlak2_0]
+%rla2_1 = add %ar2 %c1
+%rlak2_1 = add %rla2_1 %klast
+copy 32,32 %ba [5] = %pa [%rlak2_1]
+%rla3_0 = add %ar3 %c0
+%rlak3_0 = add %rla3_0 %klast
+copy 32,32 %ba [6] = %pa [%rlak3_0]
+%rla3_1 = add %ar3 %c1
+%rlak3_1 = add %rla3_1 %klast
+copy 32,32 %ba [7] = %pa [%rlak3_1]
+%rlb0_0 = add %brow %c0
+%rlbk0_0 = add %rlb0_0 %klast
+copy 32,32 %bb [0] = %pw [%rlbk0_0]
+%rlb0_1 = add %brow %c1
+%rlbk0_1 = add %rlb0_1 %klast
+copy 32,32 %bb [2] = %pw [%rlbk0_1]
+%rlb1_0 = add %br1 %c0
+%rlbk1_0 = add %rlb1_0 %klast
+copy 32,32 %bb [1] = %pw [%rlbk1_0]
+%rlb1_1 = add %br1 %c1
+%rlbk1_1 = add %rlb1_1 %klast
+copy 32,32 %bb [3] = %pw [%rlbk1_1]
+%rlb2_0 = add %br2 %c0
+%rlbk2_0 = add %rlb2_0 %klast
+copy 32,32 %bb [4] = %pw [%rlbk2_0]
+%rlb2_1 = add %br2 %c1
+%rlbk2_1 = add %rlb2_1 %klast
+copy 32,32 %bb [6] = %pw [%rlbk2_1]
+%rlb3_0 = add %br3 %c0
+%rlbk3_0 = add %rlb3_0 %klast
+copy 32,32 %bb [5] = %pw [%rlbk3_0]
+%rlb3_1 = add %br3 %c1
+%rlbk3_1 = add %rlb3_1 %klast
+copy 32,32 %bb [7] = %pw [%rlbk3_1]
+%sil = loop %nisub
+%asl = mul %sil %c4
+%sjl = loop %njsub
+%bsl = mul %sjl %c4
+load 64,64 %acc = %interm [%izero]
+load 64,64 %al = %ba [%asl]
+load 64,64 %bl = %bb [%bsl]
+matmul %acc %al %bl
+store 64,64 %bc [%izero] = %acc
+endloop
+endloop
+%wsi = loop %nisub
+%ws = mul %wsi %c2
+%wsj = loop %njsub
+%wn = mul %wsj %c2
+%wc0 = add %wn %c0
+%wcol0 = add %n0 %wc0
+%wc1 = add %wn %c1
+%wcol1 = add %n0 %wc1
+%wr0 = add %ws %c0
+%wrow0 = add %m0 %wr0
+%wrp0 = mul %wrow0 %ncols
+%widx0_0 = add %wrp0 %wcol0
+copy 32,32 %pc [%widx0_0] = %bc [0]
+%widx0_1 = add %wrp0 %wcol1
+copy 32,32 %pc [%widx0_1] = %bc [1]
+%wr1 = add %ws %c1
+%wrow1 = add %m0 %wr1
+%wrp1 = mul %wrow1 %ncols
+%widx1_0 = add %wrp1 %wcol0
+copy 32,32 %pc [%widx1_0] = %bc [2]
+%widx1_1 = add %wrp1 %wcol1
+copy 32,32 %pc [%widx1_1] = %bc [3]
+endloop
+endloop
+grid %nx,%ny
