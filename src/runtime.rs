@@ -912,7 +912,6 @@ fn stage_at(
         (mb.dump_row_count(), 0),
         (mb.trace(), 0),
         (mb.push_window(), 0),
-        (mb.unwedge(), 0),
         (mb.mop_cfg_valid(), 0),
     ] {
         device.stage_words(at, &[value])?;

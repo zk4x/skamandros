@@ -5216,11 +5216,16 @@ fn a_blocked_matmul_issues_a_block() {
 /// the operand row the inner one, which is also the order the compute wants
 /// them -- every row's tile at one k-step together.
 fn gate_proj_block(h: u32, w: u32) -> String {
-    // The k-block's width in tiles, tt-metal's `in0_block_w`
-    // (`MatmulMultiCoreReuseMultiCastProgramConfig`). Two tiles keep a block's
-    // footprint small while still amortizing one `wait`/`pop` over `h + w`
-    // reads for `h * w` MVMULs.
-    let kb = 2u32;
+    gate_proj_block_kb(h, w, 2)
+}
+
+/// The same reuse block with the k-block's width (`in0_block_w`) named.
+///
+/// Two tiles is tt-metal's smallest useful `in0_block_w` here: one `wait`/`pop`
+/// per block over `h + w` reads for `h * w` MVMULs. A block of one tile is the
+/// control for the hand-off: it is the single-page ring that already runs on
+/// the card.
+fn gate_proj_block_kb(h: u32, w: u32, kb: u32) -> String {
     let pages_a = kb * h;
     let pages_b = kb * w;
     let mut s = format!(
@@ -5618,6 +5623,64 @@ fn a_block_matmul_runs_on_one_tile() {
             K as f32,
             "({row}, {column}) holds the whole K sum"
         );
+    }
+}
+
+/// One tile, one block shape, chosen by the test script: the bisect for the
+/// 2x2 block that hangs on silicon while the simulator is green.
+///
+/// `SKAM_BH`, `SKAM_BW` and `SKAM_BKB` are the block's rows, its columns and
+/// its k width (`in0_block_w`). At (1, 1, 1) the program is the single-page
+/// ring the card already runs; at (2, 2, 2) it is the hanging one. Every datum
+/// is checked, so a variant that runs also says whether its pages are right.
+/// The grid is 1x1: whatever the block does is one tile's protocol.
+#[ignore = "driven by hand on the card while bisecting the 2x2 block"]
+#[test]
+fn a_block_protocol_bisect() {
+    let env_of = |name: &str, default: u32| -> u32 {
+        std::env::var(name)
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(default)
+    };
+    let (bh, bw, bkb) = (
+        env_of("SKAM_BH", 2),
+        env_of("SKAM_BW", 2),
+        env_of("SKAM_BKB", 2),
+    );
+    let (mt, nt) = (bh as usize, bw as usize);
+    let (M, N, K) = (32 * mt, 32 * nt, 32 * bkb as usize * 8);
+
+    const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
+    let a: Vec<u8> = ONE_BF16.iter().cycle().take(M * K * 2).copied().collect();
+    let b: Vec<u8> = ONE_BF16.iter().cycle().take(N * K * 2).copied().collect();
+
+    let program = gate_proj_block_kb(bh, bw, bkb)
+        .replace(
+            "%pa = param bf16 16384",
+            &format!("%pa = param bf16 {}", M * K),
+        )
+        .replace(
+            "%pw = param bf16 245760",
+            &format!("%pw = param bf16 {}", N * K),
+        )
+        .replace(
+            "%pc = param f32 245760",
+            &format!("%pc = param f32 {}", M * N),
+        );
+    let kt = K / 32;
+    println!("bisect: h={bh} w={bw} kb={bkb} M={M} N={N} K={K}");
+    let scalars = [1u64, 1u64, (mt * nt) as u64, kt as u64, nt as u64];
+    let out = run_kernel_launches(&program, &scalars, &[&a, &b], &[2048, 2048], M * N * 4, 1).0;
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (m, n) in (0..mt).flat_map(|m| (0..nt).map(move |n| (m, n))) {
+        for i in 0..1024 {
+            let at = (m * nt + n) * 1024 + i;
+            assert_eq!(got[at], K as f32, "tile ({m}, {n}) datum {i}");
+        }
     }
 }
 

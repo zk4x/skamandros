@@ -2044,6 +2044,14 @@ impl Device {
         self.stage_words(mb.program_addr(), &[text])?;
         self.stage_words(mb.program_len(), &[words])?;
         self.stage_words(mb.args(), &[args])?;
+        // A thread left in `SEMWAIT` by a failed run survives the reset of its
+        // core and would block the next program at the same semaphore
+        // (`crate::arch::blackhole::mailbox::UNWEDGE`). Silicon has no other way to
+        // release it: the runner posts every semaphore that reads zero before it
+        // pushes. The simulator models no such stuck thread, and its `SEMPOST`
+        // from RISC-V is not part of what it emulates.
+        let unwedge = u32::from(matches!(self.link, Link::Driver(_)));
+        self.stage_words(mb.unwedge(), &[unwedge])?;
         Ok(())
     }
 
