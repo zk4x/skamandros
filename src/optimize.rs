@@ -536,8 +536,25 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
         inserts.push((at, (edge.producer, MirOp::SemWaitFree { sem: sem(edge)? })));
     }
     // Each data post is one token, guarded like every other post.
+    //
+    // Two posts of one edge at one position are one publish: the token carries
+    // no identity, and the consumer takes one token for the reads it finds
+    // there. A body whose slot is written inside a loop and read after it
+    // hoists every slot's post to the loop's end, so a section of four
+    // accumulators put four posts in a row there while the packer took one --
+    // three tokens per section that nobody spent, and the fourth section's
+    // math blocked in `SemWaitFree` against the Sync Unit's maximum. That is a
+    // hang no simulator shows (`SEMPOST` into a full semaphore is a
+    // non-contractual verify there, a stalled thread here), and it grows with
+    // the number of output blocks, which is why the one-block program passed
+    // and the reuse kernel never finished.
+    let mut posted: Vec<(Edge, usize)> = Vec::new();
     for (edge, post, _, _) in &data {
         let post = post_at(*post);
+        if posted.contains(&(*edge, post)) {
+            continue;
+        }
+        posted.push((*edge, post));
         inserts.push((post, (edge.producer, MirOp::SemPost { sem: sem(*edge)? })));
         inserts.push((post, (edge.producer, MirOp::SemWaitFree { sem: sem(*edge)? })));
     }
