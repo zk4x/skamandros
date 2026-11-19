@@ -196,6 +196,16 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
         .collect();
     for (load, (reader, _)) in &last_src {
         let ring = consumer_ring(&consumers, *load)?;
+        // A ring that states its block is walked by the program: the pages are
+        // the indices the program names inside that block, and whether two of
+        // them are the same page is the program's business, not something the
+        // compiler can read off a loop value. tt-metal's compute does exactly
+        // this -- `matmul_tiles(in0_index, in1_index, ...)` with the indices
+        // from the subblock loops (`bmm_large_block_zm.cpp`) -- and the block
+        // hand-off is one per block whatever the indices are.
+        if matches!(k.at(ring), Op::Cb { block: Some(_), .. }) {
+            continue;
+        }
         let (Some(&from), Some(&to)) = (position.get(load), position.get(reader)) else {
             eprintln!("libskamandros: sync_cbs: a load or its `Src` reader has no position");
             return Err(ttStatus::TT_INTERNAL_BUG);
@@ -418,7 +428,10 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
     // A ring whose block is read across a nest of loops below the loop that
     // produces it: where its one wait/pop pair sits, and how many pages it
     // hands off.
-    let mut hoisted: BTreeMap<OpId, (OpId, u32)> = BTreeMap::new();
+    // One hand-off pair per (ring, scope): tt-metal's kernel reads one operand
+    // ring in a peeled prologue, in the k loop and in a peeled epilogue, and
+    // each of those is its own wait/release with the same block.
+    let mut hoisted: BTreeMap<(OpId, OpId), u32> = BTreeMap::new();
     for consumer in &consumers {
         let Some(depths) = producer_depths.get(&consumer.ring) else {
             eprintln!(
@@ -428,17 +441,35 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
             return Err(ttStatus::TT_INTERNAL_BUG);
         };
         let depth = consumer.stack.len();
-        let Some(&producer_depth) = depths.last() else {
+        // The write this read takes its page from: the last one before it. A
+        // ring read in a peeled prologue, in a loop and in a peeled epilogue is
+        // three hand-off streams on one name, and each pairs with its own
+        // producer -- pairing every read with the deepest write would put the
+        // prologue's wait and release around the wrong loop.
+        let producer_depth = write_info
+            .iter()
+            .filter(|(_, (ring, _, _, _))| *ring == consumer.ring)
+            .filter_map(|(at, (_, stack, _, _))| {
+                position.get(at).map(|p| (*p, stack.len()))
+            })
+            .filter(|(p, _)| *p < position[&consumer.at])
+            .max_by_key(|(p, _)| *p)
+            .map(|(_, d)| d);
+        let Some(producer_depth) = producer_depth else {
             eprintln!(
-                "libskamandros: sync_cbs: ring {} has no producer depth",
+                "libskamandros: sync_cbs: ring {} is read before it is written",
                 consumer.ring
             );
             return Err(ttStatus::TT_INTERNAL_BUG);
         };
-        if depths.contains(&depth) {
-            if hoisted.contains_key(&consumer.ring) {
-                return Err(ttStatus::TT_TODO_RING_IN_AND_OUT_OF_LOOP);
-            }
+        // A write of this ring at the read's own depth anywhere in the program
+        // is a hand-off at that scope (a peeled tail reads what the loop's last
+        // iteration wrote); otherwise the read is inside a deeper nest than the
+        // write before it, and the pair is hoisted to that write's scope.
+        let same_depth_write = producer_depths
+            .get(&consumer.ring)
+            .is_some_and(|d| d.contains(&depth));
+        if same_depth_write {
             // A block is waited for at its first read and released after its
             // last `Src` reader; a ring without one keeps a hand-off per read.
             let key = (consumer.ring, consumer.stack.clone());
@@ -514,9 +545,9 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
                 return Err(ttStatus::TT_INTERNAL_BUG);
             };
             let n = pages.unwrap_or(1);
-            match hoisted.insert(consumer.ring, (outer, n)) {
-                Some((previous, _)) if previous != outer => {
-                    return Err(ttStatus::TT_TODO_RING_TWO_LOOPS);
+            match hoisted.insert((consumer.ring, outer), n) {
+                Some(previous) if previous != n => {
+                    return Err(ttStatus::TT_ERROR_CB_BLOCK);
                 }
                 _ => {}
             }
@@ -524,7 +555,7 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
             return Err(ttStatus::TT_TODO_RING_READ_OUTSIDE_LOOP);
         }
     }
-    for (ring, (outer, n)) in hoisted {
+    for ((ring, outer), n) in hoisted {
         let Some(&end) = end_of.get(&outer) else {
             eprintln!("libskamandros: sync_cbs: loop {outer} has no end");
             return Err(ttStatus::TT_INTERNAL_BUG);
@@ -662,6 +693,11 @@ fn check_rings_balanced(k: &Kernel) -> Result<(), ttStatus> {
     for (cb, monomials) in traffic {
         let depth = depth.get(&cb).copied().unwrap_or(0);
         for (monomial, left) in monomials {
+            if std::env::var_os("SKAM_EDGES").is_some() {
+                eprintln!(
+                    "SKAM_EDGES ring {cb} len {depth} monomial {monomial:?} left {left}"
+                );
+            }
             let holds = if monomial.is_empty() {
                 // Pages no loop multiplies can only be a constant, and only a
                 // pipeline's leftover is allowed: never more than the ring
@@ -674,6 +710,12 @@ fn check_rings_balanced(k: &Kernel) -> Result<(), ttStatus> {
             };
             if !holds {
                 let _ = (cb, left);
+                if std::env::var_os("SKAM_EDGES").is_some() {
+                    eprintln!(
+                        "SKAM_EDGES ring {cb} ({:?}) monomial {monomial:?} left {left} depth {depth}",
+                        k.names.get(&cb)
+                    );
+                }
                 return Err(ttStatus::TT_ERROR_RING_UNBALANCED);
             }
         }

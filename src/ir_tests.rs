@@ -1593,3 +1593,20 @@ grid 4,2
     assert_eq!(text.matches(" in [").count(), 2, "{text}");
     k.verify().expect("a spanned copy verifies");
 }
+
+#[test]
+fn an_accumulator_is_one_tile_and_a_larger_block_is_refused() {
+    // What the IR accepts today: `acc_reg_shape_checked` in `src/ir.rs` allows
+    // `[1,32]`, `[32,1]`, `[1,1]` and `[32,32]` only. A block accumulator --
+    // `acc f32 64,64`, four tiles -- is `TT_ERROR_ACC_SHAPE`. The band programs
+    // spell that block as four named accumulators instead.
+    for shape in ["32,32", "1,32", "32,1", "1,1"] {
+        let text = format!("version 9\n%a = acc f32 {shape}\ngrid 1,1\n");
+        Kernel::parse(&text).unwrap_or_else(|e| panic!("{shape} is a tile accumulator: {e}"));
+    }
+    for shape in ["64,64", "64,32", "32,64", "16,16"] {
+        let text = format!("version 9\n%a = acc f32 {shape}\ngrid 1,1\n");
+        let err = Kernel::parse(&text).expect_err(shape);
+        assert_eq!(err, ttStatus::TT_ERROR_ACC_SHAPE, "{shape}");
+    }
+}

@@ -5399,6 +5399,44 @@ fn copy_to(
                 b: scale,
             });
             pool.give(scale);
+            // A stated block whose page index is a loop value: the index names
+            // the page inside the block, and the reservation's base only moves
+            // per hand-off, so the page is placed by `index * page_bytes`.
+            // tt-metal's reader walks a block exactly this way -- one
+            // `noc_async_read_page` per tile of `cb_reserve_back`'s block
+            // (`reader_bmm_tile_layout.cpp`).
+            let mut ring_page_reg = None;
+            if page_index.is_none()
+                && matches!(*k.at(buffer), Op::Cb { block: Some(_), .. })
+            {
+                let off = pool.take()?;
+                scalar_with(
+                    k,
+                    types,
+                    &mut ops,
+                    param,
+                    loops,
+                    page_offset,
+                    off,
+                    &mut pool,
+                    &MOVER_INDEX,
+                    plan,
+                    &m.cbs,
+                )?;
+                let scale = pool.take()?;
+                ops.push(MirOp::Li {
+                    reg: scale,
+                    value: page_bytes,
+                });
+                ops.push(MirOp::IArith {
+                    op: IOp::Mul,
+                    d: off,
+                    a: off,
+                    b: scale,
+                });
+                pool.give(scale);
+                ring_page_reg = Some(off);
+            }
             emit_request(
                 &mut ops,
                 &mut pool,
@@ -5409,8 +5447,12 @@ fn copy_to(
                 value,
                 None,
                 ring_page,
+                ring_page_reg,
                 interleaved,
             )?;
+            if let Some(off) = ring_page_reg {
+                pool.give(off);
+            }
         }
     } else {
         let (page, el) = index_page(k, plan, &m.cbs, offset)?;
@@ -5483,6 +5525,7 @@ fn copy_to(
                 block,
                 bytes,
                 value,
+                None,
                 None,
                 None,
                 interleaved,
@@ -6855,6 +6898,7 @@ fn narrow_pair(
         value,
         Some(ring),
         None,
+        None,
         interleaved,
     )?;
     // The second half: the next face on the parameter side, and the next face's
@@ -6884,6 +6928,7 @@ fn narrow_pair(
         half,
         second,
         Some(ring),
+        None,
         None,
         interleaved,
     )?;
@@ -7030,6 +7075,7 @@ fn emit_request(
     value: u8,
     ring_offset: Option<u8>,
     ring_page: Option<u32>,
+    ring_page_reg: Option<u8>,
     interleaved: bool,
 ) -> Result<(), ttStatus> {
     use crate::riscv::cb::{RD_PTR, STRIDE, WR_PTR};
@@ -7093,6 +7139,19 @@ fn emit_request(
             b: step,
         });
         pool.give(step);
+    }
+    // The page a block's copy fills, when the index is a loop value: the page
+    // must be placed by `index * page_bytes` on top of the reservation's base,
+    // because the base only moves per hand-off. tt-metal's reader walks a block
+    // exactly this way (`cb_reserve_back(in0_block_num_tiles)` then one
+    // `noc_async_read_page` per tile, `reader_bmm_tile_layout.cpp`).
+    if let Some(offset) = ring_page_reg {
+        ops.push(MirOp::IArith {
+            op: IOp::Add,
+            d: page,
+            a: page,
+            b: offset,
+        });
     }
     // `TARG_ADDR` is the request's source and `RET_ADDR` its destination: a
     // read has the parameter as source and L1 as destination, a write the other
