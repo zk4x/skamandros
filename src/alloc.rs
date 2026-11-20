@@ -947,8 +947,12 @@ fn rewrite_lregs(op: &mut MirOp, rename: &BTreeMap<LReg, LReg>) {
 /// Place every ring in L1, in id order, and the `LocalCBInterface` table after
 /// them. Every ring is `ALIGN`-aligned, so the two sides of a copy are
 /// congruent by construction.
-pub fn plan_cbs(m: &mut MachineKernel) -> Result<(), ttStatus> {
-    let mut at = tt_isa::arch::blackhole::l1::DATA.base as u32;
+///
+/// `data_base` is the first byte of this module's arena: the top of its kernel
+/// config block, which is [`tt_isa::arch::blackhole::l1::DATA`]`.base` unless
+/// the programs needed more than the reserved block.
+pub fn plan_cbs(m: &mut MachineKernel, data_base: u32) -> Result<(), ttStatus> {
+    let mut at = data_base;
     let mut infos: Vec<(Cb, CbInfo)> = m.cbs.iter().map(|(id, info)| (id, *info)).collect();
     infos.sort_by_key(|(id, _)| *id);
     let count = infos.len() as u32;

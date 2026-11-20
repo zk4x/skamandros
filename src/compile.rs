@@ -14,6 +14,14 @@ pub use crate::module::{GridTerm, Module, ParamKind};
 /// machine passes, the allocation and the render — in that order, and nothing
 /// else.
 ///
+/// The kernel config block is the reserved minimum
+/// ([`tt_isa::arch::blackhole::l1::KERNEL_CONFIG_MIN`]) unless the module's
+/// programs, arguments and fan-out lists do not fit it, in which case it is
+/// raised to what they need and the whole machine program is lowered again: the
+/// rings' addresses move with the block's top, so the programs change too. This
+/// is tt-metal's `default_l1_kernel_config_size` grown when a program does not
+/// fit (`bh_hal_tensix.cpp:44,57,71`).
+///
 /// Every refusal is an error, never a partial module.
 pub fn compile(k: &Kernel) -> Result<Module, ttStatus> {
     // A `loop ... unroll` body is written out first: everything after it sees
@@ -33,31 +41,70 @@ pub fn compile(k: &Kernel) -> Result<Module, ttStatus> {
     if std::env::var_os("SKAM_IR").is_some() {
         eprintln!("--- virtual kernel ---\n{k}");
     }
-    let mut machine = k.lower()?;
-    // The row bodies are fused before the hand-offs are derived: a value that
-    // stays in a lane register has no `Dst` for a seam to carry.
-    crate::alloc::fuse_bodies(&mut machine)?;
-    // The hand-offs are derived from the accesses, before fusion replaces the
-    // cross-core order with the per-core streams.
-    crate::optimize::reg_sync(&mut machine)?;
-    // The IR locks carry tt-metal's `Dst` section hand-off (a whole section at
-    // a time, which the per-slot seams cannot express across a loop). The
-    // seams above still order the unpacker's pages and pace `Src`/`Dst` reuse.
-    machine.sems.extend(crate::lower::LOCK_SEMS);
-    crate::optimize::fuse(&mut machine);
-    // The allocator is what brings the lane registers and `Dst` ids inside the
-    // hardware's limits, so it runs before the check that enforces them.
-    machine.alloc()?;
-    machine.verify()?;
-    machine.render()
+    let base = tt_isa::arch::blackhole::l1::KERNEL_CONFIG.base;
+    let mut block = u32::try_from(tt_isa::arch::blackhole::l1::KERNEL_CONFIG_MIN)
+        .map_err(|_| ttStatus::TT_ERROR_L1_ARENA)?;
+    loop {
+        let data_base = u32::try_from(base + u64::from(block))
+            .map_err(|_| ttStatus::TT_ERROR_L1_ARENA)?;
+        let mut machine = k.lower_at(data_base)?;
+        // The row bodies are fused before the hand-offs are derived: a value that
+        // stays in a lane register has no `Dst` for a seam to carry.
+        crate::alloc::fuse_bodies(&mut machine)?;
+        // The hand-offs are derived from the accesses, before fusion replaces the
+        // cross-core order with the per-core streams.
+        crate::optimize::reg_sync(&mut machine)?;
+        // The IR locks carry tt-metal's `Dst` section hand-off (a whole section at
+        // a time, which the per-slot seams cannot express across a loop). The
+        // seams above still order the unpacker's pages and pace `Src`/`Dst` reuse.
+        machine.sems.extend(crate::lower::LOCK_SEMS);
+        crate::optimize::fuse(&mut machine);
+        // The allocator is what brings the lane registers and `Dst` ids inside the
+        // hardware's limits, so it runs before the check that enforces them.
+        machine.alloc()?;
+        machine.verify()?;
+        let module = machine.render(data_base)?;
+        // Both encodings of the compute programs count: the card stages
+        // `silicon_cores` and the simulator `cores`, and the block must hold
+        // whichever the target runs.
+        let needed = crate::device::program_block_bytes(&[
+            module.reader.len(),
+            module.writer.len(),
+            module.setup.len(),
+            module.cores[0].len().max(module.silicon_cores[0].len()),
+            module.cores[1].len().max(module.silicon_cores[1].len()),
+            module.cores[2].len().max(module.silicon_cores[2].len()),
+        ])?;
+        if needed <= block {
+            if std::env::var_os("SKAM_WORDS").is_some() {
+                let end = tt_isa::arch::blackhole::l1::DATA.end;
+                eprintln!(
+                    "program block: {} bytes ({:#x}), data arena: {} bytes ({:#x})",
+                    block,
+                    u64::from(block),
+                    end - u64::from(data_base),
+                    end - u64::from(data_base)
+                );
+            }
+            return Ok(module);
+        }
+        // Grow the reserved block to what the module needs, keeping the arena
+        // 64-byte aligned (`l1::DATA`'s own alignment), and lower again: the
+        // rings sit above the block, so every address the programs name moves.
+        block = needed.next_multiple_of(64);
+    }
 }
 
 /// Render one machine kernel: the five programs as words, the setup program
 /// thread 0 runs, and the launch metadata the lowering carried over.
 ///
+/// `program_end` is the top of the block the module was lowered into: the
+/// first byte of its data arena, which the runtime needs to find the argument
+/// arrays.
+///
 /// `render` is read-only: everything that had to be decided (the rings' places,
 /// the registers, the grid and the parameters) was decided before it.
-pub fn render(m: &MachineKernel) -> Result<Module, ttStatus> {
+pub fn render(m: &MachineKernel, program_end: u32) -> Result<Module, ttStatus> {
     crate::debug::machine(m);
     let sim = encode::encode(m, false)?;
     // The card's variant: the unpacker's tile-descriptor tail written. Only
@@ -116,6 +163,9 @@ pub fn render(m: &MachineKernel) -> Result<Module, ttStatus> {
             card_words[3].clone(),
         ],
         setup,
+        program_area: u32::try_from(tt_isa::arch::blackhole::l1::KERNEL_CONFIG.base)
+            .map_err(|_| ttStatus::TT_ERROR_PROGRAM_AREA_SIZE)?,
+        program_end,
         iface,
         cbs,
         iface_words,
@@ -149,6 +199,7 @@ fn module_params_words(params: &[ParamKind]) -> u32 {
 /// grid (`Module::hash`).
 fn module_hash(module: &Module) -> u64 {
     let mut words: Vec<u32> = vec![
+        module.program_end,
         module.iface,
         module.params.len() as u32,
         module.mcast_base,

@@ -14,7 +14,8 @@
 //! argument names that NoC's endpoint of the channel.
 //!
 //! Every core has a launch message (`mailbox::launch::Mailbox`): the program's
-//! address in `l1::PROGRAM_CACHE`, its length, the arguments base and a
+//! address in the kernel config block (`l1::KERNEL_CONFIG`), its length, the
+//! arguments base and a
 //! generation. A program is placed once and later launches only name it; the
 //! resident executor on the core runs the generation it sees
 //! (tt-metal's launch message and kernel-text offset).
@@ -46,22 +47,25 @@ fn dispatch_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("SKAM_NO_DISPATCH").is_some())
 }
 
-/// First byte of `l1::PROGRAM_CACHE`, where every program is placed once.
+/// First byte of the kernel config block
+/// (`tt_isa::arch::blackhole::l1::KERNEL_CONFIG`), where every program is
+/// placed once.
 const PROGRAM_AREA: u32 = crate::device::PROGRAM_AREA as u32;
-/// Last byte of the program cache: the top of L1.
-const CACHE_END: u32 = tt_isa::arch::blackhole::l1::PROGRAM_CACHE.end as u32;
-/// Bytes reserved for one mover's argument array, and for the writer's.
-const ARGS_BLOCK: u32 = 0x400;
-/// Bytes reserved above the arguments for the fan-out lists.
-const GROUPS_BYTES: u32 = 0x2000;
-/// The fan-out lists sit at the top of the program cache, at a fixed address:
-/// a repeat launch writes only the arguments and the dispatcher's generation,
-/// and it must know where they are without rebuilding the program layout.
-const GROUPS_AT: u32 = CACHE_END - GROUPS_BYTES;
-/// The reader's argument array, and the writer's (its DRAM endpoints are NoC
-/// #1's).
-const ARGS_WRITER: u32 = GROUPS_AT - ARGS_BLOCK;
-const ARGS_AT: u32 = ARGS_WRITER - ARGS_BLOCK;
+/// The fan-out lists sit at the top of a module's kernel config block, at a
+/// fixed offset from its top: a repeat launch writes only the arguments and the
+/// dispatcher's generation, and it must know where they are without rebuilding
+/// the program layout.
+fn groups_at(module: &Module) -> u32 {
+    module.program_end - crate::device::GROUPS_BYTES
+}
+/// The writer's argument array (its DRAM endpoints are NoC #1's), and the
+/// reader's, just below the fan-out lists.
+fn args_writer(module: &Module) -> u32 {
+    groups_at(module) - crate::device::ARGS_BLOCK
+}
+fn args_reader(module: &Module) -> u32 {
+    args_writer(module) - crate::device::ARGS_BLOCK
+}
 /// The barrier word of a GDDR channel: offset 0, as tt-metal's
 /// `DRAM_BARRIER_BASE` (`bh_hal.cpp:34-37`, `DRAM_BARRIER_SIZE` = 64 bytes).
 /// It lies below [`crate::device`]'s first allocation, so a launch never reads
@@ -104,13 +108,13 @@ const GROUPS_STRIDE: u32 = 0x100;
 // executor never writes, because it has no `Dst` to dump. `firmware/src/
 // dispatch.rs` holds the same field numbers and the regions of the block; the
 // two must be changed together.
-/// L1 address of this tile's fan-out list ([`GROUPS_AT`]).
+/// L1 address of this tile's fan-out list ([`groups_at`]).
 const DESC_WORKERS: u32 = 0;
 /// Words in this tile's fan-out list.
 const DESC_COUNT: u32 = 1;
 /// Words in each argument block.
 const DESC_ARGS_WORDS: u32 = 2;
-/// The writer's block, as a byte offset from [`ARGS_AT`].
+/// The writer's block, as a byte offset from [`args_reader`].
 const DESC_WRITER_OFFSET: u32 = 3;
 /// Words in the CB interface template.
 const DESC_IFACE_WORDS: u32 = 4;
@@ -183,7 +187,7 @@ impl Slots {
                 .checked_add(bytes)
                 .map(|end| end.div_ceil(16) * 16)
                 .ok_or(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE)?;
-            if next > ARGS_AT {
+            if next > args_reader(module) {
                 return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
             }
         }
@@ -355,11 +359,11 @@ fn grid_eval(
 }
 
 /// The arguments base of each data mover's array.
-fn args_at(niu: Niu) -> u32 {
+fn args_at(module: &Module, niu: Niu) -> u32 {
     if niu == Niu::Noc1 {
-        ARGS_WRITER
+        args_writer(module)
     } else {
-        ARGS_AT
+        args_reader(module)
     }
 }
 
@@ -424,8 +428,8 @@ fn args_for(
             args.push(channels);
             args.push(page);
         }
-        if (args_at(*niu) as u64) + 4 * args.len() as u64
-            > tt_isa::arch::blackhole::l1::PROGRAM_CACHE.end
+        if (args_at(module, *niu) as u64) + 4 * args.len() as u64
+            > u64::from(module.program_end)
         {
             let _ = args.len();
             return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
@@ -533,7 +537,7 @@ fn launch_steps(
     // advances the ring pointers in it.
     let interface = &module.iface_words;
     let args_words = module.args_words as usize;
-    if 4 * args_words as u64 > u64::from(ARGS_WRITER - ARGS_AT) {
+    if 4 * args_words as u64 > u64::from(crate::device::ARGS_BLOCK) {
         return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
     }
     // The fan-out tree. One core issuing 120 workers' blocks and generations
@@ -582,8 +586,8 @@ fn launch_steps(
             plan.push((usize::MAX, columns[column][0]));
         }
     }
-    if u64::from(GROUPS_AT) + (lists.len() as u64) * u64::from(GROUPS_STRIDE)
-        > tt_isa::arch::blackhole::l1::PROGRAM_CACHE.end
+    if u64::from(groups_at(module)) + (lists.len() as u64) * u64::from(GROUPS_STRIDE)
+        > u64::from(module.program_end)
     {
         return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
     }
@@ -629,8 +633,8 @@ fn launch_steps(
         let [args, writer_args] = args_for(device, module, params, grid, *tile)?.map(|(_, v)| v);
         // Both arrays before the first core starts, not only as a side effect of
         // a mover run. Staged: a repeat launch writes only the words that differ.
-        device.stage_words(u64::from(ARGS_AT), &args)?;
-        device.stage_words(u64::from(ARGS_WRITER), &writer_args)?;
+        device.stage_words(u64::from(args_reader(module)), &args)?;
+        device.stage_words(u64::from(args_writer(module)), &writer_args)?;
         // The semaphore setup is placed here but not run: the descriptor names
         // it, and B runs it on T0 before it starts the roles, as BRISC
         // initialises the semaphores before it releases the TRISCs. It runs on
@@ -661,7 +665,7 @@ fn launch_steps(
         };
         let mut desc = vec![0u32; DESC_FIELDS as usize];
         desc[DESC_WORKERS as usize] =
-            list.map_or(0, |_| GROUPS_AT + list_slot as u32 * GROUPS_STRIDE);
+            list.map_or(0, |_| groups_at(module) + list_slot as u32 * GROUPS_STRIDE);
         // Zero when the host starts every tile itself: then no tile fans out,
         // and a launch the host has not finished staging is never started.
         desc[DESC_COUNT as usize] = if dispatchable {
@@ -670,7 +674,7 @@ fn launch_steps(
             0
         };
         desc[DESC_ARGS_WORDS as usize] = args_words as u32;
-        desc[DESC_WRITER_OFFSET as usize] = ARGS_WRITER - ARGS_AT;
+        desc[DESC_WRITER_OFFSET as usize] = crate::device::ARGS_BLOCK;
         desc[DESC_IFACE_WORDS as usize] = interface.len() as u32;
         desc[DESC_SETUP_ADDR as usize] = setup.0;
         desc[DESC_SETUP_WORDS as usize] = setup.1;
@@ -714,7 +718,7 @@ fn launch_steps(
         }
         if let Some(list) = list {
             device.stage_words(
-                u64::from(GROUPS_AT + list_slot as u32 * GROUPS_STRIDE),
+                u64::from(groups_at(module) + list_slot as u32 * GROUPS_STRIDE),
                 list,
             )?;
         }
@@ -728,7 +732,7 @@ fn launch_steps(
                 mailbox::launch::Mailbox::b(),
                 slots.at[SLOT_READER as usize],
                 module.reader.len() as u32,
-                ARGS_AT,
+                args_reader(module),
             )?;
         }
         if !module.writer.is_empty() {
@@ -737,7 +741,7 @@ fn launch_steps(
                 mailbox::launch::Mailbox::nc(),
                 slots.at[SLOT_WRITER as usize],
                 module.writer.len() as u32,
-                ARGS_WRITER,
+                args_writer(module),
             )?;
         }
         for (thread, words) in cores.iter().enumerate() {
@@ -749,7 +753,8 @@ fn launch_steps(
                 thread,
                 slots.at[ROLE_SLOT[thread] as usize],
                 words,
-                ARGS_AT,
+                args_reader(module),
+                module.program_end,
             )?;
         }
         // B's launch message, on every tile: the host names the reader here,
@@ -762,7 +767,7 @@ fn launch_steps(
         } else {
             (slots.at[SLOT_READER as usize], module.reader.len() as u32)
         };
-        device.prepare(mb, text, words, ARGS_AT)?;
+        device.prepare(mb, text, words, args_reader(module))?;
         device.stage_words(mb.enables(), &[enables])?;
         if !dispatchable {
             // Every program and launch word of this tile is staged; the
@@ -836,8 +841,8 @@ fn dispatch_launch(
         );
     }
     let [args, writer_args] = args_for(device, module, params, grid, dispatcher)?.map(|(_, v)| v);
-    device.stage_words(u64::from(ARGS_AT), &args)?;
-    device.stage_words(u64::from(ARGS_WRITER), &writer_args)?;
+    device.stage_words(u64::from(args_reader(module)), &args)?;
+    device.stage_words(u64::from(args_writer(module)), &writer_args)?;
     // The generation is the store that lets B read what the host staged.
     device.l1_barrier()?;
     let mb = mailbox::launch::Mailbox::b();
@@ -866,21 +871,23 @@ fn stage_role(
     at: u32,
     words: &[u32],
     args_at: u32,
+    program_end: u32,
 ) -> Result<(), ttStatus> {
-    stage_at(device, thread, at, words, args_at)
+    stage_at(device, thread, at, words, args_at, program_end)
 }
 
-/// [`stage_role`], at an explicit program-cache address.
+/// [`stage_role`], at an explicit program-block address.
 fn stage_at(
     device: &mut Device,
     thread: usize,
     text: u32,
     words: &[u32],
     args_at: u32,
+    program_end: u32,
 ) -> Result<(), ttStatus> {
-    // The only limit is the program cache: a role's program may use every byte
-    // between its address and the launch arguments.
-    let room = u64::from(CACHE_END - text);
+    // The only limit is the module's kernel config block: a role's program may
+    // use every byte between its address and the launch arguments.
+    let room = u64::from(program_end - text);
     if words.is_empty() || 4 * words.len() as u64 > room {
         if std::env::var_os("SKAM_DEBUG").is_some() {
             eprintln!(

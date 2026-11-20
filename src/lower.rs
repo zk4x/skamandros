@@ -185,7 +185,7 @@ struct OnesPage {
 ///
 /// Nothing here is limited by the hardware: the point of lowering with no reuse
 /// is that a missing register is a `plan`-time error, not a silent overlay.
-fn prepare(k: &Kernel) -> Result<(Plan, MachineKernel, Alloc), ttStatus> {
+fn prepare(k: &Kernel, data_base: u32) -> Result<(Plan, MachineKernel, Alloc), ttStatus> {
     use crate::mir::{CbInfo, DstInfo};
     let mut m = MachineKernel::default();
     let mut place: BTreeMap<OpId, Dst> = BTreeMap::new();
@@ -303,7 +303,7 @@ fn prepare(k: &Kernel) -> Result<(Plan, MachineKernel, Alloc), ttStatus> {
     // address (a copy whose index is read out of a page) needs it here, and the
     // ring set is already final — the program's rings, the ones page and the
     // staging pages are all minted above.
-    m.plan_cbs()?;
+    m.plan_cbs(data_base)?;
     Ok((
         plan,
         m,
@@ -343,17 +343,26 @@ fn owner(k: &Kernel, value: OpId) -> OpId {
 impl Kernel {
     /// Lower the verified SSA program to the machine IR, with one register per
     /// value and no hardware limit applied.
+    ///
+    /// The rings start at the smallest data arena ([`tt_isa::arch::blackhole::l1::DATA`]);
+    /// [`Kernel::lower_at`] is the form a launch uses, whose program block may
+    /// be larger.
     pub fn lower(&self) -> Result<MachineKernel, ttStatus> {
-        let k = self;
-        lower_with(k)
+        self.lower_at(tt_isa::arch::blackhole::l1::DATA.base as u32)
+    }
+
+    /// Lower with the arena starting at `data_base`: the top of the module's
+    /// kernel config block, which the caller sizes from its programs.
+    pub fn lower_at(&self, data_base: u32) -> Result<MachineKernel, ttStatus> {
+        lower_with(self, data_base)
     }
 }
 
 /// Lower `k` to the five programs.
-fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
+fn lower_with(k: &Kernel, data_base: u32) -> Result<MachineKernel, ttStatus> {
     let types = Types { k };
     let types = &types;
-    let (plan, mut m, alloc) = prepare(k)?;
+    let (plan, mut m, alloc) = prepare(k, data_base)?;
     let alloc = &alloc;
 
     // The dtype a value occupies `Dst` with. 16-bit mode stores every value as

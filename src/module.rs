@@ -68,6 +68,16 @@ pub struct Module {
     /// The setup program thread 0 runs before the three roles are released: the
     /// semaphore initialisation, sized to the `Dst` slots this kernel uses.
     pub setup: Vec<u32>,
+    /// First byte of the reserved kernel config block
+    /// (`tt_isa::arch::blackhole::l1::KERNEL_CONFIG`), where the programs are
+    /// placed.
+    pub program_area: u32,
+    /// First byte past the block, where this module's data arena begins. The
+    /// block runs from [`Module::program_area`] to here and holds the six
+    /// programs, the reader's and writer's argument arrays and the fan-out
+    /// lists; it is the reserved minimum unless the programs needed more, in
+    /// which case `compile` raised it.
+    pub program_end: u32,
     /// The CB interface table the host writes before the launch.
     pub iface: u32,
     /// Byte address of the first multicast site's control block, zero when the

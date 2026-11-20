@@ -2447,8 +2447,39 @@ fn place(words: &mut [u32; 3], first_bit: u32, count: u32, value: u64) {
 }
 
 /// Re-exported so the runtime need not depend on the location of the program
-/// arena; this is where every program lives in L1, named by its launch message.
-pub const PROGRAM_AREA: u64 = l1::PROGRAM_CACHE.base;
+/// block; this is where every program lives in L1, named by its launch message.
+pub const PROGRAM_AREA: u64 = l1::KERNEL_CONFIG.base;
+
+/// Bytes reserved for one mover's argument array (the reader's, and the
+/// writer's), above the programs in the kernel config block.
+pub const ARGS_BLOCK: u32 = 0x400;
+
+/// Bytes reserved above the argument arrays for the fan-out lists; they grow up
+/// from `program_end - GROUPS_BYTES`.
+pub const GROUPS_BYTES: u32 = 0x2000;
+
+/// Bytes of kernel config block a launch with programs of these word counts
+/// needs: the six programs packed from the block's base, each starting on a
+/// 16-byte boundary, then both argument arrays and the fan-out lists.
+///
+/// `compile` raises the reserved block to this when a module's programs do not
+/// fit [`l1::KERNEL_CONFIG_MIN`]; the runtime then packs the same programs into
+/// the same block (`runtime::Slots`).
+pub fn program_block_bytes(sizes: &[usize]) -> Result<u32, ttStatus> {
+    let mut at = 0u32;
+    for words in sizes {
+        let bytes = u32::try_from(*words)
+            .ok()
+            .and_then(|n| n.checked_mul(4))
+            .ok_or(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE)?;
+        at = at
+            .checked_add(bytes)
+            .map(|end| end.div_ceil(16) * 16)
+            .ok_or(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE)?;
+    }
+    at.checked_add(2 * ARGS_BLOCK + GROUPS_BYTES)
+        .ok_or(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE)
+}
 
 #[cfg(test)]
 mod tests {

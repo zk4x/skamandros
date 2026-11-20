@@ -814,14 +814,16 @@ impl MachineKernel {
         crate::alloc::alloc(self)
     }
 
-    /// Place the rings in L1 and build their interface entries.
-    pub fn plan_cbs(&mut self) -> Result<(), ttStatus> {
-        crate::alloc::plan_cbs(self)
+    /// Place the rings in L1, starting at `data_base` (the top of the module's
+    /// kernel config block), and build their interface entries.
+    pub fn plan_cbs(&mut self, data_base: u32) -> Result<(), ttStatus> {
+        crate::alloc::plan_cbs(self, data_base)
     }
 
-    /// Render the module a launch runs.
-    pub fn render(&self) -> Result<crate::module::Module, ttStatus> {
-        crate::compile::render(self)
+    /// Render the module a launch runs; `program_end` is the top of the block
+    /// its programs, arguments and fan-out lists were placed in.
+    pub fn render(&self, program_end: u32) -> Result<crate::module::Module, ttStatus> {
+        crate::compile::render(self, program_end)
     }
 
     /// Check that every op names a live slab entry, and that an op's rows fit
