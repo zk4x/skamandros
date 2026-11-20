@@ -19,7 +19,7 @@
 //! dtypes and shapes are not a side table: a leaf op carries its own, and every
 //! other op's is [`Kernel::dtype`]/[`Kernel::shape`], recomputed on demand.
 //!
-//! The text form is the only program form, and [`VERSION`] its version line.
+//! The text form is the only program form.
 
 use core::fmt;
 use std::borrow::Cow;
@@ -126,6 +126,69 @@ impl DType {
 /// unit) hold.
 pub type Dim = u32;
 
+/// One axis of a core span: the whole axis (`..`), one coordinate (`6`), or an
+/// ascending half-open range (`5..8`).
+///
+/// A coordinate is a value, so it may be a literal or `%y`: "my row" is
+/// `At(%y)`, which is how a program written once addresses the group it is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Extent {
+    /// `..`: every coordinate on the axis.
+    Whole,
+    /// One coordinate.
+    At(OpId),
+    /// `a..b`, `a < b`, both exclusive of nothing but `b`.
+    Range(OpId, OpId),
+}
+
+impl Extent {
+    /// Does this extent name exactly one coordinate?
+    pub const fn is_one(self) -> bool {
+        matches!(self, Extent::At(_))
+    }
+}
+
+/// A rectangle of cores, `[x, y]`: the participants of a collective.
+///
+/// A cross-core op names one of these instead of a remote address, because the
+/// program's L1 layout is identical on every core: a buffer name *is* the same
+/// address everywhere, and the only thing a collective has to add is which
+/// cores take part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub x: Extent,
+    pub y: Extent,
+}
+
+impl Span {
+    /// Every core on both axes: `[.., ..]`.
+    pub const WHOLE: Span = Span {
+        x: Extent::Whole,
+        y: Extent::Whole,
+    };
+
+    /// Is this the whole grid, so naming it adds nothing?
+    pub const fn is_whole(self) -> bool {
+        matches!((self.x, self.y), (Extent::Whole, Extent::Whole))
+    }
+}
+
+/// The coordinate values a span names, in field order: `x`'s operands then
+/// `y`'s, with `At` contributing one and `Range` two.
+fn span_operands(span: Span) -> [Option<OpId>; 4] {
+    let x = match span.x {
+        Extent::Whole => [None, None],
+        Extent::At(a) => [Some(a), None],
+        Extent::Range(a, b) => [Some(a), Some(b)],
+    };
+    let y = match span.y {
+        Extent::Whole => [None, None],
+        Extent::At(a) => [Some(a), None],
+        Extent::Range(a, b) => [Some(a), Some(b)],
+    };
+    [x[0], x[1], y[0], y[1]]
+}
+
 /// The shape of a register value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegShape {
@@ -137,6 +200,10 @@ pub enum RegShape {
     Row,
     /// A 32x32 tile.
     Tile,
+    /// A block of `m` x `n` tiles: tt-metal's `out_subblock_h x
+    /// out_subblock_w`, tt-lang's `ttl.block`. The shape is the block's tile
+    /// counts, not datums.
+    Block { m: Dim, n: Dim },
 }
 
 impl RegShape {
@@ -146,6 +213,17 @@ impl RegShape {
             RegShape::Scalar => 1,
             RegShape::Column | RegShape::Row => 32,
             RegShape::Tile => 32 * 32,
+            RegShape::Block { m, n } => 32 * 32 * m * n,
+        }
+    }
+
+    /// The block's tile counts: one by one for a tile, so the callers that
+    /// repeat a per-tile sequence need no special case.
+    pub const fn tiles(self) -> (Dim, Dim) {
+        match self {
+            RegShape::Tile => (1, 1),
+            RegShape::Block { m, n } => (m, n),
+            _ => (1, 1),
         }
     }
 }
@@ -173,7 +251,7 @@ impl ReduceDim {
             RegShape::Row => ReduceDim::Col,
             RegShape::Column => ReduceDim::Row,
             RegShape::Scalar => ReduceDim::Scalar,
-            RegShape::Tile => return None,
+            RegShape::Tile | RegShape::Block { .. } => return None,
         })
     }
 }
@@ -337,14 +415,10 @@ pub enum Op {
     Shape(Box<[OpId]>),
     /// A tensor parameter in DRAM, with its logical shape.
     /// A tensor parameter: `shape` is its element count, which the caller's
-    /// DRAM buffer holds. `interleaved` is the buffer's layout: its pages are
-    /// striped across the device's DRAM channels (tt-metal's interleaved
-    /// buffer, `InterleavedBuffer`), instead of lying in one channel.
-    Param {
-        dtype: DType,
-        shape: OpId,
-        interleaved: bool,
-    },
+    /// DRAM buffer holds. Where the pages live is the launch's business: a
+    /// page is named by its index, and the launch hands the mover the DRAM
+    /// bank table that index resolves through (tt-metal's tensor accessor).
+    Param { dtype: DType, shape: OpId },
     /// A scalar parameter: one word in DRAM, the value a launch argument
     /// carries (the shape `0` in the text form). Its shape is the empty one.
     Variable { dtype: DType },
@@ -356,6 +430,11 @@ pub enum Op {
         page: [Dim; 2],
         /// Pages in the ring.
         len: Dim,
+        /// Pages handed off together: the ring's block. Not program text --
+        /// `sync_cbs` derives it from the pages the accesses name (a `copy`
+        /// moves one page, a block `load`/`store` moves its `m * n`), and the
+        /// lowering reads it to place a loop's page index inside the block.
+        block: Option<u32>,
     },
     /// A named accumulator: one `Dst` region that `matmul`, `sum`/`max` and
     /// `store_to` write, read back by `store_to` into a buffer. It is mutable —
@@ -368,7 +447,14 @@ pub enum Op {
     /// The launch grid, as two terms: Tensix cores are a 2-D grid.
     Grid { x: OpId, y: OpId },
     /// `%i = loop %bound`.
-    Loop { bound: OpId },
+    Loop {
+        bound: OpId,
+        /// `loop ... unroll`: the body is written out at compile time, once per
+        /// trip, with the induction variable folded to a constant. A program
+        /// says the shape; the walks with constant page indices are the
+        /// compiler's to spell.
+        unroll: bool,
+    },
     /// `endloop`.
     EndLoop,
     /// The end of the reader's segment: the ops before it run on the inbound
@@ -394,16 +480,82 @@ pub enum Op {
         dst_offset: OpId,
         src_offset: OpId,
         shape: [Dim; 2],
+        /// Which cores issue the request: `in [.., ..]` is every core, the
+        /// default when the clause is absent. A narrower span is how a program
+        /// says that only the group's leaders read the parameter, so the rest of
+        /// the group gets the page from an `expand` instead of from DRAM. The
+        /// lowering never infers this: a copy the program wrote for every core
+        /// reads on every core.
+        span: Span,
+    },
+    /// `expand %a [span] from [pick]`: every core in `span` ends with the page
+    /// the `pick` cores hold, the pick cores being the group's leaders.
+    ///
+    /// The rule is `torch.expand`'s: per axis `pick` is either one coordinate
+    /// (`[5, 6]`) or `..`, meaning "the coordinate this receiver already has".
+    /// So `pick` is `..` on every axis where it is *not* narrower than `span`,
+    /// and a coordinate where it is. The group is partitioned among the pick
+    /// cells along the axes where `pick` is narrower, and each pick cell
+    /// multicasts to its part of `span`: one NoC request per pick cell, and the
+    /// routers replicate it.
+    ///
+    /// The source is the same buffer on the pick cores — the program's L1
+    /// layout is identical everywhere, and a multicast's one address field is
+    /// the sender's own page. `pick` must lie in `span` (the leader is a member
+    /// of its group), and it must be narrower than `span` on at least one axis
+    /// (else the op is an identity).
+    ///
+    /// `pages` is how many pages of the buffer's reservation are sent, from
+    /// its write pointer up: `expand %ba [4] [.., ..] from [0, ..]` fans out the
+    /// four pages the block reserved, the way tt-metal's reader multicasts a
+    /// whole block in one `send` (`in0_block_size_bytes`,
+    /// `reader_bmm_tile_layout_in0_sender_padding_metal2.cpp:407`). Every core's
+    /// ring advances in step, so the block starts at the same address on the
+    /// sender and on all its receivers.
+    ///
+    /// Both sides are the same buffer, so no destination is named; a fan-out
+    /// that has to land in a different buffer aliases it first.
+    Expand {
+        src: OpId,
+        pages: OpId,
+        span: Span,
+        from: Span,
+    },
+    /// `roll %a [span] by [dx, dy]`: the page each core in `span` holds moves
+    /// to `core + (dx, dy)`. One unicast per cell.
+    ///
+    /// `Whole` on an axis is a ring — the page leaving the far end arrives at
+    /// the near one — and a bounded span drops what leaves it, which is how a
+    /// chain is written. The shift is the sender's: "my page lands at
+    /// `mine + v`, not "I take from `mine - v`.
+    ///
+    /// The destination is the same buffer name at the same page, so it is not
+    /// named. The source page is the buffer's read pointer and the destination
+    /// page its write pointer: they coincide for a one-page ring and differ by
+    /// the ring depth when a pipeline forwards a page it received while
+    /// receiving the next one.
+    Roll {
+        src: OpId,
+        span: Span,
+        by: [OpId; 2],
     },
     /// L1 buffer into a register value. `shape` is the unit the index's base
     /// names; the result has that shape. The offset counts units of that shape
     /// — a page for a tile, a row for `1,32`, a column for `32,1`, a datum for
     /// `1,1` — so a narrow access names one unit of a tiled page without a
     /// second index.
+    /// `load` into a fresh register, or into an accumulator when `into` is
+    /// set: `load 32,32 %acc = %interm [p]` is tt-metal's `copy_tile` — the
+    /// page is unpacked into the accumulator's `Dst` rows, so the Matrix
+    /// Unit's next `matmul` accumulates onto the running total a previous
+    /// k-block left in L1 (`bmm_large_block_zm.cpp:56-68`). The page is a
+    /// value's worth of `Dst`, exactly as a fresh load's is.
     Load {
         buffer: OpId,
         offset: OpId,
         shape: [Dim; 2],
+        /// The accumulator the page seeds, when it is not a fresh value.
+        into: Option<OpId>,
     },
     /// A register value into an L1 buffer. The offset counts units of `shape`,
     /// as in [`Op::Load`].
@@ -498,15 +650,78 @@ impl Op {
             Op::Shape(ref ops) => ops.get(idx).copied(),
             Op::Param { shape, .. } => [shape].get(idx).copied(),
             Op::Grid { x, y } => [x, y].get(idx).copied(),
-            Op::Loop { bound } => [bound].get(idx).copied(),
+            Op::Loop { bound, .. } => [bound].get(idx).copied(),
             Op::Copy {
                 dst,
                 src,
                 dst_offset,
                 src_offset,
+                span,
                 ..
-            } => [dst, src, dst_offset, src_offset].get(idx).copied(),
-            Op::Load { buffer, offset, .. } => [buffer, offset].get(idx).copied(),
+            } => {
+                let p = span_operands(span);
+                [
+                    Some(dst),
+                    Some(src),
+                    Some(dst_offset),
+                    Some(src_offset),
+                    p[0],
+                    p[1],
+                    p[2],
+                    p[3],
+                ]
+                .get(idx)
+                .copied()
+                .flatten()
+            }
+            // The coordinates a span names are values like any other, so they
+            // are walked in field order after the buffer.
+            Op::Expand {
+                src,
+                pages,
+                span,
+                from,
+            } => {
+                let s = span_operands(span);
+                let f = span_operands(from);
+                [
+                    Some(src),
+                    Some(pages),
+                    s[0],
+                    s[1],
+                    s[2],
+                    s[3],
+                    f[0],
+                    f[1],
+                    f[2],
+                    f[3],
+                ]
+                    .get(idx)
+                    .copied()
+                    .flatten()
+            }
+            Op::Roll { src, span, by } => {
+                let s = span_operands(span);
+                [Some(src), Some(by[0]), Some(by[1]), s[0], s[1], s[2], s[3]]
+                    .get(idx)
+                    .copied()
+                    .flatten()
+            }
+            Op::Load {
+                buffer,
+                offset,
+                into,
+                ..
+            } => [buffer, offset].get(idx).copied().or_else(|| {
+                // The seeded accumulator is an operand too: the load writes it,
+                // so a pass that asks what a value's users are must see this
+                // one.
+                if idx == 2 {
+                    into
+                } else {
+                    None
+                }
+            }),
             Op::Store {
                 src,
                 buffer,
@@ -557,7 +772,7 @@ impl Op {
             Op::Shape(ops) => ParamsMut::Slice(ops.iter_mut()),
             Op::Param { shape, .. } => ParamsMut::One(Some(shape)),
             Op::Grid { x, y } => ParamsMut::Two(Some(x), Some(y)),
-            Op::Loop { bound } => ParamsMut::One(Some(bound)),
+            Op::Loop { bound, .. } => ParamsMut::One(Some(bound)),
             Op::Copy {
                 dst,
                 src,
@@ -565,7 +780,15 @@ impl Op {
                 src_offset,
                 ..
             } => ParamsMut::Four([dst, src, dst_offset, src_offset].into_iter()),
-            Op::Load { buffer, offset, .. } => ParamsMut::Two(Some(buffer), Some(offset)),
+            // A collective's span coordinates are names, not operands: the reuse
+            // pass renames buffers, and nothing here may be rebound.
+            Op::Expand { .. } | Op::Roll { .. } => ParamsMut::Empty,
+            Op::Load {
+                buffer,
+                offset,
+                into,
+                ..
+            } => ParamsMut::Three(Some(buffer), Some(offset), into.as_mut()),
             Op::Store {
                 src,
                 buffer,
@@ -791,6 +1014,40 @@ pub fn renumber(op: &mut Op, map: &BTreeMap<OpId, OpId>) -> Result<(), ttStatus>
             .ok_or(ttStatus::TT_ERROR_VALUE_UNDEFINED)?;
         *param = to;
     }
+    // A collective's span coordinates are operands too, but they are not in
+    // `parameters_mut` (which walks the fixed fields); a pass copying a
+    // program has to rebind them or the copy names the old program's values.
+    match op {
+        Op::Copy { span, .. } => renumber_span(span, map)?,
+        Op::Expand { span, from, .. } => {
+            renumber_span(span, map)?;
+            renumber_span(from, map)?;
+        }
+        Op::Roll { span, .. } => renumber_span(span, map)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Rewrite a span's coordinate operands through `map`.
+fn renumber_span(span: &mut Span, map: &BTreeMap<OpId, OpId>) -> Result<(), ttStatus> {
+    let one = |id: &mut OpId| -> Result<(), ttStatus> {
+        *id = map
+            .get(id)
+            .copied()
+            .ok_or(ttStatus::TT_ERROR_VALUE_UNDEFINED)?;
+        Ok(())
+    };
+    for extent in [&mut span.x, &mut span.y] {
+        match extent {
+            Extent::Whole => {}
+            Extent::At(a) => one(a)?,
+            Extent::Range(a, b) => {
+                one(a)?;
+                one(b)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -815,18 +1072,17 @@ pub fn unit_of(shape: [Dim; 2], dtype: DType) -> Result<(RegShape, u32, u32), tt
         RegShape::Row
     } else if b == 1 {
         RegShape::Column
-    } else if a % 32 == 0 && b % 32 == 0 {
+    } else if a == 32 && b == 32 {
         RegShape::Tile
+    } else if a % 32 == 0 && b % 32 == 0 {
+        RegShape::Block {
+            m: a / 32,
+            n: b / 32,
+        }
     } else {
         return Err(ttStatus::TT_ERROR_BUFFER_SHAPE);
     };
-    let datums = if reg == RegShape::Scalar {
-        1
-    } else if reg == RegShape::Tile {
-        32 * 32
-    } else {
-        32
-    };
+    let datums = reg.datums();
     let units = (a * b) / datums;
     let bytes = a * b * dtype.bytes();
     Ok((reg, units, bytes))
@@ -841,6 +1097,11 @@ fn cb_ring(shape: [Dim; 2], dtype: DType) -> Result<([Dim; 2], Dim), ttStatus> {
         RegShape::Row => [1, 32],
         RegShape::Column => [32, 1],
         RegShape::Tile => [32, 32],
+        // A buffer is a list of tile pages, however its block is shaped: a
+        // shape of `m x n` tiles is `m * n` pages.
+        RegShape::Block { m, n } => {
+            return Ok(([32, 32], m.checked_mul(n).ok_or(ttStatus::TT_ERROR_ZERO_DIMENSION)?));
+        }
     };
     if units == 0 {
         return Err(ttStatus::TT_ERROR_ZERO_DIMENSION);
@@ -857,6 +1118,10 @@ pub(crate) fn access_shape(shape: [Dim; 2]) -> Result<RegShape, ttStatus> {
         (1, _) if b == 32 => RegShape::Row,
         (_, 1) if a == 32 => RegShape::Column,
         _ if a == 32 && b == 32 => RegShape::Tile,
+        _ if a % 32 == 0 && b % 32 == 0 => RegShape::Block {
+            m: a / 32,
+            n: b / 32,
+        },
         _ => return Err(ttStatus::TT_ERROR_ACCESS_SHAPE),
     })
 }
@@ -974,6 +1239,8 @@ impl Kernel {
                 Store { buffer, .. } => (ValueKind::Buffer, of(buffer).dtype, RegShape::Tile),
                 Grid { .. } => (ValueKind::Shape, INDEX, RegShape::Scalar),
                 Copy { .. }
+                | Expand { .. }
+                | Roll { .. }
                 | EndLoop
                 | EndReader
                 | EndCompute
@@ -1097,7 +1364,12 @@ impl Kernel {
                         return Err(ttStatus::TT_TODO_BOOL_PARAMETER);
                     }
                 }
-                Op::Cb { dtype, page, len } => {
+                Op::Cb {
+                    dtype,
+                    page,
+                    len,
+                    block,
+                } => {
                     if dtype == DType::Bool {
                         return Err(ttStatus::TT_TODO_BOOL_BUFFER);
                     }
@@ -1105,6 +1377,13 @@ impl Kernel {
                         return Err(ttStatus::TT_ERROR_ZERO_DIMENSION);
                     }
                     unit_of(page, dtype)?;
+                    match block {
+                        Some(0) => return Err(ttStatus::TT_ERROR_ZERO_DIMENSION),
+                        // A block larger than the ring could never be handed
+                        // off.
+                        Some(n) if n > len => return Err(ttStatus::TT_ERROR_CB_BLOCK),
+                        _ => {}
+                    }
                 }
                 Op::Acc { dtype, shape } => {
                     acc_reg_shape_checked(shape, at, dtype)?;
@@ -1122,7 +1401,7 @@ impl Kernel {
                         return Err(ttStatus::TT_ERROR_GRID_AXIS);
                     }
                 }
-                Op::Loop { bound } => {
+                Op::Loop { bound, .. } => {
                     self.expect_index_scalar(bound, at)?;
                     loops.push(at);
                     visible[at] = true;
@@ -1141,6 +1420,9 @@ impl Kernel {
                     dst_offset,
                     src_offset,
                     shape,
+                    // A copy's span is a plain core rectangle: every extent form
+                    // is meaningful, and one that pins no axis is every core.
+                    span: _,
                 } => {
                     let d = self.info(dst);
                     let s = self.info(src);
@@ -1191,6 +1473,7 @@ impl Kernel {
                     buffer,
                     offset,
                     shape,
+                    ..
                 } => {
                     let b = self.info(buffer);
                     // The unit is checked for both ends: against the ring the
@@ -1212,12 +1495,22 @@ impl Kernel {
                         if b.kind != ValueKind::Buffer {
                             return Err(ttStatus::TT_ERROR_NOT_A_BUFFER);
                         }
-                        let (page, _) = match *self.at(buffer) {
+                        let (page, len) = match *self.at(buffer) {
                             Op::Cb { page, len, .. } => (page, len),
                             _ => return Err(ttStatus::TT_ERROR_NOT_A_BUFFER),
                         };
+                        // A tile is one page and a block is `m * n` of them: a
+                        // block load moves the pages after the one it names.
                         let (unit_shape, _, _) = unit_of(page, b.dtype)?;
-                        if unit_shape.datums() < datums {
+                        let pages = match access_shape(shape)? {
+                            RegShape::Block { m, n } => m * n,
+                            _ => 1,
+                        };
+                        if unit_shape != RegShape::Tile && pages > 1 {
+                            return Err(ttStatus::TT_ERROR_ACCESS_SHAPE);
+                        }
+                        if pages > len {
+                            let _ = datums;
                             return Err(ttStatus::TT_ERROR_ACCESS_SHAPE);
                         }
                     }
@@ -1236,7 +1529,14 @@ impl Kernel {
                     }
                     let datums = shape[0] * shape[1];
                     if b.kind == ValueKind::Acc {
-                        if unit != RegShape::Tile {
+                        // A narrow accumulator still occupies a whole `Dst` tile
+                        // region, and a block names its tiles: a block `m x n`
+                        // is filled by `store m,n`, everything else by `32,32`.
+                        let wanted = match b.shape {
+                            RegShape::Block { .. } => b.shape,
+                            _ => RegShape::Tile,
+                        };
+                        if unit != wanted {
                             return Err(ttStatus::TT_ERROR_ACC_SHAPE);
                         }
                         if self.const_i32(offset) != Some(0) {
@@ -1271,15 +1571,32 @@ impl Kernel {
                     if v.dtype != b.dtype {
                         return Err(ttStatus::TT_ERROR_STORE_BUFFER_CAST);
                     }
-                    let (page, _) = match *self.at(buffer) {
+                    let (page, len) = match *self.at(buffer) {
                         Op::Cb { page, len, .. } => (page, len),
                         _ => return Err(ttStatus::TT_ERROR_NOT_A_BUFFER),
                     };
                     let (unit_shape, _, _) = unit_of(page, b.dtype)?;
-                    if unit_shape.datums() < datums {
+                    let pages = match unit {
+                        RegShape::Block { m, n } => m * n,
+                        _ => 1,
+                    };
+                    if unit_shape != RegShape::Tile && pages > 1 {
                         return Err(ttStatus::TT_ERROR_ACCESS_SHAPE);
                     }
-                    if v.shape != unit && v.kind != ValueKind::Acc {
+                    if pages > len {
+                        let _ = datums;
+                        return Err(ttStatus::TT_ERROR_ACCESS_SHAPE);
+                    }
+                    // A narrow accumulator is a whole tile's region, so it
+                    // packs as one tile whatever its fold; a block names its
+                    // `m x n` pages.
+                    let narrow_acc = v.kind == ValueKind::Acc
+                        && matches!(
+                            v.shape,
+                            RegShape::Row | RegShape::Column | RegShape::Scalar
+                        )
+                        && unit == RegShape::Tile;
+                    if v.shape != unit && !narrow_acc {
                         return Err(ttStatus::TT_ERROR_STORE_BUFFER_SHAPE);
                     }
                 }
@@ -1339,13 +1656,26 @@ impl Kernel {
                     }
                 }
                 Op::Matmul { acc, a, b } => {
+                    let (acc_shape, a_shape, b_shape) =
+                        (self.info(acc).shape, self.info(a).shape, self.info(b).shape);
                     if self.info(acc).kind != ValueKind::Acc
-                        || self.info(acc).shape != RegShape::Tile
+                        || !matches!(acc_shape, RegShape::Tile | RegShape::Block { .. })
                     {
                         return Err(ttStatus::TT_ERROR_MATMUL_ACC);
                     }
-                    if self.info(a).shape != RegShape::Tile || self.info(b).shape != RegShape::Tile
+                    if !matches!(a_shape, RegShape::Tile | RegShape::Block { .. })
+                        || !matches!(b_shape, RegShape::Tile | RegShape::Block { .. })
                     {
+                        return Err(ttStatus::TT_ERROR_MATMUL_OPERAND);
+                    }
+                    // The shapes are the product's: `acc` is `m x n`, `a` is
+                    // `m x k`, `b` is `k x n`. A tile is the `1 x 1` case, so a
+                    // block matmul and a tile matmul are one op.
+                    let (m, n) = acc_shape.tiles();
+                    let (am, ak) = a_shape.tiles();
+                    let (bk, bn) = b_shape.tiles();
+                    if am != m || bn != n || ak != bk {
+                        let _ = (m, n, am, ak, bk, bn);
                         return Err(ttStatus::TT_ERROR_MATMUL_OPERAND);
                     }
                     // The operands share a dtype; the accumulator may be wider
@@ -1363,6 +1693,61 @@ impl Kernel {
                 }
                 Op::Max { acc, x } => {
                     self.expect_reduce(acc, x, at)?;
+                }
+                Op::Expand {
+                    src,
+                    pages,
+                    span,
+                    from,
+                } => {
+                    // The count is a plain scalar, like a `copy`'s ring side: a
+                    // count of pages, not a buffer.
+                    let _ = pages;
+                    if !matches!(*self.at(src), Op::Cb { .. }) {
+                        return Err(ttStatus::TT_ERROR_NOT_A_BUFFER);
+                    }
+                    // `from` names the group's leaders: per axis one coordinate
+                    // or `..`, the coordinate this receiver already has. A range
+                    // has no meaning there — the pick is one cell or the
+                    // receiver's own.
+                    if !matches!(from.x, Extent::Whole | Extent::At(_))
+                        || !matches!(from.y, Extent::Whole | Extent::At(_))
+                    {
+                        return Err(ttStatus::TT_ERROR_EXPAND_PICK);
+                    }
+                    // At least one axis must carry the fan-out: a pick that is
+                    // `..` on an axis the span covers is the receiver's own
+                    // page, so that axis moves nothing. A pick that is `At` on
+                    // an axis the span already pins to one cell moves nothing
+                    // either.
+                    let fans = |pick: Extent, extent: Extent| {
+                        matches!(pick, Extent::At(_)) && !extent.is_one()
+                    };
+                    if !fans(from.x, span.x) && !fans(from.y, span.y) {
+                        return Err(ttStatus::TT_ERROR_EXPAND_PICK);
+                    }
+                    // A pinned axis names one cell, so the pick and the span
+                    // must agree on it wherever both are literal.
+                    for (pick, extent) in [(from.x, span.x), (from.y, span.y)] {
+                        if let (Extent::At(a), Extent::At(b)) = (pick, extent) {
+                            if let (Some(a), Some(b)) = (self.const_i32(a), self.const_i32(b)) {
+                                if a != b {
+                                    return Err(ttStatus::TT_ERROR_EXPAND_PICK);
+                                }
+                            }
+                        }
+                    }
+                }
+                Op::Roll { src, span, by } => {
+                    if !matches!(*self.at(src), Op::Cb { .. }) {
+                        return Err(ttStatus::TT_ERROR_NOT_A_BUFFER);
+                    }
+                    let _ = span;
+                    if let (Some(dx), Some(dy)) = (self.const_i32(by[0]), self.const_i32(by[1])) {
+                        if dx == 0 && dy == 0 {
+                            return Err(ttStatus::TT_ERROR_ROLL_SHIFT);
+                        }
+                    }
                 }
                 Op::Wait { cb, .. }
                 | Op::Reserve { cb, .. }
@@ -1383,6 +1768,8 @@ impl Kernel {
                 if !matches!(
                     *op,
                     Op::Copy { .. }
+                        | Op::Expand { .. }
+                        | Op::Roll { .. }
                         | Op::Store { .. }
                         | Op::EndLoop
                         | Op::EndReader
@@ -1427,6 +1814,8 @@ impl Kernel {
             RegShape::Scalar => 1,
             RegShape::Row | RegShape::Column => 32,
             RegShape::Tile => 1024,
+            // An index is one page or one lane, never a whole block.
+            RegShape::Block { .. } => return Err(ttStatus::TT_ERROR_OFFSET_NOT_INDEX),
         })
     }
 
@@ -1499,11 +1888,28 @@ fn is_value(info: &ValueInfo) -> bool {
     }
 }
 
-/// An accumulator's shape and dtype, checked: the four shapes the hardware
-/// has, and a float datum.
+/// How many 32x32 tiles an accumulator's shape covers: `acc f32 64,64` is a
+/// 2x2 block of tiles. A row, a column and a scalar are one tile's worth of
+/// accumulator in the other layouts.
+pub(crate) fn acc_tiles(shape: [Dim; 2]) -> u32 {
+    match shape {
+        [1, _] | [_, 1] => 1,
+        [m, n] => (m / 32) * (n / 32),
+    }
+}
+
+/// An accumulator's shape and dtype, checked.
+///
+/// A `Dst` region is a tile, and a block of tiles is a block of `Dst` regions:
+/// `acc f32 64,64` is a 2x2 block, which is what tt-metal names
+/// `out_subblock_h x out_subblock_w` and tt-lang a `ttl.block`. The block must
+/// fit the file the accumulator lives in -- eight `Dst` slots in 32-bit mode,
+/// sixteen in 16-bit -- so a larger band is the program's spill across
+/// `interm`, not one accumulator.
 fn acc_reg_shape_checked(shape: [Dim; 2], at: usize, dtype: DType) -> Result<RegShape, ttStatus> {
     let reg = match shape {
         [1, 32] | [32, 1] | [1, 1] | [32, 32] => acc_reg_shape(shape),
+        [m, n] if m % 32 == 0 && n % 32 == 0 && m > 0 && n > 0 => acc_reg_shape(shape),
         _ => {
             let _ = at;
             return Err(ttStatus::TT_ERROR_ACC_SHAPE);
@@ -1512,6 +1918,11 @@ fn acc_reg_shape_checked(shape: [Dim; 2], at: usize, dtype: DType) -> Result<Reg
     if !matches!(dtype, DType::F32 | DType::Bf16) {
         let _ = (at, dtype);
         return Err(ttStatus::TT_ERROR_ACC_DTYPE);
+    }
+    let slots = if dtype == DType::F32 { 8 } else { 16 };
+    if acc_tiles(shape) > slots {
+        let _ = at;
+        return Err(ttStatus::TT_ERROR_DST_SLOTS_EXHAUSTED);
     }
     Ok(reg)
 }
@@ -1522,7 +1933,11 @@ fn acc_reg_shape(shape: [Dim; 2]) -> RegShape {
         [1, 32] => RegShape::Row,
         [32, 1] => RegShape::Column,
         [1, 1] => RegShape::Scalar,
-        _ => RegShape::Tile,
+        [32, 32] => RegShape::Tile,
+        [m, n] => RegShape::Block {
+            m: m / 32,
+            n: n / 32,
+        },
     }
 }
 
@@ -1530,16 +1945,12 @@ fn acc_reg_shape(shape: [Dim; 2]) -> RegShape {
 // Forms
 // ---------------------------------------------------------------------------
 
-/// The IR version this build reads.
-pub const VERSION: u32 = 9;
-
 impl Kernel {
     /// Parse the text form.
     ///
     /// The grammar is the one the tests write:
     ///
     /// ```text
-    /// version 9
     /// grid 1,1
     /// %in = param f32 2048
     /// %s  = param i32 0
@@ -1573,8 +1984,7 @@ impl Parser {
 
     /// Parse every line, in order.
     fn run(&mut self, text: &str) -> Result<Kernel, ttStatus> {
-        let mut version = false;
-        for line in text.lines() {
+            for line in text.lines() {
             // `#` starts a comment wherever it appears and runs to the end of
             // the line, so a statement can be annotated after it. Cutting it
             // off here, before the line is tokenised, keeps the rule out of
@@ -1586,16 +1996,6 @@ impl Parser {
                 continue;
             }
             let mut t = Tokens::new(line);
-            if !version {
-                if t.word() != Some("version") {
-                    return Err(ttStatus::TT_ERROR_VERSION);
-                }
-                if t.number()? != VERSION {
-                    return Err(ttStatus::TT_ERROR_VERSION);
-                }
-                version = true;
-                continue;
-            }
             if let Some(word) = t.peek_word() {
                 match word {
                     "grid" => {
@@ -1612,6 +2012,10 @@ impl Parser {
                         let shape = t.shape2()?;
                         let dst = self.value(&mut t)?;
                         let dst_offset = t.bracket(self)?;
+                        // `cores [span]` qualifies the local side of the copy:
+                        // the ring page exists only on those cores, and only
+                        // they issue the request. Without it, every core does.
+                        let mut span = self.cores(&mut t)?;
                         t.eq()?;
                         let src = self.value(&mut t)?;
                         let src_offset = if t.peek_char() == Some('[') {
@@ -1619,6 +2023,15 @@ impl Parser {
                         } else {
                             dst_offset
                         };
+                        // The local side may be either end: an outbound copy's
+                        // ring is its source.
+                        if let Some(named) = self.cores(&mut t)? {
+                            if span.is_some() {
+                                return Err(ttStatus::TT_ERROR_PARSE);
+                            }
+                            span = Some(named);
+                        }
+                        let span = span.unwrap_or(Span::WHOLE);
                         t.end()?;
                         self.push(Op::Copy {
                             dst,
@@ -1626,6 +2039,47 @@ impl Parser {
                             dst_offset,
                             src_offset,
                             shape,
+                            span,
+                        });
+                        continue;
+                    }
+                    "expand" => {
+                        t.word();
+                        let src = self.value(&mut t)?;
+                        // The count, as on a `copy`'s ring side: one bracket
+                        // of its own, before the span.
+                        let pages = t.bracket(self)?;
+                        let span = t.span(self)?;
+                        if t.word() != Some("from") {
+                            return Err(ttStatus::TT_ERROR_PARSE);
+                        }
+                        let from = t.span(self)?;
+                        t.end()?;
+                        self.push(Op::Expand {
+                            src,
+                            pages,
+                            span,
+                            from,
+                        });
+                        continue;
+                    }
+                    "roll" => {
+                        t.word();
+                        let src = self.value(&mut t)?;
+                        let span = t.span(self)?;
+                        if t.word() != Some("by") {
+                            return Err(ttStatus::TT_ERROR_PARSE);
+                        }
+                        t.char('[')?;
+                        let dx = self.signed_term(&mut t)?;
+                        t.comma()?;
+                        let dy = self.signed_term(&mut t)?;
+                        t.char(']')?;
+                        t.end()?;
+                        self.push(Op::Roll {
+                            src,
+                            span,
+                            by: [dx, dy],
                         });
                         continue;
                     }
@@ -1657,12 +2111,28 @@ impl Parser {
                         let buffer = self.value(&mut t)?;
                         let offset = t.bracket(self)?;
                         t.end()?;
-                        let id = self.ops.len();
-                        self.define(name, id)?;
+                        // A name that is already an accumulator seeds it: the
+                        // page lands in the accumulator's own `Dst` rows, which
+                        // is how a k-block resumes the total the one before it
+                        // packed to L1.
+                        let into = match self.symbols.get(&name).copied() {
+                            Some(existing)
+                            if matches!(self.ops[usize::from(existing)], Op::Acc { .. }) =>
+                        {
+                                Some(existing)
+                            }
+                            Some(_) => return Err(ttStatus::TT_ERROR_NAME_DUPLICATE),
+                            None => None,
+                        };
+                        if into.is_none() {
+                            let id = self.ops.len();
+                            self.define(name, id)?;
+                        }
                         self.push(Op::Load {
                             buffer,
                             offset,
                             shape,
+                            into,
                         });
                         continue;
                     }
@@ -1736,9 +2206,6 @@ impl Parser {
             // Everything else is a definition: `%name = ...`.
             self.definition(&mut t)?;
         }
-        if !version {
-            return Err(ttStatus::TT_ERROR_VERSION);
-        }
         let k = self.take()?;
         k.check()?;
         // The ring hand-offs are the compiler's, not the program's: `sync_cbs`
@@ -1765,7 +2232,6 @@ impl fmt::Display for Kernel {
             f: f as &mut dyn fmt::Write,
             loop_depth: 0,
         };
-        writeln!(p.f, "version {VERSION}")?;
         for (id, op) in self.ops() {
             p.op(id, op)?;
         }
@@ -1814,6 +2280,28 @@ impl Parser {
         Ok(self.intern_i32(n as i32))
     }
 
+    /// A term with an optional leading `-`: a roll's shift is signed.
+    fn signed_term(&mut self, t: &mut Tokens<'_>) -> Result<OpId, ttStatus> {
+        if t.peek_char() == Some('-') {
+            t.at += 1;
+            let n = t.number()?;
+            let Ok(v) = i32::try_from(n) else {
+                return Err(ttStatus::TT_ERROR_PARSE);
+            };
+            return Ok(self.intern_i32(-v));
+        }
+        self.term(t)
+    }
+
+    /// An optional `cores [span]` on a copy's local side.
+    fn cores(&mut self, t: &mut Tokens<'_>) -> Result<Option<Span>, ttStatus> {
+        if t.peek_word() != Some("cores") {
+            return Ok(None);
+        }
+        t.word();
+        Ok(Some(t.span(self)?))
+    }
+
     fn definition(&mut self, t: &mut Tokens<'_>) -> Result<(), ttStatus> {
         let name = t.name()?;
         t.eq()?;
@@ -1842,21 +2330,13 @@ impl Parser {
                     }
                     self.push(Op::Shape(terms.into_boxed_slice()))
                 };
-                let interleaved = t.peek_word() == Some("interleaved");
-                if interleaved {
-                    t.word();
-                }
                 t.end()?;
                 let id = self.ops.len();
                 self.define(name, id)?;
                 if scalar {
                     self.push(Op::Variable { dtype });
                 } else {
-                    self.push(Op::Param {
-                        dtype,
-                        shape,
-                        interleaved,
-                    });
+                    self.push(Op::Param { dtype, shape });
                 }
             }
             "buffer" => {
@@ -1868,7 +2348,14 @@ impl Parser {
                 let (page, len) = cb_ring([a, b], dtype)?;
                 let id = self.ops.len();
                 self.define(name, id)?;
-                self.push(Op::Cb { dtype, page, len });
+                self.push(Op::Cb {
+                    dtype,
+                    page,
+                    len,
+                    // Derived from the accesses by `sync_cbs`; never written by
+                    // the program.
+                    block: None,
+                });
             }
             "acc" => {
                 let dtype = t.dtype()?;
@@ -1885,10 +2372,14 @@ impl Parser {
             }
             "loop" => {
                 let bound = self.term(t)?;
+                let unroll = t.peek_word() == Some("unroll");
+                if unroll {
+                    t.word();
+                }
                 t.end()?;
                 let id = self.ops.len();
                 self.define(name, id)?;
-                self.push(Op::Loop { bound });
+                self.push(Op::Loop { bound, unroll });
             }
             "grid" => {
                 t.dot()?;
@@ -1987,6 +2478,18 @@ impl Printer<'_, '_> {
         }
     }
 
+    /// One span, as the text form writes it: `[5..8, ..]`.
+    fn span(&self, span: Span) -> String {
+        fn axis(p: &Printer<'_, '_>, e: Extent) -> String {
+            match e {
+                Extent::Whole => "..".to_owned(),
+                Extent::At(a) => p.name(a),
+                Extent::Range(a, b) => format!("{}..{}", p.name(a), p.name(b)),
+            }
+        }
+        format!("[{}, {}]", axis(self, span.x), axis(self, span.y))
+    }
+
     fn op(&mut self, id: OpId, op: &Op) -> fmt::Result {
         let k = self.k;
         let named = k.names.contains_key(&id);
@@ -2002,35 +2505,32 @@ impl Printer<'_, '_> {
                     Err(_) => return Err(fmt::Error),
                 }
             ),
-            Op::Param {
-                dtype,
-                shape,
-                interleaved,
-            } => {
+            Op::Param { dtype, shape } => {
                 write!(self.f, "{} = param {} ", self.name(id), dtype.name())?;
                 let terms: Vec<OpId> = match *k.at(shape) {
                     Op::Shape(ref ops) => ops.to_vec(),
                     _ => Vec::new(),
                 };
                 let text: Vec<String> = terms.iter().map(|t| self.name(*t)).collect();
-                writeln!(
-                    self.f,
-                    "{}{}",
-                    text.join(","),
-                    if interleaved { " interleaved" } else { "" }
-                )
+                writeln!(self.f, "{}", text.join(","))
             }
             Op::Variable { dtype } => {
                 writeln!(self.f, "{} = param {} 0", self.name(id), dtype.name())
             }
-            Op::Cb { dtype, page, len } => writeln!(
-                self.f,
-                "{} = buffer {} {},{}",
-                self.name(id),
-                dtype.name(),
-                page[0],
-                page[1] * len
-            ),
+            Op::Cb {
+                dtype, page, len, ..
+            } => {
+                // The hand-off block is derived, not written: it is not part of
+                // the program.
+                writeln!(
+                    self.f,
+                    "{} = buffer {} {},{}",
+                    self.name(id),
+                    dtype.name(),
+                    page[0],
+                    page[1] * len
+                )
+            }
             Op::Acc { dtype, shape } => writeln!(
                 self.f,
                 "{} = acc {} {},{}",
@@ -2040,9 +2540,15 @@ impl Printer<'_, '_> {
                 shape[1]
             ),
             Op::Grid { x, y } => writeln!(self.f, "grid {},{}", self.name(x), self.name(y)),
-            Op::Loop { bound } => {
+            Op::Loop { bound, unroll } => {
                 self.loop_depth += 1;
-                writeln!(self.f, "{} = loop {}", self.name(id), self.name(bound))
+                writeln!(
+                    self.f,
+                    "{} = loop {}{}",
+                    self.name(id),
+                    self.name(bound),
+                    if unroll { " unroll" } else { "" }
+                )
             }
             Op::EndLoop => {
                 self.loop_depth = self.loop_depth.saturating_sub(1);
@@ -2066,26 +2572,58 @@ impl Printer<'_, '_> {
                 dst_offset,
                 src_offset,
                 shape,
+                span,
             } => writeln!(
                 self.f,
-                "copy {},{} {} [{}] = {} [{}]",
+                "copy {},{} {} [{}]{} = {} [{}]",
                 shape[0],
                 shape[1],
                 self.name(dst),
                 self.name(dst_offset),
+                // `[.., ..]` is every core, so it is left implicit; any other
+                // span is printed because it changes which cores read.
+                if span.is_whole() {
+                    String::new()
+                } else {
+                    format!(" cores {}", self.span(span))
+                },
                 self.name(src),
-                self.name(src_offset)
+                self.name(src_offset),
+            ),
+            Op::Expand {
+                src,
+                pages,
+                span,
+                from,
+            } => writeln!(
+                self.f,
+                "expand {} [{}] {} from {}",
+                self.name(src),
+                self.name(pages),
+                self.span(span),
+                self.span(from)
+            ),
+            Op::Roll { src, span, by } => writeln!(
+                self.f,
+                "roll {} {} by [{}, {}]",
+                self.name(src),
+                self.span(span),
+                self.name(by[0]),
+                self.name(by[1])
             ),
             Op::Load {
                 buffer,
                 offset,
                 shape,
+                into,
             } => writeln!(
                 self.f,
                 "load {},{} {} = {} [{}]",
                 shape[0],
                 shape[1],
-                self.name(id),
+                // A seed names the accumulator it writes; a fresh load names
+                // its own value.
+                self.name(into.unwrap_or(id)),
                 self.name(buffer),
                 self.name(offset)
             ),
@@ -2386,6 +2924,41 @@ impl<'a> Tokens<'a> {
         }
         self.at += 1;
         Ok(value)
+    }
+
+    fn char(&mut self, c: char) -> Result<(), ttStatus> {
+        if self.peek_char() != Some(c) {
+            return Err(ttStatus::TT_ERROR_PARSE);
+        }
+        self.at += c.len_utf8();
+        Ok(())
+    }
+
+    /// One axis of a core span: `..`, a coordinate, or `a..b`.
+    fn extent(&mut self, p: &mut Parser) -> Result<Extent, ttStatus> {
+        if self.peek_char() == Some('.') {
+            self.dot()?;
+            self.dot()?;
+            return Ok(Extent::Whole);
+        }
+        let first = p.term(self)?;
+        if self.peek_char() == Some('.') {
+            self.dot()?;
+            self.dot()?;
+            let second = p.term(self)?;
+            return Ok(Extent::Range(first, second));
+        }
+        Ok(Extent::At(first))
+    }
+
+    /// `[x, y]`: the cores a collective names.
+    fn span(&mut self, p: &mut Parser) -> Result<Span, ttStatus> {
+        self.char('[')?;
+        let x = self.extent(p)?;
+        self.comma()?;
+        let y = self.extent(p)?;
+        self.char(']')?;
+        Ok(Span { x, y })
     }
 
     fn shape2(&mut self) -> Result<[Dim; 2], ttStatus> {

@@ -494,6 +494,26 @@ pub enum ttStatus {
     /// A `transpose` operand is not a 32x32 register tile: the op is one whole
     /// tile, and a row, a column or a scalar has no square to transpose.
     TT_ERROR_TRANSPOSE_OPERAND = 191,
+    /// An `expand`'s `from` does not pick a proper leader set: a pick axis is
+    /// either one coordinate or `..` (the receiver's own), never a range, and
+    /// at least one axis has to fan out — a pick that is `..` everywhere, or
+    /// that agrees with a span pinned to one cell, moves nothing. A pinned axis
+    /// whose literal pick and literal span disagree is refused here too.
+    TT_ERROR_EXPAND_PICK = 192,
+    /// A `roll` shifts nothing: `by [0, 0]` is not a movement.
+    TT_ERROR_ROLL_SHIFT = 193,
+    /// A collective reached the lowering, which does not place its sites or
+    /// emit its requests yet.
+    TT_TODO_COLLECTIVE = 194,
+    /// A collective outside the reader segment. `expand` publishes a page the
+    /// reader filled, and `roll` moves one, so both belong where the movers'
+    /// copies are; anywhere else there is no page for them to move.
+    TT_ERROR_COLLECTIVE_PLACEMENT = 195,
+    /// A ring's stated block (`buffer ... block n`) is larger than the ring, or
+    /// a page index the program names does not fit the block it is handed off
+    /// in. The block is the pages one hand-off moves, so a page outside it has
+    /// no address.
+    TT_ERROR_CB_BLOCK = 196,
 }
 
 impl ttStatus {
@@ -686,6 +706,11 @@ impl ttStatus {
             ttStatus::TT_ERROR_RING_UNBALANCED => "TT_ERROR_RING_UNBALANCED",
             ttStatus::TT_TODO_TRANSPOSE => "TT_TODO_TRANSPOSE",
             ttStatus::TT_ERROR_TRANSPOSE_OPERAND => "TT_ERROR_TRANSPOSE_OPERAND",
+            ttStatus::TT_ERROR_EXPAND_PICK => "TT_ERROR_EXPAND_PICK",
+            ttStatus::TT_ERROR_ROLL_SHIFT => "TT_ERROR_ROLL_SHIFT",
+            ttStatus::TT_TODO_COLLECTIVE => "TT_TODO_COLLECTIVE",
+            ttStatus::TT_ERROR_COLLECTIVE_PLACEMENT => "TT_ERROR_COLLECTIVE_PLACEMENT",
+            ttStatus::TT_ERROR_CB_BLOCK => "TT_ERROR_CB_BLOCK",
         }
     }
 }

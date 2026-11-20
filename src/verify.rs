@@ -250,7 +250,7 @@ fn walk(
 ) -> Result<(), &'static str> {
     let mut i = from;
     while i < to {
-        if let Op::Loop { bound } = *k.at(ids[i]) {
+        if let Op::Loop { bound, .. } = *k.at(ids[i]) {
             let body_end = ends[i];
             if body_end == usize::MAX || body_end >= to {
                 return Err("a loop's end is not inside the walked range");

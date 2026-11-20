@@ -18,7 +18,8 @@
 use std::collections::BTreeMap;
 
 use crate::ir::{
-    BOp, DType, Dim, Kernel, Op, OpId, RegShape, UOp, ValueInfo, access_shape, unit_of,
+    BOp, DType, Dim, Extent, Kernel, Op, OpId, RegShape, Span, UOp, ValueInfo, access_shape,
+    unit_of,
 };
 use crate::mir::{
     Bcast, BinarySfpOp, Cb, Core, Dst, ElwOp, IOp, LReg, MachineKernel, MirOp, PackMask, Target,
@@ -44,14 +45,49 @@ pub const FACE_DATUMS: u32 = TILE_DATUMS / 4;
 /// from zero and the body may use it as a value. `encode` opens the loop with
 /// the same pair, so `eval` and the branch agree on the index register.
 ///
-/// The compute roles have two levels (`t4`/`t5`, then `a7`/`a1`); the movers
-/// have (`a1`/`a2`, then `a3`/`a4`) because `t5` is their NIU base.
-const COMPUTE_PAIRS: [(u8, u8); 2] = [(reg::T4, reg::T5), (reg::A7, reg::A1)];
-const MOVER_PAIRS: [(u8, u8); 2] = [(reg::A1, reg::A2), (reg::A3, reg::A4)];
+/// The compute roles start with the caller-saved pair `t4`/`t5` and then `a7`/
+/// `a1`; the movers start with (`a1`/`a2`, then `a3`/`a4`) because `t5` is
+/// their NIU base. From the third level on both take the callee-saved bank,
+/// which `encode` saves and restores around the program.
+///
+/// The compute roles' loop counters, innermost last: the out-block walk, the
+/// k-block, the output subblock and `inner_dim`, as tt-metal's matmul body
+/// nests them (`bmm_large_block_zm_fused_bias_activation_metal2.cpp:383-420`).
+pub(crate) const COMPUTE_PAIRS: [(u8, u8); 5] = [
+    (reg::T4, reg::T5),
+    (reg::A7, reg::A1),
+    (reg::S0, reg::S1),
+    (reg::S2, reg::S3),
+    (reg::S4, reg::S5),
+];
+/// The movers' loop counters, innermost last. tt-metal's reader nests the
+/// out-block walk, the k-block, the operand row and the operand column
+/// (`reader_bmm_tile_layout_in0_sender.cpp`), so a mover needs four pairs for
+/// the same body. `s2`/`s3`/`s4` are its request temporaries ([`MOVER_POOL`]),
+/// so the deeper levels take the bank above them.
+pub(crate) const MOVER_PAIRS: [(u8, u8); 5] = [
+    (reg::A1, reg::A2),
+    (reg::A3, reg::A4),
+    (reg::S0, reg::S1),
+    (reg::S6, reg::S7),
+    (reg::S8, reg::S9),
+];
 
 /// The index registers `eval` reads an induction value from, by depth.
-const COMPUTE_INDEX: [u8; 2] = [COMPUTE_PAIRS[0].0, COMPUTE_PAIRS[1].0];
-const MOVER_INDEX: [u8; 2] = [MOVER_PAIRS[0].0, MOVER_PAIRS[1].0];
+const COMPUTE_INDEX: [u8; 5] = [
+    COMPUTE_PAIRS[0].0,
+    COMPUTE_PAIRS[1].0,
+    COMPUTE_PAIRS[2].0,
+    COMPUTE_PAIRS[3].0,
+    COMPUTE_PAIRS[4].0,
+];
+const MOVER_INDEX: [u8; 5] = [
+    MOVER_PAIRS[0].0,
+    MOVER_PAIRS[1].0,
+    MOVER_PAIRS[2].0,
+    MOVER_PAIRS[3].0,
+    MOVER_PAIRS[4].0,
+];
 
 /// Registers a role owns for evaluating a bound expression. They are disjoint
 /// from `a0` (the launch arguments), `a6` (the CB interface), the loop counters
@@ -60,10 +96,23 @@ const SCRATCH: [u8; 5] = [reg::A2, reg::A3, reg::A4, reg::A5, reg::T3];
 
 /// A mover program's temporaries: everything it does not keep across ops. `t5`
 /// is its NIU base, `t3` this tile's NOC word, `a0`/`a6` its arguments and CB
-/// table, and `a1..a4` its loop counters, so those are not in the pool. A copy's
-/// whole NoC request — its addresses, its page pointer, its config words and its
-/// spin — allocates from here too.
-const MOVER_POOL: [u8; 6] = [reg::T6, reg::T4, reg::T0, reg::T1, reg::T2, reg::A5];
+/// table, and `a1..a4`/`s0..s5` its loop counters, so those are not in the
+/// pool; `a7` counts only on the compute roles. A copy's whole NoC request —
+/// its addresses, its page pointer, its config words and its spin — allocates
+/// from here too, and resolving a page through the launch's bank table is the
+/// widest of those.
+const MOVER_POOL: [u8; 10] = [
+    reg::T6,
+    reg::T4,
+    reg::T0,
+    reg::T1,
+    reg::T2,
+    reg::A5,
+    reg::A7,
+    reg::S2,
+    reg::S3,
+    reg::S4,
+];
 
 /// The registers a role's index expressions may use, and the simplest allocator
 /// there is: take one before evaluating an operand, give it back the moment the
@@ -109,6 +158,9 @@ impl Types<'_> {
 /// pair per value, minted in program order with no reuse.
 struct Alloc {
     place: BTreeMap<OpId, Dst>,
+    /// A block value's tiles, in row-major order. A tile value has none: its
+    /// one home is `place`.
+    block: BTreeMap<OpId, Vec<Dst>>,
     lreg: BTreeMap<OpId, (LReg, LReg)>,
 }
 
@@ -116,6 +168,20 @@ impl Alloc {
     fn place_of(&self, value: OpId) -> Option<Dst> {
         self.place.get(&value).copied()
     }
+}
+
+/// Every `Dst` a value occupies: one for a tile, `m * n` for a block. Each has
+/// its own liveness, so `alloc` can place them independently.
+fn dst_regs(alloc: &Alloc, value: OpId) -> Result<Vec<Dst>, ttStatus> {
+    if let Some(regs) = alloc.block.get(&value) {
+        return Ok(regs.clone());
+    }
+    alloc
+        .place_of(value)
+        .map(|reg| vec![reg])
+        .ok_or_else(|| {
+            crate::status::internal_bug(format_args!("lower: value {value} has no `Dst`"))
+        })
 }
 
 /// The compiler's own rings: the 1.0 page a `max` needs, and a staging page for
@@ -130,6 +196,9 @@ struct Plan {
     /// The byte offset of each parameter's launch-argument block, in program
     /// order. See [`crate::mover::arg_blocks`].
     arg_block: Vec<i32>,
+    /// The site an `expand` owns, by its op id, in the order the sites were
+    /// minted.
+    expand: BTreeMap<OpId, usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -144,10 +213,11 @@ struct OnesPage {
 ///
 /// Nothing here is limited by the hardware: the point of lowering with no reuse
 /// is that a missing register is a `plan`-time error, not a silent overlay.
-fn prepare(k: &Kernel) -> Result<(Plan, MachineKernel, Alloc), ttStatus> {
+fn prepare(k: &Kernel, data_base: u32) -> Result<(Plan, MachineKernel, Alloc), ttStatus> {
     use crate::mir::{CbInfo, DstInfo};
     let mut m = MachineKernel::default();
     let mut place: BTreeMap<OpId, Dst> = BTreeMap::new();
+    let mut block: BTreeMap<OpId, Vec<Dst>> = BTreeMap::new();
     let mut lreg: BTreeMap<OpId, (LReg, LReg)> = BTreeMap::new();
     for (id, op) in k.ops() {
         let homes = matches!(
@@ -171,11 +241,20 @@ fn prepare(k: &Kernel) -> Result<(Plan, MachineKernel, Alloc), ttStatus> {
             continue;
         }
         let dtype = k.info(id).dtype;
-        let reg = m.dsts.push(DstInfo {
-            dtype,
-            shape: [32, 32],
-        });
-        place.insert(id, reg);
+        // A block is `m * n` tile regions, each with its own liveness.
+        let (tm, tn) = k.info(id).shape.tiles();
+        let count = (tm * tn) as usize;
+        let mut regs: Vec<Dst> = Vec::with_capacity(count);
+        for _ in 0..count {
+            regs.push(m.dsts.push(DstInfo {
+                dtype,
+                shape: [32, 32],
+            }));
+        }
+        place.insert(id, regs[0]);
+        if count > 1 {
+            block.insert(id, regs);
+        }
         // A body's lanes are the hardware's own: lane 0 is the input and lane 1
         // the output of every row body, with 2..7 as the scratch the bodies
         // name (an `exp2` or a reciprocal needs all six).
@@ -184,6 +263,11 @@ fn prepare(k: &Kernel) -> Result<(Plan, MachineKernel, Alloc), ttStatus> {
         }
         lreg.insert(id, (LReg(0), LReg(1)));
     }
+    // A block value's tiles are one `Dst` section: the math and pack hand the
+    // whole thing over, the way tt-metal brackets a subblock with
+    // `tile_regs_acquire`/`commit`/`wait`/`release`. A tile is a section of its
+    // own and is not listed.
+    m.sections = block.values().cloned().collect();
     // One datum width for the whole bank: a value that needs more than 16 bits
     // forces 32-bit mode, which tt-metal calls `DST_ACCUM_MODE`.
     let wide = place
@@ -196,9 +280,13 @@ fn prepare(k: &Kernel) -> Result<(Plan, MachineKernel, Alloc), ttStatus> {
         ones: None,
         staged: BTreeMap::new(),
         arg_block: Vec::new(),
+        expand: BTreeMap::new(),
     };
     for (id, op) in k.ops() {
-        if let Op::Cb { dtype, page, len } = *op {
+        if let Op::Cb {
+            dtype, page, len, ..
+        } = *op
+        {
             let cb = m.cbs.push(CbInfo::unplaced(dtype, page, len));
             plan.cb.insert(id, cb);
         }
@@ -226,6 +314,16 @@ fn prepare(k: &Kernel) -> Result<(Plan, MachineKernel, Alloc), ttStatus> {
             plan.staged.insert(value, cb);
         }
     }
+    // One site per `expand`, in program order: the words its leaders and
+    // receivers share. Nothing is detected — a copy the program wrote local
+    // stays local, and only an `expand` fans out (AGENTS.md, "One lowering per
+    // op").
+    for (at, op) in k.ops() {
+        if matches!(op, Op::Expand { .. }) {
+            plan.expand.insert(at, plan.expand.len());
+        }
+    }
+    m.mcast = vec![crate::mir::McastSite::default(); plan.expand.len()];
     m.grid = crate::compile::grid_terms(k)?;
     m.params = crate::compile::parameter_kinds(k);
     plan.arg_block = crate::mover::arg_blocks(&m.params);
@@ -233,8 +331,16 @@ fn prepare(k: &Kernel) -> Result<(Plan, MachineKernel, Alloc), ttStatus> {
     // address (a copy whose index is read out of a page) needs it here, and the
     // ring set is already final — the program's rings, the ones page and the
     // staging pages are all minted above.
-    m.plan_cbs()?;
-    Ok((plan, m, Alloc { place, lreg }))
+    m.plan_cbs(data_base)?;
+    Ok((
+        plan,
+        m,
+        Alloc {
+            place,
+            block,
+            lreg,
+        },
+    ))
 }
 
 /// The values one op reads from an L1 page because its `Src` banks are filled
@@ -265,22 +371,42 @@ fn owner(k: &Kernel, value: OpId) -> OpId {
 impl Kernel {
     /// Lower the verified SSA program to the machine IR, with one register per
     /// value and no hardware limit applied.
+    ///
+    /// The rings start at the smallest data arena ([`tt_isa::arch::blackhole::l1::DATA`]);
+    /// [`Kernel::lower_at`] is the form a launch uses, whose program block may
+    /// be larger.
     pub fn lower(&self) -> Result<MachineKernel, ttStatus> {
         self.lower_for(Target::Blackhole)
     }
 
     /// Lower for `target`: the same machine kernel, with that chip's NoC
-    /// request sequence in the movers.
+    /// request sequence in the movers, over the smallest data arena.
     pub fn lower_for(&self, target: Target) -> Result<MachineKernel, ttStatus> {
-        lower_with(self, target)
+        self.lower_at_for(tt_isa::arch::blackhole::l1::DATA.base as u32, target)
+    }
+
+    /// Lower with the arena starting at `data_base`: the top of the module's
+    /// kernel config block, which the caller sizes from its programs. This is
+    /// the Blackhole form; a Quasar launch names its target too.
+    pub fn lower_at(&self, data_base: u32) -> Result<MachineKernel, ttStatus> {
+        self.lower_at_for(data_base, Target::Blackhole)
+    }
+
+    /// Lower for `target` over an arena starting at `data_base`.
+    pub fn lower_at_for(
+        &self,
+        data_base: u32,
+        target: Target,
+    ) -> Result<MachineKernel, ttStatus> {
+        lower_with(self, data_base, target)
     }
 }
 
-/// Lower `k` to the five programs.
-fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
+/// Lower `k` to the five programs, for `target`, over `data_base`.
+fn lower_with(k: &Kernel, data_base: u32, target: Target) -> Result<MachineKernel, ttStatus> {
     let types = Types { k };
     let types = &types;
-    let (plan, mut m, alloc) = prepare(k)?;
+    let (plan, mut m, alloc) = prepare(k, data_base)?;
     m.target = target;
     // Where this core's logical grid coordinate is staged. The two chips'
     // launches put it in different words; `%x = grid.x` reads it in RISC-V.
@@ -428,7 +554,7 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
             | Op::Binary { .. }
             | Op::Select { .. }
                 if types.of(value).shape == RegShape::Scalar => {}
-            Op::Loop { bound } => {
+            Op::Loop { bound, .. } => {
                 let depth = loops.len();
                 if let Some(core) = mover {
                     // A mover segment's loop is that program's own: its own
@@ -566,6 +692,9 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                     Some(Core::Writer) => Core::Writer,
                     _ => Core::Unpack,
                 };
+                if matches!(op, MirOp::CbPop { .. }) && core == Core::Writer {
+                    drain_niu(&mut m, core);
+                }
                 m.push(core, op);
                 continue;
             }
@@ -585,6 +714,9 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                     Some(Core::Reader) => Core::Reader,
                     _ => Core::Pack,
                 };
+                if matches!(op, MirOp::CbPush { .. }) && core == Core::Reader {
+                    drain_niu(&mut m, core);
+                }
                 m.push(core, op);
                 continue;
             }
@@ -594,32 +726,65 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                 dst_offset,
                 src_offset,
                 shape: access,
+                span,
             } => {
                 if let Some(core) = mover {
                     copy_to(
                         k, types, &plan, &param, &loops, &mut m, core, dst, src, dst_offset,
-                        src_offset, access,
+                        src_offset, access, span,
                     )?;
                 }
                 continue;
             }
+            // A collective is a read-side move: it publishes a page the reader
+            // segment filled. Anywhere else the program has no page to move.
+            Op::Expand {
+                src,
+                pages,
+                span,
+                from,
+            } => {
+                if mover != Some(Core::Reader) {
+                    return Err(ttStatus::TT_ERROR_COLLECTIVE_PLACEMENT);
+                }
+                let site = *plan
+                    .expand
+                    .get(&at)
+                    .ok_or_else(|| crate::status::internal_bug("lower: an expand has no site"))?;
+                expand_to(
+                    k, types, &plan, &param, &loops, &mut m, site, src, pages, span, from,
+                )?;
+                continue;
+            }
+            Op::Roll { .. } => return Err(ttStatus::TT_TODO_COLLECTIVE),
             Op::Load {
                 buffer,
                 offset,
                 shape: access,
+                into,
             } => {
-                // A scalar load is an index read: the mover evaluates it from
-                // the page it copied, in RISC-V (see `mover::eval_value`).
-                if types.of(value).shape == RegShape::Scalar {
-                    continue;
-                }
-                // A vector load no datapath op reads is the mover's lane bases:
-                // it reads one datum per lane out of the page it just copied, so
-                // no `Dst` slot ever holds it. (The movers clone the load into
-                // their own segment to name that page, which is why a copy's
-                // index is a second such load.)
-                if !other_use.contains(&value) {
-                    continue;
+                // A seed writes an accumulator, not a value of its own: it
+                // always lands in `Dst`, in the accumulator's own rows. A block
+                // accumulator has one region per tile.
+                let seed = match into {
+                    Some(acc) => Some(dst_regs(alloc, acc)?),
+                    None => None,
+                };
+                if into.is_none() {
+                    // A scalar load is an index read: the mover evaluates it
+                    // from the page it copied, in RISC-V (see
+                    // `mover::eval_value`).
+                    if types.of(value).shape == RegShape::Scalar {
+                        continue;
+                    }
+                    // A vector load no datapath op reads is the mover's lane
+                    // bases: it reads one datum per lane out of the page it just
+                    // copied, so no `Dst` slot ever holds it. (The movers clone
+                    // the load into their own segment to name that page, which
+                    // is why a copy's index is a second such load.)
+                    if !other_use.contains(&value) {
+                        continue;
+                    }
                 }
                 let info = types.of(buffer);
                 let dtype = match k.at(buffer) {
@@ -643,13 +808,24 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                 // A value only an `Src` reader consumes never enters `Dst`: the
                 // unpack goes straight into `SrcA`/`SrcB` at the op that reads
                 // it, and this load only reserves the page.
-                let lands_in_dst = non_matmul_use.contains(&value) || !matmul_use.contains(&value);
+                let lands_in_dst = seed.is_some()
+                    || non_matmul_use.contains(&value)
+                    || !matmul_use.contains(&value);
                 let page_shape = unit_of(page, dtype)?.0;
-                if page_shape != unit_shape && !(page_shape == RegShape::Tile && !lands_in_dst) {
+                // A block is `m * n` tile pages, whatever it lands in.
+                let block_on_tiles =
+                    page_shape == RegShape::Tile && matches!(unit_shape, RegShape::Block { .. });
+                if page_shape != unit_shape
+                    && !block_on_tiles
+                    && !(page_shape == RegShape::Tile && !lands_in_dst)
+                {
                     let _ = (at, access, page);
                     return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
                 }
-                let reg = dst_reg(alloc, owner(k, value))?;
+                let regs = match seed {
+                    Some(regs) => regs,
+                    None => dst_regs(alloc, owner(k, value))?,
+                };
                 // A narrow access that only an `Src` reader consumes needs no
                 // unpack at all: that op reads the page's own layout. A narrow
                 // value that lands in `Dst` is one x-run of its own datum count,
@@ -659,7 +835,7 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                     let _ = (at, access);
                     return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
                 }
-                if unit_shape != RegShape::Tile
+                if !matches!(unit_shape, RegShape::Tile | RegShape::Block { .. })
                     && lands_in_dst
                     && wide
                     && dtype == crate::ir::DType::Bf16
@@ -676,137 +852,43 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                     ttStatus::TT_ERROR_BUFFER_NOT_PLACED
                 })?);
                 if lands_in_dst {
-                    // A bf16 page cannot enter a 32-bit `Dst` through the
-                    // unpacker: `BF16 -> BF16` is its only Dst-path conversion
-                    // for that datum, and the `Dst` is one width for the whole
-                    // kernel. It goes through `SrcA` instead, which is what
-                    // tt-lang's `copy_tile` does for `typecast bf16 -> f32`
-                    // (`llk_math_eltwise_unary_sfpu_typecast` has "no SFPU
-                    // kernel needed" for that pair): the unpacker writes the
-                    // page into `SrcA` as bf16, and a 32-bit `Dst` reads it back
-                    // through `MOVA2D`, which treats the `SrcA` lane as TF32 and
-                    // writes the full 32-bit datum. A bf16 datum widens exactly
-                    // on that move (7 mantissa bits of 10, the exponent and
-                    // sign unchanged), so the `cast` that follows is a rename.
-                    if wide && dtype == crate::ir::DType::Bf16 {
-                        // The whole page at once: one `Z` plane per face, the
-                        // descriptor's four faces, 64 `SrcA` rows.
-                        m.push(
-                            Core::Unpack,
-                            MirOp::Setadczw {
-                                u0: true,
-                                u1: false,
-                                z0: Some(0),
-                                z1: None,
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::UnpackConfig {
-                                unit: 0,
-                                to_src: true,
-                                dtype,
-                                haloize: false,
-                                add_dest_cntr: false,
-                                ch1_z_stride: 0,
-                            },
-                        );
-                        m.push(Core::Unpack, MirOp::SetUnpackBase { cb, unit: 0 });
-                        m.push(
-                            Core::Unpack,
-                            MirOp::Unpacr {
-                                unit: 0,
-                                count: unit_shape.datums(),
-                                // `UNPACR`'s bit 6: `Set_Data_Valid` on
-                                // Blackhole (ttsim's schema and tt-metal's LLK
-                                // argument), the bank handover the math's
-                                // `MOVA2D` waits for. Without it the Matrix
-                                // Unit stalls forever on an invalid bank.
-                                flip: true,
-                            },
-                        );
-                        // The `Src` row counter starts at zero, as the unpack's
-                        // own destination does.
-                        m.push(
-                            Core::Math,
-                            MirOp::Setrwc {
-                                src_a: 0,
-                                src_b: 0,
-                                dst: 0,
-                                flip_src_a: false,
-                                flip_src_b: false,
-                                dst_cr: false,
-                            },
-                        );
-                        // `MOVA2D` moves eight rows per instruction, and a
-                        // 32-bit `Dst` holds a tile's 1024 datums in 64 rows.
-                        for band in 0..(DST_ROWS / 8) {
-                            m.push(
-                                Core::Math,
-                                MirOp::Mova2d {
-                                    use_dst32b_lo: false,
-                                    src_row: 8 * band,
-                                    addr_mod: 0,
-                                    move8_rows: true,
-                                    reg,
-                                    at: 8 * band,
-                                },
-                            );
+                    // The page this load names inside the ring's block: a reuse
+                    // block keeps several pages live at once, so the unpacker
+                    // cannot simply take the read pointer's page. It is
+                    // tt-metal's `fifo_page_size * tile_index`, and the index
+                    // may be a loop value.
+                    let mut scratch = Pool::new(&SCRATCH);
+                    let (page_offset, page_extra) = page_offset(
+                        &mut m,
+                        k,
+                        &types,
+                        &plan,
+                        &param,
+                        &loops,
+                        Core::Unpack,
+                        buffer,
+                        offset,
+                        &mut scratch,
+                    )?;
+                    // A block is one unpack per tile: the pages after the
+                    // first, each into its own `Dst` region. tt-metal reloads
+                    // its partial band exactly this way (`load` a page of
+                    // `interm0` per tile of the subblock).
+                    // One page per tile of the access: a block reloads its
+                    // `m * n` pages, a tile one, a narrow unit its own page.
+                    // Each tile is the same sequence, so the block case is the
+                    // tile case repeated.
+                    let (bm, bn) = unit_shape.tiles();
+                    let per_tile = unit_shape.datums() / (bm * bn);
+                    let (_, _, page_bytes) = unit_of(page, dtype)?;
+                    for t in 0..bm * bn {
+                        let reg = regs[usize::from(t as u16)];
+                        let (po, pe) = tile_page(page_offset, page_extra, t, page_bytes);
+                        if wide && dtype == crate::ir::DType::Bf16 {
+                            widen_tile(&mut m, cb, dtype, per_tile, po, pe, reg);
+                        } else {
+                            unpack_tile(&mut m, cb, dtype, per_tile, po, pe, reg);
                         }
-                        // `SETRWC(CLR_A)`: the `SrcA` bank goes back to the
-                        // unpacker now that the Matrix Unit has read it.
-                        m.push(
-                            Core::Math,
-                            MirOp::Setrwc {
-                                src_a: 0,
-                                src_b: 0,
-                                dst: 0,
-                                flip_src_a: true,
-                                flip_src_b: false,
-                                dst_cr: false,
-                            },
-                        );
-                    } else {
-                        // The page's wait and release are the `wait`/`pop` ops
-                        // `add_movers` placed around this load.
-                        m.push(Core::Unpack, MirOp::Setdst { reg });
-                        m.push(
-                            Core::Unpack,
-                            MirOp::Setadczw {
-                                u0: true,
-                                u1: false,
-                                z0: Some(0),
-                                z1: None,
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::Setadcx {
-                                unit: 0,
-                                first: 0,
-                                count: unit_shape.datums(),
-                            },
-                        );
-                        m.push(
-                            Core::Unpack,
-                            MirOp::UnpackConfig {
-                                unit: 0,
-                                to_src: false,
-                                dtype,
-                                haloize: false,
-                                add_dest_cntr: false,
-                                ch1_z_stride: 0,
-                            },
-                        );
-                        m.push(Core::Unpack, MirOp::SetUnpackBase { cb, unit: 0 });
-                        m.push(
-                            Core::Unpack,
-                            MirOp::Unpacr {
-                                unit: 0,
-                                count: unit_shape.datums(),
-                                flip: false,
-                            },
-                        );
                     }
                 }
                 // A `matmul` operand's page is waited for and released by its
@@ -826,9 +908,14 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                 // the accumulator's own dtype, and the SFPU writes it row by
                 // row.
                 if types.of(buffer).kind == crate::ir::ValueKind::Acc {
-                    // The accumulator's region is a whole tile; a narrow one
-                    // would be filled with a tile's rows.
-                    if access_shape(access)? != RegShape::Tile {
+                    // A narrow accumulator still fills a whole tile region; a
+                    // block names its `m x n` tiles and is filled tile by tile.
+                    let acc_shape = types.of(buffer).shape;
+                    let wanted = match acc_shape {
+                        RegShape::Block { .. } => acc_shape,
+                        _ => RegShape::Tile,
+                    };
+                    if access_shape(access)? != wanted {
                         let _ = (at, access);
                         return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
                     }
@@ -846,9 +933,8 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                     }
                     // The lane is one 32-bit image: a bf16 datum widens to it.
                     let bits = lane_image(from, bits);
-                    let (unit_shape, _, _) = unit_of([32, 32], acc_dtype)?;
-                    let rows = rows_of(unit_shape, at)?;
-                    let reg = dst_reg(alloc, buffer)?;
+                    let rows = rows_of(RegShape::Tile, at)?;
+                    let regs = dst_regs(alloc, buffer)?;
                     // The fill writes `Dst` rows; `reg_sync` places the wait
                     // for a packer that still reads them.
                     m.push(
@@ -860,16 +946,18 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                     );
                     // An SFPU store covers a row pair (`SFPSTORE` refuses an odd
                     // row and writes two), the same step the datapath uses.
-                    for row in (0..rows).step_by(2) {
-                        m.push(
-                            Core::Math,
-                            MirOp::Sfpstore {
-                                lreg: LReg(0),
-                                reg,
-                                at: row,
-                                dtype: acc_dtype,
-                            },
-                        );
+                    for reg in regs {
+                        for row in (0..rows).step_by(2) {
+                            m.push(
+                                Core::Math,
+                                MirOp::Sfpstore {
+                                    lreg: LReg(0),
+                                    reg,
+                                    at: row,
+                                    dtype: acc_dtype,
+                                },
+                            );
+                        }
                     }
                     let _ = (offset, src);
                     // An accumulator store never reads a CB page, but a page
@@ -890,7 +978,18 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                     Op::Cb { page, .. } => page,
                     _ => return Err(ttStatus::TT_ERROR_NOT_A_BUFFER),
                 };
-                if unit_of(page, dtype)?.0 != unit_shape {
+                // A block accumulator spills as its `m * n` pages: one pack
+                // per tile, the ring's hand-off stated by the buffer's `block`.
+                // tt-metal's `interm0`/`out_dfb` band is written the same way
+                // (`pack_tile` per tile of `out_subblock_num_tiles`).
+                // A ring's page is one unit; a block access names `m * n` of
+                // them, so a block stores into tile pages whatever the ring's
+                // own page shape.
+                let (bm, bn) = unit_shape.tiles();
+                let block = matches!(unit_shape, RegShape::Block { .. });
+                if unit_of(page, dtype)?.0 != unit_shape
+                    && !(block && unit_of(page, dtype)?.0 == RegShape::Tile)
+                {
                     let _ = (at, access, page);
                     return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
                 }
@@ -912,7 +1011,22 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                 // around this store. The `Dst` hand-off is `reg_sync`'s: the
                 // math thread has published the section and the packer reads it
                 // here.
-                m.push(Core::Pack, MirOp::SetPackBase { cb });
+                // The page the store names inside the ring's block: the
+                // packer's base is the write pointer, and a block's pages are
+                // contiguous from it, exactly as the unpacker's read side is.
+                let mut scratch = Pool::new(&SCRATCH);
+                let (page_offset, page_extra) = page_offset(
+                    &mut m,
+                    k,
+                    &types,
+                    &plan,
+                    &param,
+                    &loops,
+                    Core::Pack,
+                    buffer,
+                    offset,
+                    &mut scratch,
+                )?;
                 m.push(
                     Core::Pack,
                     MirOp::SetPackConfig {
@@ -922,15 +1036,29 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                         mask: acc_mask[&owner(k, src)],
                     },
                 );
-                m.push(
-                    Core::Pack,
-                    MirOp::SetPackOffset {
-                        reg: dst_reg(alloc, owner(k, src))?,
-                        at: 0,
-                    },
-                );
-                m.push(Core::Pack, MirOp::PackRows { rows, last: true });
-                let _ = offset;
+                // One page per tile of the access: `m * n` pages for a block,
+                // one for a tile or a narrow unit.
+                let regs = dst_regs(alloc, owner(k, src))?;
+                let (_, _, page_bytes) = unit_of(page, dtype)?;
+                for t in 0..bm * bn {
+                    let (po, pe) = tile_page(page_offset, page_extra, t, page_bytes);
+                    m.push(
+                        Core::Pack,
+                        MirOp::SetPackBase {
+                            cb,
+                            offset: po,
+                            extra: pe,
+                        },
+                    );
+                    m.push(
+                        Core::Pack,
+                        MirOp::SetPackOffset {
+                            reg: regs[usize::from(t as u16)],
+                            at: 0,
+                        },
+                    );
+                    m.push(Core::Pack, MirOp::PackRows { rows, last: true });
+                }
             }
             Op::Cast { src, dtype } => {
                 let from = types.of(src).dtype;
@@ -1111,15 +1239,16 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                         RegShape::Row => Bcast::Row,
                         RegShape::Column => Bcast::Col,
                         RegShape::Scalar => Bcast::Scalar,
-                        RegShape::Tile => {
+                        RegShape::Tile | RegShape::Block { .. } => {
                             return Err(crate::status::internal_bug(
                                 "lower: a broadcast with two tile operands",
                             ));
                         }
                     };
+                    let target = m.target;
                     fpu_broadcast(
-                        &mut m, k, types, &plan, alloc, &acc_mask, value, op, tile, narrow, bcast,
-                        at, target,
+                        &mut m, k, types, &plan, alloc, &acc_mask, &param, &loops, value, op, tile,
+                        narrow, bcast, at, target,
                     )?;
                     // A page whose last reader this broadcast was is released
                     // here; `continue` skips the common block below.
@@ -1403,8 +1532,19 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                 let out = dst_reg(alloc, owner(k, value))?;
                 // The page the tile comes from: a `load`'s own, or the
                 // compiler's staged copy of a computed value.
-                let (cb, staged) =
-                    fpu_page(k, &plan, src, at, ttStatus::TT_ERROR_TRANSPOSE_OPERAND)?;
+                let mut scratch = Pool::new(&SCRATCH);
+                let (cb, staged, page, page_extra) = fpu_page(
+                    &mut m,
+                    k,
+                    &types,
+                    &plan,
+                    &param,
+                    &loops,
+                    src,
+                    at,
+                    ttStatus::TT_ERROR_TRANSPOSE_OPERAND,
+                    &mut scratch,
+                )?;
                 if staged {
                     stage(&mut m, k, &types, alloc, &acc_mask, src, cb)?;
                     m.push(Core::Unpack, MirOp::CbWait { cb, n: 1 });
@@ -1454,7 +1594,15 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                                 ch1_z_stride: dtype.bytes() * 256,
                             },
                         );
-                        m.push(Core::Unpack, MirOp::SetUnpackBase { cb, unit: 0 });
+                        m.push(
+                            Core::Unpack,
+                            MirOp::SetUnpackBase {
+                                cb,
+                                unit: 0,
+                                offset: page,
+                                extra: page_extra,
+                            },
+                        );
                         m.push(
                             Core::Unpack,
                             MirOp::Unpacr {
@@ -1606,8 +1754,33 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                     let _ = at;
                     return Err(ttStatus::TT_ERROR_MATMUL_ACCUM_WIDE);
                 }
-                let (cb_a, stage_a) = fpu_page(k, &plan, a, at, ttStatus::TT_ERROR_MATMUL_OPERAND)?;
-                let (cb_b, stage_b) = fpu_page(k, &plan, b, at, ttStatus::TT_ERROR_MATMUL_OPERAND)?;
+                // Both operands' run-time page indices are live together, so
+                // they come from one pool and land in distinct registers.
+                let mut scratch = Pool::new(&SCRATCH);
+                let (cb_a, stage_a, page_a, extra_a) = fpu_page(
+                    &mut m,
+                    k,
+                    &types,
+                    &plan,
+                    &param,
+                    &loops,
+                    a,
+                    at,
+                    ttStatus::TT_ERROR_MATMUL_OPERAND,
+                    &mut scratch,
+                )?;
+                let (cb_b, stage_b, page_b, extra_b) = fpu_page(
+                    &mut m,
+                    k,
+                    &types,
+                    &plan,
+                    &param,
+                    &loops,
+                    b,
+                    at,
+                    ttStatus::TT_ERROR_MATMUL_OPERAND,
+                    &mut scratch,
+                )?;
                 // A computed operand has no page: the compiler packs it into its
                 // own and the Matrix Unit reads that.
                 if stage_a {
@@ -1616,225 +1789,54 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                 if stage_b {
                     stage(&mut m, k, &types, alloc, &acc_mask, b, cb_b)?;
                 }
-                let base = dst_reg(alloc, acc)?;
-                if target == Target::Quasar {
-                    // The Quasar FPU's own geometry: eight `Dst` rows per
-                    // `MVMUL`, six address modifiers, and both operands
-                    // unpacked whole (`llk_math_matmul.h`).
-                    quasar_matmul(&mut m, base, cb_a, cb_b, dt_a, dt_b, stage_a, stage_b)?;
-                } else {
-                    // Scratch for `mvmul_group`, which emits a run of math ops: the
-                    // run is appended to the one IR as it is produced.
-                    let mut math_scratch: Vec<MirOp> = Vec::new();
-                    // The Matrix Unit writes the accumulator's rows; `reg_sync`
-                    // places the wait for a packer that still reads them.
-                    // The Matrix Unit's address modifiers, fidelity phase and row
-                    // counters are this thread's `ThreadConfig` and RWC state. Every
-                    // word goes out as a whole `SETC16`, so an entry carrying several
-                    // fields of one word is composed here.
-                    for entry in [
-                        vec![(thread::ADDR_MOD_AB_SEC0_SrcAIncr, 0u16)],
-                        vec![(thread::ADDR_MOD_DST_SEC0_DestIncr, 0)],
-                        vec![(thread::ADDR_MOD_AB_SEC1_SrcAIncr, 0)],
-                        vec![(thread::ADDR_MOD_DST_SEC1_FidelityIncr, 1)],
-                        // End of a group's first `SrcB` half: `SrcB` on eight rows,
-                        // phase back to 0.
-                        vec![
-                            (thread::ADDR_MOD_AB_SEC2_SrcBIncr, 8),
-                            (thread::ADDR_MOD_AB_SEC2_SrcBClear, 0),
-                        ],
-                        vec![
-                            (thread::ADDR_MOD_DST_SEC2_DestIncr, 0),
-                            (thread::ADDR_MOD_DST_SEC2_DestCR, 0),
-                            (thread::ADDR_MOD_DST_SEC2_FidelityClear, 1),
-                        ],
-                        // End of a group that is not the `fi`'s last: phase and
-                        // `SrcB` back to 0.
-                        vec![
-                            (thread::ADDR_MOD_AB_SEC3_SrcBIncr, 0),
-                            (thread::ADDR_MOD_AB_SEC3_SrcBClear, 1),
-                        ],
-                        vec![
-                            (thread::ADDR_MOD_DST_SEC3_DestIncr, 0),
-                            (thread::ADDR_MOD_DST_SEC3_DestCR, 0),
-                            (thread::ADDR_MOD_DST_SEC3_FidelityClear, 1),
-                        ],
-                        // End of an `fi`: as 3, and the `Dst` base on 32 rows for
-                        // the next `fi`.
-                        vec![
-                            (thread::ADDR_MOD_AB_SEC4_SrcBIncr, 0),
-                            (thread::ADDR_MOD_AB_SEC4_SrcBClear, 1),
-                        ],
-                        vec![
-                            (thread::ADDR_MOD_DST_SEC4_DestIncr, 32),
-                            (thread::ADDR_MOD_DST_SEC4_DestCR, 0),
-                            (thread::ADDR_MOD_DST_SEC4_FidelityClear, 1),
-                        ],
-                        vec![(thread::FIDELITY_BASE_Phase, 0)],
-                    ] {
-                        m.push(Core::Math, thread_word(&entry)?);
-                    }
-                    // Src rows and the `Dst` counter start at 0.
-                    m.push(
-                        Core::Math,
-                        MirOp::Setrwc {
-                            src_a: 0,
-                            src_b: 0,
-                            dst: 0,
-                            flip_src_a: false,
-                            flip_src_b: false,
-                            dst_cr: false,
-                        },
-                    );
-                    // The accumulator's rows are added to, never cleared: an `acc`
-                    // holds whatever the program last put there, and zeroing it is a
-                    // `store_to %acc from %zero` the program writes itself.
-                    // One `(fi, k)` group: A's face `(fi, k)` into `SrcB`, B's two
-                    // faces `(k, 0)` and `(k, 1)` into `SrcA`. The unpacker and the
-                    // Matrix Unit alternate through the bank handover, so the two
-                    // roles interleave by ownership, not by instruction position.
-                    // A staged operand's page is published by the packer (T2) before
-                    // the unpacker reads it, and released after the last face.
-                    for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
-                        if staged {
-                            m.push(Core::Unpack, MirOp::CbWait { cb, n: 1 });
+                // The accumulator's block: a tile is the `1 x 1` case, so
+                // this per-tile sequence is emitted once per tile of the block.
+                // The operands are blocks too -- `a` is `m x k`, `b` is `k x n`
+                // -- and their shapes are the pairing. tt-metal's compute kernel
+                // runs the same nest over its subblock (`bmm_large_block_zm.cpp`
+                // `for i in out_subblock_h: for j in out_subblock_w: for kt in
+                // in0_block_w: matmul_tiles(...)`).
+                let acc_regs = dst_regs(alloc, acc)?;
+                let (m_tiles, n_tiles) = types.of(acc).shape.tiles();
+                let (a_m, a_k) = types.of(a).shape.tiles();
+                let (b_k, b_n) = types.of(b).shape.tiles();
+                if a_m != m_tiles || b_n != n_tiles || a_k != b_k {
+                    let _ = (a_m, a_k, b_k, b_n);
+                    return Err(ttStatus::TT_ERROR_MATMUL_OPERAND);
+                }
+                // A computed block operand would have to be staged once per
+                // tile; the staging path packs one page.
+                if (stage_a && (a_m > 1 || a_k > 1)) || (stage_b && (b_k > 1 || b_n > 1)) {
+                    let _ = (stage_a, stage_b);
+                    return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
+                }
+                let page_bytes_a = cb_page_bytes(&m, cb_a)?;
+                let page_bytes_b = cb_page_bytes(&m, cb_b)?;
+                for i in 0..m_tiles {
+                    for j in 0..n_tiles {
+                        for kk in 0..a_k {
+                            // A block's pages are its tiles, row-major: `a`'s
+                            // row is `a_k` tiles wide and `b`'s `b_n`.
+                            let (pa, ea) =
+                                tile_page(page_a, extra_a, i * a_k + kk, page_bytes_a);
+                            let (pb, eb) =
+                                tile_page(page_b, extra_b, kk * b_n + j, page_bytes_b);
+                            matmul_tile(
+                                &mut m,
+                                cb_a,
+                                stage_a,
+                                pa,
+                                ea,
+                                cb_b,
+                                stage_b,
+                                pb,
+                                eb,
+                                acc_regs[usize::from((i * n_tiles + j) as u16)],
+                                dt_a,
+                                dt_b,
+                            )?;
                         }
                     }
-                    for fi in 0..2u32 {
-                        for kk in 0..2u32 {
-                            m.push(
-                                Core::Unpack,
-                                MirOp::Setadczw {
-                                    u0: false,
-                                    u1: true,
-                                    z0: Some(2 * fi + kk),
-                                    z1: None,
-                                },
-                            );
-                            m.push(
-                                Core::Unpack,
-                                MirOp::UnpackConfig {
-                                    unit: 1,
-                                    to_src: true,
-                                    dtype: dt_a,
-                                    haloize: false,
-                                    add_dest_cntr: false,
-                                    ch1_z_stride: 0,
-                                },
-                            );
-                            m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_a, unit: 1 });
-                            m.push(
-                                Core::Unpack,
-                                MirOp::Unpacr {
-                                    unit: 1,
-                                    count: FACE_DATUMS,
-                                    flip: true,
-                                },
-                            );
-                            m.push(
-                                Core::Unpack,
-                                MirOp::Setadczw {
-                                    u0: true,
-                                    u1: false,
-                                    z0: Some(2 * kk),
-                                    z1: None,
-                                },
-                            );
-                            m.push(
-                                Core::Unpack,
-                                MirOp::UnpackConfig {
-                                    unit: 0,
-                                    to_src: true,
-                                    dtype: dt_b,
-                                    haloize: false,
-                                    add_dest_cntr: false,
-                                    ch1_z_stride: 0,
-                                },
-                            );
-                            m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 0 });
-                            m.push(
-                                Core::Unpack,
-                                MirOp::Unpacr {
-                                    unit: 0,
-                                    count: FACE_DATUMS,
-                                    flip: true,
-                                },
-                            );
-                            mvmul_group(&mut math_scratch, base, 0);
-                            for op in math_scratch.drain(..) {
-                                m.push(Core::Math, op);
-                            }
-                            m.push(
-                                Core::Math,
-                                MirOp::Mvmul {
-                                    reg: base,
-                                    at: 8,
-                                    addr_mod: MATMUL_AM_GROUP,
-                                    flip_a: true,
-                                    flip_b: false,
-                                },
-                            );
-                            m.push(
-                                Core::Unpack,
-                                MirOp::Setadczw {
-                                    u0: true,
-                                    u1: false,
-                                    z0: Some(2 * kk + 1),
-                                    z1: None,
-                                },
-                            );
-                            m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 0 });
-                            m.push(
-                                Core::Unpack,
-                                MirOp::Unpacr {
-                                    unit: 0,
-                                    count: FACE_DATUMS,
-                                    flip: true,
-                                },
-                            );
-                            mvmul_group(&mut math_scratch, base, 16);
-                            for op in math_scratch.drain(..) {
-                                m.push(Core::Math, op);
-                            }
-                            let end = if kk == 0 {
-                                MATMUL_AM_GROUP
-                            } else {
-                                MATMUL_AM_FI
-                            };
-                            m.push(
-                                Core::Math,
-                                MirOp::Mvmul {
-                                    reg: base,
-                                    at: 24,
-                                    addr_mod: end,
-                                    flip_a: true,
-                                    flip_b: true,
-                                },
-                            );
-                        }
-                    }
-                    // The Matrix Unit advanced the thread's `Dst` counter as it
-                    // walked the accumulator, and an `SFPLOAD`/`SFPSTORE` address is
-                    // relative to it, so the counter goes back to 0. Its writes are
-                    // still in flight, so the accumulator is not readable (the pack
-                    // follows on T2) until the unit drains.
-                    m.push(Core::Math, MirOp::WaitMatrix);
-                    for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
-                        if staged {
-                            m.push(Core::Unpack, MirOp::CbPop { cb, n: 1 });
-                        }
-                    }
-                    m.push(
-                        Core::Math,
-                        MirOp::Setrwc {
-                            src_a: 0,
-                            src_b: 0,
-                            dst: 0,
-                            flip_src_a: false,
-                            flip_src_b: false,
-                            dst_cr: false,
-                        },
-                    );
                 }
             }
             // `sum col`/`max col`: `GAPOOL`/`GMPOOL` fold each 16x16 face over
@@ -1867,17 +1869,39 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                     let _ = at;
                     return Err(ttStatus::TT_ERROR_MATMUL_ACCUM_WIDE);
                 }
-                let (cb_x, stage_x) = fpu_page(k, &plan, x, at, ttStatus::TT_ERROR_REDUCE_OPERAND)?;
-                let (cb_b, stage_b, dt_b) = match scaler {
+                let mut scratch = Pool::new(&SCRATCH);
+                let (cb_x, stage_x, page_x, extra_x) = fpu_page(
+                    &mut m,
+                    k,
+                    &types,
+                    &plan,
+                    &param,
+                    &loops,
+                    x,
+                    at,
+                    ttStatus::TT_ERROR_REDUCE_OPERAND,
+                    &mut scratch,
+                )?;
+                let (cb_b, stage_b, page_b, extra_b, dt_b) = match scaler {
                     Some(scaler) => {
                         let dt_s = types.of(scaler).dtype;
                         if dt_s != dt_x {
                             let _ = (dt_s, dt_x);
                             return Err(ttStatus::TT_ERROR_REDUCE_DTYPE);
                         }
-                        let (cb, staged) =
-                            fpu_page(k, &plan, scaler, at, ttStatus::TT_ERROR_REDUCE_OPERAND)?;
-                        (cb, staged, dt_s)
+                        let (cb, staged, page, extra) = fpu_page(
+                            &mut m,
+                            k,
+                            &types,
+                            &plan,
+                            &param,
+                            &loops,
+                            scaler,
+                            at,
+                            ttStatus::TT_ERROR_REDUCE_OPERAND,
+                            &mut scratch,
+                        )?;
+                        (cb, staged, page, extra, dt_s)
                     }
                     None => {
                         let ones = plan.ones.ok_or_else(|| {
@@ -1888,7 +1912,7 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                             let _ = (ones.dtype, dt_x);
                             return Err(ttStatus::TT_ERROR_REDUCE_DTYPE);
                         }
-                        (cb_id(ones.cb), false, ones.dtype)
+                        (cb_id(ones.cb), false, 0, None, ones.dtype)
                     }
                 };
                 // The 1.0 page is pushed once at kernel start; a `max` waits
@@ -2006,7 +2030,15 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                                     z1: Some(0),
                                 },
                             );
-                            m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_x, unit: 0 });
+                            m.push(
+                                Core::Unpack,
+                                MirOp::SetUnpackBase {
+                                    cb: cb_x,
+                                    unit: 0,
+                                    offset: page_x,
+                                    extra: extra_x,
+                                },
+                            );
                             m.push(
                                 Core::Unpack,
                                 MirOp::Unpacr {
@@ -2030,7 +2062,15 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                                     z1: Some(0),
                                 },
                             );
-                            m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 1 });
+                            m.push(
+                                Core::Unpack,
+                                MirOp::SetUnpackBase {
+                                    cb: cb_b,
+                                    unit: 1,
+                                    offset: page_b,
+                                    extra: extra_b,
+                                },
+                            );
                             m.push(
                                 Core::Unpack,
                                 MirOp::Unpacr {
@@ -2332,7 +2372,15 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                                 ch1_z_stride: 0,
                             },
                         );
-                        m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_x, unit: 0 });
+                        m.push(
+                            Core::Unpack,
+                            MirOp::SetUnpackBase {
+                                cb: cb_x,
+                                unit: 0,
+                                offset: page_x,
+                                extra: extra_x,
+                            },
+                        );
                         m.push(
                             Core::Unpack,
                             MirOp::Unpacr {
@@ -2364,7 +2412,15 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
                                 ch1_z_stride: 0,
                             },
                         );
-                        m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 1 });
+                        m.push(
+                            Core::Unpack,
+                            MirOp::SetUnpackBase {
+                                cb: cb_b,
+                                unit: 1,
+                                offset: page_b,
+                                extra: extra_b,
+                            },
+                        );
                         m.push(
                             Core::Unpack,
                             MirOp::Unpacr {
@@ -2526,7 +2582,11 @@ fn lower_with(k: &Kernel, target: Target) -> Result<MachineKernel, ttStatus> {
         }
         for op in [
             MirOp::CbReserve { cb: ones_cb, n: 1 },
-            MirOp::SetPackBase { cb: ones_cb },
+            MirOp::SetPackBase {
+                cb: ones_cb,
+                offset: 0,
+                extra: None,
+            },
             MirOp::SetPackConfig {
                 dtype: ones.dtype,
                 mask: PackMask::None,
@@ -2945,7 +3005,7 @@ fn quasar_matmul(
                 ch1_z_stride: 0,
             },
         );
-        m.push(Core::Unpack, MirOp::SetUnpackBase { cb, unit });
+        m.push(Core::Unpack, MirOp::SetUnpackBase { cb, unit, offset: 0, extra: None });
         m.push(
             Core::Unpack,
             MirOp::Unpacr {
@@ -3054,26 +3114,41 @@ fn thread_word(fields: &[(tt_isa::cfg::ThreadConfigField, u16)]) -> Result<MirOp
 /// `load` already has a page, while a computed value is packed into the
 /// compiler's page for it (see [`stage`]). `err` is the operand rule the
 /// calling op reports when the value has neither.
+#[allow(clippy::too_many_arguments)]
 fn fpu_page(
+    m: &mut MachineKernel,
     k: &Kernel,
+    types: &Types,
     plan: &Plan,
+    param: &BTreeMap<OpId, u32>,
+    loops: &[OpId],
     value: crate::ir::OpId,
     at: OpId,
     err: ttStatus,
-) -> Result<(Cb, bool), ttStatus> {
+    scratch: &mut Pool,
+) -> Result<(Cb, bool, u32, Option<u8>), ttStatus> {
     let id = owner(k, value);
     if k.op(id).is_none() {
         let _ = (at, value);
         return Err(err);
     }
     if let Some(Op::Load { buffer, .. }) = k.op(id) {
-        return Ok((
-            cb_id(plan.cb.get(buffer).copied().ok_or_else(|| {
-                let _ = buffer;
-                ttStatus::TT_ERROR_BUFFER_NOT_PLACED
-            })?),
-            false,
-        ));
+        let cb = cb_id(plan.cb.get(buffer).copied().ok_or_else(|| {
+            let _ = buffer;
+            ttStatus::TT_ERROR_BUFFER_NOT_PLACED
+        })?);
+        let (buffer, page) = match *k.at(id) {
+            Op::Load { buffer, offset, .. } => (buffer, offset),
+            _ => {
+                return Err(crate::status::internal_bug(
+                    "lower: a page offset was asked of a value that is not a load",
+                ));
+            }
+        };
+        let (offset, extra) = page_offset(
+            m, k, types, plan, param, loops, Core::Unpack, buffer, page, scratch,
+        )?;
+        return Ok((cb, false, offset, extra));
     }
     // Not a `load`: the value lives in `Dst` and the `Src` path reads L1, so
     // the compiler packs it into a page it owns. The verifier admits only
@@ -3083,7 +3158,99 @@ fn fpu_page(
         let _ = (id, value);
         err
     })?);
-    Ok((cb, true))
+    Ok((cb, true, 0, None))
+}
+
+/// The page a `load` names, the way tt-metal's `get_tile_l1_byte_address`
+/// computes it: `(fifo_rd_ptr + fifo_page_size * tile_index) << 4`
+/// (`cb_api.h:143-151`).
+///
+/// `tile_index` there is `matmul_tiles`' run-time argument, so it is not
+/// required to be a constant here either. A constant folds into the base word
+/// the encoder writes; anything else is evaluated in the role that *uses* the
+/// address -- the unpacker for a `load`, the packer for a `store` -- and
+/// returned as the register that holds `tile_index * (page_bytes / 16)`, added
+/// to the base word when it is written.
+///
+/// The role matters: the three Tensix threads have separate register files, so
+/// a register the unpacker wrote means nothing to the packer. Computing the
+/// pack's index in the unpack role is how a `store ... [i]` once read a stale
+/// zero (and looked correct only because the write pointer had advanced by the
+/// same page).
+#[allow(clippy::too_many_arguments)]
+fn page_offset(
+    m: &mut MachineKernel,
+    k: &Kernel,
+    types: &Types,
+    plan: &Plan,
+    param: &BTreeMap<OpId, u32>,
+    loops: &[OpId],
+    core: Core,
+    buffer: OpId,
+    offset: OpId,
+    scratch: &mut Pool,
+) -> Result<(u32, Option<u8>), ttStatus> {
+    let (dtype, page) = match *k.at(buffer) {
+        Op::Cb { dtype, page, .. } => (dtype, page),
+        _ => return Err(ttStatus::TT_ERROR_NOT_A_BUFFER),
+    };
+    let (_, _, page_bytes) = crate::ir::unit_of(page, dtype)?;
+    if page_bytes % 16 != 0 {
+        return Err(ttStatus::TT_ERROR_BUFFER_OFFSET_OVERFLOW);
+    }
+    match k.const_i32(offset) {
+        Some(n) if n >= 0 => {
+            // A constant page index is a byte offset, which is what
+            // [`MirOp::SetUnpackBase`] carries: the encoder scales it to the
+            // interface's units.
+            let n = u32::try_from(n)
+                .ok()
+                .ok_or(ttStatus::TT_ERROR_PARAM_OFFSET_OVERFLOW)?;
+            n.checked_mul(page_bytes)
+                .map(|bytes| (bytes, None))
+                .ok_or(ttStatus::TT_ERROR_PARAM_OFFSET_OVERFLOW)
+        }
+        _ => {
+            // A run-time index: `tile_index * page_units`, in the unpack role, as
+            // tt-metal's `get_tile_l1_byte_address` does for its own argument.
+            // The index register stays taken: two operands of one op need two
+            // distinct pages, and the caller's pool is what keeps them apart.
+            let index = scratch.take()?;
+            let mut ops = Vec::new();
+            scalar_with(
+                k,
+                types,
+                &mut ops,
+                param,
+                loops,
+                offset,
+                index,
+                scratch,
+                &COMPUTE_INDEX,
+                plan,
+                &m.cbs,
+            )?;
+            // The encoder adds a run-time page index *after* turning the base
+            // into the interface's 16-byte units, so the register holds the
+            // index scaled by the page's units.
+            let scale = scratch.take()?;
+            ops.push(MirOp::Li {
+                reg: scale,
+                value: page_bytes / 16,
+            });
+            ops.push(MirOp::IArith {
+                op: IOp::Mul,
+                d: index,
+                a: index,
+                b: scale,
+            });
+            for op in ops {
+                m.push(core, op);
+            }
+            scratch.give(scale);
+            Ok((0, Some(index)))
+        }
+    }
 }
 
 /// `SrcA op SrcB -> Dst` with `SrcB` broadcast: tt-metal's
@@ -3103,6 +3270,8 @@ fn fpu_broadcast(
     plan: &Plan,
     alloc: &Alloc,
     acc_mask: &BTreeMap<OpId, PackMask>,
+    param: &BTreeMap<OpId, u32>,
+    loops: &[OpId],
     value: crate::ir::OpId,
     op: BOp,
     tile: crate::ir::OpId,
@@ -3111,8 +3280,31 @@ fn fpu_broadcast(
     at: OpId,
     target: Target,
 ) -> Result<(), ttStatus> {
-    let (cb_a, stage_a) = fpu_page(k, &plan, tile, at, ttStatus::TT_TODO_BROADCAST)?;
-    let (cb_b, stage_b) = fpu_page(k, &plan, narrow, at, ttStatus::TT_TODO_BROADCAST)?;
+    let mut scratch = Pool::new(&SCRATCH);
+    let (cb_a, stage_a, page_a, extra_a) = fpu_page(
+        m,
+        k,
+        types,
+        plan,
+        param,
+        loops,
+        tile,
+        at,
+        ttStatus::TT_TODO_BROADCAST,
+        &mut scratch,
+    )?;
+    let (cb_b, stage_b, page_b, extra_b) = fpu_page(
+        m,
+        k,
+        types,
+        plan,
+        param,
+        loops,
+        narrow,
+        at,
+        ttStatus::TT_TODO_BROADCAST,
+        &mut scratch,
+    )?;
     if stage_a {
         stage(m, k, types, alloc, acc_mask, tile, cb_a)?;
     }
@@ -3325,7 +3517,15 @@ fn fpu_broadcast(
                 ch1_z_stride: 0,
             },
         );
-        m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_a, unit: 0 });
+        m.push(
+            Core::Unpack,
+            MirOp::SetUnpackBase {
+                cb: cb_a,
+                unit: 0,
+                offset: page_a,
+                extra: extra_a,
+            },
+        );
         m.push(
             Core::Unpack,
             MirOp::Unpacr {
@@ -3386,7 +3586,7 @@ fn fpu_broadcast(
                         ch1_z_stride: 0,
                     },
                 );
-                m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 1 });
+                m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 1, offset: 0, extra: None });
                 m.push(
                     Core::Unpack,
                     MirOp::Unpacr {
@@ -3560,7 +3760,7 @@ fn fpu_broadcast(
                     ch1_z_stride: 0,
                 },
             );
-            m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_a, unit: 0 });
+            m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_a, unit: 0, offset: 0, extra: None });
             m.push(
                 Core::Unpack,
                 MirOp::Unpacr {
@@ -3604,7 +3804,7 @@ fn fpu_broadcast(
                     ch1_z_stride: 0,
                 },
             );
-            m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 1 });
+            m.push(Core::Unpack, MirOp::SetUnpackBase { cb: cb_b, unit: 1, offset: 0, extra: None });
             m.push(
                 Core::Unpack,
                 MirOp::Unpacr {
@@ -3693,7 +3893,14 @@ fn stage(
     let id = owner(k, value);
     let dtype = types.of(id).dtype;
     m.push(Core::Pack, MirOp::CbReserve { cb, n: 1 });
-    m.push(Core::Pack, MirOp::SetPackBase { cb });
+    m.push(
+        Core::Pack,
+        MirOp::SetPackBase {
+            cb,
+            offset: 0,
+            extra: None,
+        },
+    );
     m.push(
         Core::Pack,
         MirOp::SetPackConfig {
@@ -5521,6 +5728,12 @@ fn sfp_rows(shape: RegShape, at: OpId) -> Result<Vec<u32>, ttStatus> {
             let _ = at;
             return Err(ttStatus::TT_ERROR_SCALAR_NO_ROWS);
         }
+        // A lane body walks one tile; a block is a repeat of tile bodies, which
+        // its own caller emits.
+        RegShape::Block { .. } => {
+            let _ = at;
+            return Err(ttStatus::TT_TODO_ACCESS_SHAPE);
+        }
     })
 }
 
@@ -5532,6 +5745,8 @@ fn rows_of(shape: RegShape, at: OpId) -> Result<u32, ttStatus> {
         }
         RegShape::Row | RegShape::Column => Ok(2),
         RegShape::Tile => Ok(DST_ROWS),
+        // A block's pages are tiles: one page per call.
+        RegShape::Block { .. } => Ok(DST_ROWS),
     }
 }
 
@@ -5569,12 +5784,13 @@ fn copy_to(
     dst_offset: OpId,
     src_offset: OpId,
     access: [Dim; 2],
+    span: Span,
 ) -> Result<(), ttStatus> {
     let inbound = core == Core::Reader;
-    let (buffer, argument, offset) = if inbound {
-        (dst, src, src_offset)
+    let (buffer, argument, offset, page_offset) = if inbound {
+        (dst, src, src_offset, dst_offset)
     } else {
-        (src, dst, dst_offset)
+        (src, dst, dst_offset, src_offset)
     };
     let dtype = match *k.at(buffer) {
         Op::Cb { dtype, .. } => dtype,
@@ -5585,16 +5801,6 @@ fn copy_to(
         .get(&buffer)
         .ok_or(ttStatus::TT_ERROR_BUFFER_NOT_PLACED)?;
     let index = *param.get(&argument).ok_or(ttStatus::TT_ERROR_COPY_ENDS)?;
-    // A striped tensor's pages live on different channels, so the request's
-    // address is resolved on the core from the page index rather than added to
-    // one base. See [`emit_request`].
-    let interleaved = matches!(
-        *k.at(argument),
-        Op::Param {
-            interleaved: true,
-            ..
-        }
-    );
     // The index is in access units, so one step is the unit's bytes.
     let bytes = (access[0] * access[1])
         .checked_mul(dtype.bytes())
@@ -5605,6 +5811,9 @@ fn copy_to(
         RegShape::Scalar => 1,
         RegShape::Row | RegShape::Column => 32,
         RegShape::Tile => 1024,
+        // A copy's index names one lane; a block index would be a page list,
+        // which a copy's `block n` states instead.
+        RegShape::Block { .. } => return Err(ttStatus::TT_TODO_MULTI_LANE),
     };
     // A row unit is narrower than the parameter's page, so the copy gathers it
     // from (or scatters it to) the two face rows it occupies. See
@@ -5614,16 +5823,61 @@ fn copy_to(
         Op::Cb { page, .. } => page,
         _ => return Err(ttStatus::TT_ERROR_NOT_A_BUFFER),
     };
-    let page_unit = crate::ir::unit_of(page_shape, dtype)?.0;
+    let (page_unit, _, page_bytes) = crate::ir::unit_of(page_shape, dtype)?;
     let block = *plan
         .arg_block
         .get(index as usize)
         .ok_or(ttStatus::TT_ERROR_COPY_ENDS)?;
+    // `copy` is local by definition: DRAM to this core's L1, or this core's L1
+    // to DRAM. A fan-out is an `expand` the program wrote, never something this
+    // path recovers from the operands.
     // A mover's program has its own counters: `t5` is its NIU base, so the
     // compute roles' counters and its own `a1..a4` are not interchangeable.
     let mut ops = Vec::new();
     let mut pool = Pool::new(&MOVER_POOL);
+    // `cores [span]` says which cores issue the request. It is a runtime test over
+    // this core's own coordinate, because the program is one text; a whole-grid
+    // span emits no test at all, which is what every copy that does not name one
+    // gets. See [`span_cond`].
+    let inside = span_cond(
+        k, types, &plan, &param, &loops, &m.cbs, &mut ops, &mut pool, span,
+    )?;
+    if let Some(cond) = inside {
+        ops.push(MirOp::IfNonZero { cond });
+        pool.give(cond);
+    }
     let value = pool.take()?;
+    // The ring side's offset names a page: `copy 32,32 %ba [i]` fills page `i`
+    // of the reservation, which is how eight reads land in eight pages before
+    // one `push 8` publishes them (tt-metal's `reader_bmm_tile_layout.cpp:76-113`,
+    // where the write offset advances by a tile within one `cb_reserve_back`).
+    //
+    // A constant index is honoured, because that is what `sync_cbs` derives the
+    // block from: those pages are reserved and published together, so the write
+    // pointer does not move between them and the index is the only thing that
+    // places the page. A dynamic index names no block (its count would change
+    // per iteration), the ring keeps one page per publish, and the pointer
+    // already places it -- adding the index there would count the page twice.
+    let page_index = match k.const_i32(page_offset) {
+        Some(0) => None,
+        Some(_) => Some(page_offset),
+        None => None,
+    };
+    let ring_page = match page_index {
+        Some(index) => match k.const_i32(index) {
+            Some(n) if n > 0 => {
+                let n = u32::try_from(n)
+                    .ok()
+                    .ok_or(ttStatus::TT_ERROR_PARAM_OFFSET_OVERFLOW)?;
+                Some(
+                    n.checked_mul(page_bytes)
+                        .ok_or(ttStatus::TT_ERROR_PARAM_OFFSET_OVERFLOW)?,
+                )
+            }
+            _ => None,
+        },
+        None => None,
+    };
     if lanes == 1 {
         scalar_with(
             k,
@@ -5639,6 +5893,12 @@ fn copy_to(
             &m.cbs,
         )?;
         if unit == RegShape::Row {
+            if ring_page.is_some() {
+                // A row unit is gathered from two faces of the page, and its
+                // ring side is already an offset inside one; a page index on
+                // top of that has no caller yet.
+                return Err(ttStatus::TT_TODO_MULTI_LANE);
+            }
             narrow_pair(
                 &mut ops,
                 &mut pool,
@@ -5649,7 +5909,6 @@ fn copy_to(
                 page_unit,
                 value,
                 None,
-                interleaved,
                 m.target,
             )?;
         } else {
@@ -5665,6 +5924,44 @@ fn copy_to(
                 b: scale,
             });
             pool.give(scale);
+            // A stated block whose page index is a loop value: the index names
+            // the page inside the block, and the reservation's base only moves
+            // per hand-off, so the page is placed by `index * page_bytes`.
+            // tt-metal's reader walks a block exactly this way -- one
+            // `noc_async_read_page` per tile of `cb_reserve_back`'s block
+            // (`reader_bmm_tile_layout.cpp`).
+            let mut ring_page_reg = None;
+            if k.const_i32(page_offset).is_none()
+                && matches!(*k.at(buffer), Op::Cb { block: Some(_), .. })
+            {
+                let off = pool.take()?;
+                scalar_with(
+                    k,
+                    types,
+                    &mut ops,
+                    param,
+                    loops,
+                    page_offset,
+                    off,
+                    &mut pool,
+                    &MOVER_INDEX,
+                    plan,
+                    &m.cbs,
+                )?;
+                let scale = pool.take()?;
+                ops.push(MirOp::Li {
+                    reg: scale,
+                    value: page_bytes,
+                });
+                ops.push(MirOp::IArith {
+                    op: IOp::Mul,
+                    d: off,
+                    a: off,
+                    b: scale,
+                });
+                pool.give(scale);
+                ring_page_reg = Some(off);
+            }
             emit_request(
                 &mut ops,
                 &mut pool,
@@ -5674,9 +5971,13 @@ fn copy_to(
                 bytes,
                 value,
                 None,
-                interleaved,
                 m.target,
+                ring_page,
+                ring_page_reg,
             )?;
+            if let Some(off) = ring_page_reg {
+                pool.give(off);
+            }
         }
     } else {
         let (page, el) = index_page(k, plan, &m.cbs, offset)?;
@@ -5727,7 +6028,6 @@ fn copy_to(
                 page_unit,
                 value,
                 Some(counter),
-                interleaved,
                 m.target,
             )?;
         } else {
@@ -5751,16 +6051,1206 @@ fn copy_to(
                 bytes,
                 value,
                 None,
-                interleaved,
                 m.target,
+                None,
+                None,
             )?;
         }
         ops.push(MirOp::EndLoop);
     }
     pool.give(value);
+    if inside.is_some() {
+        ops.push(MirOp::EndIf);
+    }
     for op in ops {
         m.push(core, op);
     }
+    Ok(())
+}
+
+/// `inside = this core is in `span``, as a register, or `None` when the span is
+/// the whole grid and there is nothing to test.
+///
+/// The test is per axis and unsigned-safe because coordinates are small and
+/// non-negative: `At(v)` is one equality, and `Range(a, b)` is `!(mine < a) &&
+/// (mine < b)`, two signed compares against small literals. It uses registers
+/// only — a copy has no site block to spill into, and a span names at most two
+/// bounds — and gives every register back except the one it returns.
+#[allow(clippy::too_many_arguments)]
+fn span_cond(
+    k: &Kernel,
+    types: &Types,
+    plan: &Plan,
+    param: &BTreeMap<OpId, u32>,
+    loops: &[OpId],
+    cbs: &crate::slab::Slab<Cb, crate::mir::CbInfo>,
+    ops: &mut Vec<MirOp>,
+    pool: &mut Pool,
+    span: Span,
+) -> Result<Option<u8>, ttStatus> {
+    let mut cond: Option<u8> = None;
+    for (axis, extent) in [(0u8, span.x), (1u8, span.y)] {
+        let Some(extent) = (!matches!(extent, Extent::Whole)).then_some(extent) else {
+            continue;
+        };
+        let mine = pool.take()?;
+        ops.push(MirOp::LoadCoord { reg: mine, axis });
+        match extent {
+            Extent::Whole => unreachable!("a whole extent is skipped"),
+            Extent::At(v) => {
+                let picked = pool.take()?;
+                scalar_with(
+                    k,
+                    types,
+                    ops,
+                    param,
+                    loops,
+                    v,
+                    picked,
+                    pool,
+                    &MOVER_INDEX,
+                    plan,
+                    cbs,
+                )?;
+                ops.push(MirOp::IArith {
+                    op: IOp::Eq,
+                    d: mine,
+                    a: mine,
+                    b: picked,
+                });
+                pool.give(picked);
+            }
+            Extent::Range(a, b) => {
+                // `mine >= a`: the negation of `mine < a`.
+                let bound = pool.take()?;
+                scalar_with(
+                    k,
+                    types,
+                    ops,
+                    param,
+                    loops,
+                    a,
+                    bound,
+                    pool,
+                    &MOVER_INDEX,
+                    plan,
+                    cbs,
+                )?;
+                let below = pool.take()?;
+                ops.push(MirOp::IArith {
+                    op: IOp::Slt,
+                    d: below,
+                    a: mine,
+                    b: bound,
+                });
+                pool.give(bound);
+                ops.push(MirOp::IArith {
+                    op: IOp::Eq,
+                    d: below,
+                    a: below,
+                    b: reg::ZERO,
+                });
+                // `mine < b`, and the two together.
+                let bound = pool.take()?;
+                scalar_with(
+                    k,
+                    types,
+                    ops,
+                    param,
+                    loops,
+                    b,
+                    bound,
+                    pool,
+                    &MOVER_INDEX,
+                    plan,
+                    cbs,
+                )?;
+                let above = pool.take()?;
+                ops.push(MirOp::IArith {
+                    op: IOp::Slt,
+                    d: above,
+                    a: mine,
+                    b: bound,
+                });
+                pool.give(bound);
+                ops.push(MirOp::IArith {
+                    op: IOp::And,
+                    d: below,
+                    a: below,
+                    b: above,
+                });
+                pool.give(above);
+                ops.push(MirOp::IArith {
+                    op: IOp::Add,
+                    d: mine,
+                    a: below,
+                    b: reg::ZERO,
+                });
+                pool.give(below);
+            }
+        }
+        if let Some(acc) = cond {
+            ops.push(MirOp::IArith {
+                op: IOp::And,
+                d: acc,
+                a: acc,
+                b: mine,
+            });
+            pool.give(mine);
+        } else {
+            cond = Some(mine);
+        }
+    }
+    Ok(cond)
+}
+
+/// The byte offsets of an `expand` site's words.
+///
+/// The first four are the protocol ([`crate::mir::McastSite`]); the rest is the
+/// geometry, spilled because a mover has six registers and a span has more
+/// terms than that. The fold is once per page — a 2 KiB multicast — so a dozen
+/// L1 words cost nothing against it.
+const SITE_ARRIVE: u32 = crate::mir::McastSite { base: 0 }.data();
+const SITE_CREDIT: u32 = crate::mir::McastSite { base: 0 }.credit();
+const SITE_RET: u32 = crate::mir::McastSite { base: 0 }.ret();
+const SITE_ONE: u32 = crate::mir::McastSite { base: 0 }.one();
+const SITE_MY_X: u32 = 32;
+const SITE_MY_Y: u32 = 36;
+const SITE_LO_X: u32 = 40;
+const SITE_HI_X: u32 = 44;
+const SITE_LO_Y: u32 = 48;
+const SITE_HI_Y: u32 = 52;
+const SITE_LEAD_X: u32 = 56;
+const SITE_LEAD_Y: u32 = 60;
+const SITE_IS_LEADER: u32 = 64;
+const SITE_IS_RECEIVER: u32 = 68;
+const SITE_REMOTE: u32 = 72;
+const SITE_RECT: u32 = 76;
+const SITE_NEAR: u32 = 84;
+const SITE_FAR: u32 = 88;
+
+fn store_at(ops: &mut Vec<MirOp>, base: u8, at: u32, value: u8) {
+    ops.push(MirOp::Sw {
+        value,
+        base,
+        at: at as i32,
+    });
+}
+
+fn load_at(ops: &mut Vec<MirOp>, dest: u8, base: u8, at: u32) {
+    ops.push(MirOp::Lw {
+        reg: dest,
+        base,
+        at: at as i32,
+    });
+}
+
+/// The packed NoC coordinate of the logical `(x, y)` a site's scratch names,
+/// read out of the staged table: `table[(y << 4) | x]`. The table is indexed by
+/// shift rather than by multiply because its stride is the sixteen columns a
+/// Blackhole can address.
+fn packed_corner(
+    ops: &mut Vec<MirOp>,
+    pool: &mut Pool,
+    sbase: u8,
+    x_at: u32,
+    y_at: u32,
+) -> Result<u8, ttStatus> {
+    let coords = pool.take()?;
+    ops.push(MirOp::LoadArg {
+        reg: coords,
+        arg: crate::mover::ARG_COORDS,
+    });
+    let x = pool.take()?;
+    let y = pool.take()?;
+    let t = pool.take()?;
+    load_at(ops, x, sbase, x_at);
+    load_at(ops, y, sbase, y_at);
+    ops.push(MirOp::Li { reg: t, value: 4 });
+    ops.push(MirOp::IArith {
+        op: IOp::Sll,
+        d: y,
+        a: y,
+        b: t,
+    });
+    ops.push(MirOp::IArith {
+        op: IOp::Or,
+        d: x,
+        a: x,
+        b: y,
+    });
+    ops.push(MirOp::Li { reg: t, value: 2 });
+    ops.push(MirOp::IArith {
+        op: IOp::Sll,
+        d: x,
+        a: x,
+        b: t,
+    });
+    ops.push(MirOp::IArith {
+        op: IOp::Add,
+        d: x,
+        a: x,
+        b: coords,
+    });
+    ops.push(MirOp::Lw {
+        reg: t,
+        base: x,
+        at: 0,
+    });
+    pool.give(y);
+    pool.give(x);
+    pool.give(coords);
+    Ok(t)
+}
+
+/// `dest = sbase + at`, for a small constant.
+fn site_addr(
+    ops: &mut Vec<MirOp>,
+    pool: &mut Pool,
+    dest: u8,
+    sbase: u8,
+    at: u32,
+) -> Result<(), ttStatus> {
+    ops.push(MirOp::IArith {
+        op: IOp::Add,
+        d: dest,
+        a: sbase,
+        b: reg::ZERO,
+    });
+    let c = pool.take()?;
+    ops.push(MirOp::Li { reg: c, value: at });
+    ops.push(MirOp::IArith {
+        op: IOp::Add,
+        d: dest,
+        a: dest,
+        b: c,
+    });
+    pool.give(c);
+    Ok(())
+}
+
+/// `1` when `lo <= v <= hi`, `0` otherwise, from the site's scratch.
+///
+/// The comparison is `hi - lo >= v - lo` in signed arithmetic: a `v` below `lo`
+/// makes `v - lo` negative, which fails the test, and every coordinate is small
+/// and non-negative, so the signed forms are exact.
+fn within(
+    ops: &mut Vec<MirOp>,
+    pool: &mut Pool,
+    sbase: u8,
+    v_at: u32,
+    lo_at: u32,
+    hi_at: u32,
+) -> Result<u8, ttStatus> {
+    let value = pool.take()?;
+    let span = pool.take()?;
+    let out = pool.take()?;
+    load_at(ops, value, sbase, v_at);
+    load_at(ops, out, sbase, lo_at);
+    ops.push(MirOp::IArith {
+        op: IOp::Sub,
+        d: value,
+        a: value,
+        b: out,
+    });
+    load_at(ops, span, sbase, hi_at);
+    load_at(ops, out, sbase, lo_at);
+    ops.push(MirOp::IArith {
+        op: IOp::Sub,
+        d: span,
+        a: span,
+        b: out,
+    });
+    ops.push(MirOp::IArith {
+        op: IOp::Slt,
+        d: out,
+        a: span,
+        b: value,
+    });
+    let inside = pool.take()?;
+    // `!(span < value)`: `Eq` against the zero register inverts without needing
+    // a constant in a register of its own.
+    ops.push(MirOp::IArith {
+        op: IOp::Eq,
+        d: inside,
+        a: out,
+        b: reg::ZERO,
+    });
+    pool.give(out);
+    pool.give(span);
+    pool.give(value);
+    Ok(inside)
+}
+
+/// The first and last coordinate an extent names, into the site's scratch:
+/// `Whole` is the launch grid's own extent, `At` is one coordinate, `Range` is
+/// `a .. b - 1`.
+#[allow(clippy::too_many_arguments)]
+fn extent_bounds(
+    k: &Kernel,
+    types: &Types,
+    plan: &Plan,
+    param: &BTreeMap<OpId, u32>,
+    loops: &[OpId],
+    cbs: &crate::slab::Slab<Cb, crate::mir::CbInfo>,
+    ops: &mut Vec<MirOp>,
+    pool: &mut Pool,
+    base: u8,
+    extent: Extent,
+    lo_at: u32,
+    hi_at: u32,
+    whole_arg: i32,
+) -> Result<(), ttStatus> {
+    match extent {
+        Extent::Whole => {
+            let n = pool.take()?;
+            ops.push(MirOp::LoadArg {
+                reg: n,
+                arg: whole_arg,
+            });
+            let one = pool.take()?;
+            ops.push(MirOp::Li { reg: one, value: 1 });
+            ops.push(MirOp::IArith {
+                op: IOp::Sub,
+                d: n,
+                a: n,
+                b: one,
+            });
+            pool.give(one);
+            store_at(ops, base, hi_at, n);
+            pool.give(n);
+            store_at(ops, base, lo_at, reg::ZERO);
+        }
+        Extent::At(v) => {
+            let r = pool.take()?;
+            scalar_with(
+                k,
+                types,
+                ops,
+                param,
+                loops,
+                v,
+                r,
+                pool,
+                &MOVER_INDEX,
+                plan,
+                cbs,
+            )?;
+            store_at(ops, base, lo_at, r);
+            store_at(ops, base, hi_at, r);
+            pool.give(r);
+        }
+        Extent::Range(a, b) => {
+            let r = pool.take()?;
+            scalar_with(
+                k,
+                types,
+                ops,
+                param,
+                loops,
+                a,
+                r,
+                pool,
+                &MOVER_INDEX,
+                plan,
+                cbs,
+            )?;
+            store_at(ops, base, lo_at, r);
+            scalar_with(
+                k,
+                types,
+                ops,
+                param,
+                loops,
+                b,
+                r,
+                pool,
+                &MOVER_INDEX,
+                plan,
+                cbs,
+            )?;
+            let one = pool.take()?;
+            ops.push(MirOp::Li { reg: one, value: 1 });
+            ops.push(MirOp::IArith {
+                op: IOp::Sub,
+                d: r,
+                a: r,
+                b: one,
+            });
+            pool.give(one);
+            store_at(ops, base, hi_at, r);
+            pool.give(r);
+        }
+    }
+    Ok(())
+}
+
+/// `expand`: every leader publishes its page into the cores its part of the
+/// span names, with one NoC multicast each.
+///
+/// The program is one text, so every core decides from its own coordinate:
+///
+/// - a **leader** agrees with `from` on the axes `from` pins, so there are
+///   `|from|` of them, each owning the part of `span` that shares its
+///   coordinate on the axes `from` leaves open;
+/// - a **receiver** is in the span and is not a leader.
+///
+/// The protocol is the cheapest one that is correct, and every piece of it is
+/// forced:
+///
+/// - *flow control* is a credit count in the leader's own L1, one per receiver.
+///   A receiver deposits one when it has a page it can spare, so the leader runs
+///   ahead by the ring's depth instead of stalling on each page. The counter is
+///   only ever incremented, so it is never re-armed and no reset can race a
+///   deposit.
+/// - *completion* is the request's own transaction counter. A response-marked
+///   multicast leaves it at `1 - recipients`; both requests share the id, so one
+///   wait covers the page and the flag. Nothing is counted in software.
+/// - *ordering* between the page and the arrival flag is the static multicast
+///   virtual channel's: two requests from this NIU to this rectangle take the
+///   same route in order, which is tt-metal's own construction
+///   (`noc_async_write_multicast` then `noc_semaphore_set_multicast`). Waiting
+///   for the page's acknowledgements before sending the flag would be stronger
+///   and would cost a round trip per page for a guarantee the route already
+///   gives.
+///
+/// The leader's own page is not a recipient (`BRCST_SRC_INCLUDE` clear): it
+/// already holds what its read brought.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+fn expand_to(
+    k: &Kernel,
+    types: &Types,
+    plan: &Plan,
+    param: &BTreeMap<OpId, u32>,
+    loops: &[OpId],
+    m: &mut MachineKernel,
+    site: usize,
+    src: OpId,
+    pages: OpId,
+    span: Span,
+    from: Span,
+) -> Result<(), ttStatus> {
+    use crate::mover::{ARG_COORDS, ARG_GRID_X, ARG_GRID_Y, ARG_MCAST_SITES};
+    let cb = *plan
+        .cb
+        .get(&src)
+        .ok_or(ttStatus::TT_ERROR_BUFFER_NOT_PLACED)?;
+    let (dtype, page) = match *k.at(src) {
+        Op::Cb { dtype, page, .. } => (dtype, page),
+        _ => return Err(ttStatus::TT_ERROR_NOT_A_BUFFER),
+    };
+    let page_bytes = page[0]
+        .checked_mul(page[1])
+        .and_then(|datums| datums.checked_mul(dtype.bytes()))
+        .ok_or(ttStatus::TT_ERROR_NOC_REQUEST_BYTES)?;
+    let len = page_bytes;
+    if len == 0 || len > tt_isa::arch::blackhole::noc::niu::MAX_REQUEST_BYTES {
+        let _ = (len, page);
+        return Err(ttStatus::TT_ERROR_NOC_REQUEST_BYTES);
+    }
+
+    let mut ops: Vec<MirOp> = Vec::new();
+    let mut pool = Pool::new(&MOVER_POOL);
+
+    // The site block. `sbase` stays live for the whole op; everything else is
+    // reloaded from scratch when it is needed, because six registers is the
+    // whole pool.
+    let sbase = pool.take()?;
+    ops.push(MirOp::LoadArg {
+        reg: sbase,
+        arg: ARG_MCAST_SITES,
+    });
+    {
+        let off = pool.take()?;
+        ops.push(MirOp::Li {
+            reg: off,
+            value: site as u32 * crate::mir::McastSite::BYTES,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Add,
+            d: sbase,
+            a: sbase,
+            b: off,
+        });
+        pool.give(off);
+    }
+
+    // This core's coordinate, and the span's bounds.
+    {
+        let x = pool.take()?;
+        ops.push(MirOp::LoadCoord { reg: x, axis: 0 });
+        store_at(&mut ops, sbase, SITE_MY_X, x);
+        pool.give(x);
+        let y = pool.take()?;
+        ops.push(MirOp::LoadCoord { reg: y, axis: 1 });
+        store_at(&mut ops, sbase, SITE_MY_Y, y);
+        pool.give(y);
+    }
+    extent_bounds(
+        k, types, plan, param, loops, &m.cbs, &mut ops, &mut pool, sbase, span.x, SITE_LO_X,
+        SITE_HI_X, ARG_GRID_X,
+    )?;
+    extent_bounds(
+        k, types, plan, param, loops, &m.cbs, &mut ops, &mut pool, sbase, span.y, SITE_LO_Y,
+        SITE_HI_Y, ARG_GRID_Y,
+    )?;
+
+    // inside := the span holds me on both axes.
+    let inside = within(&mut ops, &mut pool, sbase, SITE_MY_X, SITE_LO_X, SITE_HI_X)?;
+    {
+        let other = within(&mut ops, &mut pool, sbase, SITE_MY_Y, SITE_LO_Y, SITE_HI_Y)?;
+        ops.push(MirOp::IArith {
+            op: IOp::And,
+            d: inside,
+            a: inside,
+            b: other,
+        });
+        pool.give(other);
+    }
+
+    // leader := inside, and my coordinate agrees with the pick on every axis it
+    // pins. The pick's coordinate on a pinned axis is also the leader a
+    // receiver credits, so it is kept.
+    let leader = pool.take()?;
+    ops.push(MirOp::IArith {
+        op: IOp::Add,
+        d: leader,
+        a: inside,
+        b: reg::ZERO,
+    });
+    for (extent, my_at, lead_at) in [
+        (from.x, SITE_MY_X, SITE_LEAD_X),
+        (from.y, SITE_MY_Y, SITE_LEAD_Y),
+    ] {
+        match extent {
+            Extent::Whole => {
+                let mine = pool.take()?;
+                load_at(&mut ops, mine, sbase, my_at);
+                store_at(&mut ops, sbase, lead_at, mine);
+                pool.give(mine);
+            }
+            Extent::At(v) => {
+                let picked = pool.take()?;
+                scalar_with(
+                    k,
+                    types,
+                    &mut ops,
+                    param,
+                    loops,
+                    v,
+                    picked,
+                    &mut pool,
+                    &MOVER_INDEX,
+                    plan,
+                    &m.cbs,
+                )?;
+                store_at(&mut ops, sbase, lead_at, picked);
+                let mine = pool.take()?;
+                load_at(&mut ops, mine, sbase, my_at);
+                let same = pool.take()?;
+                ops.push(MirOp::IArith {
+                    op: IOp::Eq,
+                    d: same,
+                    a: mine,
+                    b: picked,
+                });
+                ops.push(MirOp::IArith {
+                    op: IOp::And,
+                    d: leader,
+                    a: leader,
+                    b: same,
+                });
+                pool.give(same);
+                pool.give(mine);
+                pool.give(picked);
+            }
+            Extent::Range(..) => {
+                return Err(crate::status::internal_bug(
+                    "lower: an expand pick axis is a run",
+                ));
+            }
+        }
+    }
+    store_at(&mut ops, sbase, SITE_IS_LEADER, leader);
+    // receiver := inside && !leader
+    {
+        let receiver = pool.take()?;
+        ops.push(MirOp::IArith {
+            op: IOp::Eq,
+            d: receiver,
+            a: leader,
+            b: reg::ZERO,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::And,
+            d: receiver,
+            a: receiver,
+            b: inside,
+        });
+        store_at(&mut ops, sbase, SITE_IS_RECEIVER, receiver);
+        pool.give(receiver);
+    }
+    pool.give(leader);
+    pool.give(inside);
+
+    // --- the leader's body
+    let cond = pool.take()?;
+    load_at(&mut ops, cond, sbase, SITE_IS_LEADER);
+    ops.push(MirOp::IfNonZero { cond });
+    pool.give(cond);
+    // The pages this block fans out are the leader's own reads, and they have
+    // to be in L1 before the NIU reads them out: tt-metal waits here
+    // (`reader_bmm_tile_layout_in0_sender_padding_metal2.cpp`: "Barrier! make
+    // sure the reads are done", then `sender->send(...)`, line 407). The ring's hand-off
+    // drains after the send ([`drain_niu`]), which is too late for a fan-out
+    // that reads the same pages.
+    ops.push(niu_drain());
+
+    // Its rectangle: the span's whole extent on an axis the pick pins to one
+    // cell (a scalar pick is one value for the whole group), and its own
+    // coordinate on an axis the pick leaves open (`..` — "the coordinate this
+    // receiver already has", so the slab is one cell thick).
+    for (extent, my_at, lo_at, hi_at) in [
+        (from.x, SITE_MY_X, SITE_LO_X, SITE_HI_X),
+        (from.y, SITE_MY_Y, SITE_LO_Y, SITE_HI_Y),
+    ] {
+        if matches!(extent, Extent::Whole) {
+            let mine = pool.take()?;
+            load_at(&mut ops, mine, sbase, my_at);
+            store_at(&mut ops, sbase, lo_at, mine);
+            store_at(&mut ops, sbase, hi_at, mine);
+            pool.give(mine);
+        }
+    }
+    // remote := the rectangle's cells less this one. Zero means the span pins
+    // this core alone, so there is no request to make.
+    {
+        let cells = pool.take()?;
+        let other = pool.take()?;
+        load_at(&mut ops, cells, sbase, SITE_HI_X);
+        load_at(&mut ops, other, sbase, SITE_LO_X);
+        ops.push(MirOp::IArith {
+            op: IOp::Sub,
+            d: cells,
+            a: cells,
+            b: other,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Add,
+            d: cells,
+            a: cells,
+            b: reg::ZERO,
+        });
+        let one = pool.take()?;
+        ops.push(MirOp::Li { reg: one, value: 1 });
+        ops.push(MirOp::IArith {
+            op: IOp::Add,
+            d: cells,
+            a: cells,
+            b: one,
+        });
+        load_at(&mut ops, other, sbase, SITE_HI_Y);
+        let height = pool.take()?;
+        load_at(&mut ops, height, sbase, SITE_LO_Y);
+        ops.push(MirOp::IArith {
+            op: IOp::Sub,
+            d: other,
+            a: other,
+            b: height,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Add,
+            d: other,
+            a: other,
+            b: one,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Mul,
+            d: cells,
+            a: cells,
+            b: other,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Sub,
+            d: cells,
+            a: cells,
+            b: one,
+        });
+        store_at(&mut ops, sbase, SITE_REMOTE, cells);
+        pool.give(one);
+        pool.give(height);
+        pool.give(other);
+        pool.give(cells);
+    }
+    {
+        let remote = pool.take()?;
+        load_at(&mut ops, remote, sbase, SITE_REMOTE);
+        ops.push(MirOp::IfNonZero { cond: remote });
+        pool.give(remote);
+    }
+
+    // One credit per receiver, taken as a batch: the counter only grows, so the
+    // leader's subtraction leaves the difference for the next page.
+    {
+        let credit = pool.take()?;
+        site_addr(&mut ops, &mut pool, credit, sbase, SITE_CREDIT)?;
+        let remote = pool.take()?;
+        load_at(&mut ops, remote, sbase, SITE_REMOTE);
+        let value = pool.take()?;
+        ops.push(MirOp::L1PollBelow {
+            base: credit,
+            reg: value,
+            bound: remote,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Sub,
+            d: value,
+            a: value,
+            b: remote,
+        });
+        pool.give(remote);
+        ops.push(MirOp::Sw {
+            value,
+            base: credit,
+            at: 0,
+        });
+        pool.give(value);
+        pool.give(credit);
+    }
+
+    // The rectangle's word: the far corner in the low half and the near corner
+    // in the high half, both in the NoC's own coordinates. The corners come from
+    // the staged table, because a logical column is not a physical one on a
+    // harvested chip.
+    {
+        let far = packed_corner(&mut ops, &mut pool, sbase, SITE_HI_X, SITE_HI_Y)?;
+        store_at(&mut ops, sbase, SITE_FAR, far);
+        pool.give(far);
+        let near = packed_corner(&mut ops, &mut pool, sbase, SITE_LO_X, SITE_LO_Y)?;
+        store_at(&mut ops, sbase, SITE_NEAR, near);
+        pool.give(near);
+
+        // rect = x_end | y_end << 6 | x_start << 12 | y_start << 18
+        let rect = pool.take()?;
+        let far = pool.take()?;
+        let mask = pool.take()?;
+        load_at(&mut ops, far, sbase, SITE_FAR);
+        ops.push(MirOp::Li {
+            reg: mask,
+            value: 0x3F,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::And,
+            d: rect,
+            a: far,
+            b: mask,
+        });
+        ops.push(MirOp::Li {
+            reg: mask,
+            value: 0xFC0,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::And,
+            d: far,
+            a: far,
+            b: mask,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Or,
+            d: rect,
+            a: rect,
+            b: far,
+        });
+        pool.give(far);
+        let near = pool.take()?;
+        load_at(&mut ops, near, sbase, SITE_NEAR);
+        ops.push(MirOp::Li {
+            reg: mask,
+            value: 0x3F,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::And,
+            d: near,
+            a: near,
+            b: mask,
+        });
+        ops.push(MirOp::Li {
+            reg: mask,
+            value: 12,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Sll,
+            d: near,
+            a: near,
+            b: mask,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Or,
+            d: rect,
+            a: rect,
+            b: near,
+        });
+        load_at(&mut ops, near, sbase, SITE_NEAR);
+        ops.push(MirOp::Li {
+            reg: mask,
+            value: 6,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Srl,
+            d: near,
+            a: near,
+            b: mask,
+        });
+        ops.push(MirOp::Li {
+            reg: mask,
+            value: 0x3F,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::And,
+            d: near,
+            a: near,
+            b: mask,
+        });
+        // `y_start` sits 24 bits above `x_start`: six node-id bits each, and the
+        // coordinate word is `x_end | y_end << 6 | x_start << 12 | y_start << 18`
+        // (tt-metal's `NOC_MULTICAST_COORD`).
+        ops.push(MirOp::Li {
+            reg: mask,
+            value: 18,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Sll,
+            d: near,
+            a: near,
+            b: mask,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Or,
+            d: rect,
+            a: rect,
+            b: near,
+        });
+        store_at(&mut ops, sbase, SITE_RECT, rect);
+        pool.give(mask);
+        pool.give(near);
+        pool.give(rect);
+    }
+
+    // The block: the ring's write pointer, which is the address every
+    // receiver's write pointer already holds — the program is uniform and the
+    // rings advance in step. A block reserves its pages in one go, so they are
+    // contiguous from that pointer, and the program says how many by `pages`
+    // (tt-metal's `in0_block_size_bytes`, one `send` for the whole block).
+    let count = k
+        .const_i32(pages)
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n > 0)
+        .ok_or(ttStatus::TT_TODO_COLLECTIVE)?;
+    // The NIU takes at most [`MAX_REQUEST_BYTES`] per request, so a block is
+    // split at whole pages: tt-metal's `async_write_multicast` splits its
+    // `size_bytes` the same way (`noc_async_write_multicast_impl`), and the
+    // receiver's landing address stays contiguous either way.
+    let per = (tt_isa::arch::blackhole::noc::niu::MAX_REQUEST_BYTES / page_bytes).max(1);
+    let chunks = count.div_ceil(per);
+    let page_addr = pool.take()?;
+    ops.push(MirOp::Lw {
+        reg: page_addr,
+        base: reg::A6,
+        at: (u32::from(cb.0) * crate::riscv::cb::STRIDE) as i32 + crate::riscv::cb::WR_PTR,
+    });
+    for chunk in 0..chunks {
+        if chunk > 0 {
+            let step = per
+                .checked_mul(page_bytes)
+                .ok_or(ttStatus::TT_ERROR_NOC_REQUEST_BYTES)?;
+            // `Li` into a scratch and add: the mover pool is six registers, and
+            // the address is the only long-lived one here.
+            let at_reg = pool.take()?;
+            ops.push(MirOp::Li {
+                reg: at_reg,
+                value: step,
+            });
+            ops.push(MirOp::IArith {
+                op: IOp::Add,
+                d: page_addr,
+                a: page_addr,
+                b: at_reg,
+            });
+            pool.give(at_reg);
+        }
+        let len = (count - chunk * per).min(per) * page_bytes;
+        emit_mcast_request(&mut ops, &mut pool, sbase, page_addr, page_addr, len)?;
+    }
+    pool.give(page_addr);
+    // The arrival flag: four bytes from this site's `one` to the same word in
+    // every receiver.
+    {
+        let one = pool.take()?;
+        site_addr(&mut ops, &mut pool, one, sbase, SITE_ONE)?;
+        let arrive = pool.take()?;
+        site_addr(&mut ops, &mut pool, arrive, sbase, SITE_ARRIVE)?;
+        emit_mcast_request(&mut ops, &mut pool, sbase, one, arrive, 4)?;
+        pool.give(arrive);
+        pool.give(one);
+    }
+    // The requests' completion is the receivers' credits, not an
+    // acknowledgement: a credit can only be deposited after the page was
+    // consumed, which is after the NIU drained it out of this core's L1. So
+    // nothing waits on this transaction id's counter, and nothing reads it —
+    // which is also why it is a second id, so its drift cannot disturb the
+    // copies' wait for their own.
+    ops.push(MirOp::EndIf);
+    ops.push(MirOp::EndIf);
+
+    // --- the receiver's body: give the leader its credit, then wait — with the
+    // L0 cache invalidated — for the flag the leader's second multicast writes.
+    let cond = pool.take()?;
+    load_at(&mut ops, cond, sbase, SITE_IS_RECEIVER);
+    ops.push(MirOp::IfNonZero { cond });
+    pool.give(cond);
+    {
+        // The leader's packed coordinate, from the coordinate table.
+        let coords = pool.take()?;
+        ops.push(MirOp::LoadArg {
+            reg: coords,
+            arg: ARG_COORDS,
+        });
+        let a = pool.take()?;
+        let b = pool.take()?;
+        let c = pool.take()?;
+        load_at(&mut ops, a, sbase, SITE_LEAD_X);
+        load_at(&mut ops, b, sbase, SITE_LEAD_Y);
+        ops.push(MirOp::Li { reg: c, value: 4 });
+        ops.push(MirOp::IArith {
+            op: IOp::Sll,
+            d: b,
+            a: b,
+            b: c,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Or,
+            d: a,
+            a: a,
+            b,
+        });
+        ops.push(MirOp::Li { reg: c, value: 2 });
+        ops.push(MirOp::IArith {
+            op: IOp::Sll,
+            d: a,
+            a: a,
+            b: c,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Add,
+            d: a,
+            a: a,
+            b: coords,
+        });
+        ops.push(MirOp::Lw {
+            reg: b,
+            base: a,
+            at: 0,
+        });
+        pool.give(c);
+        pool.give(coords);
+        // The credit word lives in the leader's tile.
+        let credit = pool.take()?;
+        site_addr(&mut ops, &mut pool, credit, sbase, SITE_CREDIT)?;
+        let ret = pool.take()?;
+        site_addr(&mut ops, &mut pool, ret, sbase, SITE_RET)?;
+        let lead = pool.take()?;
+        ops.push(MirOp::IArith {
+            op: IOp::Add,
+            d: lead,
+            a: b,
+            b: reg::ZERO,
+        });
+        pool.give(b);
+        pool.give(a);
+        emit_atomic_increment(
+            &mut ops,
+            &mut pool,
+            credit,
+            lead,
+            ret,
+            (SITE_CREDIT >> 2) & 3,
+        )?;
+        pool.give(lead);
+        pool.give(ret);
+        pool.give(credit);
+    }
+    {
+        let arrive = pool.take()?;
+        site_addr(&mut ops, &mut pool, arrive, sbase, SITE_ARRIVE)?;
+        let word = pool.take()?;
+        ops.push(MirOp::L1PollNonZero {
+            base: arrive,
+            reg: word,
+        });
+        ops.push(MirOp::Sw {
+            value: reg::ZERO,
+            base: arrive,
+            at: 0,
+        });
+        pool.give(word);
+        pool.give(arrive);
+    }
+    ops.push(MirOp::EndIf);
+
+    pool.give(sbase);
+    for op in ops {
+        m.push(Core::Reader, op);
+    }
+    Ok(())
+}
+
+/// One multicast write: the initiator's registers, then `CMD_CTRL`. It waits for
+/// the NIU to accept the request, not for its acknowledgements, so the second
+/// request of an `expand` can follow immediately.
+///
+/// The control word and the rectangle are read from the site's scratch, which
+/// keeps them off the mover's six registers. The word itself is tt-metal's
+/// `ncrisc_noc_fast_write` with `mcast` set (`noc_nonblocking_api.h:635-636`):
+/// `BRCST_PACKET`, `PATH_RESERVE`, `RESP_MARKED`, and the multicast class on the
+/// static virtual channel (`NOC_MULTICAST_WRITE_VC` = 4,
+/// `dataflow_api_common.h:58`).
+fn emit_mcast_request(
+    ops: &mut Vec<MirOp>,
+    pool: &mut Pool,
+    sbase: u8,
+    src: u8,
+    dest: u8,
+    len: u32,
+) -> Result<(), ttStatus> {
+    use tt_isa::arch::blackhole::noc::niu::initiator;
+    /// `CMD_WR | RESP_MARKED | BRCST_PACKET | VC_STATIC | PATH_RESERVE |
+    /// STATIC_VC(4)`: tt-metal's multicast fast write (`noc_nonblocking_api.h`,
+    /// `ncrisc_noc_fast_write` with `mcast` set), with `NOC_MULTICAST_WRITE_VC`
+    /// = 4 as the static channel (`dataflow_api_common.h:58`).
+    ///
+    /// `BRCST_XY` is left at zero — an x-major tree — for every rectangle.
+    /// tt-metal sets it from the caller's `multicast_mode`
+    /// (`firmware/src/tt-1xx/blackhole/noc.c:241`), but it picks the tree's
+    /// shape and not its recipients, and ttsim refuses the bit outright
+    /// (`noc_cmd_ctrl: noc_ctrl=0x181b2`). The shape is a routing choice to
+    /// revisit when the simulator models it.
+    const CTRL: u32 = 2 | (1 << 4) | (1 << 5) | (1 << 7) | (1 << 8) | (1 << 15);
+    let rect = pool.take()?;
+    load_at(ops, rect, sbase, SITE_RECT);
+    for (at, value) in [
+        (initiator::TARG_ADDR_LO, src),
+        (initiator::TARG_ADDR_MID, reg::ZERO),
+        (initiator::TARG_ADDR_HI, reg::T3),
+        (initiator::RET_ADDR_LO, dest),
+        (initiator::RET_ADDR_MID, reg::ZERO),
+        (initiator::RET_ADDR_HI, rect),
+    ] {
+        ops.push(MirOp::Sw {
+            value,
+            base: reg::T5,
+            at: at as i32,
+        });
+    }
+    let word = pool.take()?;
+    ops.push(MirOp::Li {
+        reg: word,
+        value: (crate::mover::TXN_MCAST.index() as u32) << 10,
+    });
+    ops.push(MirOp::Sw {
+        value: word,
+        base: reg::T5,
+        at: initiator::PACKET_TAG as i32,
+    });
+    for (value, at) in [
+        (CTRL, initiator::CTRL),
+        (len, initiator::AT_LEN_BE),
+        (0, initiator::AT_DATA),
+        (1, initiator::CMD_CTRL),
+    ] {
+        ops.push(MirOp::Li { reg: word, value });
+        ops.push(MirOp::Sw {
+            value: word,
+            base: reg::T5,
+            at: at as i32,
+        });
+    }
+    // Accepted, not completed: the initiator is free for the next request.
+    ops.push(MirOp::NiuPoll {
+        reg: word,
+        field: initiator::CMD_CTRL as i32,
+    });
+    pool.give(word);
+    pool.give(rect);
+    Ok(())
+}
+
+/// One atomic increment of a remote L1 word: a receiver's credit to its leader.
+/// This is tt-isa's `Command::AtomicIncrement` laid out by hand, as
+/// [`emit_request`] lays out a copy: `NOC_AT_LEN_BE`'s increment opcode, a
+/// full-width (`IntWidth` 31) add, and the word's place in its 16-byte unit. It
+/// waits for the transaction id to drain, so the credit has landed before the
+/// receiver goes on to wait for its page.
+fn emit_atomic_increment(
+    ops: &mut Vec<MirOp>,
+    pool: &mut Pool,
+    target: u8,
+    target_hi: u8,
+    ret: u8,
+    ofs: u32,
+) -> Result<(), ttStatus> {
+    use tt_isa::arch::blackhole::noc::niu::{
+        RESP_MARKED, STATIC_VC_1, initiator, reqs_outstanding,
+    };
+    const CMD_AT: u32 = 1;
+    const AT_INCREMENT: u32 = 1 << 12;
+    let word = pool.take()?;
+    for (at, value) in [
+        (initiator::TARG_ADDR_LO, target),
+        (initiator::TARG_ADDR_MID, reg::ZERO),
+        (initiator::TARG_ADDR_HI, target_hi),
+        (initiator::RET_ADDR_LO, ret),
+        (initiator::RET_ADDR_MID, reg::ZERO),
+        (initiator::RET_ADDR_HI, reg::T3),
+    ] {
+        ops.push(MirOp::Sw {
+            value,
+            base: reg::T5,
+            at: at as i32,
+        });
+    }
+    let len_be = AT_INCREMENT | (31 << 2) | ofs;
+    for (value, at) in [
+        (
+            (crate::mover::TXN.index() as u32) << 10,
+            initiator::PACKET_TAG,
+        ),
+        (CMD_AT | RESP_MARKED | STATIC_VC_1, initiator::CTRL),
+        (len_be, initiator::AT_LEN_BE),
+        (1, initiator::AT_DATA),
+        (1, initiator::CMD_CTRL),
+    ] {
+        ops.push(MirOp::Li { reg: word, value });
+        ops.push(MirOp::Sw {
+            value: word,
+            base: reg::T5,
+            at: at as i32,
+        });
+    }
+    ops.push(MirOp::NiuPoll {
+        reg: word,
+        field: initiator::CMD_CTRL as i32,
+    });
+    ops.push(MirOp::Lw {
+        reg: word,
+        base: reg::T5,
+        at: initiator::CMD_CTRL as i32,
+    });
+    ops.push(MirOp::NiuPoll {
+        reg: word,
+        field: reqs_outstanding(crate::mover::TXN) as i32,
+    });
+    pool.give(word);
     Ok(())
 }
 
@@ -5787,7 +7277,6 @@ fn narrow_pair(
     page_unit: RegShape,
     value: u8,
     lane: Option<u8>,
-    interleaved: bool,
     target: Target,
 ) -> Result<(), ttStatus> {
     let el = u32::from(dtype.bytes());
@@ -5940,8 +7429,9 @@ fn narrow_pair(
         half,
         value,
         Some(ring),
-        interleaved,
         target,
+        None,
+        None,
     )?;
     // The second half: the next face on the parameter side, and the next face's
     // row (or the datums after the first sixteen) on the ring side.
@@ -5970,8 +7460,9 @@ fn narrow_pair(
         half,
         second,
         Some(ring),
-        interleaved,
         target,
+        None,
+        None,
     )?;
     pool.give(ring);
     pool.give(second);
@@ -6115,8 +7606,9 @@ fn emit_request(
     bytes: u32,
     value: u8,
     ring_offset: Option<u8>,
-    interleaved: bool,
     target: Target,
+    ring_page: Option<u32>,
+    ring_page_reg: Option<u8>,
 ) -> Result<(), ttStatus> {
     if target == Target::Quasar {
         return emit_request_quasar(
@@ -6128,38 +7620,16 @@ fn emit_request(
             bytes,
             value,
             ring_offset,
-            interleaved,
         );
     }
     use crate::riscv::cb::{RD_PTR, STRIDE, WR_PTR};
-    use tt_isa::arch::blackhole::noc::niu::{
-        CMD_RD, CMD_WR, RESP_MARKED, STATIC_VC_1, initiator, reqs_outstanding,
-    };
+    use tt_isa::arch::blackhole::noc::niu::{CMD_RD, CMD_WR, RESP_MARKED, STATIC_VC_1, initiator};
     if bytes == 0 || bytes > tt_isa::arch::blackhole::noc::niu::MAX_REQUEST_BYTES {
         return Err(ttStatus::TT_ERROR_NOC_REQUEST_BYTES);
     }
-    let (lo_arg, hi_arg) = (block, block + 4);
-    let (lo, hi) = if interleaved {
-        interleaved_address(ops, pool, block, value)?
-    } else {
-        let lo = pool.take()?;
-        let hi = pool.take()?;
-        ops.push(MirOp::LoadArg {
-            reg: lo,
-            arg: lo_arg,
-        });
-        ops.push(MirOp::IArith {
-            op: IOp::Add,
-            d: lo,
-            a: lo,
-            b: value,
-        });
-        ops.push(MirOp::LoadArg {
-            reg: hi,
-            arg: hi_arg,
-        });
-        (lo, hi)
-    };
+    // Every parameter is a table of channel bases, a count and a page: one
+    // entry per DRAM channel, always.
+    let (lo, hi) = interleaved_address(ops, pool, block, value)?;
     let page = pool.take()?;
     // A read from DRAM publishes into the ring (its write pointer); a write to
     // DRAM drains the page the ring's read pointer names.
@@ -6170,6 +7640,37 @@ fn emit_request(
         at: (u32::from(cb.0) * STRIDE) as i32 + field,
     });
     if let Some(offset) = ring_offset {
+        ops.push(MirOp::IArith {
+            op: IOp::Add,
+            d: page,
+            a: page,
+            b: offset,
+        });
+    }
+    // The page a block's copy fills, as a byte offset from the reservation's
+    // base: `copy 32,32 %ba [3]` fills page 3. It is added here rather than
+    // carried as a register so it costs nothing while the request's addresses
+    // are being resolved, which is where the mover's pool is tightest.
+    if let Some(bytes) = ring_page {
+        let step = pool.take()?;
+        ops.push(MirOp::Li {
+            reg: step,
+            value: bytes,
+        });
+        ops.push(MirOp::IArith {
+            op: IOp::Add,
+            d: page,
+            a: page,
+            b: step,
+        });
+        pool.give(step);
+    }
+    // The page a block's copy fills, when the index is a loop value: the page
+    // must be placed by `index * page_bytes` on top of the reservation's base,
+    // because the base only moves per hand-off. tt-metal's reader walks a block
+    // exactly this way (`cb_reserve_back(in0_block_num_tiles)` then one
+    // `noc_async_read_page` per tile, `reader_bmm_tile_layout.cpp`).
+    if let Some(offset) = ring_page_reg {
         ops.push(MirOp::IArith {
             op: IOp::Add,
             d: page,
@@ -6233,6 +7734,17 @@ fn emit_request(
         base: reg::T5,
         at: initiator::AT_DATA as i32,
     });
+    // The command buffer must be free before it is rewritten, and tt-metal polls
+    // it there -- `while (!ncrisc_noc_read_cmd_buf_ready(noc, cmd_buf));` before
+    // every issue (`noc_nonblocking_api.h`, `ncrisc_noc_read`), with the issue
+    // path itself writing `NOC_CMD_CTRL` last and no poll after it
+    // (`ncrisc_noc_fast_read`). Polling *after* the write instead waits for the
+    // NIU to take each command before the next is even assembled, which is one
+    // request at a time.
+    ops.push(MirOp::NiuPoll {
+        reg: page,
+        field: initiator::CMD_CTRL as i32,
+    });
     ops.push(MirOp::Li {
         reg: page,
         value: 1,
@@ -6242,20 +7754,10 @@ fn emit_request(
         base: reg::T5,
         at: initiator::CMD_CTRL as i32,
     });
-    // The hardware takes the request, then the transaction completes.
-    ops.push(MirOp::NiuPoll {
-        reg: page,
-        field: initiator::CMD_CTRL as i32,
-    });
-    ops.push(MirOp::Lw {
-        reg: page,
-        base: reg::T5,
-        at: initiator::CMD_CTRL as i32,
-    });
-    ops.push(MirOp::NiuPoll {
-        reg: page,
-        field: reqs_outstanding(crate::mover::TXN) as i32,
-    });
+    // The request is not waited for here: the ring's hand-off ([`drain_niu`]) is
+    // where the page changes hands, so a block's requests are in flight
+    // together (tt-metal's `reader_bmm_tile_layout.cpp`: issue a block, one
+    // barrier, one push).
     pool.give(page);
     Ok(())
 }
@@ -6284,7 +7786,6 @@ fn emit_request_quasar(
     bytes: u32,
     value: u8,
     ring_offset: Option<u8>,
-    interleaved: bool,
 ) -> Result<(), ttStatus> {
     use crate::quasar_mover::{
         MISC_WRITE, READ_BUFFER, REQ_VC, RESP_VC_READ, RESP_VC_WRITE, WRITE_BUFFER, register,
@@ -6332,27 +7833,9 @@ fn emit_request_quasar(
         if inbound { RESP_VC_READ } else { RESP_VC_WRITE },
     )?;
     let (lo_arg, hi_arg) = (block, block + 4);
-    let (lo, hi) = if interleaved {
-        interleaved_address(ops, pool, block, value)?
-    } else {
-        let lo = pool.take()?;
-        let hi = pool.take()?;
-        ops.push(MirOp::LoadArg {
-            reg: lo,
-            arg: lo_arg,
-        });
-        ops.push(MirOp::IArith {
-            op: IOp::Add,
-            d: lo,
-            a: lo,
-            b: value,
-        });
-        ops.push(MirOp::LoadArg {
-            reg: hi,
-            arg: hi_arg,
-        });
-        (lo, hi)
-    };
+    // Every parameter is a table of channel bases: the address is resolved on
+    // the core from the page index. See [`interleaved_address`].
+    let (lo, hi) = interleaved_address(ops, pool, block, value)?;
     let page = pool.take()?;
     let field = if inbound { WR_PTR } else { RD_PTR };
     ops.push(MirOp::Lw {
@@ -6405,6 +7888,32 @@ fn emit_request_quasar(
     });
     pool.give(page);
     Ok(())
+}
+
+/// The mover's NoC barrier: wait until every request this core issued has
+/// completed. It is tt-metal's `noc_async_read_barrier()` before `push_back`
+/// (`reader_bmm_tile_layout.cpp:110`) and before a multicast send
+/// (`reader_bmm_tile_layout_in0_sender_padding_metal2.cpp:352-353`), and its
+/// `noc_async_write_barrier()` before `pop_front`: a page changes hands only
+/// when the NoC is done with it.
+///
+/// That is why a request is not drained when it is issued. Issuing several and
+/// waiting once is what lets the NoC hold more than one request, which is the
+/// difference between a round trip per page and a block in flight; the two
+/// places the order is observable are the ring hand-off and a fan-out that
+/// sends the pages it just read.
+fn drain_niu(m: &mut MachineKernel, core: Core) {
+    m.push(core, niu_drain());
+}
+
+/// [`drain_niu`] as a machine op, for the sites that emit into an `ops` list
+/// rather than a machine kernel: a multicast's source is the leader's own reads,
+/// so the barrier belongs between the copies and the send.
+fn niu_drain() -> MirOp {
+    MirOp::NiuPoll {
+        reg: reg::T4,
+        field: tt_isa::arch::blackhole::noc::niu::reqs_outstanding(crate::mover::TXN) as i32,
+    }
 }
 
 /// The L1 address of the page a lane index reads its bases out of, and the width
@@ -6650,7 +8159,6 @@ mod tests {
     #[test]
     fn a_dst_write_after_a_post_waits_for_the_packer() {
         const PROGRAM: &str = "\
-version 9
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -6722,7 +8230,6 @@ copy 32,32 %out [1] = %bo [0]
     #[test]
     fn an_integer_broadcast_is_refused_as_an_sfpu_todo() {
         const PROGRAM: &str = "\
-version 9
 grid 1,1
 %pi = param i32 1024
 %po = param i32 1024
@@ -6743,4 +8250,441 @@ copy 32,32 %po [0] = %bo [0]
             ttStatus::TT_TODO_BROADCAST_SFPU
         );
     }
+}
+
+/// One `32x32` tile's product, tt-metal's `matmul_tiles`: A's four faces and
+/// B's, the Matrix Unit's fidelity phases, and the accumulator tile the result
+/// is added into. A block matmul is this sequence repeated per tile.
+#[allow(clippy::too_many_arguments)]
+fn matmul_tile(
+    m: &mut MachineKernel,
+    cb_a: Cb,
+    stage_a: bool,
+    page_a: u32,
+    extra_a: Option<u8>,
+    cb_b: Cb,
+    stage_b: bool,
+    page_b: u32,
+    extra_b: Option<u8>,
+    acc_reg: Dst,
+    dt_a: DType,
+    dt_b: DType,
+) -> Result<(), ttStatus> {
+        // Scratch for `mvmul_group`, which emits a run of math ops: the
+        // run is appended to the one IR as it is produced.
+        let mut math_scratch: Vec<MirOp> = Vec::new();
+        // The Matrix Unit writes the accumulator's rows; `reg_sync`
+        // places the wait for a packer that still reads them.
+        // The Matrix Unit's address modifiers, fidelity phase and row
+        // counters are this thread's `ThreadConfig` and RWC state. Every
+        // word goes out as a whole `SETC16`, so an entry carrying several
+        // fields of one word is composed here.
+        for entry in [
+            vec![(thread::ADDR_MOD_AB_SEC0_SrcAIncr, 0u16)],
+            vec![(thread::ADDR_MOD_DST_SEC0_DestIncr, 0)],
+            vec![(thread::ADDR_MOD_AB_SEC1_SrcAIncr, 0)],
+            vec![(thread::ADDR_MOD_DST_SEC1_FidelityIncr, 1)],
+            // End of a group's first `SrcB` half: `SrcB` on eight rows,
+            // phase back to 0.
+            vec![
+                (thread::ADDR_MOD_AB_SEC2_SrcBIncr, 8),
+                (thread::ADDR_MOD_AB_SEC2_SrcBClear, 0),
+            ],
+            vec![
+                (thread::ADDR_MOD_DST_SEC2_DestIncr, 0),
+                (thread::ADDR_MOD_DST_SEC2_DestCR, 0),
+                (thread::ADDR_MOD_DST_SEC2_FidelityClear, 1),
+            ],
+            // End of a group that is not the `fi`'s last: phase and
+            // `SrcB` back to 0.
+            vec![
+                (thread::ADDR_MOD_AB_SEC3_SrcBIncr, 0),
+                (thread::ADDR_MOD_AB_SEC3_SrcBClear, 1),
+            ],
+            vec![
+                (thread::ADDR_MOD_DST_SEC3_DestIncr, 0),
+                (thread::ADDR_MOD_DST_SEC3_DestCR, 0),
+                (thread::ADDR_MOD_DST_SEC3_FidelityClear, 1),
+            ],
+            // End of an `fi`: as 3, and the `Dst` acc_reg on 32 rows for
+            // the next `fi`.
+            vec![
+                (thread::ADDR_MOD_AB_SEC4_SrcBIncr, 0),
+                (thread::ADDR_MOD_AB_SEC4_SrcBClear, 1),
+            ],
+            vec![
+                (thread::ADDR_MOD_DST_SEC4_DestIncr, 32),
+                (thread::ADDR_MOD_DST_SEC4_DestCR, 0),
+                (thread::ADDR_MOD_DST_SEC4_FidelityClear, 1),
+            ],
+            vec![(thread::FIDELITY_BASE_Phase, 0)],
+        ] {
+            m.push(Core::Math, thread_word(&entry)?);
+        }
+        // Src rows and the `Dst` counter start at 0.
+        m.push(
+            Core::Math,
+            MirOp::Setrwc {
+                src_a: 0,
+                src_b: 0,
+                dst: 0,
+                flip_src_a: false,
+                flip_src_b: false,
+                dst_cr: false,
+            },
+        );
+        // The accumulator's rows are added to, never cleared: an `acc`
+        // holds whatever the program last put there, and zeroing it is a
+        // `store_to %acc from %zero` the program writes itself.
+        // One `(fi, k)` group: A's face `(fi, k)` into `SrcB`, B's two
+        // faces `(k, 0)` and `(k, 1)` into `SrcA`. The unpacker and the
+        // Matrix Unit alternate through the bank handover, so the two
+        // roles interleave by ownership, not by instruction position.
+        // A staged operand's page is published by the packer (T2) before
+        // the unpacker reads it, and released after the last face.
+        for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
+            if staged {
+                m.push(Core::Unpack, MirOp::CbWait { cb, n: 1 });
+            }
+        }
+        for fi in 0..2u32 {
+            for kk in 0..2u32 {
+                m.push(
+                    Core::Unpack,
+                    MirOp::Setadczw {
+                        u0: false,
+                        u1: true,
+                        z0: Some(2 * fi + kk),
+                        z1: None,
+                    },
+                );
+                m.push(
+                    Core::Unpack,
+                    MirOp::UnpackConfig {
+                        unit: 1,
+                        to_src: true,
+                        dtype: dt_a,
+                        haloize: false,
+                        add_dest_cntr: false,
+                        ch1_z_stride: 0,
+                    },
+                );
+                m.push(
+                    Core::Unpack,
+                    MirOp::SetUnpackBase {
+                        cb: cb_a,
+                        unit: 1,
+                        offset: page_a,
+                        extra: extra_a,
+                    },
+                );
+                m.push(
+                    Core::Unpack,
+                    MirOp::Unpacr {
+                        unit: 1,
+                        count: FACE_DATUMS,
+                        flip: true,
+                    },
+                );
+                m.push(
+                    Core::Unpack,
+                    MirOp::Setadczw {
+                        u0: true,
+                        u1: false,
+                        z0: Some(2 * kk),
+                        z1: None,
+                    },
+                );
+                m.push(
+                    Core::Unpack,
+                    MirOp::UnpackConfig {
+                        unit: 0,
+                        to_src: true,
+                        dtype: dt_b,
+                        haloize: false,
+                        add_dest_cntr: false,
+                        ch1_z_stride: 0,
+                    },
+                );
+                m.push(
+                    Core::Unpack,
+                    MirOp::SetUnpackBase {
+                        cb: cb_b,
+                        unit: 0,
+                        offset: page_b,
+                        extra: extra_b,
+                    },
+                );
+                m.push(
+                    Core::Unpack,
+                    MirOp::Unpacr {
+                        unit: 0,
+                        count: FACE_DATUMS,
+                        flip: true,
+                    },
+                );
+                mvmul_group(&mut math_scratch, acc_reg, 0);
+                for op in math_scratch.drain(..) {
+                    m.push(Core::Math, op);
+                }
+                m.push(
+                    Core::Math,
+                    MirOp::Mvmul {
+                        reg: acc_reg,
+                        at: 8,
+                        addr_mod: MATMUL_AM_GROUP,
+                        flip_a: true,
+                        flip_b: false,
+                    },
+                );
+                m.push(
+                    Core::Unpack,
+                    MirOp::Setadczw {
+                        u0: true,
+                        u1: false,
+                        z0: Some(2 * kk + 1),
+                        z1: None,
+                    },
+                );
+                m.push(
+                    Core::Unpack,
+                    MirOp::SetUnpackBase {
+                        cb: cb_b,
+                        unit: 0,
+                        offset: page_b,
+                        extra: extra_b,
+                    },
+                );
+                m.push(
+                    Core::Unpack,
+                    MirOp::Unpacr {
+                        unit: 0,
+                        count: FACE_DATUMS,
+                        flip: true,
+                    },
+                );
+                mvmul_group(&mut math_scratch, acc_reg, 16);
+                for op in math_scratch.drain(..) {
+                    m.push(Core::Math, op);
+                }
+                let end = if kk == 0 {
+                    MATMUL_AM_GROUP
+                } else {
+                    MATMUL_AM_FI
+                };
+                m.push(
+                    Core::Math,
+                    MirOp::Mvmul {
+                        reg: acc_reg,
+                        at: 24,
+                        addr_mod: end,
+                        flip_a: true,
+                        flip_b: true,
+                    },
+                );
+            }
+        }
+        // The Matrix Unit advanced the thread's `Dst` counter as it
+        // walked the accumulator, and an `SFPLOAD`/`SFPSTORE` address is
+        // relative to it, so the counter goes back to 0. Its writes are
+        // still in flight, so the accumulator is not readable (the pack
+        // follows on T2) until the unit drains.
+        m.push(Core::Math, MirOp::WaitMatrix);
+        for (cb, staged) in [(cb_a, stage_a), (cb_b, stage_b)] {
+            if staged {
+                m.push(Core::Unpack, MirOp::CbPop { cb, n: 1 });
+            }
+        }
+        m.push(
+            Core::Math,
+            MirOp::Setrwc {
+                src_a: 0,
+                src_b: 0,
+                dst: 0,
+                flip_src_a: false,
+                flip_src_b: false,
+                dst_cr: false,
+            },
+        );
+    Ok(())
+}
+
+/// The bytes of one page of a ring, for a block's per-tile page step.
+fn cb_page_bytes(m: &MachineKernel, cb: Cb) -> Result<u32, ttStatus> {
+    m.cbs
+        .get(cb)
+        .map(|info| info.page_bytes)
+        .ok_or(ttStatus::TT_ERROR_BUFFER_NOT_PLACED)
+}
+
+/// A tile's place inside a block: the block's base page plus `tiles` pages,
+/// or, for a page index the program computes at run time, the same step added
+/// into the index register the unpacker already holds. `tmp` is the compute
+/// role's own scratch (the three threads have separate register files).
+fn tile_page(base: u32, extra: Option<u8>, tile: u32, page_bytes: u32) -> (u32, Option<u8>) {
+    // A block's pages are consecutive from the first: the tile's page is a
+    // constant byte offset past it, which `SETUNPACKBASE`/`SETPACKBASE` add to
+    // the ring's page pointer. The run-time page index, when there is one,
+    // stays the register `page_offset` computed -- one register for the whole
+    // block, never a per-tile accumulation in a register the encoder owns.
+    (base + tile * page_bytes, extra)
+}
+
+/// One tile page into a `Dst` region: the unpacker's destination, its `Z`
+/// plane, its datum run and the page, then the request. The seed and the
+/// block reload share it; tt-metal's `unpack_tile<...>` is the same sequence.
+fn unpack_tile(
+    m: &mut MachineKernel,
+    cb: Cb,
+    dtype: DType,
+    datums: u32,
+    page_offset: u32,
+    page_extra: Option<u8>,
+    reg: Dst,
+) {
+    m.push(Core::Unpack, MirOp::Setdst { reg });
+    m.push(
+        Core::Unpack,
+        MirOp::Setadczw {
+            u0: true,
+            u1: false,
+            z0: Some(0),
+            z1: None,
+        },
+    );
+    m.push(
+        Core::Unpack,
+        MirOp::Setadcx {
+            unit: 0,
+            first: 0,
+            count: datums,
+        },
+    );
+    m.push(
+        Core::Unpack,
+        MirOp::UnpackConfig {
+            unit: 0,
+            to_src: false,
+            dtype,
+            haloize: false,
+            add_dest_cntr: false,
+            ch1_z_stride: 0,
+        },
+    );
+    m.push(
+        Core::Unpack,
+        MirOp::SetUnpackBase {
+            cb,
+            unit: 0,
+            offset: page_offset,
+            extra: page_extra,
+        },
+    );
+    m.push(
+        Core::Unpack,
+        MirOp::Unpacr {
+            unit: 0,
+            count: datums,
+            flip: false,
+        },
+    );
+}
+
+/// A bf16 tile into a 32-bit `Dst`: the page enters `SrcA` as bf16 and
+/// `MOVA2D` widens it. tt-lang's `copy_tile` casts the same way
+/// (`llk_math_eltwise_unary_sfpu_typecast` has no SFPU kernel for that pair).
+fn widen_tile(
+    m: &mut MachineKernel,
+    cb: Cb,
+    dtype: DType,
+    datums: u32,
+    page_offset: u32,
+    page_extra: Option<u8>,
+    reg: Dst,
+) {
+    // The whole page at once: one `Z` plane per face, the
+    // descriptor's four faces, 64 `SrcA` rows.
+    m.push(
+        Core::Unpack,
+        MirOp::Setadczw {
+            u0: true,
+            u1: false,
+            z0: Some(0),
+            z1: None,
+        },
+    );
+    m.push(
+        Core::Unpack,
+        MirOp::UnpackConfig {
+            unit: 0,
+            to_src: true,
+            dtype,
+            haloize: false,
+            add_dest_cntr: false,
+            ch1_z_stride: 0,
+        },
+    );
+    m.push(
+        Core::Unpack,
+        MirOp::SetUnpackBase {
+            cb,
+            unit: 0,
+            offset: page_offset,
+            extra: page_extra,
+        },
+    );
+    m.push(
+        Core::Unpack,
+        MirOp::Unpacr {
+            unit: 0,
+            count: datums,
+            // `UNPACR`'s bit 6: `Set_Data_Valid` on
+            // Blackhole (ttsim's schema and tt-metal's LLK
+            // argument), the bank handover the math's
+            // `MOVA2D` waits for. Without it the Matrix
+            // Unit stalls forever on an invalid bank.
+            flip: true,
+        },
+    );
+    // The `Src` row counter starts at zero, as the unpack's
+    // own destination does.
+    m.push(
+        Core::Math,
+        MirOp::Setrwc {
+            src_a: 0,
+            src_b: 0,
+            dst: 0,
+            flip_src_a: false,
+            flip_src_b: false,
+            dst_cr: false,
+        },
+    );
+    // `MOVA2D` moves eight rows per instruction, and a
+    // 32-bit `Dst` holds a tile's 1024 datums in 64 rows.
+    for band in 0..(DST_ROWS / 8) {
+        m.push(
+            Core::Math,
+            MirOp::Mova2d {
+                use_dst32b_lo: false,
+                src_row: 8 * band,
+                addr_mod: 0,
+                move8_rows: true,
+                reg,
+                at: 8 * band,
+            },
+        );
+    }
+    // `SETRWC(CLR_A)`: the `SrcA` bank goes back to the
+    // unpacker now that the Matrix Unit has read it.
+    m.push(
+        Core::Math,
+        MirOp::Setrwc {
+            src_a: 0,
+            src_b: 0,
+            dst: 0,
+            flip_src_a: true,
+            flip_src_b: false,
+            dst_cr: false,
+        },
+    );
 }

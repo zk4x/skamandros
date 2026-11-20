@@ -878,6 +878,9 @@ pub struct Device {
     /// the host. Cleared whenever the tiles are reset or their executors
     /// restart.
     installed: Option<u64>,
+    /// The CB interface table's L1 address, from the launch's arguments, so a
+    /// timed-out launch can say which buffer each role is waiting on.
+    iface_at: u32,
 }
 
 impl Device {
@@ -920,6 +923,7 @@ impl Device {
             backend_released: Vec::new(),
             dram_dirty: false,
             installed: None,
+            iface_at: 0,
         }
     }
 
@@ -1648,6 +1652,12 @@ impl Device {
     /// `ChannelAllocator` picks a bank — `free_size` per bank and the largest
     /// first (`allocator.cpp:57-100`, `bank_manager.cpp:417-446`). No range is
     /// ever freed here, so "most free" is "least used".
+    /// Reserve `bytes` of DRAM in `page`-sized pages, striped across the
+    /// channels, and return the tagged handle a launch names it by.
+    pub fn alloc(&mut self, bytes: usize, page: usize) -> Result<u64, ttStatus> {
+        self.alloc_interleaved(bytes, page)
+    }
+
     pub fn alloc_dram(&mut self, bytes: usize) -> Result<u64, ttStatus> {
         if bytes == 0 {
             return Err(ttStatus::TT_ERROR_ALLOC_ZERO);
@@ -2027,6 +2037,12 @@ impl Device {
     /// so its next launch can be fanned out on the card.
     pub fn note_installed(&mut self, fingerprint: u64) {
         self.installed = Some(fingerprint);
+    }
+
+    /// Remember where this launch's CB interface table lives, so a timeout can
+    /// print what each buffer's counters say.
+    pub fn note_iface(&mut self, at: u32) {
+        self.iface_at = at;
     }
 
     /// The tiles no longer hold a complete installation: the next launch has to
@@ -2466,6 +2482,33 @@ impl Device {
                             d
                         }
                     );
+                    for other in Self::launch_mailboxes() {
+                        eprintln!(
+                            "  mailbox {:#x}: gen {} ack {} status {:#x} panic {}",
+                            other.generation(),
+                            self.read32(other.generation())?,
+                            self.read32(other.ack())?,
+                            self.read32(other.status())?,
+                            self.read32(other.panic_code())?,
+                        );
+                    }
+                    let iface = self.iface_at;
+                    if iface != 0 {
+                        for cb in 0..crate::riscv::cb::COUNT {
+                            let at = u64::from(iface) + u64::from(cb * crate::riscv::cb::STRIDE);
+                            let num_pages = self.read32(at + 12)?;
+                            if num_pages == 0 {
+                                continue;
+                            }
+                            let counters = self.read32(at + 24)?;
+                            let (acked, received) = (counters & 0xFFFF, counters >> 16);
+                            eprintln!(
+                                "  cb {cb}: pages {num_pages} rd {} wr {} acked {acked} received {received}",
+                                self.read32(at + 16)?,
+                                self.read32(at + 20)?,
+                            );
+                        }
+                    }
                 }
                 return Err(ttStatus::TT_ERROR_FIRMWARE_TIMEOUT);
             }
@@ -3038,7 +3081,38 @@ fn place(words: &mut [u32; 3], first_bit: u32, count: u32, value: u64) {
 
 /// Re-exported so the runtime need not depend on the location of the program
 /// arena; this is where every program lives in L1, named by its launch message.
-pub const PROGRAM_AREA: u64 = l1::PROGRAM_CACHE.base;
+pub const PROGRAM_AREA: u64 = l1::KERNEL_CONFIG.base;
+
+/// Bytes reserved for one mover's argument array (the reader's, and the
+/// writer's), above the programs in the kernel config block.
+pub const ARGS_BLOCK: u32 = 0x400;
+
+/// Bytes reserved above the argument arrays for the fan-out lists; they grow up
+/// from `program_end - GROUPS_BYTES`.
+pub const GROUPS_BYTES: u32 = 0x2000;
+
+/// Bytes of kernel config block a launch with programs of these word counts
+/// needs: the six programs packed from the block's base, each starting on a
+/// 16-byte boundary, then both argument arrays and the fan-out lists.
+///
+/// `compile` raises the reserved block to this when a module's programs do not
+/// fit [`l1::KERNEL_CONFIG_MIN`]; the runtime then packs the same programs into
+/// the same block (`runtime::Slots`).
+pub fn program_block_bytes(sizes: &[usize]) -> Result<u32, ttStatus> {
+    let mut at = 0u32;
+    for words in sizes {
+        let bytes = u32::try_from(*words)
+            .ok()
+            .and_then(|n| n.checked_mul(4))
+            .ok_or(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE)?;
+        at = at
+            .checked_add(bytes)
+            .map(|end| end.div_ceil(16) * 16)
+            .ok_or(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE)?;
+    }
+    at.checked_add(2 * ARGS_BLOCK + GROUPS_BYTES)
+        .ok_or(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE)
+}
 
 #[cfg(test)]
 mod tests {

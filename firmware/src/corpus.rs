@@ -75,6 +75,10 @@ pub fn run_exec(mb: Mailbox, icache_mask: u32) -> ! {
     let mut generation = unsafe { l1_read32(mb.generation()) };
     loop {
         if generation != 0 {
+            // A launch starts with both NIUs' transaction counters at zero, so a
+            // run that ended on an unanswered acknowledgement (`noc::reset`) does
+            // not wedge this tile for the next one.
+            crate::noc::reset();
             let enables = unsafe { l1_read32(mb.enables()) };
             let program = unsafe { l1_read32(mb.program_addr()) } as u64;
             let words = unsafe { l1_read32(mb.program_len()) };
@@ -89,7 +93,7 @@ pub fn run_exec(mb: Mailbox, icache_mask: u32) -> ! {
                     || program % 16 != 0
                     || words == 0
                     || words > mailbox::MAX_WORDS
-                    || !tt_isa::arch::blackhole::l1::PROGRAM_CACHE.contains(program, bytes)
+                    || !tt_isa::arch::blackhole::l1::program_fits(program, bytes)
                 {
                     fail_in(mb, mailbox::panic_code::EXPLICIT);
                 }
@@ -643,12 +647,12 @@ where
     {
         fail_in(mb, panic_code::EXPLICIT);
     }
-    // The program (`mailbox::PROGRAM_ADDR`) must lie in the program cache, so a
-    // stale or corrupt address cannot push arbitrary L1. There is no slot
-    // fallback: the launch message names the text, it does not carry it.
+    // The program (`mailbox::PROGRAM_ADDR`) must lie above the system block,
+    // so a stale or corrupt address cannot push firmware or a mailbox. There is
+    // no slot fallback: the launch message names the text, it does not carry it.
     if program_addr == 0
         || program_addr % 16 != 0
-        || !tt_isa::arch::blackhole::l1::PROGRAM_CACHE.contains(program_addr, program_len as u64 * 4)
+        || !tt_isa::arch::blackhole::l1::program_fits(program_addr, program_len as u64 * 4)
     {
         fail_in(mb, panic_code::EXPLICIT);
     }

@@ -11,8 +11,14 @@ use tt_isa::arch::blackhole::Blackhole;
 use tt_isa::arch::quasar::Quasar;
 use tt_isa::arch::{Arch, Specials};
 
-/// Register numbers of the caller-saved set the programs use. A program is a
-/// leaf: no `sp`, `gp`, `tp`, `ra`, `s0..s11`.
+/// Register numbers the programs use.
+///
+/// The executor calls a program as a function and promises it only the
+/// caller-saved registers (`firmware/src/bin/exec_b.rs`), so `gp`, `tp`, `ra`
+/// and `s2`..`s11` are off limits. `s0`/`s1` are the third loop counter pair
+/// (the caller-saved set is spent on the launch arguments, the CB table, the
+/// two inner counters and the expression pool), and a program that takes them
+/// saves and restores them on the executor's stack, as [`callee_save`] does.
 pub mod reg {
     pub const ZERO: u8 = 0;
     pub const A0: u8 = 10;
@@ -30,6 +36,21 @@ pub mod reg {
     pub const T4: u8 = 29;
     pub const T5: u8 = 30;
     pub const T6: u8 = 31;
+    pub const S0: u8 = 8;
+    pub const S1: u8 = 9;
+    /// The rest of the callee-saved bank (x18..x27). The third, fourth and
+    /// fifth loop levels are `s0`/`s1`, `s2`/`s3`, `s4`/`s5`; the mover keeps
+    /// its request temporaries in what is left.
+    pub const S2: u8 = 18;
+    pub const S3: u8 = 19;
+    pub const S4: u8 = 20;
+    pub const S5: u8 = 21;
+    pub const S6: u8 = 22;
+    pub const S7: u8 = 23;
+    pub const S8: u8 = 24;
+    pub const S9: u8 = 25;
+    /// The caller's stack pointer, used only to bracket a callee-saved pair.
+    pub const SP: u8 = 2;
 }
 
 fn r_type(funct7: u32, rs2: u8, rs1: u8, funct3: u32, rd: u8, opcode: u32) -> u32 {
@@ -171,6 +192,11 @@ pub fn bgeu(rs1: u8, rs2: u8, imm: i32) -> u32 {
     b_type(imm, rs2, rs1, 7, 0x63)
 }
 
+/// `bltu rs1, rs2, off`: unsigned below.
+pub fn bltu(rs1: u8, rs2: u8, imm: i32) -> u32 {
+    b_type(imm, rs2, rs1, 6, 0x63)
+}
+
 /// `jal rd, off`: the J-type jump, a +-1 MiB displacement. A loop edge whose
 /// body is larger than a B-type branch's +-4 KiB uses it (`x86`-style long
 /// branch): `bgeu` skips over a `jal` back to the top, and the zero-trip test
@@ -220,6 +246,33 @@ pub fn min(rd: u8, rs1: u8, rs2: u8) -> u32 {
 /// `ret`: `jalr x0, 0(x1)`.
 pub fn ret() -> u32 {
     0x0000_8067
+}
+
+/// Save the callee-saved registers a role program uses: `addi sp, sp, -4n`,
+/// then one `sw` each.
+///
+/// The executor calls a program as a function (`firmware/src/bin/exec_b.rs`:
+/// "It may use the caller-saved registers only"), so the callee-saved bank
+/// belongs to the caller -- the third loop level's `s0`/`s1`, and whatever the
+/// mover's request temporaries take from it. `sp` is valid because that call is
+/// an ordinary Rust call with a stack in the core's local data RAM.
+pub fn callee_save(regs: &[u8]) -> Vec<u32> {
+    let bytes = 4 * regs.len() as i32;
+    let mut out = vec![addi(reg::SP, reg::SP, -bytes)];
+    for (i, reg) in regs.iter().enumerate() {
+        out.push(sw(*reg, reg::SP, (regs.len() - 1 - i) as i32 * 4));
+    }
+    out
+}
+
+/// Undo [`callee_save`], in the opposite order.
+pub fn callee_restore(regs: &[u8]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(regs.len() + 1);
+    for (i, reg) in regs.iter().enumerate() {
+        out.push(lw(*reg, reg::SP, (regs.len() - 1 - i) as i32 * 4));
+    }
+    out.push(addi(reg::SP, reg::SP, 4 * regs.len() as i32));
+    out
 }
 
 /// Block this core until the Tensix coprocessor has finished every instruction

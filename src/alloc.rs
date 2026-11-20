@@ -818,12 +818,15 @@ fn alloc_dsts(m: &mut MachineKernel) -> Result<(), ttStatus> {
     let mut rename: BTreeMap<Dst, Dst> = BTreeMap::new();
     // Each physical register's end of life, by physical id.
     let mut ends: Vec<Option<usize>> = vec![None; slots];
+    let all = order.clone();
     for (id, (first, last)) in order {
         let free = ends
             .iter()
             .position(|end| end.map(|end| end < first).unwrap_or(true));
         let Some(slot) = free else {
-            let _ = (id, first);
+            if std::env::var_os("SKAM_DEBUG").is_some() {
+                eprintln!("alloc: dst {id:?} {first}..{last} has no slot; live = {all:?}");
+            }
             return Err(ttStatus::TT_ERROR_DST_SLOTS_EXHAUSTED);
         };
         ends[slot] = Some(last);
@@ -850,6 +853,9 @@ fn alloc_dsts(m: &mut MachineKernel) -> Result<(), ttStatus> {
         fresh.push(info);
     }
     m.dsts = fresh;
+    // The sections named virtual `Dst` ids; the physical slab is a different
+    // space, and the hand-offs they described were derived before allocation.
+    m.sections.clear();
     Ok(())
 }
 
@@ -941,8 +947,12 @@ fn rewrite_lregs(op: &mut MirOp, rename: &BTreeMap<LReg, LReg>) {
 /// Place every ring in L1, in id order, and the `LocalCBInterface` table after
 /// them. Every ring is `ALIGN`-aligned, so the two sides of a copy are
 /// congruent by construction.
-pub fn plan_cbs(m: &mut MachineKernel) -> Result<(), ttStatus> {
-    let mut at = tt_isa::arch::blackhole::l1::DATA.base as u32;
+///
+/// `data_base` is the first byte of this module's arena: the top of its kernel
+/// config block, which is [`tt_isa::arch::blackhole::l1::DATA`]`.base` unless
+/// the programs needed more than the reserved block.
+pub fn plan_cbs(m: &mut MachineKernel, data_base: u32) -> Result<(), ttStatus> {
+    let mut at = data_base;
     let mut infos: Vec<(Cb, CbInfo)> = m.cbs.iter().map(|(id, info)| (id, *info)).collect();
     infos.sort_by_key(|(id, _)| *id);
     let count = infos.len() as u32;
@@ -973,6 +983,38 @@ pub fn plan_cbs(m: &mut MachineKernel) -> Result<(), ttStatus> {
         let _ = (iface, end);
         return Err(ttStatus::TT_ERROR_L1_ARENA);
     }
+    // A multicast copy's kernel semaphores follow the interface table: the
+    // same four words in every tile, so a sender can name a receiver's word and
+    // a receiver can name its sender's.
+    let mcast = end.div_ceil(ALIGN) * ALIGN;
+    let sites = u32::try_from(m.mcast.len()).map_err(|_| ttStatus::TT_ERROR_L1_OVERFLOW)?;
+    let mcast_end = sites
+        .checked_mul(crate::mir::McastSite::BYTES)
+        .and_then(|bytes| mcast.checked_add(bytes))
+        .ok_or(ttStatus::TT_ERROR_L1_OVERFLOW)?;
+    if u64::from(mcast_end) > tt_isa::arch::blackhole::l1::DATA.end {
+        let _ = (mcast, mcast_end);
+        return Err(ttStatus::TT_ERROR_L1_ARENA);
+    }
+    for (i, site) in m.mcast.iter_mut().enumerate() {
+        site.base = mcast + (i as u32) * crate::mir::McastSite::BYTES;
+    }
+    // The coordinate table follows the sites: one packed NoC coordinate per
+    // logical `(x, y)`, indexed `y * COORD_COLUMNS + x`. A harvested chip's
+    // logical columns are not its physical ones, so a rectangle cannot be
+    // computed from the logical span alone.
+    if !m.mcast.is_empty() {
+        let at = mcast_end.div_ceil(ALIGN) * ALIGN;
+        let bytes = crate::mir::COORDS_WORDS as u32 * 4;
+        let end = at
+            .checked_add(bytes)
+            .ok_or(ttStatus::TT_ERROR_L1_OVERFLOW)?;
+        if u64::from(end) > tt_isa::arch::blackhole::l1::DATA.end {
+            let _ = (at, end);
+            return Err(ttStatus::TT_ERROR_L1_ARENA);
+        }
+        m.coords = at;
+    }
     for (k, (_, info)) in infos.iter_mut().enumerate() {
         let stride = u32::try_from(k)
             .ok()
@@ -998,7 +1040,6 @@ mod tests {
     fn activation(op: &str) -> String {
         format!(
             "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024

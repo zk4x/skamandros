@@ -10,14 +10,15 @@ use crate::ir::BOp;
 pub enum ParamKind {
     /// A scalar parameter: the argument is its value.
     Scalar,
-    /// A tensor parameter: the argument is its DRAM address.
-    Tensor,
-    /// A tensor parameter whose pages are striped across the DRAM channels.
-    /// Its argument block is the per-channel page bases, the channel count and
-    /// the page size, so the program can resolve a page's channel itself — the
-    /// device-side half of tt-metal's interleaved address generator
-    /// (`InterleavedAddrGen` / `get_noc_addr_from_bank_id`).
-    Interleaved,
+    /// A tensor parameter. Its argument block is the per-channel page bases,
+    /// the channel count and the page size, so the program resolves a page's
+    /// channel itself — the device-side half of tt-metal's address generator
+    /// (`InterleavedAddrGen` / `get_noc_addr_from_bank_id`). Every DRAM tensor
+    /// is allocated striped, so the block always has one entry per channel.
+    Tensor {
+        /// One page's byte size, from the parameter's dtype (a 32x32 tile).
+        page: u32,
+    },
 }
 
 /// One grid extent, resolved at launch from the scalar arguments. A `Dim` is a
@@ -97,8 +98,27 @@ pub struct Module {
     /// A launch on a Quasar reports it instead of guessing: the module is still
     /// valid, and a Blackhole launch runs it exactly as before.
     pub quasar_refusal: Option<crate::status::ttStatus>,
+    /// First byte of the reserved kernel config block
+    /// (`tt_isa::arch::blackhole::l1::KERNEL_CONFIG`), where the programs are
+    /// placed.
+    pub program_area: u32,
+    /// First byte past the block, where this module's data arena begins. The
+    /// block runs from [`Module::program_area`] to here and holds the six
+    /// programs, the reader's and writer's argument arrays and the fan-out
+    /// lists; it is the reserved minimum unless the programs needed more, in
+    /// which case `compile` raised it.
+    pub program_end: u32,
     /// The CB interface table the host writes before the launch.
     pub iface: u32,
+    /// Byte address of the first multicast site's control block, zero when the
+    /// module has none. Each site is four words ([`crate::mir::McastSite`]).
+    pub mcast_base: u32,
+    /// How many multicast sites follow [`Module::mcast_base`].
+    pub mcast_sites: u32,
+    /// Byte address of the coordinate table every tile holds: one packed NoC
+    /// coordinate per logical `(x, y)` ([`crate::mir::COORDS_WORDS`] words),
+    /// zero when the program has no collective.
+    pub coords: u32,
     /// The rings the table describes, in base-address order.
     pub cbs: Vec<crate::mir::CbInfo>,
     /// The CB interface words every tile's B installs from its own L1

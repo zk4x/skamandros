@@ -14,7 +14,8 @@
 //! argument names that NoC's endpoint of the channel.
 //!
 //! Every core has a launch message (`mailbox::launch::Mailbox`): the program's
-//! address in `l1::PROGRAM_CACHE`, its length, the arguments base and a
+//! address in the kernel config block (`l1::KERNEL_CONFIG`), its length, the
+//! arguments base and a
 //! generation. A program is placed once and later launches only name it; the
 //! resident executor on the core runs the generation it sees
 //! (tt-metal's launch message and kernel-text offset).
@@ -22,7 +23,7 @@
 use std::sync::Mutex;
 
 use crate::compile::Module;
-use crate::device::{Architecture, Device};
+use crate::device::Device;
 use crate::status::ttStatus;
 use tt_isa::arch::blackhole::dram::CHANNEL_BYTES;
 use tt_isa::arch::blackhole::mailbox;
@@ -48,213 +49,17 @@ fn dispatch_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("SKAM_NO_DISPATCH").is_some())
 }
 
-/// First byte of `l1::PROGRAM_CACHE`, where every program is placed once.
+/// First byte of the kernel config block
+/// (`tt_isa::arch::blackhole::l1::KERNEL_CONFIG`), where every program is
+/// placed once.
 const PROGRAM_AREA: u32 = crate::device::PROGRAM_AREA as u32;
-/// Bytes in one program-cache slot: `mailbox::MAX_WORDS` words.
-const SLOT_BYTES: u32 = 0x8000;
-/// The barrier word of a GDDR channel: offset 0, as tt-metal's
-/// `DRAM_BARRIER_BASE` (`bh_hal.cpp:34-37`, `DRAM_BARRIER_SIZE` = 64 bytes).
-/// It lies below [`crate::device`]'s first allocation, so a launch never reads
-/// a tensor there and no tensor is ever written there.
-const DRAM_BARRIER: u64 = 0;
-
-/// The two values tt-metal alternates through the barrier word (`MemBarFlag`,
-/// `umd/device/types/cluster_types.hpp:106-109`): a barrier writes one and
-/// reads it back, so every earlier write to the channel has been committed,
-/// and a value the previous barrier left behind can never be mistaken for this
-/// one because every barrier uses the other value first.
-const BARRIER_SET: u32 = 0xAA;
-const BARRIER_RESET: u32 = 0xBB;
-
-/// How many times the barrier word is read before the channel is declared not
-/// to answer. A flush is one or two PCIe round trips; a thousand reads is far
-/// past that and still bounded, so a channel that is not answering is reported
-/// rather than spun on.
-const BARRIER_POLLS: u32 = 1000;
-
-/// Slot 0 and 1: RISCV B's reader and writer. 3..6: T0/T1/T2. The arguments
-/// follow the last slot.
-const SLOT_READER: u32 = 0;
-const SLOT_WRITER: u32 = 1;
-/// The setup program's slot. It is not one of the role slots: T0 runs both, and
-/// sharing a slot would evict the role program every launch.
-const SLOT_SETUP: u32 = 2;
-const ROLE_SLOT: [u32; 3] = [3, 4, 5];
-pub(crate) const ARGS_AT: u32 = PROGRAM_AREA + 6 * SLOT_BYTES;
-/// The writer's array, one kilobyte after the reader's: its DRAM endpoints are
-/// NoC #1's.
-const ARGS_WRITER: u32 = ARGS_AT + 0x400;
-
-/// The fan-out lists, which the tree in `launch_steps` stages: the root's
-/// (every other column leader, then its own column's workers) and one per
-/// column leader (its column's other tiles). One packed endpoint per word
-/// (`endpoint_of`), `GROUPS_STRIDE` bytes apart.
-const GROUPS_AT: u32 = ARGS_WRITER + 0x400;
-/// Bytes per fan-out list: sixty-four endpoints of room. The root's is the
-/// widest (every other column leader plus its own column), and the slots must
-/// not overlap: an 0x40 stride truncated the root's list and started the wrong
-/// tiles.
-const GROUPS_STRIDE: u32 = 0x100;
-
-// The dispatcher's descriptor, in RISCV B's dump block -- which that core's
-// executor never writes, because it has no `Dst` to dump. `firmware/src/
-// dispatch.rs` holds the same field numbers and the regions of the block; the
-// two must be changed together.
-/// L1 address of this tile's fan-out list ([`GROUPS_AT`]).
-const DESC_WORKERS: u32 = 0;
-/// Words in this tile's fan-out list.
-const DESC_COUNT: u32 = 1;
-/// Words in each argument block.
-const DESC_ARGS_WORDS: u32 = 2;
-/// The writer's block, as a byte offset from [`ARGS_AT`].
-const DESC_WRITER_OFFSET: u32 = 3;
-/// Words in the CB interface template.
-const DESC_IFACE_WORDS: u32 = 4;
-/// The semaphore setup program's address; zero for none.
-const DESC_SETUP_ADDR: u32 = 5;
-/// Words in the setup program.
-const DESC_SETUP_WORDS: u32 = 6;
-/// This tile's packed endpoint.
-const DESC_SELF: u32 = 7;
-/// The dispatcher's packed endpoint; zero on the dispatcher itself.
-const DESC_DISPATCHER: u32 = 8;
-/// How many argument blocks the module has: the reader's, plus the writer's
-/// when it has one.
-const DESC_BLOCKS: u32 = 9;
-/// Words in the descriptor itself, before the interface template.
-const DESC_FIELDS: u32 = 16;
-/// The CB interface template's first word in the same block.
-const DESC_IFACE_AT: u32 = 16;
-/// Words the template may hold (sixteen rings of eight words).
-const DESC_IFACE_CAPACITY: u32 = 128;
-/// Words an argument block may hold for the dispatcher path.
-const DESC_SCRATCH_CAPACITY: u32 = 64;
-
-/// Word `k` of RISCV B's descriptor, in its mailbox's dump block.
-fn descriptor_at(k: u32) -> u64 {
-    mailbox::launch::Mailbox::b().dump_offset(k / 16, k % 16)
+/// The fan-out lists sit at the top of a module's kernel config block, at a
+/// fixed offset from its top: a repeat launch writes only the arguments and the
+/// dispatcher's generation, and it must know where they are without rebuilding
+/// the program layout.
+fn groups_at(module: &Module) -> u32 {
+    module.program_end - crate::device::GROUPS_BYTES
 }
-
-/// A tile's NoC endpoint, packed into one word: the coordinate a NoC request
-/// names, not the logical grid coordinate a module sees.
-fn endpoint_of(tile: NocCoord) -> u32 {
-    u32::from(tile.x()) | (u32::from(tile.y()) << 8)
-}
-
-/// `index`'s slot in the program cache.
-const fn slot(index: u32) -> u32 {
-    PROGRAM_AREA + index * SLOT_BYTES
-}
-
-/// Open the device. Idempotent; the simulator is initialized once per process.
-///
-/// [`Device::open`] chooses the transport the way tt-metal chooses: if
-/// `$TT_METAL_SIMULATOR` names a shared object, the simulator is used, and
-/// otherwise the card. `TT_HARDWARE=1` is additionally required before this
-/// driver will touch silicon — a bring-up gate that goes away once a kernel has
-/// run on the card — so with neither variable set, [`init`] refuses rather than
-/// guessing which of the two the caller wanted.
-pub fn init() -> Result<(), ttStatus> {
-    let mut device = lock()?;
-    if device.is_none() {
-        *device = Some(Device::open()?);
-    }
-    Ok(())
-}
-
-/// Close the device. DRAM allocations from this device are gone; a later
-/// [`init`] opens a fresh one over the same simulator.
-///
-/// On the card, the chip is returned to its idle operating point first, as
-/// tt-metal does when it closes a device (`LocalChip::close_device` ->
-/// `set_power_state(LONG_IDLE)`, `local_chip.cpp:195-211`). This path only moves
-/// the clock: it never resets the board — no `RESET_DEVICE` ioctl, no ARC reset
-/// message, no backend pulse. tt-metal's `close_device` also calls
-/// `assert_risc_reset(RiscType::ALL)`; that is a soft hold of the five cores, not
-/// a board reset, and this driver already has its own holds (`Device::quiesce`
-/// at open and `Kmd::hold_on_close` at descriptor close), so nothing here
-/// repeats it.
-pub fn release() -> Result<(), ttStatus> {
-    let mut device = lock()?;
-    let result = match device.as_mut() {
-        Some(device) => device.set_power_state(false),
-        None => Ok(()),
-    };
-    *device = None;
-    result
-}
-
-/// Reserve `bytes` of DRAM and return its address.
-pub fn alloc(bytes: usize) -> Result<u64, ttStatus> {
-    with_device(|d| d.alloc_dram(bytes))
-}
-
-/// Reserve a tensor striped across the DRAM channels and return its handle.
-pub fn alloc_interleaved(bytes: usize, page: usize) -> Result<u64, ttStatus> {
-    with_device(|d| d.alloc_interleaved(bytes, page))
-}
-
-/// Copy host bytes into DRAM at `address`.
-pub fn h2d(address: u64, bytes: &[u8]) -> Result<(), ttStatus> {
-    with_device(|d| d.dram_write(address, bytes))
-}
-
-/// Copy DRAM at `address` into host bytes.
-pub fn d2h(address: u64, out: &mut [u8]) -> Result<(), ttStatus> {
-    with_device(|d| d.dram_read(address, out))
-}
-
-/// Run a module over its grid with one launch argument per parameter.
-///
-/// A tensor parameter's argument is its DRAM address; a scalar parameter's is
-/// its value, as CUDA's kernel parameter buffer holds values for scalars and
-/// addresses for pointers. A grid extent may be a launch-bound value too, so it
-/// is resolved here, before any core starts. The launch arguments are built
-/// here, not by the caller: the grid, this tile's coordinate, and each
-/// parameter's word(s). A count that disagrees with the module is refused.
-/// Every failure is a [`ttStatus`] variant; there is no second error channel
-/// and no string error.
-pub fn launch(module: &Module, params: &[u64]) -> Result<(), ttStatus> {
-    if module.params.len() != params.len() {
-        return Err(ttStatus::TT_ERROR_ARGUMENT);
-    }
-    let grid = resolve_grid(module, params)?;
-    if module.reader.is_empty()
-        && module.writer.is_empty()
-        && module.cores.iter().all(Vec::is_empty)
-    {
-        return Err(ttStatus::TT_ERROR_UNSUPPORTED);
-    }
-    with_device(|device| run(device, module, params, grid))
-}
-
-fn run(
-    device: &mut Device,
-    module: &Module,
-    params: &[u64],
-    grid: [u32; 2],
-) -> Result<(), ttStatus> {
-    // The two chips launch differently and neither path can stand in for the
-    // other: Blackhole runs its own firmware on five cores, Quasar has no such
-    // firmware and runs the two movers the module carries for it.
-    if device.arch() == Architecture::Quasar {
-        let result = quasar_launch(device, module, params, grid);
-        if result.is_err() {
-            device.quasar_quiesce()?;
-        }
-        return result;
-    }
-    let result = launch_steps(device, module, params, grid);
-    if result.is_err() {
-        // A failed launch is a status, not a wedged tile: stop the cores this
-        // launch started and clear the mailboxes it wrote before returning, so
-        // the next launch starts from a known state. No `ttReset` exists; this
-        // is the driver's own cleanup.
-        device.quiesce()?;
-    }
-    result
-}
-
 /// Where a Quasar mover's boot stub lives: the image its reset vector jumps to.
 ///
 /// All eight movers fetch L1 word 0 and every one of them is released the same
@@ -315,7 +120,7 @@ fn quasar_image(hart: u8) -> u32 {
 /// and `quasar_start_at` points that word here. `mhartid` (CSR 0xF14) is the
 /// only thing that tells the eight movers apart, and the simulator was measured
 /// to return 0..=7 there.
-fn quasar_stub() -> Vec<u32> {
+fn quasar_stub(args: u32) -> Vec<u32> {
     use crate::riscv::reg;
     let base = QUASAR_IMAGE_BASE >> 12;
     let mut words = Vec::with_capacity(6);
@@ -327,10 +132,10 @@ fn quasar_stub() -> Vec<u32> {
     ));
     words.push(crate::riscv::lui(reg::T1, base));
     words.push(crate::riscv::add(reg::T0, reg::T0, reg::T1));
-    // `li a0, ARGS_AT`: the argument block, as the launch's `a0` on every other
+    // `li a0, args`: the argument block, as the launch's `a0` on every other
     // chip would carry it.
-    let high = ARGS_AT.wrapping_add(0x800) >> 12;
-    let low = ARGS_AT as i32 - ((high as i32) << 12);
+    let high = args.wrapping_add(0x800) >> 12;
+    let low = args as i32 - ((high as i32) << 12);
     words.push(crate::riscv::lui(reg::A0, high));
     words.push(crate::riscv::addi(reg::A0, reg::A0, low));
     words.push(crate::riscv::jalr(reg::ZERO, reg::T0, 0));
@@ -421,7 +226,7 @@ fn quasar_launch(
         device.forget_staged(u64::from(crate::mir::QUASAR_CORE_INFO), 8);
         device.stage_words(u64::from(crate::mir::QUASAR_CORE_INFO), &[*x, *y])?;
         let args = args_for(device, module, params, grid, *tile)?[0].1.clone();
-        device.stage_words(u64::from(ARGS_AT), &args)?;
+        device.stage_words(u64::from(args_reader(module)), &args)?;
         // The last launch's harts advanced this table's counters and set the
         // ready flag, so the cached words for those ranges are not what is in L1
         // any more.
@@ -430,7 +235,7 @@ fn quasar_launch(
         if !module.iface_words.is_empty() {
             device.stage_words(u64::from(module.iface), &module.iface_words)?;
         }
-        device.stage_words(u64::from(QUASAR_STUB), &quasar_stub())?;
+        device.stage_words(u64::from(QUASAR_STUB), &quasar_stub(args_reader(module)))?;
         device.stage_words(u64::from(QUASAR_READY_AT), &[0])?;
         // The mover that reports: the writer drains what the reader pushed, so
         // it finishes last; with no writer the reader is the whole launch.
@@ -472,7 +277,7 @@ fn quasar_launch(
             }
             let core = Core::Math { engine: 0, trisc };
             let at = QUASAR_COMPUTE_BASE + QUASAR_TRISC_IMAGE_STRIDE * u32::from(trisc);
-            let image = quasar_compute_image(words);
+            let image = quasar_compute_image(words, args_reader(module));
             if 4 * image.len() as u32 > QUASAR_TRISC_IMAGE_STRIDE {
                 eprintln!(
                     "libskamandros: TRISC{trisc}'s image is {} words; a Quasar image slot holds {}",
@@ -524,13 +329,13 @@ fn quasar_launch(
 /// Turn a compute program into an image a Quasar TRISC can be started at.
 ///
 /// `a0` is the launch's argument block, which the movers' stub supplies and a
-/// TRISC has no supplier for, so the image starts with `li a0, ARGS_AT`. Its
+/// TRISC has no supplier for, so the image starts with `li a0, args`. Its
 /// trailing `ret` becomes a park for the same reason it does for a mover: no
 /// executor calls this hart.
-fn quasar_compute_image(words: &[u32]) -> Vec<u32> {
+fn quasar_compute_image(words: &[u32], args: u32) -> Vec<u32> {
     use crate::riscv::reg;
-    let high = ARGS_AT.wrapping_add(0x800) >> 12;
-    let low = ARGS_AT as i32 - ((high as i32) << 12);
+    let high = args.wrapping_add(0x800) >> 12;
+    let low = args as i32 - ((high as i32) << 12);
     let mut image = Vec::with_capacity(words.len() + 4);
     image.push(crate::riscv::lui(reg::A0, high));
     image.push(crate::riscv::addi(reg::A0, reg::A0, low));
@@ -540,6 +345,253 @@ fn quasar_compute_image(words: &[u32]) -> Vec<u32> {
     }
     image.push(crate::riscv::jal(reg::ZERO, 0));
     image
+}
+
+
+/// The writer's argument array (its DRAM endpoints are NoC #1's), and the
+/// reader's, just below the fan-out lists.
+fn args_writer(module: &Module) -> u32 {
+    groups_at(module) - crate::device::ARGS_BLOCK
+}
+fn args_reader(module: &Module) -> u32 {
+    args_writer(module) - crate::device::ARGS_BLOCK
+}
+/// The barrier word of a GDDR channel: offset 0, as tt-metal's
+/// `DRAM_BARRIER_BASE` (`bh_hal.cpp:34-37`, `DRAM_BARRIER_SIZE` = 64 bytes).
+/// It lies below [`crate::device`]'s first allocation, so a launch never reads
+/// a tensor there and no tensor is ever written there.
+const DRAM_BARRIER: u64 = 0;
+
+/// The two values tt-metal alternates through the barrier word (`MemBarFlag`,
+/// `umd/device/types/cluster_types.hpp:106-109`): a barrier writes one and
+/// reads it back, so every earlier write to the channel has been committed,
+/// and a value the previous barrier left behind can never be mistaken for this
+/// one because every barrier uses the other value first.
+const BARRIER_SET: u32 = 0xAA;
+const BARRIER_RESET: u32 = 0xBB;
+
+/// How many times the barrier word is read before the channel is declared not
+/// to answer. A flush is one or two PCIe round trips; a thousand reads is far
+/// past that and still bounded, so a channel that is not answering is reported
+/// rather than spun on.
+const BARRIER_POLLS: u32 = 1000;
+
+/// Slot 0 and 1: RISCV B's reader and writer. 3..6: T0/T1/T2.
+const SLOT_READER: u32 = 0;
+const SLOT_WRITER: u32 = 1;
+/// The setup program's slot. It is not one of the role slots: T0 runs both, and
+/// sharing a slot would evict the role program every launch.
+const SLOT_SETUP: u32 = 2;
+const ROLE_SLOT: [u32; 3] = [3, 4, 5];
+/// The fan-out lists, which the tree in `launch_steps` stages: the root's
+/// (every other column leader, then its own column's workers) and one per
+/// column leader (its column's other tiles). One packed endpoint per word
+/// (`endpoint_of`), `GROUPS_STRIDE` bytes apart.
+
+/// Bytes per fan-out list: sixty-four endpoints of room. The root's is the
+/// widest (every other column leader plus its own column), and the slots must
+/// not overlap: an 0x40 stride truncated the root's list and started the wrong
+/// tiles.
+const GROUPS_STRIDE: u32 = 0x100;
+
+// The dispatcher's descriptor, in RISCV B's dump block -- which that core's
+// executor never writes, because it has no `Dst` to dump. `firmware/src/
+// dispatch.rs` holds the same field numbers and the regions of the block; the
+// two must be changed together.
+/// L1 address of this tile's fan-out list ([`groups_at`]).
+const DESC_WORKERS: u32 = 0;
+/// Words in this tile's fan-out list.
+const DESC_COUNT: u32 = 1;
+/// Words in each argument block.
+const DESC_ARGS_WORDS: u32 = 2;
+/// The writer's block, as a byte offset from [`args_reader`].
+const DESC_WRITER_OFFSET: u32 = 3;
+/// Words in the CB interface template.
+const DESC_IFACE_WORDS: u32 = 4;
+/// The semaphore setup program's address; zero for none.
+const DESC_SETUP_ADDR: u32 = 5;
+/// Words in the setup program.
+const DESC_SETUP_WORDS: u32 = 6;
+/// This tile's packed endpoint.
+const DESC_SELF: u32 = 7;
+/// The dispatcher's packed endpoint; zero on the dispatcher itself.
+const DESC_DISPATCHER: u32 = 8;
+/// How many argument blocks the module has: the reader's, plus the writer's
+/// when it has one.
+const DESC_BLOCKS: u32 = 9;
+/// Words in the descriptor itself, before the interface template.
+const DESC_FIELDS: u32 = 16;
+/// The CB interface template's first word in the same block.
+const DESC_IFACE_AT: u32 = 16;
+/// Words the template may hold (sixteen rings of eight words).
+const DESC_IFACE_CAPACITY: u32 = 128;
+/// Words an argument block may hold for the dispatcher path.
+const DESC_SCRATCH_CAPACITY: u32 = 64;
+
+/// Word `k` of RISCV B's descriptor, in its mailbox's dump block.
+fn descriptor_at(k: u32) -> u64 {
+    mailbox::launch::Mailbox::b().dump_offset(k / 16, k % 16)
+}
+
+/// A tile's NoC endpoint, packed into one word: the coordinate a NoC request
+/// names, not the logical grid coordinate a module sees.
+fn endpoint_of(tile: NocCoord) -> u32 {
+    u32::from(tile.x()) | (u32::from(tile.y()) << 8)
+}
+
+/// This launch's program slots, packed from the bottom of the program cache.
+///
+/// The address goes through the role's launch message, so a slot need not be
+/// fixed or of a fixed size: each program gets the room it actually needs, and
+/// the five together may use the whole cache below the arguments. tt-metal has
+/// no per-role slot either — a kernel binary is bounded by the L1 program
+/// region (`MEM_MAX_KERNEL_SIZE` is 1497 KiB on Blackhole,
+/// `dev_mem_map.h:79-80`) and shares L1 with the CBs at run time — so a fixed
+/// 32 KiB slot would be a limit of this driver, not of the hardware.
+struct Slots {
+    at: [u32; 6],
+}
+
+impl Slots {
+    /// Pack the six programs (reader, writer, setup, T0, T1, T2) in that
+    /// order, each at the next 16-byte boundary, and refuse a launch whose
+    /// programs would run into the arguments.
+    fn new(module: &Module, cores: &[Vec<u32>; 3]) -> Result<Self, ttStatus> {
+        let sizes = [
+            module.reader.len(),
+            module.writer.len(),
+            module.setup.len(),
+            cores[0].len(),
+            cores[1].len(),
+            cores[2].len(),
+        ];
+        let mut at = [0u32; 6];
+        let mut next = PROGRAM_AREA;
+        for (slot, words) in at.iter_mut().zip(sizes) {
+            *slot = next;
+            let bytes = u32::try_from(words)
+                .ok()
+                .and_then(|n| n.checked_mul(4))
+                .ok_or(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE)?;
+            next = next
+                .checked_add(bytes)
+                .map(|end| end.div_ceil(16) * 16)
+                .ok_or(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE)?;
+            if next > args_reader(module) {
+                return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
+            }
+        }
+        Ok(Self { at })
+    }
+}
+
+/// Open the device. Idempotent; the simulator is initialized once per process.
+///
+/// The transport is chosen the way tt-metal chooses: if `$TT_METAL_SIMULATOR`
+/// names a shared object, the simulator is used, and otherwise the card
+/// (`Device::open_hardware`). `TT_HARDWARE=1` is additionally required before this
+/// driver will touch silicon — a bring-up gate that goes away once a kernel has
+/// run on the card — so with neither variable set, [`init`] refuses rather than
+/// guessing which of the two the caller wanted.
+pub fn init() -> Result<(), ttStatus> {
+    let mut device = lock()?;
+    if device.is_none() {
+        let simulator = std::env::var_os(crate::device::LIB_PATH_ENV).filter(|p| !p.is_empty());
+        *device = Some(match simulator {
+            Some(_) => Device::open()?,
+            None => Device::open_hardware()?,
+        });
+    }
+    Ok(())
+}
+
+/// Close the device. DRAM allocations from this device are gone; a later
+/// [`init`] opens a fresh one over the same simulator.
+///
+/// On the card, the chip is returned to its idle operating point first, as
+/// tt-metal does when it closes a device (`LocalChip::close_device` ->
+/// `set_power_state(LONG_IDLE)`, `local_chip.cpp:195-211`). This path only moves
+/// the clock: it never resets the board — no `RESET_DEVICE` ioctl, no ARC reset
+/// message, no backend pulse. tt-metal's `close_device` also calls
+/// `assert_risc_reset(RiscType::ALL)`; that is a soft hold of the five cores, not
+/// a board reset, and this driver already has its own holds (`Device::quiesce`
+/// at open and `Kmd::hold_on_close` at descriptor close), so nothing here
+/// repeats it.
+pub fn release() -> Result<(), ttStatus> {
+    let mut device = lock()?;
+    let result = match device.as_mut() {
+        Some(device) => device.set_power_state(false),
+        None => Ok(()),
+    };
+    *device = None;
+    result
+}
+
+/// Reserve `bytes` of DRAM in `page`-sized pages, striped across the channels,
+/// and return its handle.
+pub fn alloc(bytes: usize, page: usize) -> Result<u64, ttStatus> {
+    with_device(|d| d.alloc(bytes, page))
+}
+
+/// Copy host bytes into the tensor `address` names.
+pub fn h2d(address: u64, bytes: &[u8]) -> Result<(), ttStatus> {
+    with_device(|d| d.dram_write(address, bytes))
+}
+
+/// Copy the tensor `address` names into host bytes.
+pub fn d2h(address: u64, out: &mut [u8]) -> Result<(), ttStatus> {
+    with_device(|d| d.dram_read(address, out))
+}
+
+/// Run a module over its grid with one launch argument per parameter.
+///
+/// A tensor parameter's argument is its DRAM address; a scalar parameter's is
+/// its value, as CUDA's kernel parameter buffer holds values for scalars and
+/// addresses for pointers. A grid extent may be a launch-bound value too, so it
+/// is resolved here, before any core starts. The launch arguments are built
+/// here, not by the caller: the grid, this tile's coordinate, and each
+/// parameter's word(s). A count that disagrees with the module is refused.
+/// Every failure is a [`ttStatus`] variant; there is no second error channel
+/// and no string error.
+pub fn launch(module: &Module, params: &[u64]) -> Result<(), ttStatus> {
+    if module.params.len() != params.len() {
+        return Err(ttStatus::TT_ERROR_ARGUMENT);
+    }
+    let grid = resolve_grid(module, params)?;
+    if module.reader.is_empty()
+        && module.writer.is_empty()
+        && module.cores.iter().all(Vec::is_empty)
+    {
+        return Err(ttStatus::TT_ERROR_UNSUPPORTED);
+    }
+    with_device(|device| run(device, module, params, grid))
+}
+
+fn run(
+    device: &mut Device,
+    module: &Module,
+    params: &[u64],
+    grid: [u32; 2],
+) -> Result<(), ttStatus> {
+    // The two chips launch differently and neither path can stand in for the
+    // other: Blackhole runs its own firmware on five cores, Quasar has no such
+    // firmware and runs the two movers the module carries for it.
+    if device.arch() == crate::device::Architecture::Quasar {
+        let result = quasar_launch(device, module, params, grid);
+        if result.is_err() {
+            device.quasar_quiesce()?;
+        }
+        return result;
+    }
+    let result = launch_steps(device, module, params, grid);
+    if result.is_err() {
+        // A failed launch is a status, not a wedged tile: stop the cores this
+        // launch started and clear the mailboxes it wrote before returning, so
+        // the next launch starts from a known state. No `ttReset` exists; this
+        // is the driver's own cleanup.
+        device.quiesce()?;
+    }
+    result
 }
 
 /// The grid extent of one axis, from the launch's scalar arguments. Zero, a
@@ -607,11 +659,11 @@ fn grid_eval(
 }
 
 /// The arguments base of each data mover's array.
-fn args_at(niu: Niu) -> u32 {
+fn args_at(module: &Module, niu: Niu) -> u32 {
     if niu == Niu::Noc1 {
-        ARGS_WRITER
+        args_writer(module)
     } else {
-        ARGS_AT
+        args_reader(module)
     }
 }
 
@@ -628,53 +680,56 @@ fn args_for(
 ) -> Result<[(Niu, Vec<u32>); 2], ttStatus> {
     let mut arrays = [(Niu::Noc0, Vec::new()), (Niu::Noc1, Vec::new())];
     for (niu, args) in arrays.iter_mut() {
-        *args = vec![grid[0], grid[1], module.iface, me_hi(tile)];
+        // The collective tables: the sites every `expand` owns, and the
+        // logical-to-physical coordinate map a rectangle or a neighbour is
+        // named from. Neither depends on the tile, but both are per-tile
+        // addresses staged in L1, so they ride with the launch arguments the
+        // movers already read.
+        *args = vec![
+            grid[0],
+            grid[1],
+            module.iface,
+            me_hi(tile),
+            module.mcast_base,
+            module.coords,
+            grid[0],
+            grid[1],
+        ];
         for (index, kind) in module.params.iter().enumerate() {
             let word = params[index];
-            // A DRAM address is a channel and an offset inside it, and the two
-            // chips' channels are not the same size.
-            let channel_bytes = match device.arch() {
-                Architecture::Blackhole => tt_isa::arch::blackhole::dram::CHANNEL_BYTES,
-                Architecture::Quasar => tt_isa::arch::quasar::dram::CHANNEL_BYTES,
-            };
-            if *kind == crate::compile::ParamKind::Interleaved {
-                // A striped tensor: a pair per channel, then the count and the
-                // page, exactly what the mover's address arithmetic reads.
-                let layout = device
-                    .interleaved_at(word)
-                    .ok_or(ttStatus::TT_ERROR_ARGUMENT)?;
-                let mut pairs = 0u32;
-                for (bank, base) in layout.base.iter().enumerate() {
-                    let flat = u64::from(bank as u32) * channel_bytes + base;
-                    args.push((flat % channel_bytes) as u32);
-                    args.push(device.dram_hi(flat, *niu)?);
-                    pairs += 1;
-                }
-                for _ in pairs..crate::mover::MAX_BANKS as u32 {
-                    args.push(0);
-                    args.push(0);
-                }
-                args.push(pairs);
-                args.push(layout.page);
+            let channel_bytes = tt_isa::arch::blackhole::dram::CHANNEL_BYTES;
+            let crate::compile::ParamKind::Tensor { .. } = *kind else {
+                args.push(word as u32);
+                args.push(0);
                 continue;
-            }
-            let (low, high) = match kind {
-                crate::compile::ParamKind::Scalar => (word as u32, 0),
-                // A tensor names its channel's endpoint in the high word and
-                // the offset inside that channel in the low one, as tt-metal's
-                // `get_noc_addr_from_bank_id` does: the endpoint comes from the
-                // bank, the address is the bank-local offset
-                // (`dataflow_api_addrgen.h:516-533`).
-                _ => {
-                    let hi = device.dram_hi(word, *niu)?;
-                    ((word % channel_bytes) as u32, hi)
-                }
             };
-            args.push(low);
-            args.push(high);
+            // A tensor is a table of channel bases, then the count and the
+            // page: exactly what the mover's address arithmetic reads. Every
+            // DRAM tensor is allocated striped, so the handle always names its
+            // table; a tensor argument that is not an allocation is refused,
+            // never given a one-channel table it does not have.
+            let Some(layout) = device.interleaved_at(word) else {
+                return Err(ttStatus::TT_ERROR_ARGUMENT);
+            };
+            let bases = layout.base.clone();
+            let channels = layout.base.len() as u32;
+            let page = layout.page;
+            let mut pairs = 0u32;
+            for base in bases {
+                let flat = u64::from(pairs) * channel_bytes + base;
+                args.push((flat % channel_bytes) as u32);
+                args.push(device.dram_hi(flat, *niu)?);
+                pairs += 1;
+            }
+            for _ in pairs..crate::mover::MAX_BANKS as u32 {
+                args.push(0);
+                args.push(0);
+            }
+            args.push(channels);
+            args.push(page);
         }
-        if (args_at(*niu) as u64) + 4 * args.len() as u64
-            > tt_isa::arch::blackhole::l1::PROGRAM_CACHE.end
+        if (args_at(module, *niu) as u64) + 4 * args.len() as u64
+            > u64::from(module.program_end)
         {
             let _ = args.len();
             return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
@@ -724,8 +779,9 @@ fn launch_steps(
                     if polls == BARRIER_POLLS {
                         eprintln!(
                             "libskamandros: the DRAM barrier word at offset {DRAM_BARRIER:#x} of \
-                             channel {channel} still reads {:#010x}, not {flag:#010x}: the host's \
-                             writes are not reaching that channel",
+                             channel {} still reads {:#010x}, not {flag:#010x}: the host's writes \
+                             are not reaching that channel",
+                            channel,
                             u32::from_le_bytes(back)
                         );
                         return Err(ttStatus::TT_ERROR_DEVICE);
@@ -744,15 +800,6 @@ fn launch_steps(
             tiles.push(((x, y), device.tile_at(x, y)?));
         }
     }
-    for (name, words) in [("reader", &module.reader), ("writer", &module.writer)] {
-        if words.is_empty() {
-            continue;
-        }
-        if 4 * words.len() as u32 > SLOT_BYTES {
-            let _ = (name, words.len());
-            return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
-        }
-    }
     // Which programs this target can run: the card writes the unpacker's
     // tile-descriptor tail, which `ttsim` refuses, so the compiler emitted both
     // sets and the launch picks one (`Module::silicon_cores`).
@@ -762,6 +809,8 @@ fn launch_steps(
         &module.silicon_cores
     };
     let compute = cores.iter().any(|words| !words.is_empty());
+    // Where this launch's programs go: packed, at their own sizes.
+    let slots = Slots::new(module, cores)?;
     // Which processors the launch starts. Only RISCV B reads it: it starts the
     // reader's and the writer's cores and the three Tensors threads itself.
     let mut enables = 0u32;
@@ -788,7 +837,7 @@ fn launch_steps(
     // advances the ring pointers in it.
     let interface = &module.iface_words;
     let args_words = module.args_words as usize;
-    if 4 * args_words as u64 > u64::from(ARGS_WRITER - ARGS_AT) {
+    if 4 * args_words as u64 > u64::from(crate::device::ARGS_BLOCK) {
         return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
     }
     // The fan-out tree. One core issuing 120 workers' blocks and generations
@@ -837,8 +886,8 @@ fn launch_steps(
             plan.push((usize::MAX, columns[column][0]));
         }
     }
-    if u64::from(GROUPS_AT) + (lists.len() as u64) * u64::from(GROUPS_STRIDE)
-        > tt_isa::arch::blackhole::l1::PROGRAM_CACHE.end
+    if u64::from(groups_at(module)) + (lists.len() as u64) * u64::from(GROUPS_STRIDE)
+        > u64::from(module.program_end)
     {
         return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
     }
@@ -884,8 +933,10 @@ fn launch_steps(
         let [args, writer_args] = args_for(device, module, params, grid, *tile)?.map(|(_, v)| v);
         // Both arrays before the first core starts, not only as a side effect of
         // a mover run. Staged: a repeat launch writes only the words that differ.
-        device.stage_words(u64::from(ARGS_AT), &args)?;
-        device.stage_words(u64::from(ARGS_WRITER), &writer_args)?;
+        device.stage_words(u64::from(args_reader(module)), &args)?;
+        device.stage_words(u64::from(args_writer(module)), &writer_args)?;
+        let iface = device.read32(u64::from(args_reader(module)) + 8)?;
+        device.note_iface(iface);
         // The semaphore setup is placed here but not run: the descriptor names
         // it, and B runs it on T0 before it starts the roles, as BRISC
         // initialises the semaphores before it releases the TRISCs. It runs on
@@ -895,7 +946,7 @@ fn launch_steps(
         // kernel ~20% slower, as well as relying on an end state no code
         // guarantees).
         if compute && !module.setup.is_empty() {
-            device.place(slot(SLOT_SETUP), &module.setup)?;
+            device.place(slots.at[SLOT_SETUP as usize], &module.setup)?;
         }
 
         // The descriptor: the tiles this one fans out to, the width of the
@@ -910,13 +961,13 @@ fn launch_steps(
             Some(&lists[list_slot])
         };
         let setup = if compute && !module.setup.is_empty() {
-            (slot(SLOT_SETUP), module.setup.len() as u32)
+            (slots.at[SLOT_SETUP as usize], module.setup.len() as u32)
         } else {
             (0, 0)
         };
         let mut desc = vec![0u32; DESC_FIELDS as usize];
         desc[DESC_WORKERS as usize] =
-            list.map_or(0, |_| GROUPS_AT + list_slot as u32 * GROUPS_STRIDE);
+            list.map_or(0, |_| groups_at(module) + list_slot as u32 * GROUPS_STRIDE);
         // Zero when the host starts every tile itself: then no tile fans out,
         // and a launch the host has not finished staging is never started.
         desc[DESC_COUNT as usize] = if dispatchable {
@@ -925,7 +976,7 @@ fn launch_steps(
             0
         };
         desc[DESC_ARGS_WORDS as usize] = args_words as u32;
-        desc[DESC_WRITER_OFFSET as usize] = ARGS_WRITER - ARGS_AT;
+        desc[DESC_WRITER_OFFSET as usize] = crate::device::ARGS_BLOCK;
         desc[DESC_IFACE_WORDS as usize] = interface.len() as u32;
         desc[DESC_SETUP_ADDR as usize] = setup.0;
         desc[DESC_SETUP_WORDS as usize] = setup.1;
@@ -936,9 +987,40 @@ fn launch_steps(
         desc[DESC_DISPATCHER as usize] = parent;
         device.stage_words(descriptor_at(0), &desc)?;
         device.stage_words(descriptor_at(DESC_IFACE_AT), interface)?;
+        // The multicast sites' kernel semaphores: every tile starts with the
+        // credit and data words at zero and the four-byte semaphore at one.
+        // They return to that state after a launch that ran to completion (the
+        // sender drains its credits, the receivers clear their data words), so
+        // this is staged once with the programs, not rewritten per launch.
+        if module.mcast_sites != 0 {
+            // `arrive`, `credit`, `ret` start at zero and `one` at one; the
+            // rest of the block is the geometry's scratch.
+            let site_words = (crate::mir::McastSite::BYTES / 4) as usize;
+            let mut words = Vec::with_capacity(module.mcast_sites as usize * site_words);
+            for _ in 0..module.mcast_sites {
+                let mut site = vec![0u32; site_words];
+                site[(crate::mir::McastSite { base: 0 }.one() / 4) as usize] = 1;
+                words.extend_from_slice(&site);
+            }
+            device.stage_words(u64::from(module.mcast_base), &words)?;
+            // The logical-to-physical map a rectangle or a neighbour is named
+            // from. It is a property of the chip, not of the launch, so it is
+            // staged with the programs; a coordinate the grid cannot hold
+            // reads zero and is never named by a verified program.
+            let mut table = vec![0u32; crate::mir::COORDS_WORDS];
+            for y in 0..crate::mir::COORD_ROWS {
+                for x in 0..crate::mir::COORD_COLUMNS {
+                    let at = (y * crate::mir::COORD_COLUMNS + x) as usize;
+                    if let Ok(tile) = device.tile_at(x, y) {
+                        table[at] = u32::from(tile.packed());
+                    }
+                }
+            }
+            device.stage_words(u64::from(module.coords), &table)?;
+        }
         if let Some(list) = list {
             device.stage_words(
-                u64::from(GROUPS_AT + list_slot as u32 * GROUPS_STRIDE),
+                u64::from(groups_at(module) + list_slot as u32 * GROUPS_STRIDE),
                 list,
             )?;
         }
@@ -947,28 +1029,35 @@ fn launch_steps(
         // the enabled cores itself; the reader on B and the writer on NC
         // therefore run with the compute cores, not before or after them.
         if !module.reader.is_empty() {
-            device.place(slot(SLOT_READER), &module.reader)?;
+            device.place(slots.at[SLOT_READER as usize], &module.reader)?;
             device.prepare(
                 mailbox::launch::Mailbox::b(),
-                slot(SLOT_READER),
+                slots.at[SLOT_READER as usize],
                 module.reader.len() as u32,
-                ARGS_AT,
+                args_reader(module),
             )?;
         }
         if !module.writer.is_empty() {
-            device.place(slot(SLOT_WRITER), &module.writer)?;
+            device.place(slots.at[SLOT_WRITER as usize], &module.writer)?;
             device.prepare(
                 mailbox::launch::Mailbox::nc(),
-                slot(SLOT_WRITER),
+                slots.at[SLOT_WRITER as usize],
                 module.writer.len() as u32,
-                ARGS_WRITER,
+                args_writer(module),
             )?;
         }
         for (thread, words) in cores.iter().enumerate() {
             if words.is_empty() {
                 continue;
             }
-            stage_role(device, thread, words, ARGS_AT)?;
+            stage_role(
+                device,
+                thread,
+                slots.at[ROLE_SLOT[thread] as usize],
+                words,
+                args_reader(module),
+                module.program_end,
+            )?;
         }
         // B's launch message, on every tile: the host names the reader here,
         // and the generation below is the only word a launch writes. The
@@ -978,9 +1067,9 @@ fn launch_steps(
         let (text, words) = if module.reader.is_empty() {
             (0, 0)
         } else {
-            (slot(SLOT_READER), module.reader.len() as u32)
+            (slots.at[SLOT_READER as usize], module.reader.len() as u32)
         };
-        device.prepare(mb, text, words, ARGS_AT)?;
+        device.prepare(mb, text, words, args_reader(module))?;
         device.stage_words(mb.enables(), &[enables])?;
         if !dispatchable {
             // Every program and launch word of this tile is staged; the
@@ -1054,8 +1143,8 @@ fn dispatch_launch(
         );
     }
     let [args, writer_args] = args_for(device, module, params, grid, dispatcher)?.map(|(_, v)| v);
-    device.stage_words(u64::from(ARGS_AT), &args)?;
-    device.stage_words(u64::from(ARGS_WRITER), &writer_args)?;
+    device.stage_words(u64::from(args_reader(module)), &args)?;
+    device.stage_words(u64::from(args_writer(module)), &writer_args)?;
     // The generation is the store that lets B read what the host staged.
     device.l1_barrier()?;
     let mb = mailbox::launch::Mailbox::b();
@@ -1081,31 +1170,37 @@ const ROLE_ENABLE: [u32; 3] = [
 fn stage_role(
     device: &mut Device,
     thread: usize,
+    at: u32,
     words: &[u32],
     args_at: u32,
+    program_end: u32,
 ) -> Result<(), ttStatus> {
-    stage_at(device, thread, ROLE_SLOT[thread], words, args_at)
+    stage_at(device, thread, at, words, args_at, program_end)
 }
 
-/// [`stage_role`], in an explicit program-cache slot: the setup program runs on
-/// T0 too, but out of a slot of its own.
+/// [`stage_role`], at an explicit program-block address.
 fn stage_at(
     device: &mut Device,
     thread: usize,
-    slot_index: u32,
+    text: u32,
     words: &[u32],
     args_at: u32,
+    program_end: u32,
 ) -> Result<(), ttStatus> {
-    if words.is_empty() || words.len() as u32 > mailbox::MAX_WORDS {
-        let _ = (thread, words.len());
+    // The only limit is the module's kernel config block: a role's program may
+    // use every byte between its address and the launch arguments.
+    let room = u64::from(program_end - text);
+    if words.is_empty() || 4 * words.len() as u64 > room {
+        if std::env::var_os("SKAM_DEBUG").is_some() {
+            eprintln!(
+                "stage: thread {thread} program is {} words ({:#x} bytes), {room:#x} bytes of room",
+                words.len(),
+                4 * words.len() as u32
+            );
+        }
         return Err(ttStatus::TT_ERROR_ROLE_PROGRAM_SIZE);
     }
-    if 4 * words.len() as u32 > SLOT_BYTES {
-        let _ = (thread, words.len());
-        return Err(ttStatus::TT_ERROR_PROGRAM_AREA_SIZE);
-    }
     let mb = mailbox::launch::Mailbox::of(thread as u32);
-    let text = slot(slot_index);
     device.place(text, words)?;
     // The role's configuration words are host state the executor never
     // touches, so staging them costs nothing on a repeat launch.
@@ -1116,7 +1211,6 @@ fn stage_at(
         (mb.dump_row_count(), 0),
         (mb.trace(), 0),
         (mb.push_window(), 0),
-        (mb.unwedge(), 0),
         (mb.mop_cfg_valid(), 0),
     ] {
         device.stage_words(at, &[value])?;

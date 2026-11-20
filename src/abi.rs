@@ -167,9 +167,15 @@ pub unsafe extern "C" fn ttRelease(err: *mut *mut c_char) -> ttStatus {
     }
 }
 
-/// Reserve `bytes` of DRAM and write its address to `*addr`.
+/// Reserve `bytes` of DRAM in `page`-sized pages, striped across the DRAM
+/// channels, and write its handle to `*addr`.
 ///
-/// The address is opaque to the caller: pass it back to `ttMemcpyH2D`,
+/// `page` is the buffer's page size: the unit the host copies and the kernel
+/// reads, one 32x32 tile of the tensor's dtype. Page `p` lives on channel
+/// `p % channels`, at `base[channel] + (p / channels) * page`; the launch hands
+/// the kernel that table, so a program names page indices and never a layout.
+///
+/// The handle is opaque to the caller: pass it back to `ttMemcpyH2D`,
 /// `ttMemcpyD2H` and `ttLaunch`. Allocations are 64-byte aligned.
 ///
 /// # Safety
@@ -177,40 +183,6 @@ pub unsafe extern "C" fn ttRelease(err: *mut *mut c_char) -> ttStatus {
 /// `addr` and `err` must be writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ttMemAlloc(
-    bytes: usize,
-    addr: *mut u64,
-    err: *mut *mut c_char,
-) -> ttStatus {
-    clear(err);
-    if addr.is_null() {
-        return fail(ttStatus::TT_ERROR_ARGUMENT, err);
-    }
-    unsafe { *addr = 0 };
-    if bytes == 0 {
-        return fail(ttStatus::TT_ERROR_ARGUMENT, err);
-    }
-    match runtime::alloc(bytes) {
-        Ok(at) => {
-            unsafe { *addr = at };
-            ttStatus::TT_OK
-        }
-        Err(e) => fail(e, err),
-    }
-}
-
-/// Reserve a tensor whose pages are striped across the DRAM channels.
-///
-/// Page `p` lives on channel `p % channels`; the split is invisible to the
-/// caller, which copies the tensor page by page (`page` bytes each, the last
-/// one short) and passes the handle to a parameter declared `interleaved`. The
-/// program resolves each page's channel itself, so a tensor's reads are spread
-/// over every bank instead of one.
-///
-/// # Safety
-///
-/// `addr` and `err` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ttMemAllocInterleaved(
     bytes: usize,
     page: usize,
     addr: *mut u64,
@@ -224,7 +196,7 @@ pub unsafe extern "C" fn ttMemAllocInterleaved(
     if bytes == 0 || page == 0 {
         return fail(ttStatus::TT_ERROR_ARGUMENT, err);
     }
-    match runtime::alloc_interleaved(bytes, page) {
+    match runtime::alloc(bytes, page) {
         Ok(at) => {
             unsafe { *addr = at };
             ttStatus::TT_OK

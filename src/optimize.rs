@@ -12,6 +12,8 @@
 //! row-address modifier execute. The hand-offs between the three roles are
 //! derived here too ([`reg_sync`]), from the accesses themselves.
 
+use std::collections::BTreeMap;
+
 use crate::mir::{Core, Dst, MachineKernel, MirOp};
 use crate::status::ttStatus;
 
@@ -35,8 +37,32 @@ struct Access {
 }
 
 /// An ordered `(producer, consumer)` role edge: one Sync Unit semaphore carries
-/// every seam between those two roles.
-type Edge = (Core, Core);
+/// every seam between those two roles of one kind.
+///
+/// `kind` separates the two kinds of reuse seam a role pair can have. A *loop
+/// wrap* seam's take is the first write of a loop body and its post the last
+/// read, so its semaphore starts with one credit per hand-off the bodies
+/// perform: the first iteration overwrites nothing. That credit is fungible
+/// with any token on the same counter, and a straight-line seam's take would
+/// spend it: the peeled last block's second subblock then skipped waiting for
+/// its own first subblock's pack, and the packer read an accumulator the
+/// unpacker had already reseeded. Those credits must therefore never share a
+/// counter with a seam that has none, so the wrap seams of a role pair get
+/// their own semaphore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Edge {
+    producer: Core,
+    consumer: Core,
+    kind: EdgeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum EdgeKind {
+    /// A data or straight-line reuse seam, which starts at zero.
+    Seam,
+    /// A loop-wrap seam, whose semaphore starts with the hand-off credit.
+    Wrap,
+}
 
 /// The role hand-offs over the `Dst` slots.
 ///
@@ -103,9 +129,30 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
     // `Src`: an `UNPACR` writes `Dst` only when its unit is on the `Dst` path.
     let mut target: Option<Dst> = None;
     let mut to_src = [false; 2];
-    // One bucket per `Dst` the lowering minted: before `alloc` an id is a name,
-    // not a hardware register, so the slab's length is the right size.
-    let mut touches: Vec<Vec<Access>> = vec![Vec::new(); usize::from(m.dsts.len())];
+    // The hand-off is per `Dst` section, not per register: a block value's
+    // tiles are one unit, so math and pack hand the whole section over with one
+    // pair of hand-offs, exactly tt-metal's `tile_regs_commit` and
+    // `tile_regs_wait` around a whole `out_subblock_num_tiles`
+    // (`bmm_large_block_zm.cpp:55-110`). A register that is not part of a block
+    // is a section of its own.
+    let mut section_of: BTreeMap<Dst, usize> = BTreeMap::new();
+    let mut sections: Vec<Vec<Dst>> =
+        Vec::with_capacity(usize::from(m.dsts.len()) + m.sections.len());
+    for group in &m.sections {
+        let index = sections.len();
+        sections.push(group.clone());
+        for reg in group {
+            section_of.insert(*reg, index);
+        }
+    }
+    for (reg, _) in m.dsts.iter() {
+        if !section_of.contains_key(&reg) {
+            section_of.insert(reg, sections.len());
+            sections.push(vec![reg]);
+        }
+    }
+    // One bucket per section, filled in program order.
+    let mut touches: Vec<Vec<Access>> = vec![Vec::new(); sections.len()];
     for (at, (role, op)) in ops.iter().enumerate() {
         let mut touched: Vec<(Dst, bool)> = Vec::new();
         match *op {
@@ -126,8 +173,16 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
             MirOp::Sfpstore { reg, .. } => touched.push((reg, true)),
             MirOp::Sfpload { reg, .. } => touched.push((reg, false)),
             // The Matrix Unit's accumulator: `MVMUL` carries the register it
-            // accumulates into.
-            MirOp::Mvmul { reg, .. } => touched.push((reg, true)),
+            // accumulates into. It reads the rows it writes -- that is what
+            // `accumulate` means, and it is how a page the unpacker seeded into
+            // `Dst` (tt-metal's `copy_tile` reload of the partial sum,
+            // `bmm_large_block_zm.cpp:56-68`) reaches the unit: the read comes
+            // before the write, so the hand-off is the seed's write edge, not
+            // the unit's own.
+            MirOp::Mvmul { reg, .. } => {
+                touched.push((reg, false));
+                touched.push((reg, true));
+            }
             MirOp::Elw { reg, .. }
             | MirOp::Gapool { reg, .. }
             | MirOp::Gmpool { reg, .. }
@@ -151,7 +206,12 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
             _ => {}
         }
         for (reg, write) in touched {
-            touches[usize::from(reg.0)].push(Access {
+            let section = *section_of.get(&reg).ok_or_else(|| {
+                crate::status::internal_bug(format_args!(
+                    "reg_sync: `Dst` {reg:?} is in no section"
+                ))
+            })?;
+            touches[section].push(Access {
                 at,
                 role: *role,
                 write,
@@ -245,9 +305,6 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
     // `(edge, post position, take position)`: a post after the slot's last
     // reader and the take before the same slot's next writer.
     let mut seams: Vec<(Edge, usize, usize)> = Vec::new();
-    // Loop-pacing edges, counted per body: the semaphore starts with one token
-    // per hand-off the body performs.
-    let mut reuse: Vec<(Edge, usize, u8)> = Vec::new();
     for events in &touches {
         // One epoch per write: the data an epoch publishes is what the reads
         // that follow it (before the next write) consume.
@@ -267,7 +324,11 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
         for (n, ((writer, write_at), readers)) in epochs.iter().enumerate() {
             for &(reader, first, _) in readers {
                 data.push((
-                    (*writer, reader),
+                    Edge {
+                        producer: *writer,
+                        consumer: reader,
+                        kind: EdgeKind::Seam,
+                    },
                     hoist_end(*write_at, first),
                     hoist_begin(*write_at, first),
                     *write_at,
@@ -280,7 +341,15 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
             if let Some(((next_writer, next_write), _)) = epochs.get(n + 1) {
                 for &(reader, _, last) in readers {
                     if reader != *next_writer && scope(last) == scope(*next_write) {
-                        seams.push(((reader, *next_writer), last + 1, *next_write));
+                        seams.push((
+                            Edge {
+                                producer: reader,
+                                consumer: *next_writer,
+                                kind: EdgeKind::Seam,
+                            },
+                            last + 1,
+                            *next_write,
+                        ));
                     }
                 }
             }
@@ -299,14 +368,42 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
             if w.role == r.role {
                 continue;
             }
-            seams.push(((r.role, w.role), r.at + 1, w.at));
-            match reuse
-                .iter_mut()
-                .find(|(edge, body, _)| *edge == (r.role, w.role) && *body == *start)
-            {
-                Some(count) => count.2 += 1,
-                None => reuse.push(((r.role, w.role), *start, 1)),
-            }
+            let edge = Edge {
+                producer: r.role,
+                consumer: w.role,
+                kind: EdgeKind::Wrap,
+            };
+            seams.push((edge, r.at + 1, w.at));
+        }
+    }
+    // One hand-off, however many bodies name it. Nested loops report the same
+    // first write and last read for each level that contains the section, and
+    // only the innermost body actually runs the hand-off; counting the levels
+    // separately started the semaphore with tokens no post would ever match,
+    // and the consumer then ran a whole section ahead of its producer.
+    seams.sort_unstable();
+    seams.dedup();
+    // A pacing semaphore starts with exactly the tokens the program takes
+    // before its first post: a take whose position is past the edge's first
+    // post needs no credit, because at runtime it finds that post's token. A
+    // token too many is not a deadlock but worse -- the consumer runs a whole
+    // section ahead and overwrites `Dst` while the producer still reads it,
+    // and only some of the tiles are lost.
+    let mut first_post: BTreeMap<Edge, usize> = BTreeMap::new();
+    for &(edge, post, _) in &seams {
+        first_post
+            .entry(edge)
+            .and_modify(|first| *first = (*first).min(post))
+            .or_insert(post);
+    }
+    let mut reuse: Vec<(Edge, usize, u8)> = Vec::new();
+    for &(edge, post, take) in &seams {
+        if edge.kind != EdgeKind::Wrap || take >= first_post[&edge] {
+            continue;
+        }
+        match reuse.iter_mut().find(|(e, _, _)| *e == edge) {
+            Some(count) => count.2 = count.2.saturating_add(1),
+            None => reuse.push((edge, post, 1)),
         }
     }
     if data.is_empty() && seams.is_empty() {
@@ -331,6 +428,17 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
             tt_isa::arch::blackhole::sync::Semaphore::COUNT
         )));
     }
+    if std::env::var("SKAM_EDGES").is_ok() {
+        for (i, e) in edges.iter().enumerate() {
+            eprintln!("SKAM_EDGES sem{i} = {e:?}");
+        }
+        for (edge, post, take) in &seams {
+            eprintln!("SKAM_EDGES seam {edge:?} post@{post} take@{take}");
+        }
+        for (edge, post, take, epoch) in &data {
+            eprintln!("SKAM_EDGES data {edge:?} post@{post} take@{take} epoch@{epoch}");
+        }
+    }
     let sem = |edge: Edge| -> Result<u8, ttStatus> {
         match edges.iter().position(|e| *e == edge) {
             Some(index) => Ok(index as u8),
@@ -351,19 +459,28 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
     // The rank of each data post on its edge within its body: the n-th post of
     // that edge in that scope.
     let mut rank: Vec<(usize, Option<(usize, usize)>, usize)> = Vec::new();
-    let mut counted: Vec<(Edge, Option<(usize, usize)>, usize)> = Vec::new();
+    // Ranked by *distinct* posting position, because the posts below collapse
+    // two posts at one position into one publish (the token carries no
+    // identity). Ranking every post while publishing one per position gave a
+    // take three more waits per accumulator section than there were tokens,
+    // and the Sync Unit's four-bit count then stalled the producer once enough
+    // output blocks had gone by -- a hang the simulator, whose `SEMPOST` into a
+    // full semaphore is only verified, never shows.
+    let mut counted: Vec<(Edge, Option<(usize, usize)>, usize, usize)> = Vec::new();
     let mut data_posts: Vec<&(Edge, usize, usize, usize)> = data.iter().collect();
     data_posts.sort_by_key(|(_, post, _, _)| *post);
     for (edge, post, _, epoch) in &data_posts {
         let at = scope(*post);
-        let n = match counted.iter().position(|(e, s, _)| e == edge && *s == at) {
-            Some(i) => {
-                counted[i].2 += 1;
-                counted[i].2
-            }
+        let where_ = post_at(*post);
+        let n = match counted
+            .iter()
+            .find(|(e, s, p, _)| e == edge && *s == at && *p == where_)
+        {
+            Some(k) => k.3,
             None => {
-                counted.push((*edge, at, 1));
-                1
+                let n = counted.iter().filter(|(e, s, _, _)| e == edge && *s == at).count() + 1;
+                counted.push((*edge, at, where_, n));
+                n
             }
         };
         rank.push((*epoch, at, n));
@@ -395,7 +512,7 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
             inserts.push((
                 take_at(*take),
                 (
-                    edge.1,
+                    edge.consumer,
                     MirOp::SemWait {
                         sem: sem(*edge)?,
                         before: 0,
@@ -460,7 +577,7 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
             inserts.push((
                 take_at(take),
                 (
-                    edge.1,
+                    edge.consumer,
                     MirOp::SemWait {
                         sem: sem(edge)?,
                         before: 0,
@@ -475,14 +592,31 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
         // front of what is already there: the post goes in first, so the guard
         // ends up before it.
         let at = post_at(at);
-        inserts.push((at, (edge.0, MirOp::SemPost { sem: sem(edge)? })));
-        inserts.push((at, (edge.0, MirOp::SemWaitFree { sem: sem(edge)? })));
+        inserts.push((at, (edge.producer, MirOp::SemPost { sem: sem(edge)? })));
+        inserts.push((at, (edge.producer, MirOp::SemWaitFree { sem: sem(edge)? })));
     }
     // Each data post is one token, guarded like every other post.
+    //
+    // Two posts of one edge at one position are one publish: the token carries
+    // no identity, and the consumer takes one token for the reads it finds
+    // there. A body whose slot is written inside a loop and read after it
+    // hoists every slot's post to the loop's end, so a section of four
+    // accumulators put four posts in a row there while the packer took one --
+    // three tokens per section that nobody spent, and the fourth section's
+    // math blocked in `SemWaitFree` against the Sync Unit's maximum. That is a
+    // hang no simulator shows (`SEMPOST` into a full semaphore is a
+    // non-contractual verify there, a stalled thread here), and it grows with
+    // the number of output blocks, which is why the one-block program passed
+    // and the reuse kernel never finished.
+    let mut posted: Vec<(Edge, Option<(usize, usize)>, usize)> = Vec::new();
     for (edge, post, _, _) in &data {
-        let post = post_at(*post);
-        inserts.push((post, (edge.0, MirOp::SemPost { sem: sem(*edge)? })));
-        inserts.push((post, (edge.0, MirOp::SemWaitFree { sem: sem(*edge)? })));
+        let at = post_at(*post);
+        if posted.contains(&(*edge, scope(*post), at)) {
+            continue;
+        }
+        posted.push((*edge, scope(*post), at));
+        inserts.push((at, (edge.producer, MirOp::SemPost { sem: sem(*edge)? })));
+        inserts.push((at, (edge.producer, MirOp::SemWaitFree { sem: sem(*edge)? })));
     }
     // Apply from the back, so the earlier positions stay valid.
     inserts.sort_by(|a, b| b.0.cmp(&a.0));
@@ -493,13 +627,18 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
     // the run's semaphore inits, before any role is released.
     let mut inits: Vec<(Core, MirOp)> = Vec::new();
     for (index, edge) in edges.iter().enumerate() {
-        let value = reuse
+        // One token per hand-off the *whole* program performs before it posts:
+        // every nested body that paces on this edge contributes its own, and a
+        // single iteration takes all of them before the first post. Taking the
+        // largest body alone under-counts a nested program and deadlocks on its
+        // first iteration (a two-deep body takes two tokens and a one-token
+        // semaphore has one).
+        let value: u32 = reuse
             .iter()
             .filter(|(e, _, _)| e == edge)
-            .map(|(_, _, count)| *count)
-            .max()
-            .unwrap_or(0);
-        if value > tt_isa::arch::blackhole::sync::MAX_VALUE {
+            .map(|(_, _, count)| u32::from(*count))
+            .sum();
+        if value > u32::from(tt_isa::arch::blackhole::sync::MAX_VALUE) {
             return Err(crate::status::internal_bug(format_args!(
                 "reg_sync: edge {edge:?} performs {value} loop hand-offs per iteration, more than the {} a semaphore can start with",
                 tt_isa::arch::blackhole::sync::MAX_VALUE
@@ -509,7 +648,7 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
             Core::Unpack,
             MirOp::Semset {
                 sem: index as u8,
-                value,
+                value: value as u8,
             },
         ));
     }
@@ -755,7 +894,7 @@ pub fn verify(m: &MachineKernel) -> Result<(), ttStatus> {
                     }
                 }
                 MirOp::SetUnpackBase { cb, .. }
-                | MirOp::SetPackBase { cb }
+                | MirOp::SetPackBase { cb, .. }
                 | MirOp::CbWait { cb, .. }
                 | MirOp::CbPop { cb, .. }
                 | MirOp::CbReserve { cb, .. }
@@ -910,7 +1049,7 @@ pub fn verify(m: &MachineKernel) -> Result<(), ttStatus> {
                 MirOp::Loop { count } => {
                     let _ = count;
                     depth += 1;
-                    if depth > 2 {
+                    if depth > 5 {
                         let _ = (name, at, depth);
                         return Err(ttStatus::TT_TODO_LOOP_DEPTH);
                     }
@@ -918,7 +1057,7 @@ pub fn verify(m: &MachineKernel) -> Result<(), ttStatus> {
                 MirOp::LoopReg { reg } => {
                     let _ = reg;
                     depth += 1;
-                    if depth > 2 {
+                    if depth > 5 {
                         let _ = (name, at, depth);
                         return Err(ttStatus::TT_TODO_LOOP_DEPTH);
                     }
@@ -932,8 +1071,14 @@ pub fn verify(m: &MachineKernel) -> Result<(), ttStatus> {
                 | MirOp::CmdbufWrReg { .. }
                 | MirOp::CmdbufIssue { .. }
                 | MirOp::RoccPoll { .. }
+                | MirOp::L1PollNonZero { .. }
+                | MirOp::L1PollBelow { .. }
                 | MirOp::IArith { .. }
                 | MirOp::Cmov { .. } => {}
+                // A multicast copy's conditional bodies live on the movers,
+                // which this check does not walk; the encoder checks their
+                // nesting.
+                MirOp::IfNonZero { .. } | MirOp::EndIf => {}
                 MirOp::EndLoop => {
                     depth = depth.checked_sub(1).ok_or_else(|| {
                         let _ = (name, at);
@@ -958,7 +1103,6 @@ mod tests {
     use crate::mir::LReg;
 
     const NEG: &str = "\
-version 9
 grid 1,1
 %in = param f32 4096
 %out = param f32 4096

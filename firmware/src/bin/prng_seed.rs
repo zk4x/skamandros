@@ -28,7 +28,7 @@ pub extern "Rust" fn firmware_main() -> ! {
         || len == 0
         || len > mailbox::MAX_WORDS
         || program == 0
-        || !tt_isa::arch::blackhole::l1::PROGRAM_CACHE.contains(u64::from(program), u64::from(len) * 4)
+        || !tt_isa::arch::blackhole::l1::program_fits(u64::from(program), u64::from(len) * 4)
     {
         fail(panic_code::EXPLICIT);
     }

@@ -106,8 +106,7 @@ type ModuleUnload = unsafe extern "C" fn(*mut c_void, *mut *mut c_char) -> c_int
 type Free = unsafe extern "C" fn(*mut c_void);
 type Init = unsafe extern "C" fn(*mut *mut c_char) -> c_int;
 type Release = unsafe extern "C" fn(*mut *mut c_char) -> c_int;
-type MemAlloc = unsafe extern "C" fn(usize, *mut u64, *mut *mut c_char) -> c_int;
-type MemAllocInterleaved = unsafe extern "C" fn(usize, usize, *mut u64, *mut *mut c_char) -> c_int;
+type MemAlloc = unsafe extern "C" fn(usize, usize, *mut u64, *mut *mut c_char) -> c_int;
 type MemcpyH2D = unsafe extern "C" fn(u64, *const u8, usize, *mut *mut c_char) -> c_int;
 type MemcpyD2H = unsafe extern "C" fn(*mut u8, u64, usize, *mut *mut c_char) -> c_int;
 type Launch = unsafe extern "C" fn(*mut c_void, *const u64, usize, *mut *mut c_char) -> c_int;
@@ -185,7 +184,6 @@ fn build_library(path: &Path) {
 }
 
 const COPY: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -236,7 +234,7 @@ fn a_refused_program_comes_back_as_an_error_not_a_crash() {
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
 
-    let bad = "version 9\ngrid 1,1\n%out = param f32 1024\n%x = neg %y\n";
+    let bad = "grid 1,1\n%out = param f32 1024\n%x = neg %y\n";
     let mut module: *mut c_void = std::ptr::null_mut();
     let mut err: *mut c_char = std::ptr::null_mut();
     let code = unsafe { compile(bad.as_ptr().cast(), bad.len(), &mut module, &mut err) };
@@ -295,7 +293,7 @@ fn the_error_codes_are_the_documented_ones() {
 
     // Argument checks that need no device.
     let mut addr = 0u64;
-    assert_eq!(unsafe { alloc(0, &mut addr, &mut err) }, TT_ERROR_ARGUMENT);
+    assert_eq!(unsafe { alloc(0, 4096, &mut addr, &mut err) }, TT_ERROR_ARGUMENT);
     assert_eq!(addr, 0);
     let _ = take_error(&free, err);
     let host = [0u8; 4];
@@ -315,7 +313,6 @@ fn the_error_codes_are_the_documented_ones() {
 /// A copy kernel over a two-page buffer: DRAM into L1, and the same L1 buffer
 /// back into DRAM, in 32x32 units.
 const COPY_8K: &str = "\
-version 9
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
@@ -323,13 +320,12 @@ grid 1,1
 copy 32,32 %b0 [0] = %in [0]
 copy 32,32 %b0 [1] = %in [1]
 copy 32,32 %out [0] = %b0 [0]
-copy 32,32 %out [1] = %b0 [0]
+copy 32,32 %out [1] = %b0 [1]
 ";
 
 /// One 32x32 tile through the datapath: DRAM into L1, unpack, negate, pack,
 /// L1 into DRAM. The program names no core, no `Dst` slot and no unpacker.
 const NEG_TILE: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -346,7 +342,6 @@ copy 32,32 %out [0] = %bo [0]
 /// the step are constants, so the loop becomes a RISC-V branch in the movers and
 /// each iteration's addresses are computed from the counter.
 const NEG_TWO_TILES: &str = "\
-version 9
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
@@ -356,11 +351,38 @@ grid 1,1
 %step = const i32 1
 %i = loop %two
 %o = mul %i %step
-copy 32,32 %bi [%o] = %in [%o]
-load 32,32 %x = %bi [%o]
+copy 32,32 %bi [0] = %in [%o]
+load 32,32 %x = %bi [0]
 %y = neg %x
-store 32,32 %bo [%o] = %y
-copy 32,32 %out [%o] = %bo [%o]
+store 32,32 %bo [0] = %y
+copy 32,32 %out [%o] = %bo [0]
+endloop
+";
+
+/// Three nested loops in a compute role, the depth tt-metal's matmul body uses
+/// (k-block, output subblock, `inner_dim`; `bmm_large_block_zm.cpp:46-118`).
+/// The inner two run once here so the test is about the counters, not the math:
+/// the third pair is `s0`/`s1`, and a clobber would show as a wrong datum.
+const NEG_THREE_DEEP: &str = "\
+grid 1,1
+%in = param f32 2048
+%out = param f32 2048
+%bi = buffer f32 32,64
+%bo = buffer f32 32,64
+%two = const i32 2
+%one = const i32 1
+%step = const i32 1
+%i = loop %two
+%o = mul %i %step
+%j = loop %one
+%k = loop %one
+copy 32,32 %bi [0] = %in [%o]
+load 32,32 %x = %bi [0]
+%y = neg %x
+store 32,32 %bo [0] = %y
+copy 32,32 %out [%o] = %bo [0]
+endloop
+endloop
 endloop
 ";
 
@@ -369,7 +391,6 @@ endloop
 /// start row is its `W` counter, set per pack (`SETADC`, tt-metal's
 /// `set_dst_write_addr`); a packer stuck on row 0 repeats the first value.
 const NEG_TWO_LIVE: &str = "\
-version 9
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
@@ -384,14 +405,13 @@ load 32,32 %b = %bi [1]
 store 32,32 %bo [0] = %na
 store 32,32 %bo [1] = %nb
 copy 32,32 %out [0] = %bo [0]
-copy 32,32 %out [1] = %bo [0]
+copy 32,32 %out [1] = %bo [1]
 ";
 
 /// The same elementwise kernel with no buffer and no `copy_to`: the parameter is
 /// named directly and `mover::add_movers` supplies the staging and the traffic,
 /// as zyx's `tt_add_movers` does.
 const NEG_TILE_DIRECT: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -424,13 +444,13 @@ fn a_copy_kernel_runs_on_the_simulator() {
 
     let (mut input, mut output) = (0u64, 0u64);
     assert_eq!(
-        unsafe { alloc(8192, &mut input, &mut err) },
+        unsafe { alloc(8192, 4096, &mut input, &mut err) },
         TT_OK,
         "input: {}",
         take_error(&free, err)
     );
     assert_eq!(
-        unsafe { alloc(8192, &mut output, &mut err) },
+        unsafe { alloc(8192, 4096, &mut output, &mut err) },
         TT_OK,
         "output: {}",
         take_error(&free, err)
@@ -489,7 +509,6 @@ fn a_copy_kernel_runs_on_the_simulator() {
 #[test]
 fn a_hash_comment_runs_to_the_end_of_its_line() {
     const ANNOTATED: &str = "\
-version 9           # the only version this build reads
 grid 1,1            # one tile, one core
 %in = param f32 1024
 %out = param f32 1024
@@ -531,13 +550,13 @@ fn an_elementwise_kernel_runs_on_the_simulator() {
     let bytes = 1024 * 4;
     let (mut input, mut output) = (0u64, 0u64);
     assert_eq!(
-        unsafe { alloc(bytes, &mut input, &mut err) },
+        unsafe { alloc(bytes, 4096, &mut input, &mut err) },
         TT_OK,
         "input: {}",
         take_error(&free, err)
     );
     assert_eq!(
-        unsafe { alloc(bytes, &mut output, &mut err) },
+        unsafe { alloc(bytes, 4096, &mut output, &mut err) },
         TT_OK,
         "output: {}",
         take_error(&free, err)
@@ -623,13 +642,13 @@ fn two_live_values_pack_from_their_own_dst_rows() {
     let bytes = 2048 * 4;
     let (mut input, mut output) = (0u64, 0u64);
     assert_eq!(
-        unsafe { alloc(bytes, &mut input, &mut err) },
+        unsafe { alloc(bytes, 4096, &mut input, &mut err) },
         TT_OK,
         "input: {}",
         take_error(&free, err)
     );
     assert_eq!(
-        unsafe { alloc(bytes, &mut output, &mut err) },
+        unsafe { alloc(bytes, 4096, &mut output, &mut err) },
         TT_OK,
         "output: {}",
         take_error(&free, err)
@@ -711,7 +730,7 @@ fn a_direct_parameter_kernel_runs_on_the_simulator() {
     let (mut input, mut output) = (0u64, 0u64);
     for (name, at) in [("input", &mut input), ("output", &mut output)] {
         assert_eq!(
-            unsafe { alloc(bytes, at, &mut err) },
+            unsafe { alloc(bytes, 4096, at, &mut err) },
             TT_OK,
             "{name}: {}",
             take_error(&free, err)
@@ -792,13 +811,13 @@ fn a_constant_loop_runs_on_the_simulator() {
     let bytes = count * 4;
     let (mut input, mut output) = (0u64, 0u64);
     assert_eq!(
-        unsafe { alloc(bytes, &mut input, &mut err) },
+        unsafe { alloc(bytes, 4096, &mut input, &mut err) },
         TT_OK,
         "input: {}",
         take_error(&free, err)
     );
     assert_eq!(
-        unsafe { alloc(bytes, &mut output, &mut err) },
+        unsafe { alloc(bytes, 4096, &mut output, &mut err) },
         TT_OK,
         "output: {}",
         take_error(&free, err)
@@ -857,12 +876,156 @@ fn a_constant_loop_runs_on_the_simulator() {
     );
 }
 
+/// [`NEG_THREE_DEEP`] without a compute body: a copy in and a copy out under
+/// three loops, which exercises the movers' third counter pair alone.
+const COPY_THREE_DEEP: &str = "\
+grid 1,1
+%in = param f32 2048
+%out = param f32 2048
+%bi = buffer f32 32,64
+%two = const i32 2
+%one = const i32 1
+%step = const i32 1
+%i = loop %two
+%o = mul %i %step
+%j = loop %one
+%k = loop %one
+copy 32,32 %bi [0] = %in [%o]
+copy 32,32 %out [%o] = %bi [%o]
+endloop
+endloop
+endloop
+";
+
+/// [`COPY_THREE_DEEP`] with the callee-saved bank all the way down: five
+/// nested loops, so the two deeper counter pairs (`s2`/`s3`, `s4`/`s5`) are
+/// taken, saved and restored around the movers' program.
+const COPY_FIVE_DEEP: &str = "\
+grid 1,1
+%in = param f32 2048
+%out = param f32 2048
+%bi = buffer f32 32,64
+%two = const i32 2
+%one = const i32 1
+%step = const i32 1
+%i = loop %two
+%o = mul %i %step
+%j = loop %one
+%k = loop %one
+%l = loop %one
+%m = loop %one
+copy 32,32 %bi [0] = %in [%o]
+copy 32,32 %out [%o] = %bi [%o]
+endloop
+endloop
+endloop
+endloop
+endloop
+";
+
+/// The movers under five loops: the third, fourth and fifth counter pairs all
+/// sit in the callee-saved bank, so this is the save/restore bracket and the
+/// index registers at once.
+#[test]
+fn a_five_deep_copy_runs_on_the_simulator() {
+    let host: Vec<f32> = (0..2048).map(|i| i as f32 * 0.5).collect();
+    let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_launches(COPY_FIVE_DEEP, &[], &[&bytes], &[], 2048 * 4, 1).0;
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(got, host, "the copies moved both tiles");
+}
+
+/// [`NEG_THREE_DEEP`] under five loops: the compute roles' fourth and fifth
+/// counter pairs, with the `Dst` hand-off inside them.
+const NEG_FIVE_DEEP: &str = "\
+grid 1,1
+%in = param f32 2048
+%out = param f32 2048
+%bi = buffer f32 32,64
+%bo = buffer f32 32,64
+%two = const i32 2
+%one = const i32 1
+%step = const i32 1
+%i = loop %two
+%o = mul %i %step
+%j = loop %one
+%k = loop %one
+%l = loop %one
+%m = loop %one
+copy 32,32 %bi [0] = %in [%o]
+load 32,32 %x = %bi [0]
+%y = neg %x
+store 32,32 %bo [0] = %y
+copy 32,32 %out [%o] = %bo [0]
+endloop
+endloop
+endloop
+endloop
+endloop
+";
+
+#[test]
+fn a_five_deep_loop_runs_on_the_simulator() {
+    let host: Vec<f32> = (0..2048)
+        .map(|i| {
+            let v = (i as f32 - 1024.0) * 0.125;
+            if i % 7 == 0 { -v } else { v }
+        })
+        .collect();
+    let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_launches(NEG_FIVE_DEEP, &[], &[&bytes], &[], 2048 * 4, 1).0;
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (i, (x, y)) in host.iter().zip(&got).enumerate() {
+        assert_eq!(*y, -*x, "datum {i}: {x} negated is {}", -*x);
+    }
+}
+
+/// The movers under three loops: if this runs, the third counter pair is sound
+/// and a failure of [`NEG_THREE_DEEP`] is the `Dst` hand-off's placement.
+#[test]
+fn a_three_deep_copy_runs_on_the_simulator() {
+    let host: Vec<f32> = (0..2048).map(|i| i as f32 * 0.5).collect();
+    let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_launches(COPY_THREE_DEEP, &[], &[&bytes], &[], 2048 * 4, 1).0;
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(got, host, "the copies moved both tiles");
+}
+
+/// [`NEG_THREE_DEEP`]: the third loop level runs, and the counters do not
+/// collide with the registers the role's own code uses.
+#[test]
+fn a_three_deep_loop_runs_on_the_simulator() {
+    let host: Vec<f32> = (0..2048)
+        .map(|i| {
+            let v = (i as f32 - 1024.0) * 0.125;
+            if i % 7 == 0 { -v } else { v }
+        })
+        .collect();
+    let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_launches(NEG_THREE_DEEP, &[], &[&bytes], &[], 2048 * 4, 1).0;
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (i, (x, y)) in host.iter().zip(&got).enumerate() {
+        assert_eq!(*y, -*x, "datum {i}: {x} negated is {}", -*x);
+    }
+}
+
 /// The unary and binary ops the SFPU has an encoding for, run through the C ABI:
 /// `abs` on one loaded tile, and `add`/`sub`/`mul` on two.
 #[test]
 fn arithmetic_ops_run_on_the_simulator() {
     const TWO_LOAD: &str = "\
-version 9
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
@@ -877,7 +1040,6 @@ store 32,32 %bo [0] = %r
 copy 32,32 %out [0] = %bo [0]
 ";
     const ONE_LOAD: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -912,13 +1074,13 @@ copy 32,32 %out [0] = %bo [0]
 
     let (mut input, mut output) = (0u64, 0u64);
     assert_eq!(
-        unsafe { alloc(8192, &mut input, &mut err) },
+        unsafe { alloc(8192, 4096, &mut input, &mut err) },
         TT_OK,
         "input: {}",
         take_error(&free, err)
     );
     assert_eq!(
-        unsafe { alloc(8192, &mut output, &mut err) },
+        unsafe { alloc(8192, 4096, &mut output, &mut err) },
         TT_OK,
         "output: {}",
         take_error(&free, err)
@@ -1017,7 +1179,6 @@ copy 32,32 %out [0] = %bo [0]
 #[test]
 fn comparisons_select_and_max_run_on_the_simulator() {
     const TEMPLATE: &str = "\
-version 9
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
@@ -1058,7 +1219,7 @@ copy 32,32 %out [0] = %bo [0]
         (8192, &mut output, "output"),
     ] {
         assert_eq!(
-            unsafe { alloc(bytes, addr, &mut err) },
+            unsafe { alloc(bytes, 4096, addr, &mut err) },
             TT_OK,
             "{name}: {}",
             take_error(&free, err)
@@ -1138,7 +1299,6 @@ copy 32,32 %out [0] = %bo [0]
 #[test]
 fn bitwise_ops_run_on_the_simulator() {
     const TWO_LOAD: &str = "\
-version 9
 grid 1,1
 %in = param i32 2048
 %out = param i32 2048
@@ -1153,7 +1313,6 @@ store 32,32 %bo [0] = %r
 copy 32,32 %out [0] = %bo [0]
 ";
     const ONE_LOAD: &str = "\
-version 9
 grid 1,1
 %in = param i32 1024
 %out = param i32 1024
@@ -1192,7 +1351,7 @@ copy 32,32 %out [0] = %bo [0]
         (8192, &mut output, "output"),
     ] {
         assert_eq!(
-            unsafe { alloc(bytes, addr, &mut err) },
+            unsafe { alloc(bytes, 4096, addr, &mut err) },
             TT_OK,
             "{name}: {}",
             take_error(&free, err)
@@ -1268,7 +1427,6 @@ copy 32,32 %out [0] = %bo [0]
 /// count is a scalar argument, loaded by the movers and by each compute role,
 /// and branched on in RISC-V; both tiles come back negated.
 const NEG_SYMBOLIC_LOOP: &str = "\
-version 9
 grid 1,1
 %n = param i32 0
 %in = param f32 2048
@@ -1278,11 +1436,11 @@ grid 1,1
 %step = const i32 1
 %i = loop %n
 %o = mul %i %step
-copy 32,32 %bi [%o] = %in [%o]
-load 32,32 %x = %bi [%o]
+copy 32,32 %bi [0] = %in [%o]
+load 32,32 %x = %bi [0]
 %y = neg %x
-store 32,32 %bo [%o] = %y
-copy 32,32 %out [%o] = %bo [%o]
+store 32,32 %bo [0] = %y
+copy 32,32 %out [%o] = %bo [0]
 endloop
 ";
 
@@ -1312,13 +1470,13 @@ fn a_symbolic_loop_bound_runs_on_the_simulator() {
     let bytes = count * 4;
     let (mut input, mut output) = (0u64, 0u64);
     assert_eq!(
-        unsafe { alloc(bytes, &mut input, &mut err) },
+        unsafe { alloc(bytes, 4096, &mut input, &mut err) },
         TT_OK,
         "input: {}",
         take_error(&free, err)
     );
     assert_eq!(
-        unsafe { alloc(bytes, &mut output, &mut err) },
+        unsafe { alloc(bytes, 4096, &mut output, &mut err) },
         TT_OK,
         "output: {}",
         take_error(&free, err)
@@ -1374,7 +1532,6 @@ fn a_symbolic_loop_bound_runs_on_the_simulator() {
 /// A symbolic `2,2` grid: each of the four tiles negates its own slice, selected
 /// from `grid.x`/`grid.y`. Four executors run and all four slices come back.
 const NEG_GRID: &str = "\
-version 9
 %nx = param i32 0
 %ny = param i32 0
 %in = param f32 4096
@@ -1421,13 +1578,13 @@ fn a_symbolic_grid_runs_each_tiles_own_slice() {
     let bytes = count * 4;
     let (mut input, mut output) = (0u64, 0u64);
     assert_eq!(
-        unsafe { alloc(bytes, &mut input, &mut err) },
+        unsafe { alloc(bytes, 4096, &mut input, &mut err) },
         TT_OK,
         "input: {}",
         take_error(&free, err)
     );
     assert_eq!(
-        unsafe { alloc(bytes, &mut output, &mut err) },
+        unsafe { alloc(bytes, 4096, &mut output, &mut err) },
         TT_OK,
         "output: {}",
         take_error(&free, err)
@@ -1527,13 +1684,13 @@ fn a_repeat_launch_is_fanned_out_on_the_card() {
     for round in 0..2u32 {
         let (mut input, mut output) = (0u64, 0u64);
         assert_eq!(
-            unsafe { alloc(bytes, &mut input, &mut err) },
+            unsafe { alloc(bytes, 4096, &mut input, &mut err) },
             TT_OK,
             "input: {}",
             take_error(&free, err)
         );
         assert_eq!(
-            unsafe { alloc(bytes, &mut output, &mut err) },
+            unsafe { alloc(bytes, 4096, &mut output, &mut err) },
             TT_OK,
             "output: {}",
             take_error(&free, err)
@@ -1582,7 +1739,6 @@ fn a_repeat_launch_is_fanned_out_on_the_card() {
 
 /// [`NEG_GRID`] over the whole part: twelve columns, ten rows, one page a tile.
 const NEG_FULL_GRID: &str = "\
-version 9
 %nx = param i32 0
 %ny = param i32 0
 %in = param f32 122880
@@ -1649,13 +1805,13 @@ fn a_full_grid_repeat_launch_is_fanned_out_on_the_card() {
     for round in 0..2u32 {
         let (mut input, mut output) = (0u64, 0u64);
         assert_eq!(
-            unsafe { alloc(bytes, &mut input, &mut err) },
+            unsafe { alloc(bytes, 4096, &mut input, &mut err) },
             TT_OK,
             "input: {}",
             take_error(&free, err)
         );
         assert_eq!(
-            unsafe { alloc(bytes, &mut output, &mut err) },
+            unsafe { alloc(bytes, 4096, &mut output, &mut err) },
             TT_OK,
             "output: {}",
             take_error(&free, err)
@@ -1716,7 +1872,6 @@ fn a_full_grid_repeat_launch_is_fanned_out_on_the_card() {
 /// loop is a `LoopReg` over that value. Here 11 tiles over 8 sites: sites 0-2
 /// copy two tiles, the rest one.
 const TAIL_TILES: &str = "\
-version 9
 %nx = param i32 0
 %ny = param i32 0
 %ntiles = param i32 0
@@ -1799,8 +1954,32 @@ fn run_kernel_scalars(
     run_kernel_scalars_paged(program, scalars, inputs, &[], out_bytes)
 }
 
-/// The same launch, with the inputs that name a page striped across the
-/// channels: `pages[i]` is input `i`'s page size, or 0 for a contiguous tensor.
+/// The page each tensor parameter names: one 32x32 tile of its dtype. The
+/// launch allocates every tensor that way, so the harness has to as well;
+/// `pages[i]` overrides it for a test that wants another page.
+fn tensor_pages(program: &str) -> Vec<usize> {
+    program
+        .lines()
+        .filter_map(|line| {
+            let line = line.split('#').next().unwrap_or("");
+            let (_, rest) = line.split_once("= param ")?;
+            let (dtype, shape) = rest.trim().split_once(' ')?;
+            // A scalar parameter is `param i32 0`: one word, not a tile.
+            if shape.trim() == "0" {
+                return None;
+            }
+            let bytes = match dtype {
+                "bf16" => 2,
+                "f32" | "i32" => 4,
+                _ => return None,
+            };
+            Some(1024 * bytes)
+        })
+        .collect()
+}
+
+/// The same launch, with `pages[i]` overriding input `i`'s page size (`0` takes
+/// the program's own, which is the tensor parameter's tile).
 fn run_kernel_scalars_paged(
     program: &str,
     scalars: &[u64],
@@ -1808,6 +1987,20 @@ fn run_kernel_scalars_paged(
     pages: &[usize],
     out_bytes: usize,
 ) -> Vec<u8> {
+    run_kernel_launches(program, scalars, inputs, pages, out_bytes, 1).0
+}
+
+/// The same launch, repeated `launches` times once everything is staged, with
+/// the wall time of the launches alone. Compiling, the upload and the download
+/// are outside the clock: only a launch's cost is being measured.
+fn run_kernel_launches(
+    program: &str,
+    scalars: &[u64],
+    inputs: &[&[u8]],
+    pages: &[usize],
+    out_bytes: usize,
+    launches: usize,
+) -> (Vec<u8>, std::time::Duration) {
     let _device = device();
     let lib = library();
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
@@ -1816,10 +2009,6 @@ fn run_kernel_scalars_paged(
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
     let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
     let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
-    let alloc_interleaved: Symbol<MemAllocInterleaved> = unsafe {
-        lib.get(b"ttMemAllocInterleaved\0")
-            .expect("ttMemAllocInterleaved")
-    };
     let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
     let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
     let launch: Symbol<Launch> = unsafe { lib.get(b"ttLaunch\0") }.expect("ttLaunch");
@@ -1831,25 +2020,24 @@ fn run_kernel_scalars_paged(
         "ttInit: {}",
         take_error(&free, err)
     );
+    // Every tensor is allocated the way a launch hands one over: in pages,
+    // striped across the DRAM channels. The page is the program's own -- one
+    // 32x32 tile of the parameter's dtype -- unless the test overrides it.
+    let named = tensor_pages(program);
     let mut tensors: Vec<u64> = Vec::new();
     for (i, input) in inputs.iter().enumerate() {
         let mut at = 0u64;
-        let page = pages.get(i).copied().unwrap_or(0);
-        if page == 0 {
-            assert_eq!(
-                unsafe { alloc(input.len(), &mut at, &mut err) },
-                TT_OK,
-                "input {i}: {}",
-                take_error(&free, err)
-            );
-        } else {
-            assert_eq!(
-                unsafe { alloc_interleaved(input.len(), page, &mut at, &mut err) },
-                TT_OK,
-                "interleaved input {i}: {}",
-                take_error(&free, err)
-            );
-        }
+        let page = pages.get(i).copied().filter(|page| *page != 0).unwrap_or_else(|| {
+            *named
+                .get(i)
+                .unwrap_or_else(|| panic!("input {i} has no tensor parameter in the program"))
+        });
+        assert_eq!(
+            unsafe { alloc(input.len(), page, &mut at, &mut err) },
+            TT_OK,
+            "input {i}: {}",
+            take_error(&free, err)
+        );
         assert_eq!(
             unsafe { h2d(at, input.as_ptr(), input.len(), &mut err) },
             TT_OK,
@@ -1858,9 +2046,10 @@ fn run_kernel_scalars_paged(
         );
         tensors.push(at);
     }
+    let out_page = *named.last().expect("the output's tensor parameter");
     let mut output_at = 0u64;
     assert_eq!(
-        unsafe { alloc(out_bytes, &mut output_at, &mut err) },
+        unsafe { alloc(out_bytes, out_page, &mut output_at, &mut err) },
         TT_OK,
         "output: {}",
         take_error(&free, err)
@@ -1879,8 +2068,12 @@ fn run_kernel_scalars_paged(
     let mut params: Vec<u64> = scalars.to_vec();
     params.extend_from_slice(&tensors);
     params.push(output_at);
-    let code = unsafe { launch(module, params.as_ptr(), params.len(), &mut err) };
-    assert_eq!(code, TT_OK, "ttLaunch: {}", take_error(&free, err));
+    let clock = std::time::Instant::now();
+    for _ in 0..launches {
+        let code = unsafe { launch(module, params.as_ptr(), params.len(), &mut err) };
+        assert_eq!(code, TT_OK, "ttLaunch: {}", take_error(&free, err));
+    }
+    let elapsed = clock.elapsed();
 
     let mut back = vec![0u8; out_bytes];
     assert_eq!(
@@ -1895,12 +2088,11 @@ fn run_kernel_scalars_paged(
         "unload: {}",
         take_error(&free, err)
     );
-    back
+    (back, elapsed)
 }
 
 /// `(int)f`: truncation toward zero, in two's complement.
 const CAST_F32_TO_I32: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param i32 1024
@@ -1915,7 +2107,6 @@ copy 32,32 %out [0] = %bo [0]
 
 /// `(float)i`: two's complement to FP32, round to nearest even.
 const CAST_I32_TO_F32: &str = "\
-version 9
 grid 1,1
 %in = param i32 1024
 %out = param f32 1024
@@ -1930,7 +2121,6 @@ copy 32,32 %out [0] = %bo [0]
 
 /// The same bits under another name: no instruction at all.
 const BITCAST_F32_TO_I32: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param i32 1024
@@ -1946,7 +2136,6 @@ copy 32,32 %out [0] = %bo [0]
 /// A comparison writes `-1`/`0` in the lane; a cast to an integer is the C
 /// value, one or zero.
 const CAST_BOOL_TO_I32: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param i32 1024
@@ -2003,7 +2192,6 @@ fn casts_and_bitcasts_run_on_the_simulator() {
 /// the packer writes 16-bit datums back. A negation only flips the sign bit, so
 /// every pattern -- zeros, subnormals, infinities, NaN payloads -- is exact.
 const NEG_BF16: &str = "\
-version 9
 grid 1,1
 %in = param bf16 1024
 %out = param bf16 1024
@@ -2111,7 +2299,6 @@ fn widen_bf16(bits: u16) -> f32 {
 /// bf16 arithmetic in the 16-bit `Dst`: two tiles in, one out, every datum the
 /// SFPU's widening and truncating round trip.
 const BF16_TWO_LOAD: &str = "\
-version 9
 grid 1,1
 %in = param bf16 2048
 %out = param bf16 1024
@@ -2149,13 +2336,13 @@ fn bf16_arithmetic_runs_on_the_simulator() {
     );
     let (mut input, mut output) = (0u64, 0u64);
     assert_eq!(
-        unsafe { alloc(4096, &mut input, &mut err) },
+        unsafe { alloc(4096, 4096, &mut input, &mut err) },
         TT_OK,
         "input: {}",
         take_error(&free, err)
     );
     assert_eq!(
-        unsafe { alloc(2048, &mut output, &mut err) },
+        unsafe { alloc(2048, 4096, &mut output, &mut err) },
         TT_OK,
         "output: {}",
         take_error(&free, err)
@@ -2256,7 +2443,6 @@ fn bf16_arithmetic_runs_on_the_simulator() {
 
 /// The 32-bit `Dst` kernel's bf16 output: the packer narrows as it writes.
 const CAST_F32_TO_BF16: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param bf16 1024
@@ -2271,7 +2457,6 @@ copy 32,32 %out [0] = %bo [0]
 
 /// `i32` to bf16: `(float)i` in the lane, then the same narrowing.
 const CAST_I32_TO_BF16: &str = "\
-version 9
 grid 1,1
 %in = param i32 1024
 %out = param bf16 1024
@@ -2286,7 +2471,6 @@ copy 32,32 %out [0] = %bo [0]
 
 /// A comparison's `bool` to bf16: one or zero.
 const CAST_BOOL_TO_BF16: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param bf16 1024
@@ -2304,7 +2488,6 @@ copy 32,32 %out [0] = %bo [0]
 /// bf16 to bf16, the 16-bit `Dst`'s identity: the store truncates what the load
 /// widened, so every normal comes back unchanged.
 const CAST_BF16_TO_BF16: &str = "\
-version 9
 grid 1,1
 %in = param bf16 1024
 %out = param bf16 1024
@@ -2320,7 +2503,6 @@ copy 32,32 %out [0] = %bo [0]
 /// bf16 into `f32` has no `Dst` path: the unpacker cannot widen a bf16 page into
 /// a 32-bit `Dst`, and a 16-bit `Dst` cannot pack `f32`.
 const CAST_BF16_TO_F32: &str = "\
-version 9
 grid 1,1
 %in = param bf16 1024
 %out = param f32 1024
@@ -2336,7 +2518,6 @@ copy 32,32 %out [0] = %bo [0]
 /// `sel` on bf16: against `y`, so the `bool` lives in the 16-bit `Dst` as the
 /// `-1.0`/`0.0` lane the comparison writes, and the result is the smaller value.
 const BF16_MIN: &str = "\
-version 9
 grid 1,1
 %in = param bf16 2048
 %out = param bf16 1024
@@ -2479,8 +2660,7 @@ fn a_bf16_constant_multiplies_in_both_spellings() {
             ),
         ] {
             let program = format!(
-                "version 9
-grid 1,1
+                "grid 1,1
 %in = param bf16 1024
 %out = param bf16 1024
 %bi = buffer bf16 32,32
@@ -2517,8 +2697,7 @@ copy 32,32 %out [0] = %bo [0]
     for literal in ["0.3", "-1.5", "0.5"] {
         let c = literal.parse::<f32>().expect("a literal");
         let program = format!(
-            "version 9
-grid 1,1
+            "grid 1,1
 %in = param f32 1024
 %out = param f32 1024
 %bi = buffer f32 32,32
@@ -2545,7 +2724,6 @@ copy 32,32 %out [0] = %bo [0]
 /// / `SrcB` path (unpacked straight from their CB pages), the accumulator is the
 /// 32-bit `Dst`, and the packer drains it.
 const MATMUL_F32: &str = "\
-version 9
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -2568,7 +2746,6 @@ copy 32,32 %out [0] = %bo [0]
 /// The same product, with `%a` also feeding a datapath op: the load keeps its
 /// `Dst` unpack and the matmul unpacks the same page again into `Src`.
 const MATMUL_F32_MIXED: &str = "\
-version 9
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -2602,7 +2779,7 @@ fn bf16_transcendentals_run_in_the_lane() {
             .flat_map(|v| truncate_to_bf16(*v).to_le_bytes())
             .collect();
         let program = format!(
-            "version 9\ngrid 1,1\n%in = param bf16 1024\n%out = param bf16 1024\n\
+            "grid 1,1\n%in = param bf16 1024\n%out = param bf16 1024\n\
              %b0 = buffer bf16 32,32\n%bo = buffer bf16 32,32\n\
              copy 32,32 %b0 [0] = %in [0]\nload 32,32 %x = %b0 [0]\n\
              %r = {name} %x\nstore 32,32 %bo [0] = %r\ncopy 32,32 %out [0] = %bo [0]\n"
@@ -2631,7 +2808,6 @@ fn bf16_transcendentals_run_in_the_lane() {
 
     // `div`: a bf16 numerator over a bf16 divisor, every datum.
     const DIV: &str = "\
-version 9
 grid 1,1
 %in = param bf16 2048
 %out = param bf16 1024
@@ -2753,7 +2929,6 @@ fn matmul_runs_on_the_simulator() {
 /// the Matrix Unit reads only `Src`, so the compiler packs `%n` into a page it
 /// owns and the product is `(-a) x b`.
 const MATMUL_F32_STAGED: &str = "\
-version 9
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -2777,7 +2952,6 @@ copy 32,32 %out [0] = %bo [0]
 /// The same with the other operand staged: `%n = neg %b` and the product is
 /// `a x (-b)`.
 const MATMUL_F32_STAGED_B: &str = "\
-version 9
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -2841,7 +3015,6 @@ fn a_computed_matmul_operand_is_staged_into_a_page() {
 /// they are, the Matrix Unit accumulates in the 32-bit `Dst`, and the packer
 /// writes the f32 result.
 const MATMUL_BF16_F32: &str = "\
-version 9
 grid 1,1
 %pa = param bf16 1024
 %pb = param bf16 1024
@@ -2863,7 +3036,6 @@ copy 32,32 %out [0] = %bo [0]
 
 /// bf16 operands over a `bf16` accumulator: the 16-bit `Dst`, the native path.
 const MATMUL_BF16: &str = "\
-version 9
 grid 1,1
 %pa = param bf16 1024
 %pb = param bf16 1024
@@ -2923,7 +3095,6 @@ fn bf16_matmul_runs_on_the_simulator() {
 /// Every table is full-width, so one page is one 32-wide slice of the head and
 /// the rotation never crosses a page.
 const ROPE_INTERLEAVED: &str = "\
-version 9
 grid 1,1
 %px = param f32 4096
 %pc = param f32 4096
@@ -2964,7 +3135,6 @@ endloop
 /// multiplies and an add per output page — no matmul, no data movement. The
 /// `+64` half reuses the low half's cos/sin page.
 const ROPE_SPLIT_HALF: &str = "\
-version 9
 grid 1,1
 %px = param f32 4096
 %pc = param f32 2048
@@ -3003,7 +3173,6 @@ endloop
 /// Split-half RoPE at `head_dim = 32`: both halves are inside one page, so the
 /// swap is the block permutation `[[0, I],[-I, 0]]` the Matrix Unit applies.
 const ROPE_SPLIT_HALF_PAGE: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %pc = param f32 1024
@@ -3037,7 +3206,7 @@ store 32,32 %bo [0] = %y
 copy 32,32 %out [0] = %bo [0]
 ";
 
-/// The interleaved rotation: `y[2k] = -x[2k+1]`, `y[2k+1] = x[2k]` — one
+/// The rotation: `y[2k] = -x[2k+1]`, `y[2k+1] = x[2k]` — one
 /// `matmul` against a ±1 page, then the two multiplies and the add.
 #[test]
 fn rope_interleaved_runs_on_the_simulator() {
@@ -3215,7 +3384,6 @@ fn rope_split_half_within_a_page_runs_on_the_simulator() {
 /// this combination (`prepare_reduce_scaler`) — so the product is each row's
 /// sum in column 0 and zeros elsewhere.
 const REDUCE_SUM_ROW: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %ps = param f32 1024
@@ -3289,7 +3457,6 @@ fn sum_row_runs_on_the_simulator() {
 /// of each face (tt-metal's row-0 fill); `max` carries none and the compiler
 /// moves 1.0 into `SrcB` itself.
 const REDUCE_SUM_COL: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %ps = param f32 1024
@@ -3310,7 +3477,6 @@ copy 32,32 %out [0] = %bo [0]
 ";
 
 const REDUCE_MAX_COL: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %out = param f32 1024
@@ -3329,7 +3495,6 @@ copy 32,32 %out [0] = %bo [0]
 /// The same, seeded above every datum: the accumulator is the fold's other
 /// operand, so every column keeps the seed.
 const REDUCE_MAX_COL_SEEDED: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %out = param f32 1024
@@ -3348,7 +3513,6 @@ copy 32,32 %out [0] = %bo [0]
 /// The same, seeded below every datum: the accumulator is the fold's other
 /// operand, so every row's own maximum survives.
 const REDUCE_MAX_ROW: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %out = param f32 1024
@@ -3366,7 +3530,6 @@ copy 32,32 %out [0] = %bo [0]
 
 /// The same with a seed above every datum.
 const REDUCE_MAX_ROW_SEEDED: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %out = param f32 1024
@@ -3417,7 +3580,6 @@ fn col_reduce_oracle(input: &[f32], max: bool, scaler: Option<f32>) -> Vec<f32> 
 /// `x @ scaler`), `sum col` and `max col` (`GAPOOL`/`GMPOOL`), and `max row`.
 /// Every datum is an integer, so bf16 carries each fold exactly.
 const REDUCE_SUM_ROW_BF16: &str = "\
-version 9
 grid 1,1
 %px = param bf16 1024
 %ps = param bf16 1024
@@ -3438,7 +3600,6 @@ copy 32,32 %out [0] = %bo [0]
 ";
 
 const REDUCE_SUM_COL_BF16: &str = "\
-version 9
 grid 1,1
 %px = param bf16 1024
 %ps = param bf16 1024
@@ -3459,7 +3620,6 @@ copy 32,32 %out [0] = %bo [0]
 ";
 
 const REDUCE_MAX_COL_BF16: &str = "\
-version 9
 grid 1,1
 %px = param bf16 1024
 %out = param bf16 1024
@@ -3479,7 +3639,6 @@ copy 32,32 %out [0] = %bo [0]
 /// maximum, and the fold goes through the 16-bit transpose (`MOVD2B`,
 /// `TRNSPSRCB`, the two `ELWADD`s) rather than the 32-bit hi/lo split.
 const REDUCE_MAX_ROW_BF16: &str = "\
-version 9
 grid 1,1
 %px = param bf16 1024
 %out = param bf16 1024
@@ -3714,7 +3873,6 @@ fn max_row_runs_on_the_simulator() {
 /// A buffer the datapath writes and then reads: `store` packs a page, `load`
 /// unpacks the same page. Any role may drive either end of a buffer.
 const ROUND_TRIP: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %out = param f32 1024
@@ -3757,7 +3915,6 @@ fn a_buffer_a_store_wrote_a_load_reads() {
 /// row broadcast reads `SrcB`'s first face row. The narrow value's page is
 /// laid out as a `1,32`: row 0 of faces 0 and 1.
 const BROADCAST_ROW_ADD: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %pm = param f32 1024
@@ -3776,7 +3933,6 @@ copy 32,32 %out [0] = %bo [0]
 
 /// `x * row`, the same shape pair and the multiply's own instruction.
 const BROADCAST_ROW_MUL: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %pm = param f32 1024
@@ -3797,7 +3953,6 @@ copy 32,32 %out [0] = %bo [0]
 /// broadcast reads `SrcB`'s column 0. The subtraction has the tile on the left,
 /// which is the order the instruction takes.
 const BROADCAST_COL_SUB: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %pm = param f32 1024
@@ -3816,7 +3971,6 @@ copy 32,32 %out [0] = %bo [0]
 
 /// `x * column`, the same shape pair and the multiply's own instruction.
 const BROADCAST_COL_MUL: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %pm = param f32 1024
@@ -3836,7 +3990,6 @@ copy 32,32 %out [0] = %bo [0]
 /// `neg x * row`: `SrcA` is a value the datapath computed, so the compiler
 /// stages it into a page the FPU reads, while `SrcB` is the load's own page.
 const BROADCAST_STAGED_A: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %pm = param f32 1024
@@ -3858,7 +4011,6 @@ copy 32,32 %out [0] = %bo [0]
 /// a copy from a parameter: the narrow read names column 0 of faces 0 and 2,
 /// and every row of the tile is multiplied by its own row's first datum.
 const BROADCAST_COL_FROM_PACK: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %pm = param f32 1024
@@ -3985,7 +4137,6 @@ fn a_broadcast_reads_its_narrow_page() {
 /// and a per-tile scale, walked by a `loop` whose index is the copy's offset.
 /// `out[j] = x[j] · m · s[j]`, every datum.
 const SCALE_LOOP: &str = "\
-version 9
 grid 1,1
 %px = param f32 2048
 %ps = param f32 2048
@@ -4115,7 +4266,6 @@ fn a_scale_loop_keeps_every_datum() {
 /// The same three operands without the `loop`: two tiles, each loaded, scaled
 /// by a per-row factor and a per-tile scale, and written back.
 const SCALE_STRAIGHT: &str = "\
-version 9
 grid 1,1
 %px = param f32 2048
 %ps = param f32 2048
@@ -4196,7 +4346,6 @@ fn a_broadcast_reads_a_packed_narrow_page() {
 /// page is loaded as a tile, the tile's reciprocal is stored, and its row is the
 /// broadcast operand of the final multiply.
 const SOFTMAX_COL: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %ps = param f32 1024
@@ -4300,7 +4449,6 @@ fn softmax_runs_on_the_simulator() {
 /// `32,1` column the broadcast multiplies every tile by. The walk over the
 /// hidden tiles is one `loop` for the fold and one for the scale.
 const RMS_NORM: &str = "\
-version 9
 grid 1,1
 %px = param f32 98304
 %ps = param f32 98304
@@ -4451,7 +4599,6 @@ fn a_narrow_multiply_keeps_every_datum() {
     }
     let narrow_bytes: Vec<u8> = narrow.iter().flat_map(|v| v.to_le_bytes()).collect();
     let program = "\
-version 9
 grid 1,1
 %pr = param f32 1024
 %pn = param f32 1024
@@ -4483,7 +4630,6 @@ copy 32,32 %out [0] = %bo [0]
     // The same tile through `add` against a zero page: `ELWADD`/`ELWSUB` are
     // one pass at any fidelity, so they are exact where the multiply is sliced.
     let program_add = "\
-version 9
 grid 1,1
 %pr = param f32 1024
 %pn = param f32 1024
@@ -4518,7 +4664,6 @@ copy 32,32 %out [0] = %bo [0]
     // lowering zeroes the section first, so anything non-zero here is `Dst`
     // content the zeroing did not reach.
     let program_mul0 = "\
-version 9
 grid 1,1
 %pr = param f32 1024
 %pn = param f32 1024
@@ -4553,7 +4698,6 @@ copy 32,32 %out [0] = %bo [0]
 /// the second one does not clear what the first wrote. No loop — the only thing
 /// exercised is that `acc` holds its value from one `matmul` to the next.
 const MATMUL_ACC: &str = "\
-version 9
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -4606,7 +4750,6 @@ fn matmul_accumulates_into_one_dst() {
 /// into an `acc` declared outside it, and one `store_to` after `endloop` — the
 /// accumulator is visible where it is declared, so the pack happens once.
 const MATMUL_ACC_LOOP: &str = "\
-version 9
 grid 1,1
 %pa = param f32 2048
 %pb = param f32 2048
@@ -4666,7 +4809,6 @@ fn a_matmul_accumulates_over_a_k_loop() {
 /// values are what the wait protects on a board; on the simulator they are what
 /// the program produces either way.
 const MATMUL_ACC_REUSED: &str = "\
-version 9
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -4730,7 +4872,6 @@ fn an_acc_is_reused_after_it_has_been_packed() {
 /// count per core is derived from the grid at launch
 /// (`%per = div %ntiles %nsites`).
 const GATE_PROJ: &str = "\
-version 9
 %nx = param i32 0
 %ny = param i32 0
 %ntiles = param i32 0
@@ -4857,17 +4998,1642 @@ fn gate_proj_runs_over_a_full_grid() {
     }
 }
 
+/// The 2-D blocked matmul's throughput on whatever device is attached.
+///
+/// This *reports* instead of gating: the figure is the oracle for a lowering
+/// change, and a regression shows as a moved number rather than a failed
+/// assertion. `SKAM_PERF_LAUNCHES` sets the repeat count (20 by default), and
+/// only the launches are timed — compiling, the upload and the download stay
+/// outside the clock, so the number is the kernel's.
+///
+/// A simulator's figure is model time, not silicon: run it on the card for a
+/// number worth recording.
+#[test]
+fn gate_proj_throughput() {
+    const NX: u64 = 12;
+    const NY: u64 = 10;
+    const M: usize = 128;
+    const N: usize = 1920;
+    const K: usize = 64;
+    let (mt, nt, kt) = (M / 32, N / 32, K / 32);
+    let ntiles = mt * nt;
+    let launches: usize = std::env::var("SKAM_PERF_LAUNCHES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(20);
+
+    let a_vals: Vec<f32> = (0..M * K).map(|i| (i % 7) as f32 - 3.0).collect();
+    let w_vals: Vec<f32> = (0..N * K).map(|i| (i % 5) as f32 - 2.0).collect();
+    let a: Vec<u16> = tiled(M, K, &a_vals)
+        .iter()
+        .map(|v| truncate_to_bf16(*v))
+        .collect();
+    let w: Vec<u16> = tiled(N, K, &w_vals)
+        .iter()
+        .map(|v| truncate_to_bf16(*v))
+        .collect();
+    let bytes = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|h| h.to_le_bytes()).collect() };
+    let scalars = [NX, NY, ntiles as u64, kt as u64, nt as u64];
+    let (out, elapsed) = run_kernel_launches(
+        GATE_PROJ,
+        &scalars,
+        &[&bytes(&a), &bytes(&w)],
+        &[],
+        ntiles * 1024 * 4,
+        launches,
+    );
+    // A launch that wrote nothing is a failed run, not a slow one.
+    assert!(
+        out.chunks_exact(4)
+            .any(|c| f32::from_le_bytes(c.try_into().unwrap()) != 0.0),
+        "the matmul wrote nothing"
+    );
+
+    let per = elapsed / u32::try_from(launches).unwrap_or(1);
+    let macs = 2.0 * (M * N * K) as f64;
+    println!(
+        "gate_proj {M}x{K} by {K}x{N} over {NX}x{NY}: {launches} launches in {elapsed:?}, \
+         {per:?} each, {:.2} GMAC/s",
+        macs * launches as f64 / elapsed.as_secs_f64() / 1e9
+    );
+}
+
+/// The gate projection with its K loop blocked, which is what puts more than
+/// one request in flight.
+///
+/// [`GATE_PROJ`] publishes one page per `copy`, so the mover's NoC barrier --
+/// tt-metal's `noc_async_read_barrier()` before `push_back` -- has nothing
+/// outstanding to overlap: each 2 KiB read is issued and waited for alone. One
+/// 2 KiB page per core in flight is, by Little's law, `120 * 2 KiB / 2.35 us` =
+/// 105 GB/s, which is exactly the measured rate on the big shape.
+///
+/// This program is tt-metal's block (`reader_bmm_tile_layout.cpp:76-113`)
+/// written out: eight reads with no wait between them and one barrier for all
+/// of them. The program does not name the hand-offs -- they are the compiler's
+/// -- it names the *pages*: `copy 32,32 %ba [3] = ...` fills page 3 of
+/// `%ba`, whose `buffer bf16 32,256` is eight 32x32 pages, and `sync_cbs`
+/// derives one `reserve 8` and one `push 8` around the run. The compute walks
+/// the ring a page per `wait`/`pop`, in the order the pages landed.
+///
+/// The ring is *two* blocks deep (`32,512` is sixteen pages), which is
+/// tt-metal's `MCAST_INPUT_BUFFERING_DEPTH = 2`
+/// (`matmul_multicore_reuse_mcast_2d_program_factory.cpp`): the reader reserves
+/// the next block while the compute still consumes this one, so the fill of a
+/// block and the math of the block before it overlap. One block deep, the two
+/// alternate and nothing is hidden.
+///
+/// The eight reads are unrolled instead of looped because a mover has two loop
+/// counters (`MOVER_PAIRS`) and the tile loop and the K-block loop are both
+/// real; the ROSCs' third nest would have no counter.
+fn gate_proj_blocked() -> String {
+    let mut s = String::from(
+        "\
+%nx = param i32 0
+%ny = param i32 0
+%ntiles = param i32 0
+%ktiles = param i32 0
+%ncols = param i32 0
+%pa = param bf16 16384
+%pw = param bf16 245760
+%pc = param f32 245760
+%ba = buffer bf16 32,512
+%bb = buffer bf16 32,512
+%bc = buffer f32 32,32
+%acc = acc f32 32,32
+%zero = const f32 0
+%tile = const i32 1
+%eight = const i32 8
+%x = grid.x
+%y = grid.y
+%nsites = mul %nx %ny
+%sitey = mul %y %nx
+%site = add %sitey %x
+%per = div %ntiles %nsites
+%nkb = div %ktiles %eight
+%i = loop %per
+%step = mul %i %nsites
+%t = add %site %step
+%m = div %t %ncols
+%n = mod %t %ncols
+%arow = mul %m %ktiles
+%brow = mul %n %ktiles
+store 32,32 %acc = %zero
+%k = loop %nkb
+%k8 = mul %k %eight
+%ka = add %arow %k8
+%kb = add %brow %k8
+",
+    );
+    // The block: eight pages of A and eight of B, all requested before one
+    // barrier. `[j]` is the page each read fills, which is why a ring's write
+    // pointer does not have to move between them.
+    for j in 0u32..8 {
+        let (ka, kb) = if j == 0 {
+            ("%ka".to_string(), "%kb".to_string())
+        } else {
+            // The next k tile is the previous one plus one: `add` takes values,
+            // not literals, so `%tile` (the constant 1) is the step.
+            let ka = format!("%ka{j}");
+            let kb = format!("%kb{j}");
+            let prev = |j: u32| {
+                if j == 1 {
+                    ("%ka".to_string(), "%kb".to_string())
+                } else {
+                    (format!("%ka{}", j - 1), format!("%kb{}", j - 1))
+                }
+            };
+            let (pa, pb) = prev(j);
+            s.push_str(&format!("{ka} = add {pa} %tile\n"));
+            s.push_str(&format!("{kb} = add {pb} %tile\n"));
+            (ka, kb)
+        };
+        s.push_str(&format!("copy 32,32 %ba [{j}] = %pa [{ka}]\n"));
+        s.push_str(&format!("copy 32,32 %bb [{j}] = %pw [{kb}]\n"));
+    }
+
+    // The whole block, then the math: each `load` names its page (`load ... =
+    // %ba [p]` is tt-metal's `fifo_rd_ptr + fifo_page_size * tile_index`,
+    // `cb_api.h:143-151`), so the block is live at once -- one `wait`/`pop` of
+    // eight pages, tt-metal's `wait_front(in0_block_num_tiles)` /
+    // `pop_front(in0_block_num_tiles)` around the tile loop
+    // (`bmm_large_block_zm.cpp:46-126`).
+    for j in 0u32..8 {
+        s.push_str(&format!("load 32,32 %a{j} = %ba [{j}]\n"));
+        s.push_str(&format!("load 32,32 %b{j} = %bb [{j}]\n"));
+    }
+    for j in 0u32..8 {
+        s.push_str(&format!("matmul %acc %a{j} %b{j}\n"));
+    }
+    s.push_str(
+        "\
+endloop
+store 32,32 %bc [0] = %acc
+%coff = mul %t %tile
+copy 32,32 %pc [%coff] = %bc [0]
+endloop
+grid %nx,%ny
+",
+    );
+    s
+}
+
+/// A matmul big enough that the answer is the kernel's, not the launch's:
+/// A[2048,2048] bf16 times B[2048,16384] bf16 into a `f32` accumulator, over the
+/// whole 12x10 grid.
+///
+/// Every page is `1.0`, so each output datum is exactly `K` and the result is
+/// checked rather than just timed. The program is [`GATE_PROJ`] with the six
+/// sizes it is written against: `M` and `N` in tiles, `K` in k-steps, and `N` in
+/// tiles per row.
+#[test]
+fn a_big_matmul_runs_on_the_card() {
+    const NX: u64 = 12;
+    const NY: u64 = 10;
+    const M: usize = 2048;
+    const N: usize = 16384;
+    const K: usize = 2048;
+    let (mt, nt, kt) = (M / 32, N / 32, K / 32);
+    let ntiles = mt * nt;
+    let launches: usize = std::env::var("SKAM_PERF_LAUNCHES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(3);
+
+    // One page of `1.0` in bf16: the tile layout stops mattering.
+    const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
+    let a: Vec<u8> = ONE_BF16.iter().cycle().take(M * K * 2).copied().collect();
+    let b: Vec<u8> = ONE_BF16.iter().cycle().take(N * K * 2).copied().collect();
+
+    let program = GATE_PROJ
+        .replace(
+            "%pa = param bf16 16384",
+            &format!("%pa = param bf16 {}", M * K),
+        )
+        .replace(
+            "%pw = param bf16 245760",
+            &format!("%pw = param bf16 {}", N * K),
+        )
+        .replace(
+            "%pc = param f32 245760",
+            &format!("%pc = param f32 {}", M * N),
+        );
+    let scalars = [NX, NY, ntiles as u64, kt as u64, nt as u64];
+    let (out, elapsed) = run_kernel_launches(
+        &program,
+        &scalars,
+        &[&a, &b],
+        &[],
+        ntiles * 1024 * 4,
+        launches,
+    );
+    let first = f32::from_le_bytes(out[0..4].try_into().unwrap());
+    assert_eq!(first, K as f32, "the accumulator holds the whole K sum");
+    let per = elapsed / u32::try_from(launches).unwrap_or(1);
+    let macs = (M * N * K) as f64 * launches as f64;
+    println!(
+        "matmul {M}x{K} by {K}x{N} (bf16 in, f32 acc) over {NX}x{NY}: \
+         {launches} launches in {elapsed:?}, {per:?} each, {:.2} GMAC/s, {:.1} GFLOP/s",
+        macs / elapsed.as_secs_f64() / 1e9,
+        2.0 * macs / elapsed.as_secs_f64() / 1e9
+    );
+}
+
+/// The same product and the same grid as [`a_big_matmul_runs_on_the_card`], with
+/// K blocked so eight pages are in flight per core instead of one.
+///
+/// This is the measurement that says whether the big matmul is bound by
+/// requests in flight rather than by bandwidth: the bytes are identical, the
+/// only change is that the eight reads of a block are issued before the barrier
+/// instead of one per barrier.
+#[test]
+fn a_blocked_matmul_issues_a_block() {
+    const NX: u64 = 12;
+    const NY: u64 = 10;
+    const M: usize = 2048;
+    const N: usize = 16384;
+    const K: usize = 2048;
+    let (mt, nt, kt) = (M / 32, N / 32, K / 32);
+    let ntiles = mt * nt;
+    let launches: usize = std::env::var("SKAM_PERF_LAUNCHES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(3);
+
+    const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
+    let a: Vec<u8> = ONE_BF16.iter().cycle().take(M * K * 2).copied().collect();
+    let b: Vec<u8> = ONE_BF16.iter().cycle().take(N * K * 2).copied().collect();
+
+    let program = gate_proj_blocked()
+        .replace(
+            "%pa = param bf16 16384",
+            &format!("%pa = param bf16 {}", M * K),
+        )
+        .replace(
+            "%pw = param bf16 245760",
+            &format!("%pw = param bf16 {}", N * K),
+        )
+        .replace(
+            "%pc = param f32 245760",
+            &format!("%pc = param f32 {}", M * N),
+        );
+    let scalars = [NX, NY, ntiles as u64, kt as u64, nt as u64];
+    // tt-metal's tensors live in DRAM across the channels, one tile
+    // a page; a contiguous buffer sends a core's whole stream at one bank.
+    let (out, elapsed) = run_kernel_launches(
+        &program,
+        &scalars,
+        &[&a, &b],
+        &[2048, 2048],
+        ntiles * 1024 * 4,
+        launches,
+    );
+    assert_eq!(
+        f32::from_le_bytes(out[0..4].try_into().unwrap()),
+        K as f32,
+        "the accumulator holds the whole K sum"
+    );
+    let per = elapsed / u32::try_from(launches).unwrap_or(1);
+    let macs = (M * N * K) as f64 * launches as f64;
+    println!(
+        "blocked matmul {M}x{K} by {K}x{N} over {NX}x{NY}: {launches} launches in \
+         {elapsed:?}, {per:?} each, {:.2} GMAC/s, {:.1} GFLOP/s",
+        macs / elapsed.as_secs_f64() / 1e9,
+        2.0 * macs / elapsed.as_secs_f64() / 1e9
+    );
+}
+
+/// The same block reader, but each core owns a rectangular block of `h × w`
+/// output tiles instead of one tile.
+///
+/// This is tt-metal's `per_core_M × per_core_N` (`out_block_h × out_block_w`,
+/// `matmul_multicore_reuse_mcast_2d_program_factory.cpp:414-432`). A k-block
+/// then costs `h + w` operand tiles for `h * w` MVMULs, where one output tile
+/// at a time costs two tiles for one: at 2x2 that is half the requests per
+/// MVMUL, at 4x4 a quarter, at 8x8 an eighth.
+///
+/// The pages of a ring are consumed in the order they are written, so the page
+/// index is `j * rows + r`: the k-step is the outer loop of the copy run and
+/// the operand row the inner one, which is also the order the compute wants
+/// them -- every row's tile at one k-step together.
+fn gate_proj_block(h: u32, w: u32) -> String {
+    gate_proj_block_kb(h, w, 2)
+}
+
+/// The same reuse block with the k-block's width (`in0_block_w`) named.
+///
+/// Two tiles is tt-metal's smallest useful `in0_block_w` here: one `wait`/`pop`
+/// per block over `h + w` reads for `h * w` MVMULs. A block of one tile is the
+/// control for the hand-off: it is the single-page ring that already runs on
+/// the card.
+fn gate_proj_block_kb(h: u32, w: u32, kb: u32) -> String {
+    let pages_a = kb * h;
+    let pages_b = kb * w;
+    let mut s = format!(
+        "\
+%nx = param i32 0
+%ny = param i32 0
+%ntiles = param i32 0
+%ktiles = param i32 0
+%ncols = param i32 0
+%pa = param bf16 16384
+%pw = param bf16 245760
+%pc = param f32 245760
+%ba = buffer bf16 32,{}
+%bb = buffer bf16 32,{}
+%bc = buffer f32 32,32
+",
+        // Two blocks deep: `MCAST_INPUT_BUFFERING_DEPTH = 2`
+        // (`matmul_multicore_reuse_mcast_2d_program_factory.cpp`). The reader
+        // reserves the next block while the compute still reads this one.
+        32 * 2 * pages_a,
+        32 * 2 * pages_b
+    );
+    for r in 0..h {
+        for c in 0..w {
+            s.push_str(&format!("%acc{r}{c} = acc f32 32,32\n"));
+        }
+    }
+    s.push_str(
+        "\
+%zero = const f32 0
+%tile = const i32 1
+%eight = const i32 8
+%kb = const i32 KB
+%hh = const i32 %H
+%ww = const i32 %W
+%x = grid.x
+%y = grid.y
+%nsites = mul %nx %ny
+%sitey = mul %y %nx
+%site = add %sitey %x
+%mt = div %ntiles %ncols
+%mtb = div %mt %hh
+%nbcol = div %ncols %ww
+%nblocks = mul %mtb %nbcol
+%per = div %nblocks %nsites
+%kblocks = div %ktiles %kb
+%i = loop %per
+%step = mul %i %nsites
+%b = add %site %step
+%bm = div %b %nbcol
+%bn = mod %b %nbcol
+%tm = mul %bm %hh
+%tn = mul %bn %ww
+",
+    );
+    // The rows and columns of the output block, in tiles.
+    for r in 0..h {
+        if r == 0 {
+            // `%tm` itself.
+        } else {
+            let prev = if r == 1 {
+                "%tm".to_string()
+            } else {
+                format!("%m{}", r - 1)
+            };
+            s.push_str(&format!("%m{r} = add {prev} %tile\n"));
+        }
+    }
+    for c in 0..w {
+        if c == 0 {
+            // `%tn` itself.
+        } else {
+            let prev = if c == 1 {
+                "%tn".to_string()
+            } else {
+                format!("%n{}", c - 1)
+            };
+            s.push_str(&format!("%n{c} = add {prev} %tile\n"));
+        }
+    }
+    for r in 0..h {
+        let m = if r == 0 {
+            "%tm".to_string()
+        } else {
+            format!("%m{r}")
+        };
+        s.push_str(&format!("%arow{r} = mul {m} %ktiles\n"));
+    }
+    for c in 0..w {
+        let n = if c == 0 {
+            "%tn".to_string()
+        } else {
+            format!("%n{c}")
+        };
+        s.push_str(&format!("%brow{c} = mul {n} %ktiles\n"));
+    }
+    for r in 0..h {
+        for c in 0..w {
+            s.push_str(&format!("store 32,32 %acc{r}{c} = %zero\n"));
+        }
+    }
+    s.push_str("%k = loop %kblocks\n%k8 = mul %k %kb\n");
+    for r in 0..h {
+        s.push_str(&format!("%ka{r} = add %arow{r} %k8\n"));
+    }
+    for c in 0..w {
+        s.push_str(&format!("%kbv{c} = add %brow{c} %k8\n"));
+    }
+    // The block, in page order: k-step outer, operand row inner. Each operand's
+    // k-tile is the last one plus one, and `add` takes values, so the run is a
+    // chain of `%tile` steps.
+    let step_name = |base: &str, operand: u32, j: u32| {
+        if j == 0 {
+            format!("%{base}{operand}")
+        } else {
+            format!("%{base}{operand}_{j}")
+        }
+    };
+    for j in 0..kb {
+        for r in 0..h {
+            if j > 0 {
+                s.push_str(&format!(
+                    "{} = add {} %tile\n",
+                    step_name("ka", r, j),
+                    step_name("ka", r, j - 1)
+                ));
+            }
+            s.push_str(&format!(
+                "copy 32,32 %ba [{}] = %pa [{}]\n",
+                j * h + r,
+                step_name("ka", r, j)
+            ));
+        }
+    }
+    for j in 0..kb {
+        for c in 0..w {
+            if j > 0 {
+                s.push_str(&format!(
+                    "{} = add {} %tile\n",
+                    step_name("kbv", c, j),
+                    step_name("kbv", c, j - 1)
+                ));
+            }
+            s.push_str(&format!(
+                "copy 32,32 %bb [{}] = %pw [{}]\n",
+                j * w + c,
+                step_name("kbv", c, j)
+            ));
+        }
+    }
+    // Consume the pages in the order they were written: the k-step's rows, then
+    // the `w * h` products that share them. Each `load` names the page the copy
+    // filled (`load ... = %ba [p]` is tt-metal's
+    // `fifo_rd_ptr + fifo_page_size * tile_index`, `cb_api.h:143-151`), so the
+    // whole block is live at once and the unpacker does not walk the read
+    // pointer one page per pop.
+    for j in 0..kb {
+        for r in 0..h {
+            s.push_str(&format!("load 32,32 %a{r}_{j} = %ba [{}]\n", j * h + r));
+        }
+        for c in 0..w {
+            s.push_str(&format!("load 32,32 %bv{c}_{j} = %bb [{}]\n", j * w + c));
+        }
+        for r in 0..h {
+            for c in 0..w {
+                s.push_str(&format!("matmul %acc{r}{c} %a{r}_{j} %bv{c}_{j}\n"));
+            }
+        }
+    }
+    s.push_str("endloop\n");
+    for r in 0..h {
+        for c in 0..w {
+            let m = if r == 0 {
+                "%tm".to_string()
+            } else {
+                format!("%m{r}")
+            };
+            let n = if c == 0 {
+                "%tn".to_string()
+            } else {
+                format!("%n{c}")
+            };
+            s.push_str(&format!("store 32,32 %bc [0] = %acc{r}{c}\n"));
+            s.push_str(&format!("%t{r}{c} = mul {m} %ncols\n"));
+            s.push_str(&format!("%t{r}{c}b = add %t{r}{c} {n}\n"));
+            s.push_str(&format!("copy 32,32 %pc [%t{r}{c}b] = %bc [0]\n"));
+        }
+    }
+    s.push_str("endloop\ngrid %nx,%ny\n");
+    s.replace("%W", &w.to_string())
+        .replace("%H", &h.to_string())
+        .replace("KB", &kb.to_string())
+}
+
+/// tt-metal's large-block kernel, the program as text: `programs/tt_metal_bmm.ir`.
+///
+/// One core owns a 4x4 band of output tiles walked in 2x2 subblocks with
+/// `in0_block_w = 2`. The k blocks are the peeled first (no reload), the loop
+/// between, and the peeled `last_out`; K comes from the `%kt` launch scalar, so
+/// the same text runs any number of k blocks.
+#[test]
+fn a_tt_metal_kernel_matmuls_one_band() {
+    const OBH: u32 = 4;
+    const OBW: u32 = 4;
+    const KB: u32 = 2;
+    let kblocks: u32 = std::env::var("SKAM_KBLOCKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let (m, n, k) = (
+        32 * OBH as usize,
+        32 * OBW as usize,
+        32 * KB as usize * kblocks as usize,
+    );
+    let kt = k / 32;
+
+    const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
+    // A's k tile `j` of every row is the bf16 value `j+1`, so each k block
+    // contributes a different amount: a block that is lost, doubled or read
+    // from the wrong page cannot add up to the answer. B is all ones, so an
+    // output datum is `32 * sum(j+1)`, the whole K sum.
+    let mut a: Vec<u8> = Vec::with_capacity(m * k * 2);
+    for page in 0..m * k / 1024 {
+        let bits = (((page % kt) + 1) as f32).to_bits() >> 16;
+        for _ in 0..1024 {
+            a.extend_from_slice(&(bits as u16).to_le_bytes());
+        }
+    }
+    let b: Vec<u8> = ONE_BF16.iter().cycle().take(n * k * 2).copied().collect();
+    let expected = 32.0 * (1..=kt).map(|j| j as f32).sum::<f32>();
+
+    let program = include_str!("../programs/tt_metal_bmm.ir")
+        .replace("%pa = param bf16 16384", &format!("%pa = param bf16 {}", m * k))
+        .replace("%pw = param bf16 245760", &format!("%pw = param bf16 {}", n * k))
+        .replace("%pc = param f32 245760", &format!("%pc = param f32 {}", m * n));
+    let scalars = [1u64, 1u64, kt as u64, (n / 32) as u64];
+    let out = run_kernel_launches(&program, &scalars, &[&a, &b], &[2048, 2048], m * n * 4, 1).0;
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (row, column) in (0..m).flat_map(|r| (0..n).map(move |c| (r, c))) {
+        assert_eq!(got[row * n + column], expected, "({row}, {column})");
+    }
+}
+
+/// `programs/tt_metal_mcast_bmm.ir` at one tiling.
+///
+/// The artifact ships the benchmark's tiling -- 8x8 tiles per out block, eight
+/// out blocks each way, `in0_block_w = 8`, a 2x4 subblock -- and names the
+/// tiling as constants, spelling every size that follows from it (ring pages,
+/// the accumulator's shape, the operand loads).  A test that hands the same
+/// program a smaller tiling rewrites those constants and the sizes they
+/// determine, nothing else: the shape itself (K, N, the grid) is launch
+/// scalars.
+///
+/// The ring depths are tt-metal's and do not change with the tiling: A's and
+/// B's rings are two k blocks deep (`MCAST_INPUT_BUFFERING_DEPTH`), `interm0`
+/// and `out` are one out block each
+/// (`matmul_multicore_reuse_mcast_2d_program_factory.cpp:417-434`).
+#[allow(clippy::too_many_arguments)]
+fn mcast_bmm_tiled(
+    obh: u32,
+    obw: u32,
+    kb: u32,
+    sbh: u32,
+    sbw: u32,
+    nobh: u32,
+    nobw: u32,
+) -> String {
+    let (nisub, njsub) = (obh / sbh, obw / sbw);
+    let (pm, pn) = (obh * nobh, obw * nobw);
+    // `SKAM_DEPTH` deepens the operand rings, to tell a depth/credit deadlock
+    // from a protocol one; tt-metal's two is the default.
+    let depth: u32 = std::env::var("SKAM_DEPTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+    let (a_ring, b_ring) = (depth * obh * kb, depth * obw * kb);
+    // `SKAM_ODEPTH` deepens the output rings the same way.
+    let od: u32 = std::env::var("SKAM_ODEPTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let out_block = obh * obw;
+    let (ah, aw) = (sbh * 32, sbw * 32);
+    let bk = kb * 32;
+    include_str!("../programs/tt_metal_mcast_bmm.ir")
+        .replace("%pm = const i32 64", &format!("%pm = const i32 {pm}"))
+        .replace("%pn = const i32 64", &format!("%pn = const i32 {pn}"))
+        .replace("%obh = const i32 8", &format!("%obh = const i32 {obh}"))
+        .replace("%obw = const i32 8", &format!("%obw = const i32 {obw}"))
+        .replace("%kb = const i32 8", &format!("%kb = const i32 {kb}"))
+        .replace("%sbh = const i32 2", &format!("%sbh = const i32 {sbh}"))
+        .replace("%sbw = const i32 4", &format!("%sbw = const i32 {sbw}"))
+        .replace("%nisub = const i32 4", &format!("%nisub = const i32 {nisub}"))
+        .replace("%njsub = const i32 2", &format!("%njsub = const i32 {njsub}"))
+        .replace("%nobh = const i32 8", &format!("%nobh = const i32 {nobh}"))
+        .replace("%nobw = const i32 8", &format!("%nobw = const i32 {nobw}"))
+        .replace(
+            "%apages = const i32 64",
+            &format!("%apages = const i32 {}", obh * kb),
+        )
+        .replace(
+            "%bpages = const i32 64",
+            &format!("%bpages = const i32 {}", obw * kb),
+        )
+        .replace(
+            "%ba = buffer bf16 32,4096",
+            &format!("%ba = buffer bf16 32,{}", 32 * a_ring),
+        )
+        .replace(
+            "%bb = buffer bf16 32,4096",
+            &format!("%bb = buffer bf16 32,{}", 32 * b_ring),
+        )
+        .replace(
+            "%interm = buffer bf16 32,2048",
+            &format!("%interm = buffer bf16 32,{}", 32 * out_block * od),
+        )
+        .replace(
+            "%bc = buffer bf16 32,2048",
+            &format!("%bc = buffer bf16 32,{}", 32 * out_block * od),
+        )
+        .replace(
+            "%acc = acc bf16 64,128",
+            &format!("%acc = acc bf16 {ah},{aw}"),
+        )
+        .replace(
+            "store 64,128 %acc = %zero",
+            &format!("store {ah},{aw} %acc = %zero"),
+        )
+        .replace(
+            "store 64,128 %interm",
+            &format!("store {ah},{aw} %interm"),
+        )
+        .replace("store 64,128 %bc", &format!("store {ah},{aw} %bc"))
+        .replace(
+            "load 64,128 %acc = %interm",
+            &format!("load {ah},{aw} %acc = %interm"),
+        )
+        .replace("load 64,256 %sa", &format!("load {ah},{bk} %sa"))
+        .replace("load 64,256 %am", &format!("load {ah},{bk} %am"))
+        .replace("load 64,256 %al", &format!("load {ah},{bk} %al"))
+        .replace("load 256,128 %sb", &format!("load {bk},{aw} %sb"))
+        .replace("load 256,128 %bm", &format!("load {bk},{aw} %bm"))
+        .replace("load 256,128 %bl", &format!("load {bk},{aw} %bl"))
+}
+
+/// tt-metal's 2D-multicast kernel: `programs/tt_metal_mcast_bmm.ir` on the full
+/// grid.
+///
+/// One out block per core (4x4 tiles) over 12x10 cores, A read by column 0 and
+/// fanned out along each row, B read by row 0 and fanned down each column --
+/// the reuse-mcast reader pair, with the block-accumulator compute. K is the
+/// `%kt` launch scalar, so the same text runs any number of k blocks; A's k
+/// tile `j` is the value `j+1` and B is all ones, so a lost, doubled or
+/// misplaced block cannot add up to `32 * sum(1..kt)`.  The accumulator is
+/// tt-metal's 16-bit `Dst`, and every partial sum here is a multiple of 32
+/// below 2048, which bf16 holds exactly.
+#[test]
+fn a_tt_metal_mcast_kernel_matmuls_a_band() {
+    const NX: u64 = 12;
+    const NY: u64 = 10;
+    const OBH: u32 = 4;
+    const OBW: u32 = 4;
+    const KB: u32 = 2;
+    let kblocks: u32 = std::env::var("SKAM_KBLOCKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    // The out-block walk's size, so the case can be asked for more than one out
+    // block per core without inventing a second program.
+    let nobh: u32 = std::env::var("SKAM_NOBH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let nobw: u32 = std::env::var("SKAM_NOBW")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let (m, n, k) = (
+        32 * OBH as usize * nobh as usize * NY as usize,
+        32 * OBW as usize * nobw as usize * NX as usize,
+        32 * KB as usize * kblocks as usize,
+    );
+    let kt = k / 32;
+
+    const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
+    let mut a: Vec<u8> = Vec::with_capacity(m * k * 2);
+    for page in 0..m * k / 1024 {
+        let bits = (((page % kt) + 1) as f32).to_bits() >> 16;
+        for _ in 0..1024 {
+            a.extend_from_slice(&(bits as u16).to_le_bytes());
+        }
+    }
+    let b: Vec<u8> = ONE_BF16.iter().cycle().take(n * k * 2).copied().collect();
+    let expected = 32.0 * (1..=kt).map(|j| j as f32).sum::<f32>();
+
+    let program = mcast_bmm_tiled(OBH, OBW, KB, 2, 2, nobh, nobw)
+        .replace("%pa = param bf16 16384", &format!("%pa = param bf16 {}", m * k))
+        .replace("%pw = param bf16 245760", &format!("%pw = param bf16 {}", n * k))
+        .replace("%pc = param bf16 245760", &format!("%pc = param bf16 {}", m * n));
+    let scalars = [NX, NY, kt as u64, (n / 32) as u64];
+    let out = run_kernel_launches(&program, &scalars, &[&a, &b], &[2048, 2048], m * n * 2, 1).0;
+    let got: Vec<f32> = out
+        .chunks_exact(2)
+        .map(|c| f32::from_bits((u16::from_le_bytes(c.try_into().unwrap()) as u32) << 16))
+        .collect();
+    for (row, column) in (0..m).flat_map(|r| (0..n).map(move |c| (r, c))) {
+        assert_eq!(got[row * n + column], expected, "({row}, {column})");
+    }
+}
+
+/// The benchmark program itself: `20480 x 24576 x 24576` on the 12x10 grid,
+/// per-core 64x64 tiles, out blocks 8x8 tiles, `in0_block_w = 8`, subblock 2x4.
+///
+/// It is compiled, not launched: the point of the case is the artifact's size
+/// against the arena. The rings are tt-metal's (`2 * out_block * in0_block_w`
+/// for A and B, one out block each for `interm0` and `out`); `in0_block_w = 8`
+/// rather than the benchmark's 16 is the one reduction its L1 budget forces
+/// (`get_multi_dim_per_core_factor`'s all-DRAM branch). At 16 the rings alone
+/// are 1280 KiB, the whole region above the kernel config block.
+#[test]
+fn the_benchmark_program_compiles_and_fits() {
+    const M: usize = 20480;
+    const N: usize = 24576;
+    const K: usize = 24576;
+    let program = mcast_bmm_tiled(8, 8, 8, 2, 4, 8, 8)
+        .replace("%pa = param bf16 16384", &format!("%pa = param bf16 {}", M * K))
+        .replace("%pw = param bf16 245760", &format!("%pw = param bf16 {}", N * K))
+        .replace("%pc = param bf16 245760", &format!("%pc = param bf16 {}", M * N));
+    let lib = library();
+    let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
+    let unload: Symbol<ModuleUnload> =
+        unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
+    let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
+    let mut module: *mut c_void = std::ptr::null_mut();
+    let mut err: *mut c_char = std::ptr::null_mut();
+    let code = unsafe { compile(program.as_ptr().cast(), program.len(), &mut module, &mut err) };
+    assert_eq!(code, TT_OK, "ttCompile: {}", take_error(&free, err));
+    assert_eq!(
+        unsafe { unload(module, &mut err) },
+        TT_OK,
+        "unload: {}",
+        take_error(&free, err)
+    );
+}
+
+/// The benchmark shape end to end: tt-metal's `20480 x 24576 x 24576` on the
+/// 12x10 grid, per-core 64x64 tiles, out blocks 8x8 tiles, `in0_block_w = 8`,
+/// subblock 2x4 -- the whole per-core band, 64 out blocks per core over 768 k
+/// tiles.
+///
+/// A is all ones; B's tile column `n` is one when `n` is even and two when it
+/// is odd.  An output datum is therefore `32 * kt` or `64 * kt` by its column:
+/// B read as `[N, K]` pairs the k tiles with the wrong columns and misses both
+/// values by orders of magnitude.
+///
+/// The accumulator is tt-metal's 16-bit `Dst` with `packer_l1_acc`, so the sum
+/// over 768 k tiles rounds at every step and the comparison is relative, 1e-3.
+#[test]
+fn the_benchmark_shape_runs_on_the_card() {
+    const TOLERANCE: f64 = 0.001;
+    // `SKAM_KT` shrinks K, keeping every other size and the whole per-core
+    // band: a launch waits at most a second on silicon, so a shape this large
+    // is measured in K as well as in wall time.  `SKAM_NOBH`/`SKAM_NOBW` shrink
+    // the out-block walk, so a single out block can be measured on its own.
+    let kt: usize = std::env::var("SKAM_KT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(768);
+    let nobh: usize = std::env::var("SKAM_NOBH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    let nobw: usize = std::env::var("SKAM_NOBW")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    // The tiling itself, so the hang can be bisected one quantity at a time.
+    let (ob, kb, sb) = (
+        std::env::var("SKAM_OB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8u32),
+        std::env::var("SKAM_KB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8u32),
+        std::env::var("SKAM_SB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4u32),
+    );
+    let (sbh, sbw) = (2u32, sb);
+    let m = 10 * nobh * ob as usize * 32;
+    let n = 12 * nobw * ob as usize * 32;
+
+    let k = kt * 32;
+    const ONE: [u8; 2] = 0x3F80u16.to_le_bytes();
+    const TWO: [u8; 2] = 0x4000u16.to_le_bytes();
+
+    let a: Vec<u8> = ONE.iter().cycle().take(m * k * 2).copied().collect();
+    let mut b: Vec<u8> = Vec::with_capacity(n * k * 2);
+    for _ in 0..kt {
+        for column in 0..n / 32 {
+            let value = if column % 2 == 0 { ONE } else { TWO };
+            for _ in 0..1024 {
+                b.extend_from_slice(&value);
+            }
+        }
+    }
+
+    let program = mcast_bmm_tiled(ob, ob, kb, sbh, sbw, nobh as u32, nobw as u32)
+        .replace("%pa = param bf16 16384", &format!("%pa = param bf16 {}", m * k))
+        .replace("%pw = param bf16 245760", &format!("%pw = param bf16 {}", n * k))
+        .replace("%pc = param bf16 245760", &format!("%pc = param bf16 {}", m * n));
+    let scalars = [12u64, 10u64, kt as u64, (n / 32) as u64];
+    let (out, elapsed) =
+        run_kernel_launches(&program, &scalars, &[&a, &b], &[2048, 2048], m * n * 2, 1);
+
+    let mut worst = 0.0f64;
+    for row in 0..m {
+        for column in 0..n {
+            let want = if (column / 32) % 2 == 0 {
+                32.0 * kt as f64
+            } else {
+                64.0 * kt as f64
+            };
+            let at = (row * n + column) * 2;
+            let got = f32::from_bits(
+                (u16::from_le_bytes([out[at], out[at + 1]]) as u32) << 16,
+            ) as f64;
+            let error = (got - want).abs() / want;
+            if error > worst {
+                worst = error;
+            }
+            assert!(
+                error <= TOLERANCE,
+                "({row}, {column}): {got} for {want}, relative error {error}"
+            );
+        }
+    }
+    let flops = 2.0 * (m * n * k) as f64;
+    eprintln!(
+        "the benchmark shape (kt {kt}): worst relative error {worst} of {TOLERANCE}, \
+         {:.2} TFLOP/s over {elapsed:?}",
+        flops / elapsed.as_secs_f64() / 1e12
+    );
+}
+
+/// The 2x2 block with `in0_block_w = 2`: the same program, smaller body.
+
+/// The blocked program's arithmetic, at a shape the simulator can run.
+///
+/// The big one is a card measurement: at 137 GFLOP it is far past the
+/// simulator's cycle budget, and a timeout there would say nothing about the
+/// kernel. This one blocks K in two halves and checks every datum, which is
+/// what proves the pages of a block are the ones the compute reads.
+#[test]
+fn a_blocked_matmul_is_the_same_product() {
+    const NX: u64 = 12;
+    const NY: u64 = 10;
+    const M: usize = 128;
+    const N: usize = 1920;
+    const K: usize = 512;
+    let (mt, nt, kt) = (M / 32, N / 32, K / 32);
+    let ntiles = mt * nt;
+
+    const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
+    let a: Vec<u8> = ONE_BF16.iter().cycle().take(M * K * 2).copied().collect();
+    let b: Vec<u8> = ONE_BF16.iter().cycle().take(N * K * 2).copied().collect();
+
+    let program = gate_proj_blocked()
+        .replace(
+            "%pa = param bf16 16384",
+            &format!("%pa = param bf16 {}", M * K),
+        )
+        .replace(
+            "%pw = param bf16 245760",
+            &format!("%pw = param bf16 {}", N * K),
+        )
+        .replace(
+            "%pc = param f32 245760",
+            &format!("%pc = param f32 {}", M * N),
+        );
+    let scalars = [NX, NY, ntiles as u64, kt as u64, nt as u64];
+    let out = run_kernel_launches(
+        &program,
+        &scalars,
+        &[&a, &b],
+        &[2048, 2048],
+        ntiles * 1024 * 4,
+        1,
+    )
+    .0;
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (m, n) in (0..mt).flat_map(|m| (0..nt).map(move |n| (m, n))) {
+        for i in 0..1024 {
+            let at = (m * nt + n) * 1024 + i;
+            assert_eq!(got[at], K as f32, "tile ({m}, {n}) datum {i}");
+        }
+    }
+}
+
+/// The reuse block's arithmetic, every datum checked.
+///
+/// The grid is dealt whole blocks here (240 of them on 120 cores), so no output
+/// tile is left to a core that does not exist, which is what lets the test check
+/// every datum rather than tile 0.
+/// The reuse block's arithmetic on the simulator: `load ... = %ba [p]` names
+/// each page of the block, and `sync_cbs` derives one `wait`/`pop` of the whole
+/// block from the pages the body reads.
+#[test]
+fn a_block_matmul_is_the_same_product() {
+    const NX: u64 = 12;
+    const NY: u64 = 10;
+    const M: usize = 256;
+    const N: usize = 3840;
+    const K: usize = 512;
+    let (mt, nt, kt) = (M / 32, N / 32, K / 32);
+    let ntiles = mt * nt;
+    assert_eq!((mt / 2) * (nt / 2) % (NX * NY) as usize, 0);
+
+    const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
+    let a: Vec<u8> = ONE_BF16.iter().cycle().take(M * K * 2).copied().collect();
+    let b: Vec<u8> = ONE_BF16.iter().cycle().take(N * K * 2).copied().collect();
+
+    let program = gate_proj_block(2, 2)
+        .replace(
+            "%pa = param bf16 16384",
+            &format!("%pa = param bf16 {}", M * K),
+        )
+        .replace(
+            "%pw = param bf16 245760",
+            &format!("%pw = param bf16 {}", N * K),
+        )
+        .replace(
+            "%pc = param f32 245760",
+            &format!("%pc = param f32 {}", M * N),
+        );
+    let scalars = [NX, NY, ntiles as u64, kt as u64, nt as u64];
+    let out = run_kernel_launches(
+        &program,
+        &scalars,
+        &[&a, &b],
+        &[2048, 2048],
+        ntiles * 1024 * 4,
+        1,
+    )
+    .0;
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (m, n) in (0..mt).flat_map(|m| (0..nt).map(move |n| (m, n))) {
+        for i in 0..1024 {
+            let at = (m * nt + n) * 1024 + i;
+            assert_eq!(got[at], K as f32, "tile ({m}, {n}) datum {i}");
+        }
+    }
+}
+
+
+/// One `acc f32 64,64` block: the accumulator, the operand loads and the spill
+/// are block ops, repeated per tile in `lower` (a tile is the 1x1 case). A
+/// 2x2-tile product with `in0_block_w = 4`, every datum checked.
+#[test]
+fn a_block_accumulator_matmuls_two_by_two() {
+    const M: usize = 64;
+    const N: usize = 64;
+    const K: usize = 128;
+    const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
+    let a: Vec<u8> = ONE_BF16.iter().cycle().take(M * K * 2).copied().collect();
+    let b: Vec<u8> = ONE_BF16.iter().cycle().take(N * K * 2).copied().collect();
+
+    // A's block is `m x k` row-major (`page = r * 4 + kk`), which is also the
+    // parameter's tiled order, so the copy is the identity. B's is a dense
+    // `k x n` block (`page = kk * 2 + c`) gathered from the parameter's
+    // `n * Kt + k` order; the ring's layout is the program's, and a dense block
+    // is what lets the compute name it as one block.
+    let program = "\
+%pa = param bf16 8192
+%pw = param bf16 8192
+%pc = param f32 4096
+%ba = buffer bf16 32,256
+%bb = buffer bf16 32,256
+%bc = buffer f32 32,128
+%acc = acc f32 64,64
+%zero = const f32 0
+store 64,64 %acc = %zero
+copy 32,32 %ba [0] = %pa [0]
+copy 32,32 %ba [1] = %pa [1]
+copy 32,32 %ba [2] = %pa [2]
+copy 32,32 %ba [3] = %pa [3]
+copy 32,32 %ba [4] = %pa [4]
+copy 32,32 %ba [5] = %pa [5]
+copy 32,32 %ba [6] = %pa [6]
+copy 32,32 %ba [7] = %pa [7]
+copy 32,32 %bb [0] = %pw [0]
+copy 32,32 %bb [1] = %pw [4]
+copy 32,32 %bb [2] = %pw [1]
+copy 32,32 %bb [3] = %pw [5]
+copy 32,32 %bb [4] = %pw [2]
+copy 32,32 %bb [5] = %pw [6]
+copy 32,32 %bb [6] = %pw [3]
+copy 32,32 %bb [7] = %pw [7]
+load 64,128 %a = %ba [0]
+load 128,64 %b = %bb [0]
+matmul %acc %a %b
+store 64,64 %bc [0] = %acc
+copy 32,32 %pc [0] = %bc [0]
+copy 32,32 %pc [1] = %bc [1]
+copy 32,32 %pc [2] = %bc [2]
+copy 32,32 %pc [3] = %bc [3]
+grid 1,1
+";
+    if std::env::var_os("SKAM_PROGRAM").is_some() {
+        println!("{program}");
+    }
+    let out = run_kernel_scalars_paged(program, &[], &[&a, &b], &[2048, 2048], M * N * 4);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (row, column) in (0..M).flat_map(|r| (0..N).map(move |c| (r, c))) {
+        assert_eq!(got[row * N + column], K as f32, "({row}, {column})");
+    }
+}
+
+/// The 1x1 blocked program on one tile, the control for
+/// [`a_block_matmul_runs_on_one_tile`]: same grid, same launch path, one output
+/// tile. If this runs and the 2x2 does not, the difference is the block.
+#[test]
+fn a_blocked_matmul_runs_on_one_tile() {
+    const M: usize = 32;
+    const N: usize = 32;
+    const K: usize = 512;
+    let (mt, nt, kt) = (M / 32, N / 32, K / 32);
+    const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
+    let a: Vec<u8> = ONE_BF16.iter().cycle().take(M * K * 2).copied().collect();
+    let b: Vec<u8> = ONE_BF16.iter().cycle().take(N * K * 2).copied().collect();
+    let program = gate_proj_blocked()
+        .replace(
+            "%pa = param bf16 16384",
+            &format!("%pa = param bf16 {}", M * K),
+        )
+        .replace(
+            "%pw = param bf16 245760",
+            &format!("%pw = param bf16 {}", N * K),
+        )
+        .replace(
+            "%pc = param f32 245760",
+            &format!("%pc = param f32 {}", M * N),
+        );
+    let scalars = [1u64, 1u64, (mt * nt) as u64, kt as u64, nt as u64];
+    let out = run_kernel_launches(&program, &scalars, &[&a, &b], &[2048, 2048], M * N * 4, 1).0;
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (row, column) in (0..M).flat_map(|r| (0..N).map(move |c| (r, c))) {
+        assert_eq!(got[row * N + column], K as f32, "({row}, {column})");
+    }
+}
+
+/// The 2x2 block on **one** Tensix tile.
+///
+/// A tile runs the reader, the compute and the writer on its own RISC-V cores,
+/// so one tile exercises the whole ring protocol: two rings two blocks deep, a
+/// block `wait`/`pop` of four pages, four `Dst` accumulators and four packs to
+/// the output ring. The grid is 1x1 and the work is one block, so a deadlock
+/// costs one tile, not the 12x10 dispatcher, and every datum of the 64x64
+/// product is checked. This is the shape to debug a protocol on; the big test
+/// is only the rate.
+/// The 2x2 program is simulator-correct and address-clean (`nblocks` counts
+/// `(mt/h) * (nt/w)`), but on silicon the first block never finishes: no
+/// request, wait or pack of the block protocol is left outstanding on the
+/// simulator, so the difference is something only the card enforces. Parked
+/// until the card can bisect it; the 1x1 blocked program runs at 36.8 ms.
+#[ignore = "hangs on the first block on silicon; sim is green"]
+#[test]
+fn a_block_matmul_runs_on_one_tile() {
+    const M: usize = 64;
+    const N: usize = 64;
+    const K: usize = 512;
+    let (mt, nt, kt) = (M / 32, N / 32, K / 32);
+
+    const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
+    let a: Vec<u8> = ONE_BF16.iter().cycle().take(M * K * 2).copied().collect();
+    let b: Vec<u8> = ONE_BF16.iter().cycle().take(N * K * 2).copied().collect();
+
+    let program = gate_proj_block(2, 2)
+        .replace(
+            "%pa = param bf16 16384",
+            &format!("%pa = param bf16 {}", M * K),
+        )
+        .replace(
+            "%pw = param bf16 245760",
+            &format!("%pw = param bf16 {}", N * K),
+        )
+        .replace(
+            "%pc = param f32 245760",
+            &format!("%pc = param f32 {}", M * N),
+        );
+    let scalars = [1u64, 1u64, (mt * nt) as u64, kt as u64, nt as u64];
+    let out = run_kernel_launches(&program, &scalars, &[&a, &b], &[2048, 2048], M * N * 4, 1).0;
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (row, column) in (0..M).flat_map(|r| (0..N).map(move |c| (r, c))) {
+        assert_eq!(
+            got[row * N + column],
+            K as f32,
+            "({row}, {column}) holds the whole K sum"
+        );
+    }
+}
+
+/// One tile, one block shape, chosen by the test script: the bisect for the
+/// 2x2 block that hangs on silicon while the simulator is green.
+///
+/// `SKAM_BH`, `SKAM_BW` and `SKAM_BKB` are the block's rows, its columns and
+/// its k width (`in0_block_w`). At (1, 1, 1) the program is the single-page
+/// ring the card already runs; at (2, 2, 2) it is the hanging one. Every datum
+/// is checked, so a variant that runs also says whether its pages are right.
+/// The grid is 1x1: whatever the block does is one tile's protocol.
+#[ignore = "driven by hand on the card while bisecting the 2x2 block"]
+#[test]
+fn a_block_protocol_bisect() {
+    let env_of = |name: &str, default: u32| -> u32 {
+        std::env::var(name)
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(default)
+    };
+    let (bh, bw, bkb) = (
+        env_of("SKAM_BH", 2),
+        env_of("SKAM_BW", 2),
+        env_of("SKAM_BKB", 2),
+    );
+    let (mt, nt) = (bh as usize, bw as usize);
+    let (M, N, K) = (32 * mt, 32 * nt, 32 * bkb as usize * 8);
+
+    const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
+    let a: Vec<u8> = ONE_BF16.iter().cycle().take(M * K * 2).copied().collect();
+    let b: Vec<u8> = ONE_BF16.iter().cycle().take(N * K * 2).copied().collect();
+
+    let program = gate_proj_block_kb(bh, bw, bkb)
+        .replace(
+            "%pa = param bf16 16384",
+            &format!("%pa = param bf16 {}", M * K),
+        )
+        .replace(
+            "%pw = param bf16 245760",
+            &format!("%pw = param bf16 {}", N * K),
+        )
+        .replace(
+            "%pc = param f32 245760",
+            &format!("%pc = param f32 {}", M * N),
+        );
+    let kt = K / 32;
+    println!("bisect: h={bh} w={bw} kb={bkb} M={M} N={N} K={K}");
+    let scalars = [1u64, 1u64, (mt * nt) as u64, kt as u64, nt as u64];
+    let out = run_kernel_launches(&program, &scalars, &[&a, &b], &[2048, 2048], M * N * 4, 1).0;
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (m, n) in (0..mt).flat_map(|m| (0..nt).map(move |n| (m, n))) {
+        for i in 0..1024 {
+            let at = (m * nt + n) * 1024 + i;
+            assert_eq!(got[at], K as f32, "tile ({m}, {n}) datum {i}");
+        }
+    }
+}
+
+/// The reuse block's rate on the card, against the same product as the other
+/// two big-matmul tests.
+#[ignore = "hangs on the first block on silicon; sim is green"]
+#[test]
+fn a_block_matmul_runs_on_the_card() {
+    const NX: u64 = 12;
+    const NY: u64 = 10;
+    const M: usize = 2048;
+    const N: usize = 16384;
+    const K: usize = 2048;
+    let (mt, nt, kt) = (M / 32, N / 32, K / 32);
+    let ntiles = mt * nt;
+    let launches: usize = std::env::var("SKAM_PERF_LAUNCHES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(3);
+
+    const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
+    let a: Vec<u8> = ONE_BF16.iter().cycle().take(M * K * 2).copied().collect();
+    let b: Vec<u8> = ONE_BF16.iter().cycle().take(N * K * 2).copied().collect();
+
+    let program = gate_proj_block(2, 2)
+        .replace(
+            "%pa = param bf16 16384",
+            &format!("%pa = param bf16 {}", M * K),
+        )
+        .replace(
+            "%pw = param bf16 245760",
+            &format!("%pw = param bf16 {}", N * K),
+        )
+        .replace(
+            "%pc = param f32 245760",
+            &format!("%pc = param f32 {}", M * N),
+        );
+    let scalars = [NX, NY, ntiles as u64, kt as u64, nt as u64];
+    let (out, elapsed) = run_kernel_launches(
+        &program,
+        &scalars,
+        &[&a, &b],
+        &[2048, 2048],
+        ntiles * 1024 * 4,
+        launches,
+    );
+    assert_eq!(
+        f32::from_le_bytes(out[0..4].try_into().unwrap()),
+        K as f32,
+        "the accumulator holds the whole K sum"
+    );
+    let per = elapsed / u32::try_from(launches).unwrap_or(1);
+    let macs = (M * N * K) as f64 * launches as f64;
+    println!(
+        "2x2 block matmul {M}x{K} by {K}x{N} over {NX}x{NY}: {launches} launches in \
+         {elapsed:?}, {per:?} each, {:.2} GMAC/s, {:.1} GFLOP/s",
+        macs / elapsed.as_secs_f64() / 1e9,
+        2.0 * macs / elapsed.as_secs_f64() / 1e9
+    );
+}
+
+/// Where the matmul's time goes: the same program, the same grid, three
+/// variants of the work it does per launch.
+///
+/// - *full*: the gate projection as written;
+/// - *movement*: the same, with the `matmul` replaced by an add, so the page
+///   loads, the ring hand-offs and the DRAM traffic are all still there but the
+///   FPU does nothing;
+/// - *floor*: one page written per core and nothing else, which is the cost of
+///   the launch machinery itself (barriers, argument staging, dispatch).
+///
+/// `full - movement` is the FPU's share and `movement - floor` is the data
+/// movement's. Without this split a GMAC/s figure cannot say which of the three
+/// to attack.
+#[test]
+fn matmul_breakdown() {
+    const NX: u64 = 12;
+    const NY: u64 = 10;
+    const M: usize = 128;
+    const N: usize = 1920;
+    const K: usize = 64;
+    let (mt, nt, kt) = (M / 32, N / 32, K / 32);
+    let ntiles = mt * nt;
+    let launches: usize = std::env::var("SKAM_PERF_LAUNCHES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(20);
+
+    const FLOOR: &str = "\
+%nx = param i32 0
+%ny = param i32 0
+%pc = param f32 245760
+%bc = buffer f32 32,32
+%acc = acc f32 32,32
+%zero = const f32 0
+%x = grid.x
+%y = grid.y
+%row = mul %y %nx
+%site = add %row %x
+store 32,32 %acc = %zero
+store 32,32 %bc [0] = %acc
+copy 32,32 %pc [%site] = %bc [0]
+grid %nx,%ny
+";
+
+    let a_vals: Vec<f32> = (0..M * K).map(|i| (i % 7) as f32 - 3.0).collect();
+    let w_vals: Vec<f32> = (0..N * K).map(|i| (i % 5) as f32 - 2.0).collect();
+    let a: Vec<u16> = tiled(M, K, &a_vals)
+        .iter()
+        .map(|v| truncate_to_bf16(*v))
+        .collect();
+    let w: Vec<u16> = tiled(N, K, &w_vals)
+        .iter()
+        .map(|v| truncate_to_bf16(*v))
+        .collect();
+    let bytes = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|h| h.to_le_bytes()).collect() };
+    let scalars = [NX, NY, ntiles as u64, kt as u64, nt as u64];
+    let out_bytes = ntiles * 1024 * 4;
+
+    let mut times = Vec::new();
+    for (label, program) in [
+        ("full", GATE_PROJ.to_owned()),
+        (
+            "movement",
+            GATE_PROJ.replace("matmul %acc %a %b", "%noop = add %zero %zero"),
+        ),
+    ] {
+        let (_out, elapsed) = run_kernel_launches(
+            &program,
+            &scalars,
+            &[&bytes(&a), &bytes(&w)],
+            &[],
+            out_bytes,
+            launches,
+        );
+        let per = elapsed / u32::try_from(launches).unwrap_or(1);
+        println!("matmul breakdown, {label}: {per:?} each");
+        times.push(per);
+    }
+    // `%pc` is the output the harness allocates and appends as the last
+    // argument, so the floor launch names no input of its own.
+    let (_out, elapsed) = run_kernel_launches(FLOOR, &[NX, NY], &[], &[], out_bytes, launches);
+    let floor = elapsed / u32::try_from(launches).unwrap_or(1);
+    println!("matmul breakdown, floor: {floor:?} each");
+    println!(
+        "matmul breakdown: movement {:?}, FPU {:?} after a {:?} floor",
+        times[1] - floor,
+        times[0] - times[1],
+        floor
+    );
+}
+
+/// The fan-out: one leader per row publishes its page into every core of its
+/// row, so each core ends with the page its row's leader read.
+///
+/// `expand %b [1] [.., ..] from [0, ..]` names column 0 as the leader on the pinned
+/// axis and the whole row as its part of the span, so the request count is one
+/// per row and every other core is a receiver.
+#[test]
+fn a_row_fans_out_from_its_leader() {
+    const NX: u64 = 4;
+    const NY: u64 = 3;
+    const EXPAND: &str = "\
+%nx = const i32 4
+%ny = const i32 3
+%in = param f32 12288
+%out = param f32 12288
+%b = buffer f32 32,32
+%x = grid.x
+%y = grid.y
+%row = mul %y %nx
+%t = add %row %x
+copy 32,32 %b [0] = %in [%t]
+expand %b [1] [.., ..] from [0, ..]
+copy 32,32 %out [%t] = %b [0]
+grid %nx,%ny
+";
+    let ntiles = (NX * NY) as usize;
+    // Page order, one tile per core: the copy moves a page whole, so the
+    // reference needs no layout of its own.
+    let mut input = vec![0f32; ntiles * 1024];
+    for (at, datum) in input.iter_mut().enumerate() {
+        *datum = at as f32;
+    }
+    let bytes: Vec<u8> = input.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_scalars(EXPAND, &[], &[&bytes], ntiles * 1024 * 4);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for y in 0..NY {
+        for x in 0..NX {
+            let leader = (y * NX) as usize;
+            let at = ((y * NX + x) as usize) * 1024;
+            for i in 0..1024 {
+                assert_eq!(
+                    got[at + i],
+                    input[leader * 1024 + i],
+                    "core ({x},{y}) datum {i} is not its row leader's page"
+                );
+            }
+        }
+    }
+}
+
+/// What the copy span is worth: the same fan-out, timed with every core reading
+/// DRAM and with only the leaders reading.
+///
+/// `PAGES` pages are fanned out per core, so the all-reads form issues
+/// `NX * NY * PAGES` reads and the leader-only form `NY * PAGES`, one twelfth as
+/// many over this grid. Both programs are explicit texts — the span is the
+/// program's choice, never inferred — and only the launches are timed.
+#[test]
+fn fan_out_perf() {
+    const NX: u64 = 12;
+    const NY: u64 = 10;
+    const PAGES: u64 = 16;
+    let ntiles = NX * NY;
+    let launches: usize = std::env::var("SKAM_PERF_LAUNCHES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(20);
+    let program = |only_leaders: bool| {
+        format!(
+            "\
+%nx = const i32 {NX}
+%ny = const i32 {NY}
+%pages = const i32 {PAGES}
+%in = param f32 {n}
+%out = param f32 {n}
+%b = buffer f32 32,32
+%x = grid.x
+%y = grid.y
+%row = mul %y %nx
+%t = add %row %x
+%base = mul %t %pages
+%i = loop %pages
+%at = add %base %i
+copy 32,32 %b [0]{span} = %in [%at]
+expand %b [1] [.., ..] from [0, ..]
+copy 32,32 %out [%at] = %b [0]
+endloop
+grid %nx,%ny
+",
+            n = ntiles * PAGES * 1024,
+            span = if only_leaders { " cores [0, ..]" } else { "" },
+        )
+    };
+    let bytes_len = (ntiles * PAGES * 1024) as usize * 4;
+    let input = vec![1u8; bytes_len];
+    for (label, only_leaders) in [("every core reads", false), ("leaders only", true)] {
+        let (out, elapsed) = run_kernel_launches(
+            &program(only_leaders),
+            &[],
+            &[&input],
+            &[],
+            bytes_len,
+            launches,
+        );
+        assert!(
+            out.chunks_exact(4)
+                .any(|c| f32::from_le_bytes(c.try_into().unwrap()) != 0.0),
+            "{label}: the fan-out wrote nothing"
+        );
+        let per = elapsed / u32::try_from(launches).unwrap_or(1);
+        println!("fan-out over {NX}x{NY}, {PAGES} pages, {label}: {per:?} each");
+    }
+}
+
+/// Only the leaders read DRAM: the copy names `in [0, ..]`, so the receivers of
+/// the fan-out never issue a read and their page arrives entirely by multicast.
+///
+/// This is the point of the span. Without it every core reads its own page from
+/// DRAM and then throws it away when the leader's page arrives, so a fan-out
+/// would cost more traffic than it saves. The assertion is the same one the row
+/// test makes — every core ends with its row leader's page — but here the only
+/// core that ever saw DRAM is the leader.
+#[test]
+fn only_the_leaders_read_the_parameter() {
+    const NX: u64 = 4;
+    const NY: u64 = 3;
+    const LEADERS_READ: &str = "\
+%nx = const i32 4
+%ny = const i32 3
+%in = param f32 12288
+%out = param f32 12288
+%b = buffer f32 32,32
+%x = grid.x
+%y = grid.y
+%row = mul %y %nx
+%t = add %row %x
+copy 32,32 %b [0] cores [0, ..] = %in [%t]
+expand %b [1] [.., ..] from [0, ..]
+copy 32,32 %out [%t] = %b [0]
+grid %nx,%ny
+";
+    let ntiles = (NX * NY) as usize;
+    let mut input = vec![0f32; ntiles * 1024];
+    for (at, datum) in input.iter_mut().enumerate() {
+        *datum = at as f32;
+    }
+    let bytes: Vec<u8> = input.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_scalars(LEADERS_READ, &[], &[&bytes], ntiles * 1024 * 4);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for y in 0..NY {
+        for x in 0..NX {
+            let leader = (y * NX) as usize;
+            let at = ((y * NX + x) as usize) * 1024;
+            for i in 0..1024 {
+                assert_eq!(
+                    got[at + i],
+                    input[leader * 1024 + i],
+                    "core ({x},{y}) datum {i} is not its row leader's page"
+                );
+            }
+        }
+    }
+}
+
+/// The fan-out down a column: `from [.., 0]` pins the pick on the row, so the
+/// leaders are row 0 and each owns its column.
+#[test]
+fn a_column_fans_out_from_its_leader() {
+    const NX: u64 = 3;
+    const NY: u64 = 4;
+    const EXPAND: &str = "\
+%nx = const i32 3
+%ny = const i32 4
+%in = param f32 12288
+%out = param f32 12288
+%b = buffer f32 32,32
+%x = grid.x
+%y = grid.y
+%row = mul %y %nx
+%t = add %row %x
+copy 32,32 %b [0] = %in [%t]
+expand %b [1] [.., ..] from [.., 0]
+copy 32,32 %out [%t] = %b [0]
+grid %nx,%ny
+";
+    let ntiles = (NX * NY) as usize;
+    let mut input = vec![0f32; ntiles * 1024];
+    for (at, datum) in input.iter_mut().enumerate() {
+        *datum = at as f32;
+    }
+    let bytes: Vec<u8> = input.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_scalars(EXPAND, &[], &[&bytes], ntiles * 1024 * 4);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for y in 0..NY {
+        for x in 0..NX {
+            let leader = x as usize;
+            let at = ((y * NX + x) as usize) * 1024;
+            for i in 0..1024 {
+                assert_eq!(
+                    got[at + i],
+                    input[leader * 1024 + i],
+                    "core ({x},{y}) datum {i} is not its column leader's page"
+                );
+            }
+        }
+    }
+}
+
+/// A single leader for the whole grid: both pick axes are scalars, so one core
+/// owns the span and one request carries it to every other core.
+#[test]
+fn one_leader_fills_the_grid() {
+    const NX: u64 = 3;
+    const NY: u64 = 3;
+    const EXPAND: &str = "\
+%nx = const i32 3
+%ny = const i32 3
+%in = param f32 9216
+%out = param f32 9216
+%b = buffer f32 32,32
+%x = grid.x
+%y = grid.y
+%row = mul %y %nx
+%t = add %row %x
+copy 32,32 %b [0] = %in [%t]
+expand %b [1] [.., ..] from [1, 1]
+copy 32,32 %out [%t] = %b [0]
+grid %nx,%ny
+";
+    let ntiles = (NX * NY) as usize;
+    let mut input = vec![0f32; ntiles * 1024];
+    for (at, datum) in input.iter_mut().enumerate() {
+        *datum = at as f32;
+    }
+    let bytes: Vec<u8> = input.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_scalars(EXPAND, &[], &[&bytes], ntiles * 1024 * 4);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    // The leader is `(1, 1)`, the fourth tile in row-major order.
+    let leader = 1 * NX as usize + 1;
+    for t in 0..ntiles {
+        for i in 0..1024 {
+            assert_eq!(
+                got[t * 1024 + i],
+                input[leader * 1024 + i],
+                "tile {t} datum {i} is not the grid leader's page"
+            );
+        }
+    }
+}
+
 /// A weight tile whose pages are striped across the DRAM channels: the kernel
-/// resolves each page's channel from the page index (tt-metal's interleaved
+/// resolves each page's channel from the page index (tt-metal's
 /// address generator), so the four weight pages land on four different banks
 /// and the four GEMMs must still see the pages the host wrote.
 #[test]
 fn an_interleaved_tensor_is_read_page_by_page() {
     const INTERLEAVED: &str = "\
-version 9
 grid 1,1
 %pa = param bf16 1024
-%pw = param bf16 4096 interleaved
+%pw = param bf16 4096
 %pc = param f32 4096
 %ba = buffer bf16 32,32
 %bw = buffer bf16 32,32
@@ -4941,7 +6707,6 @@ endloop
 #[test]
 fn exp2_runs_on_the_simulator() {
     const PROGRAM: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -4990,7 +6755,6 @@ fn check_unary(program: &str, host: &[f32], want: impl Fn(f32) -> f32, tol: f32,
 }
 
 const ONE_LOAD: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -5033,7 +6797,6 @@ fn sin_and_cos_are_unfolded_into_primitives() {
 #[test]
 fn pow_is_unfolded_into_exp2_and_log2() {
     const POW: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -5056,7 +6819,6 @@ copy 32,32 %out [0] = %bo [0]
 #[test]
 fn div_is_unfolded_into_a_reciprocal() {
     const DIV: &str = "\
-version 9
 grid 1,1
 %in = param f32 2048
 %out = param f32 1024
@@ -5093,7 +6855,6 @@ copy 32,32 %out [0] = %bo [0]
 fn activation_program(chain: &str) -> String {
     format!(
         "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -5228,7 +6989,6 @@ fn gelu_runs_on_the_simulator() {
 fn bf16_activation_program(chain: &str) -> String {
     format!(
         "\
-version 9
 grid 1,1
 %in = param bf16 1024
 %out = param bf16 1024
@@ -5298,7 +7058,6 @@ fn bf16_activations_run_on_the_simulator() {
 /// accumulator, and the coefficients at the tile's dtype. `%zero` stays f32
 /// because the accumulator's fill is the one thing that must be f32.
 const RMS_NORM_BF16: &str = "\
-version 9
 grid 1,1
 %px = param bf16 98304
 %ps = param bf16 98304
@@ -5351,7 +7110,6 @@ endloop
 /// `Dst`, so every tile's fold is added to a bf16 datum. This is the rms_norm
 /// fold, isolated.
 const SUM_ROW_MANY_BF16: &str = "\
-version 9
 grid 1,1
 %px = param bf16 98304
 %pone = param bf16 1024
@@ -5436,7 +7194,6 @@ fn bf16_sum_row_over_many_tiles() {
 fn sum_row_probe_program(n: u32, dt: &str, acc: &str, out: &str) -> String {
     format!(
         "\
-version 9
 grid 1,1
 %px = param {dt} 98304
 %pone = param {dt} 1024
@@ -5474,7 +7231,6 @@ copy 32,32 %out [0] = %bo [0]
 fn sum_loaded_probe_program(n: u32, dt: &str, acc: &str, out: &str) -> String {
     format!(
         "\
-version 9
 grid 1,1
 %px = param {dt} 98304
 %pone = param {dt} 1024
@@ -5510,7 +7266,6 @@ copy 32,32 %out [0] = %bo [0]
 fn mul_store_probe_program(n: u32, dt: &str) -> String {
     format!(
         "\
-version 9
 grid 1,1
 %px = param {dt} 98304
 %out = param {dt} 98304
@@ -5934,7 +7689,6 @@ fn bf16_rms_norm_runs_on_the_simulator() {
 /// `softmax` down a tile's columns in a bf16 kernel: a 16-bit `Dst`, a bf16
 /// accumulator, and constants at the tile's dtype.
 const SOFTMAX_COL_BF16: &str = "\
-version 9
 grid 1,1
 %px = param bf16 1024
 %ps = param bf16 1024
@@ -6041,7 +7795,6 @@ fn bf16_softmax_runs_on_the_simulator() {
 /// gather moves those two halves. That is also why the ids page is written the
 /// way a tile holds row 0.
 const GATHER: &str = "\
-version 9
 grid 1,1
 %ids = param i32 1024
 %w = param f32 32768
@@ -6096,7 +7849,6 @@ fn a_gather_is_pure_data_movement() {
 /// the writer's, so a page the writer touches has to be filled by the writer
 /// too.
 const SCATTER: &str = "\
-version 9
 grid 1,1
 %src = param f32 1024
 %zero = param f32 1024
@@ -6147,7 +7899,6 @@ fn a_row_scatter_writes_a_parameter_in_the_tile_layout() {
 #[test]
 fn transpose_runs_on_the_simulator() {
     const TRANSPOSE: &str = "\
-version 9
 grid 1,1
 %pin = param bf16 1024
 %pout = param bf16 1024
@@ -6193,7 +7944,6 @@ copy 32,32 %pout [0] = %bout [0]
 #[test]
 fn q_times_k_transposed_runs_on_the_simulator() {
     const QK_TRANSPOSED: &str = "\
-version 9
 grid 1,1
 %pq = param bf16 1024
 %pk = param bf16 1024
@@ -6263,7 +8013,6 @@ copy 32,32 %pout [0] = %bo [0]
 /// negative where it is in the future. The rest is `SOFTMAX_COL`'s chain, so the
 /// mask is the one new input.
 const MASKED_SOFTMAX: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %pm = param f32 1024
@@ -6370,7 +8119,6 @@ fn a_causal_mask_hides_the_future_keys() {
 /// and a ring, so the page makes the round trip through a register — one `load`
 /// and one `store` per head, which is the same store the caller would issue.
 const REPEAT_KV: &str = "\
-version 9
 grid 1,1
 %pk = param f32 1024
 %out = param f32 4096
@@ -6415,7 +8163,6 @@ fn repeat_kv_copies_a_head_into_every_query_head() {
 /// through the tile softmax and the probabilities multiply V. `q @ kᵀ` is the
 /// one piece this kernel cannot name (`Op::Matmul` has no transpose).
 const SOFTMAX_TIMES_V: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %pv = param f32 1024
@@ -6508,7 +8255,6 @@ fn softmax_then_attention_times_v_runs_on_the_simulator() {
 /// SwiGLU: `down(silu(gate(x)) * up(x))`, every projection a tile GEMM, the
 /// activation the sigmoid chain the `silu` gate already covers.
 const SWIGLU: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %pg = param f32 1024
@@ -6615,7 +8361,6 @@ fn swiglu_runs_on_the_simulator() {
 /// parameter is `TT_TODO_ACCESS_SHAPE`, not an undefined request. A bf16 row
 /// has to move at page granularity, which is the next step for this path.
 const EMBEDDING_CAST: &str = "\
-version 9
 grid 1,1
 %ids = param i32 1024
 %w = param bf16 32768
@@ -6660,7 +8405,6 @@ fn a_bf16_row_gather_is_refused_by_the_alignment_rule() {
 /// page has one live row, which is what the pre-lm_head narrow leaves behind;
 /// every other row of the product is zero.
 const LM_HEAD: &str = "\
-version 9
 grid 1,1
 %pa = param f32 1024
 %pw = param f32 1024
@@ -6749,3 +8493,750 @@ load 32,32 %x = %bi [0]
 store 32,32 %bo [0] = %y
 copy 32,32 %out [0] = %bo [0]
 ";
+/// The reuse matmul with both operands multicast: the transcript of tt-metal's
+/// `matmul_multicore_reuse_mcast_2d` reader and compute.
+///
+/// Each grid row owns a band of `h` output rows and each grid column a band of
+/// `w` columns, so the A pages of a row band are read by that row's first column
+/// and fanned out along the row, and the B pages of a column band by that
+/// column's first row and fanned out down the column
+/// (`reader_bmm_tile_layout_in0.cpp` / `reader_bmm_tile_layout_in1.cpp`: the
+/// sender reads, every other core of the group receives).
+///
+/// The block is tt-metal's: `wait_front(in0_block_num_tiles)` for the whole
+/// operand block, then the tile loop, then `pop_front(in0_block_num_tiles)`
+/// (`bmm_large_block_zm.cpp:46-126`). The pages of one k-block are reserved
+/// once, read once, fanned out one request per page, and published once.
+fn gate_proj_mcast(h: u32, w: u32, kb: u32) -> String {
+    // Two blocks deep: `MCAST_INPUT_BUFFERING_DEPTH = 2`, so the reader can
+    // fill the next block while the compute still walks this one.
+    let depth_a = 2 * h * kb;
+    let depth_b = 2 * w * kb;
+    let mut s = format!(
+        "\
+%nx = param i32 0
+%ny = param i32 0
+%ktiles = param i32 0
+%ncols = param i32 0
+%pa = param bf16 16384
+%pw = param bf16 245760
+%pc = param f32 245760
+%ba = buffer bf16 32,{a}
+%bb = buffer bf16 32,{b}
+%bc = buffer f32 32,32
+",
+        a = 32 * depth_a,
+        b = 32 * depth_b
+    );
+    for r in 0..h {
+        for c in 0..w {
+            s.push_str(&format!("%acc{r}{c} = acc f32 32,32\n"));
+        }
+    }
+    s.push_str(&format!(
+        "\
+%zero = const f32 0
+%izero = const i32 0
+%tile = const i32 1
+%apages = const i32 {apages}
+%bpages = const i32 {bpages}
+%kb = const i32 {kb}
+%hh = const i32 {h}
+%ww = const i32 {w}
+%x = grid.x
+%y = grid.y
+%m0 = mul %y %hh
+%n0 = mul %x %ww
+%kblocks = div %ktiles %kb
+",
+        apages = h * kb,
+        bpages = w * kb,
+    ));
+    // The band's first row and column, then one `add` per further tile.
+    for r in 0..h {
+        if r == 0 {
+            s.push_str("%mr0 = add %m0 %izero\n");
+        } else {
+            s.push_str(&format!("%mr{r} = add %mr{} %tile\n", r - 1));
+        }
+    }
+    for c in 0..w {
+        if c == 0 {
+            s.push_str("%nr0 = add %n0 %izero\n");
+        } else {
+            s.push_str(&format!("%nr{c} = add %nr{} %tile\n", c - 1));
+        }
+    }
+    for r in 0..h {
+        s.push_str(&format!("%arow{r} = mul %mr{r} %ktiles\n"));
+    }
+    for c in 0..w {
+        s.push_str(&format!("%brow{c} = mul %nr{c} %ktiles\n"));
+    }
+    // The accumulator is cleared before the k loop, as tt-metal's `tile_regs_acquire`
+    // first product is a `matmul_tiles` into a fresh `Dst` section.
+    for r in 0..h {
+        for c in 0..w {
+            s.push_str(&format!("store 32,32 %acc{r}{c} = %zero\n"));
+        }
+    }
+    s.push_str("%k = loop %kblocks\n%k0 = mul %k %kb\n");
+    for r in 0..h {
+        s.push_str(&format!("%ka{r} = add %arow{r} %k0\n"));
+    }
+    for c in 0..w {
+        s.push_str(&format!("%kbv{c} = add %brow{c} %k0\n"));
+    }
+    // The k-step's index within the block: `%ka{r}` plus the step, one chain of
+    // `add`s like the block's own pages.
+    let step_name = |base: &str, which: u32, j: u32| {
+        if j == 0 {
+            format!("%{base}{which}")
+        } else {
+            format!("%{base}{which}_{j}")
+        }
+    };
+    for j in 0..kb {
+        for r in 0..h {
+            if j > 0 {
+                s.push_str(&format!(
+                    "{} = add {} %tile\n",
+                    step_name("ka", r, j),
+                    step_name("ka", r, j - 1)
+                ));
+            }
+        }
+        for c in 0..w {
+            if j > 0 {
+                s.push_str(&format!(
+                    "{} = add {} %tile\n",
+                    step_name("kbv", c, j),
+                    step_name("kbv", c, j - 1)
+                ));
+            }
+        }
+    }
+    // The block: every read of it, then one fan-out per page. A is read by the
+    // row's first column and travels along the row; B by the column's first row
+    // and travels down the column.
+    let page_a = |r: u32, j: u32| r * kb + j;
+    let page_b = |c: u32, j: u32| c * kb + j;
+    for j in 0..kb {
+        for r in 0..h {
+            s.push_str(&format!(
+                "copy 32,32 %ba [{}] cores [0, ..] = %pa [{}]\n",
+                page_a(r, j),
+                step_name("ka", r, j)
+            ));
+        }
+        for c in 0..w {
+            s.push_str(&format!(
+                "copy 32,32 %bb [{}] cores [.., 0] = %pw [{}]\n",
+                page_b(c, j),
+                step_name("kbv", c, j)
+            ));
+        }
+    }
+    // One fan-out per operand block: the reservation's pages are contiguous
+    // from the write pointer, and tt-metal sends the block in one call
+    // (`in0_block_size_bytes`, `reader_bmm_tile_layout_in0_sender_padding_metal2.cpp:407`).
+    s.push_str(&format!(
+        "expand %ba [%apages] [.., ..] from [0, ..]\n"
+    ));
+    s.push_str(&format!(
+        "expand %bb [%bpages] [.., ..] from [.., 0]\n"
+    ));
+    // The compute: wait for the block's pages, walk the tiles by index, and the
+    // last reader of each page pops the block.
+    for j in 0..kb {
+        for r in 0..h {
+            s.push_str(&format!(
+                "load 32,32 %a{r}_{j} = %ba [{}]\n",
+                page_a(r, j)
+            ));
+        }
+        for c in 0..w {
+            s.push_str(&format!(
+                "load 32,32 %b{c}_{j} = %bb [{}]\n",
+                page_b(c, j)
+            ));
+        }
+        for r in 0..h {
+            for c in 0..w {
+                s.push_str(&format!("matmul %acc{r}{c} %a{r}_{j} %b{c}_{j}\n"));
+            }
+        }
+    }
+    s.push_str("endloop\n");
+    for r in 0..h {
+        for c in 0..w {
+            s.push_str(&format!("%t{r}{c} = mul %mr{r} %ncols\n"));
+            s.push_str(&format!("%tb{r}{c} = add %t{r}{c} %nr{c}\n"));
+            s.push_str(&format!("store 32,32 %bc [0] = %acc{r}{c}\n"));
+            s.push_str(&format!("copy 32,32 %pc [%tb{r}{c}] = %bc [0]\n"));
+        }
+    }
+    s.push_str("grid %nx,%ny\n");
+    s
+}
+
+/// The multicast reuse matmul: every output datum is `K`, over the whole
+/// 12x10 grid, with each row band's A pages read once and fanned out along the
+/// row and each column band's B pages fanned out down the column.
+#[test]
+fn a_multicast_matmul_is_the_same_product() {
+    const NX: u64 = 12;
+    const NY: u64 = 10;
+    // Bands of 2x2 tiles per core, so the grid covers the output exactly.
+    const M: usize = 640;
+    const N: usize = 768;
+    const K: usize = 2048;
+    let (mt, nt, kt) = (M / 32, N / 32, K / 32);
+    assert_eq!(mt, 2 * NY as usize);
+    assert_eq!(nt, 2 * NX as usize);
+
+    const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
+    let a: Vec<u8> = ONE_BF16.iter().cycle().take(M * K * 2).copied().collect();
+    let b: Vec<u8> = ONE_BF16.iter().cycle().take(N * K * 2).copied().collect();
+
+    let program = gate_proj_mcast(2, 2, 2)
+        .replace(
+            "%pa = param bf16 16384",
+            &format!("%pa = param bf16 {}", M * K),
+        )
+        .replace(
+            "%pw = param bf16 245760",
+            &format!("%pw = param bf16 {}", N * K),
+        )
+        .replace(
+            "%pc = param f32 245760",
+            &format!("%pc = param f32 {}", M * N),
+        );
+    let scalars = [NX, NY, kt as u64, nt as u64];
+    let out = run_kernel_launches(&program, &scalars, &[&a, &b], &[2048, 2048], M * N * 4, 1).0;
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (m, n) in (0..mt).flat_map(|m| (0..nt).map(move |n| (m, n))) {
+        for i in 0..1024 {
+            let at = (m * nt + n) * 1024 + i;
+            assert_eq!(got[at], K as f32, "tile ({m}, {n}) datum {i}");
+        }
+    }
+}
+
+/// The multicast matmul on silicon: the program the simulator proves, run on
+/// the card and timed.
+///
+/// `SKAM_K` widens the k loop (the steady state, where every k-block is the
+/// same eight pages and one fan-out each) without changing the bands.
+#[test]
+fn a_multicast_matmul_runs_on_the_card() {
+    const NX: u64 = 12;
+    const NY: u64 = 10;
+    const M: usize = 640;
+    const N: usize = 768;
+    let k: usize = std::env::var("SKAM_K")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(2048);
+    let launches: usize = std::env::var("SKAM_PERF_LAUNCHES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1);
+    let (mt, nt, kt) = (M / 32, N / 32, k / 32);
+
+    const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
+    let a: Vec<u8> = ONE_BF16.iter().cycle().take(M * k * 2).copied().collect();
+    let b: Vec<u8> = ONE_BF16.iter().cycle().take(N * k * 2).copied().collect();
+
+    let program = gate_proj_mcast(2, 2, 2)
+        .replace(
+            "%pa = param bf16 16384",
+            &format!("%pa = param bf16 {}", M * k),
+        )
+        .replace(
+            "%pw = param bf16 245760",
+            &format!("%pw = param bf16 {}", N * k),
+        )
+        .replace(
+            "%pc = param f32 245760",
+            &format!("%pc = param f32 {}", M * N),
+        );
+    let scalars = [NX, NY, kt as u64, nt as u64];
+    let (out, elapsed) = run_kernel_launches(
+        &program,
+        &scalars,
+        &[&a, &b],
+        &[2048, 2048],
+        M * N * 4,
+        launches,
+    );
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (m, n) in (0..mt).flat_map(|m| (0..nt).map(move |n| (m, n))) {
+        for i in 0..1024 {
+            let at = (m * nt + n) * 1024 + i;
+            assert_eq!(got[at], k as f32, "tile ({m}, {n}) datum {i}");
+        }
+    }
+    let per = elapsed / u32::try_from(launches).unwrap_or(1);
+    let macs = (M * N * k) as f64 * launches as f64;
+    println!(
+        "mcast matmul {M}x{k} by {k}x{N} over {NX}x{NY}: {launches} launches in {elapsed:?}, \
+         {per:?} each, {:.2} GMAC/s, {:.1} GFLOP/s",
+        macs / elapsed.as_secs_f64() / 1e9,
+        2.0 * macs / elapsed.as_secs_f64() / 1e9
+    );
+}
+
+/// A k-block accumulator that spills to L1 and resumes: tt-metal's
+/// `enable_reload` path (`bmm_large_block_zm.cpp:56-68`), where the partial
+/// product of the previous block is `copy_tile`d back into `Dst` and the next
+/// block's `matmul_tiles` accumulate onto it.
+///
+/// The program seeds the accumulator from the `interm` page at the top of every
+/// k-block and packs it back at the bottom, so no accumulator lives in `Dst`
+/// across the loop; the answer must still be the whole K sum.
+const SPILL_K_LOOP: &str = "\
+grid 1,1
+%in = param bf16 16384
+%w = param bf16 16384
+%out = param f32 1024
+%ba = buffer bf16 32,32
+%bb = buffer bf16 32,32
+%interm = buffer f32 32,32
+%bc = buffer f32 32,32
+%acc = acc f32 32,32
+%zero = const f32 0
+%izero = const i32 0
+%sixteen = const i32 16
+store 32,32 %acc = %zero
+store 32,32 %interm [0] = %acc
+%k = loop %sixteen
+copy 32,32 %ba [0] = %in [%k]
+copy 32,32 %bb [0] = %w [%k]
+load 32,32 %acc = %interm [0]
+load 32,32 %a = %ba [0]
+load 32,32 %b = %bb [0]
+matmul %acc %a %b
+store 32,32 %interm [0] = %acc
+endloop
+load 32,32 %r = %interm [0]
+store 32,32 %bc [0] = %r
+copy 32,32 %out [0] = %bc [0]
+";
+
+/// The block accumulator crossing a k loop through L1: the same spill as
+/// [`a_spilled_accumulator_keeps_the_whole_k_sum`], with `acc f32 64,64` and
+/// block operands. The four tiles are one section, so the reload, the math and
+/// the pack move them as one hand-off per iteration.
+const BLOCK_SPILL_K_LOOP: &str = "\
+grid 1,1
+%in = param bf16 16384
+%w = param bf16 16384
+%out = param f32 4096
+%ba = buffer bf16 32,128
+%bb = buffer bf16 32,128
+%interm = buffer f32 32,128
+%bc = buffer f32 32,128
+%acc = acc f32 64,64
+%zero = const f32 0
+%izero = const i32 0
+%four = const i32 4
+store 64,64 %acc = %zero
+store 64,64 %interm [0] = %acc
+%k = loop %four
+copy 32,32 %ba [0] = %in [%k]
+copy 32,32 %ba [1] = %in [%k]
+copy 32,32 %ba [2] = %in [%k]
+copy 32,32 %ba [3] = %in [%k]
+copy 32,32 %bb [0] = %w [%k]
+copy 32,32 %bb [1] = %w [%k]
+copy 32,32 %bb [2] = %w [%k]
+copy 32,32 %bb [3] = %w [%k]
+%off = mul %k %izero
+load 64,64 %acc = %interm [0]
+load 64,64 %a = %ba [%off]
+load 64,64 %b = %bb [%off]
+matmul %acc %a %b
+store 64,64 %interm [0] = %acc
+endloop
+load 64,64 %r = %interm [0]
+store 64,64 %bc [0] = %r
+copy 32,32 %out [0] = %bc [0]
+copy 32,32 %out [1] = %bc [1]
+copy 32,32 %out [2] = %bc [2]
+copy 32,32 %out [3] = %bc [3]
+";
+
+#[test]
+fn a_block_accumulator_crosses_a_k_loop() {
+    const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
+    let bytes: Vec<u8> = ONE_BF16.iter().cycle().take(16384 * 2).copied().collect();
+    let out = run_kernel_scalars(BLOCK_SPILL_K_LOOP, &[], &[&bytes, &bytes], 4096 * 4);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let nz = got.iter().filter(|v| **v != 0.0).count();
+    let distinct: std::collections::BTreeSet<u32> = got.iter().map(|v| v.to_bits()).collect();
+    eprintln!("block spill: {nz}/{} nonzero, distinct {:?}", got.len(), distinct);
+    eprintln!("first 8: {:?}", &got[..8]);
+    for (i, datum) in got.iter().enumerate() {
+        assert_eq!(*datum, 256.0, "datum {i} is the whole K sum");
+    }
+}
+
+#[test]
+fn a_spilled_accumulator_keeps_the_whole_k_sum() {
+    // bf16 `1.0`, the operand the parameters are declared as.
+    const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
+    let bytes: Vec<u8> = ONE_BF16.iter().cycle().take(16384 * 2).copied().collect();
+    let out = run_kernel_scalars(SPILL_K_LOOP, &[], &[&bytes, &bytes], 1024 * 4);
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (i, datum) in got.iter().enumerate() {
+        assert_eq!(*datum, 512.0, "datum {i} is the whole K sum");
+    }
+}
+
+/// The reuse multicast matmul with a per-core band larger than `Dst`: tt-metal's
+/// block loop with the `interm0` spill (`bmm_large_block_zm.cpp`).
+///
+/// Each core owns an `h`x`w` band of output tiles. A k-block's A pages are
+/// fanned out along the core's row and its B pages down the column, one request
+/// per operand block. The band is walked in 2x2 subblocks; each subblock's four
+/// accumulators are seeded from the L1 partial (`copy_tile`), accumulated, and
+/// packed back, so no accumulator lives in `Dst` across the k loop while the
+/// whole band's partial sums stay in L1. That is what lets the band be bigger
+/// than the eight `Dst` slots, and a bigger band is what makes each page read
+/// pay for more MVMULs.
+fn gate_proj_mcast_band(h: u32, w: u32, kb: u32) -> String {
+    assert!(h % 2 == 0 && w % 2 == 0, "subblocks are 2x2");
+    let mut s = format!(
+        "\
+%nx = param i32 0
+%ny = param i32 0
+%ktiles = param i32 0
+%ncols = param i32 0
+%pa = param bf16 16384
+%pw = param bf16 245760
+%pc = param f32 245760
+%ba = buffer bf16 32,{a}
+%bb = buffer bf16 32,{b}
+%interm = buffer f32 32,{i}
+%bc = buffer f32 32,32
+",
+        // Two operand blocks deep (`MCAST_INPUT_BUFFERING_DEPTH = 2`) and two
+        // partial blocks deep, so the reader and the compute both run one block
+        // ahead.
+        a = 32 * 2 * h * kb,
+        b = 32 * 2 * w * kb,
+        i = 32 * 2 * h * w
+    );
+    for d in 0..4 {
+        s.push_str(&format!("%acc{d} = acc f32 32,32\n"));
+    }
+    s.push_str(&format!(
+        "\
+%zero = const f32 0
+%izero = const i32 0
+%tile = const i32 1
+%apages = const i32 {ap}
+%bpages = const i32 {bp}
+%kb = const i32 {kb}
+%hh = const i32 {h}
+%ww = const i32 {w}
+%x = grid.x
+%y = grid.y
+%m0 = mul %y %hh
+%n0 = mul %x %ww
+%kblocks = div %ktiles %kb
+%km1 = sub %kblocks %tile
+",
+        ap = h * kb,
+        bp = w * kb
+    ));
+    for r in 0..h {
+        if r == 0 {
+            s.push_str("%mr0 = add %m0 %izero\n");
+        } else {
+            s.push_str(&format!("%mr{r} = add %mr{} %tile\n", r - 1));
+        }
+    }
+    for c in 0..w {
+        if c == 0 {
+            s.push_str("%nr0 = add %n0 %izero\n");
+        } else {
+            s.push_str(&format!("%nr{c} = add %nr{} %tile\n", c - 1));
+        }
+    }
+    for r in 0..h {
+        s.push_str(&format!("%arow{r} = mul %mr{r} %ktiles\n"));
+    }
+    for c in 0..w {
+        s.push_str(&format!("%brow{c} = mul %nr{c} %ktiles\n"));
+    }
+    // Every partial starts at zero, so the first k-block's seed adds nothing.
+    s.push_str("store 32,32 %acc0 = %zero\n");
+    for p in 0..h * w {
+        s.push_str(&format!("store 32,32 %interm [{p}] = %acc0\n"));
+    }
+    let page = |r: u32, c: u32| r * w + c;
+    // One k-block: the operand reads, the two fan-outs, and the band's 2x2
+    // subblocks. `tag` separates the loop body's names from the peeled last
+    // block's; `last` says whether this block's products are the answer (packed
+    // out) or another partial (packed back to the spill).
+    let mut body = |s: &mut String, index: &str, tag: &str, last: bool| {
+        s.push_str(&format!("%k0{tag} = mul {index} %kb\n"));
+        for r in 0..h {
+            s.push_str(&format!("%ka{r}{tag} = add %arow{r} %k0{tag}\n"));
+        }
+        for c in 0..w {
+            s.push_str(&format!("%kbv{c}{tag} = add %brow{c} %k0{tag}\n"));
+        }
+        let step_name = |base: &str, which: u32, j: u32| {
+            if j == 0 {
+                format!("%{base}{which}{tag}")
+            } else {
+                format!("%{base}{which}{tag}_{j}")
+            }
+        };
+        for j in 0..kb {
+            for r in 0..h {
+                if j > 0 {
+                    s.push_str(&format!(
+                        "{} = add {} %tile\n",
+                        step_name("ka", r, j),
+                        step_name("ka", r, j - 1)
+                    ));
+                }
+            }
+            for c in 0..w {
+                if j > 0 {
+                    s.push_str(&format!(
+                        "{} = add {} %tile\n",
+                        step_name("kbv", c, j),
+                        step_name("kbv", c, j - 1)
+                    ));
+                }
+            }
+        }
+        for j in 0..kb {
+            for r in 0..h {
+                s.push_str(&format!(
+                    "copy 32,32 %ba [{}] cores [0, ..] = %pa [{}]\n",
+                    r * kb + j,
+                    step_name("ka", r, j)
+                ));
+            }
+            for c in 0..w {
+                s.push_str(&format!(
+                    "copy 32,32 %bb [{}] cores [.., 0] = %pw [{}]\n",
+                    c * kb + j,
+                    step_name("kbv", c, j)
+                ));
+            }
+        }
+        s.push_str("expand %ba [%apages] [.., ..] from [0, ..]\n");
+        s.push_str("expand %bb [%bpages] [.., ..] from [.., 0]\n");
+        let mut sub = 0u32;
+        for i in (0..h).step_by(2) {
+            for jj in (0..w).step_by(2) {
+                sub += 1;
+                // Seed the four accumulators from the block before, exactly
+                // tt-metal's `copy_tile(interm0, i, i)`.
+                for (d, (r, c)) in [
+                    (0, (i, jj)),
+                    (1, (i, jj + 1)),
+                    (2, (i + 1, jj)),
+                    (3, (i + 1, jj + 1)),
+                ] {
+                    s.push_str(&format!(
+                        "load 32,32 %acc{d} = %interm [{}]\n",
+                        page(r, c)
+                    ));
+                }
+                for j in 0..kb {
+                    // The operands this subblock reads. They are named here
+                    // rather than once per block because a value lives in a
+                    // `Dst` slot: eight slots hold four accumulators and four
+                    // operands, and nothing more.
+                    for r in [i, i + 1] {
+                        s.push_str(&format!(
+                            "load 32,32 %a{tag}{sub}_{r}_{j} = %ba [{}]\n",
+                            r * kb + j
+                        ));
+                    }
+                    for c in [jj, jj + 1] {
+                        s.push_str(&format!(
+                            "load 32,32 %b{tag}{sub}_{c}_{j} = %bb [{}]\n",
+                            c * kb + j
+                        ));
+                    }
+                    for (d, (r, c)) in [
+                        (0, (i, jj)),
+                        (1, (i, jj + 1)),
+                        (2, (i + 1, jj)),
+                        (3, (i + 1, jj + 1)),
+                    ] {
+                        s.push_str(&format!(
+                            "matmul %acc{d} %a{tag}{sub}_{r}_{j} %b{tag}{sub}_{c}_{j}\n"
+                        ));
+                    }
+                }
+                for (d, (r, c)) in [
+                    (0, (i, jj)),
+                    (1, (i, jj + 1)),
+                    (2, (i + 1, jj)),
+                    (3, (i + 1, jj + 1)),
+                ] {
+                    if last {
+                        // The last k-block's product is the answer: pack it
+                        // straight to the output ring, as tt-metal's `last_out`
+                        // branch does (`bmm_large_block_zm.cpp:93-110`).
+                        s.push_str(&format!("store 32,32 %bc [0] = %acc{d}\n"));
+                        s.push_str(&format!("%t{r}{c}{tag} = mul %mr{r} %ncols\n"));
+                        s.push_str(&format!("%tb{r}{c}{tag} = add %t{r}{c}{tag} %nr{c}\n"));
+                        s.push_str(&format!(
+                            "copy 32,32 %pc [%tb{r}{c}{tag}] = %bc [0]\n"
+                        ));
+                    } else {
+                        s.push_str(&format!(
+                            "store 32,32 %interm [{}] = %acc{d}\n",
+                            page(r, c)
+                        ));
+                    }
+                }
+            }
+        }
+    };
+    s.push_str("%k = loop %km1\n");
+    body(&mut s, "%k", "", false);
+    s.push_str("endloop\n");
+    // The last k-block is peeled: it is the one that packs out instead of back,
+    // which is tt-metal's `last_out`. A runtime `if` would be a branch no
+    // lowering here carries, and the peel is the same program either way.
+    s.push_str("%kf = sub %kblocks %tile\n");
+    body(&mut s, "%kf", "f", true);
+    s.push_str("grid %nx,%ny\n");
+    s
+}
+/// The 4x4 band with the spill, on the simulator: each core reads its four 2x2
+/// subblocks' partials back from L1 and every output datum is still the whole K
+/// sum. A 4x4 band already asks for 16 accumulators, twice the eight `Dst`
+/// slots, so the band can only cross the k loop in L1.
+#[test]
+#[allow(non_snake_case)]
+fn a_small_band_scratch() {
+    const NX: u64 = 1;
+    const NY: u64 = 1;
+    let bh: u32 = std::env::var("SKAM_BH").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    let bw: u32 = std::env::var("SKAM_BW").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    let (BH, BW) = (bh, bw);
+    let M: usize = 32 * BH as usize;
+    let N: usize = 32 * BW as usize;
+    const K: usize = 64;
+    let (mt, nt, kt) = (M / 32, N / 32, K / 32);
+
+    const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
+    let a: Vec<u8> = ONE_BF16.iter().cycle().take(M * K * 2).copied().collect();
+    let b: Vec<u8> = ONE_BF16.iter().cycle().take(N * K * 2).copied().collect();
+
+    let program = gate_proj_mcast_band(BH, BW, 2)
+        .replace(
+            "%pa = param bf16 16384",
+            &format!("%pa = param bf16 {}", M * K),
+        )
+        .replace(
+            "%pw = param bf16 245760",
+            &format!("%pw = param bf16 {}", N * K),
+        )
+        .replace(
+            "%pc = param f32 245760",
+            &format!("%pc = param f32 {}", M * N),
+        );
+    let scalars = [NX, NY, kt as u64, nt as u64];
+    let out = run_kernel_launches(&program, &scalars, &[&a, &b], &[2048, 2048], M * N * 4, 1).0;
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (m, n) in (0..mt).flat_map(|m| (0..nt).map(move |n| (m, n))) {
+        let at = (m * nt + n) * 1024;
+        eprintln!("tile ({m},{n}) = {:?}", &got[at..at + 4]);
+    }
+    for (m, n) in (0..mt).flat_map(|m| (0..nt).map(move |n| (m, n))) {
+        for i in 0..1024 {
+            let at = (m * nt + n) * 1024 + i;
+            assert_eq!(got[at], K as f32, "tile ({m}, {n}) datum {i}");
+        }
+    }
+}
+
+#[test]
+fn a_banded_multicast_matmul_is_the_same_product() {
+    const NX: u64 = 12;
+    const NY: u64 = 10;
+    const M: usize = 32 * 4 * 10; // 4-tile bands over 10 core rows
+    const N: usize = 32 * 4 * 12; // 4-tile bands over 12 core columns
+    let k: usize = std::env::var("SKAM_K")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(64);
+    let launches: usize = std::env::var("SKAM_PERF_LAUNCHES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1);
+    let K: usize = k;
+    let (mt, nt, kt) = (M / 32, N / 32, K / 32);
+    assert_eq!((mt, nt), (4 * 10, 4 * 12));
+
+    const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
+    let a: Vec<u8> = ONE_BF16.iter().cycle().take(M * K * 2).copied().collect();
+    let b: Vec<u8> = ONE_BF16.iter().cycle().take(N * K * 2).copied().collect();
+
+    let program = gate_proj_mcast_band(4, 4, 2)
+        .replace(
+            "%pa = param bf16 16384",
+            &format!("%pa = param bf16 {}", M * K),
+        )
+        .replace(
+            "%pw = param bf16 245760",
+            &format!("%pw = param bf16 {}", N * K),
+        )
+        .replace(
+            "%pc = param f32 245760",
+            &format!("%pc = param f32 {}", M * N),
+        );
+    let scalars = [NX, NY, kt as u64, nt as u64];
+    let (out, elapsed) =
+        run_kernel_launches(&program, &scalars, &[&a, &b], &[2048, 2048], M * N * 4, launches);
+    if launches > 1 {
+        let per = elapsed / u32::try_from(launches).unwrap_or(1);
+        let mac = M as f64 * N as f64 * K as f64;
+        println!(
+            "banded matmul {M}x{N} by {K} over {NX}x{NY}: {launches} launches in {elapsed:?}, {per:?} each, {:.2} GMAC/s, {:.1} GFLOP/s",
+            mac / per.as_secs_f64() / 1e9,
+            2.0 * mac / per.as_secs_f64() / 1e9
+        );
+    }
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (m, n) in (0..mt).flat_map(|m| (0..nt).map(move |n| (m, n))) {
+        for i in 0..1024 {
+            let at = (m * nt + n) * 1024 + i;
+            assert_eq!(got[at], K as f32, "tile ({m}, {n}) datum {i}");
+        }
+    }
+}

@@ -643,10 +643,22 @@ pub mod noc {
     }
 
     /// Every ID at no requests in flight and the default cap; nothing issued
-    /// on NoC #1; no stalls, no clock. Called once, before `firmware_main`.
+    /// on NoC #1; no stalls, no clock. Called before `firmware_main` and again
+    /// at the start of every launch, so a run that left a request unanswered
+    /// cannot poison the next one.
     pub(crate) fn reset() {
         // SAFETY: as `in_flight`; nothing else runs yet.
         unsafe { core::ptr::addr_of_mut!(IN_FLIGHT).write([[InFlight::new(); 16]; 2]) };
+        // A response-marked broadcast is acknowledged by every recipient, so an
+        // acknowledgement that never arrived leaves its transaction ID's
+        // `NIU_MST_REQS_OUTSTANDING_ID` non-zero for good, and `wait` spins on it
+        // (`Counters.md`, "Clear NIU transaction ID counters"). A launch that
+        // ended on one would wedge this tile for every later launch -- a state
+        // only a card reset clears -- so both NIUs' counters are zeroed here.
+        for niu in [Niu::Noc0, Niu::Noc1] {
+            // SAFETY: a write-only NIU register; `1 << id` for all sixteen IDs.
+            unsafe { write_volatile(reg(niu, niu::CLEAR_OUTSTANDING), 0xFFFF) };
+        }
         *stalls_mut() = Stalls {
             count: 0,
             cycles: 0,

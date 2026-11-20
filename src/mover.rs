@@ -27,18 +27,39 @@ use crate::module::ParamKind;
 use crate::status::ttStatus;
 use tt_isa::arch::blackhole::noc::niu::TxnId;
 
-/// Transaction ID every request uses. A mover issues in order and drains after
-/// each copy, so one ID is enough.
+/// Transaction ID every addressed request uses. A mover issues in order and
+/// drains after each copy, so one ID is enough.
 pub const TXN: TxnId = match TxnId::new(1) {
     Some(txn) => txn,
     None => panic!("transaction id 1 exists"),
 };
 
-/// The inbound launch argument: the DRAM address a parameter's page is read
-/// from.
-pub const ARG_HEAD: usize = 4;
+/// The transaction ID a collective's requests use. A multicast's acknowledgements
+/// are not waited for — the receivers' credits pace the sender, and they can only
+/// arrive after the page — so its counter is never read and must not be shared
+/// with the copies', whose drain it would disturb.
+pub const TXN_MCAST: TxnId = match TxnId::new(2) {
+    Some(txn) => txn,
+    None => panic!("transaction id 2 exists"),
+};
+
+/// The words of the launch argument block's head: the grid, the CB interface
+/// table, this tile's NOC word, and the collective tables.
+pub const ARG_HEAD: usize = 8;
 /// The launch argument word that holds the CB interface table's address.
 pub const ARG_IFACE: usize = 2;
+
+/// The multicast sites' base: the four-word block each `expand` owns in every
+/// tile. The site index is a compile-time constant, so the lowering adds its
+/// offset to this base instead of the base being baked into the program.
+pub const ARG_MCAST_SITES: i32 = 4 * 4;
+/// The coordinate table's base: one packed NoC coordinate per logical
+/// `(x, y)`, so a rectangle or a neighbour can be named in the coordinates the
+/// NoC actually routes on.
+pub const ARG_COORDS: i32 = 5 * 4;
+/// The launch grid's extents, for the wrap a `roll` over a whole axis takes.
+pub const ARG_GRID_X: i32 = 6 * 4;
+pub const ARG_GRID_Y: i32 = 7 * 4;
 
 /// The most channels a parameter can be striped over: every channel a
 /// Blackhole can have.
@@ -59,8 +80,9 @@ pub const INTERLEAVED_WORDS: usize = 2 * MAX_BANKS + 2;
 /// parameter pay for the striped case's channel table.
 pub const fn arg_words(kind: ParamKind) -> usize {
     match kind {
-        ParamKind::Scalar | ParamKind::Tensor => 2,
-        ParamKind::Interleaved => INTERLEAVED_WORDS,
+        ParamKind::Scalar => 2,
+        // A tensor's block is the channel table plus the count and the page.
+        ParamKind::Tensor { .. } => INTERLEAVED_WORDS,
     }
 }
 
@@ -110,9 +132,9 @@ fn page_of(shape: [crate::ir::Dim; 2], src_only: bool) -> Result<[crate::ir::Dim
     match crate::ir::access_shape(shape)? {
         crate::ir::RegShape::Tile => Ok([32, 32]),
         crate::ir::RegShape::Row => Ok(if src_only { [32, 32] } else { shape }),
-        crate::ir::RegShape::Column | crate::ir::RegShape::Scalar => {
-            Err(ttStatus::TT_TODO_ACCESS_SHAPE)
-        }
+        crate::ir::RegShape::Column
+        | crate::ir::RegShape::Scalar
+        | crate::ir::RegShape::Block { .. } => Err(ttStatus::TT_TODO_ACCESS_SHAPE),
     }
 }
 
@@ -225,6 +247,7 @@ impl Mover<'_> {
                     dst_offset,
                     src_offset,
                     shape,
+                    span,
                 } => {
                     let reader = self.old.info(src).kind == ValueKind::Param;
                     let writer = self.old.info(dst).kind == ValueKind::Param;
@@ -240,14 +263,43 @@ impl Mover<'_> {
                             dst_offset,
                             src_offset,
                             shape,
+                            span,
                         },
                         reader,
+                    });
+                }
+                // A collective is a reader-segment move: it publishes a page
+                // the segment filled, or hands one on. It is copied into the
+                // segment with the loops it lives under, exactly as a copy is.
+                Op::Expand {
+                    src,
+                    pages,
+                    span,
+                    from,
+                } => {
+                    self.copies.push(Copy {
+                        path: self.loops.clone(),
+                        op: Op::Expand {
+                            src,
+                            pages,
+                            span,
+                            from,
+                        },
+                        reader: true,
+                    });
+                }
+                Op::Roll { src, span, by } => {
+                    self.copies.push(Copy {
+                        path: self.loops.clone(),
+                        op: Op::Roll { src, span, by },
+                        reader: true,
                     });
                 }
                 Op::Load {
                     buffer,
                     offset,
                     shape,
+                    ..
                 } if self.old.info(buffer).kind == ValueKind::Param => {
                     // A lane's own index is an assembly, which fills the tile's
                     // rows; a single unit an `Src` reader consumes keeps the
@@ -267,6 +319,7 @@ impl Mover<'_> {
                             dst_offset: zero,
                             src_offset: offset,
                             shape,
+                            span: crate::ir::Span::WHOLE,
                         },
                         reader: true,
                     });
@@ -276,6 +329,7 @@ impl Mover<'_> {
                             buffer: ring,
                             offset: zero,
                             shape,
+                            into: None,
                         },
                     ));
                 }
@@ -299,6 +353,7 @@ impl Mover<'_> {
                             dst_offset: offset,
                             src_offset: zero,
                             shape,
+                            span: crate::ir::Span::WHOLE,
                         },
                         reader: false,
                     });
@@ -338,6 +393,8 @@ impl Mover<'_> {
                 dtype: info.dtype,
                 page,
                 len: 1,
+                // The compiler's staged page is handed off one at a time.
+                block: None,
             },
         ));
         self.names.push((ring, name));
@@ -414,56 +471,110 @@ impl Mover<'_> {
         Ok(out)
     }
 
-    /// One mover segment: its copies, each inside a copy of the loops it lived
-    /// under, with the ring hand-offs around it.
+    /// One mover segment: its moves, in program order, each inside a copy of
+    /// the loops it lived under.
+    ///
+    /// The loops are shared between moves that live under the same old loop,
+    /// not reopened per move: the reader's A block and B block are two nests in
+    /// one iteration of the k loop, which is how tt-metal's reader reads them
+    /// (`reader_bmm_tile_layout_in0.cpp`: `cb_reserve_back`, the in0 reads, the
+    /// in1 reads, the multicasts, `cb_push_back`, all in one `block` iteration).
+    /// Reopening the k loop per nest would read every A block before any B
+    /// block and publish them all after, which is neither that order nor a
+    /// hand-off the rings can hold.
+    ///
+    /// A peeled prologue and a peeled epilogue share the empty path but the k
+    /// loop sits between them, so the nesting is still closed around it: the
+    /// loops a move needs are opened from the common prefix with the last move,
+    /// and the prefix is what keeps the k loop open across a block's reads.
     fn segment(&mut self, into: &mut Kernel, reader: bool) -> Result<(), ttStatus> {
-        let mut groups: BTreeMap<Vec<(OpId, OpId)>, Vec<Copy>> = BTreeMap::new();
-        for copy in &self.copies {
-            if copy.reader != reader {
-                continue;
+        let moves: Vec<Copy> = self
+            .copies
+            .iter()
+            .filter(|copy| copy.reader == reader)
+            .cloned()
+            .collect();
+        // The old `(loop, induction)` pair of every loop the segment is
+        // currently inside, outermost first.
+        let mut open: Vec<(OpId, OpId)> = Vec::new();
+        for copy in &moves {
+            let common = open
+                .iter()
+                .zip(&copy.path)
+                .take_while(|(here, there)| here.0 == there.0)
+                .count();
+            while open.len() > common {
+                let Some((_, old_ind)) = open.pop() else {
+                    return Err(crate::status::internal_bug(
+                        "mover: the loop stack underflowed while closing it",
+                    ));
+                };
+                into.push(Op::EndLoop);
+                self.map.remove(&old_ind);
             }
-            groups
-                .entry(copy.path.clone())
-                .or_default()
-                .push(copy.clone());
+            for (old_loop, old_ind) in copy.path[common..].iter().copied() {
+                let Op::Loop { bound, .. } = *self.old.at(old_loop) else {
+                    return Err(ttStatus::TT_ERROR_ENDLOOP_WITHOUT_LOOP);
+                };
+                let bound = self.clone_value(into, bound)?;
+                let new = into.push(Op::Loop { bound, unroll: false });
+                self.map.insert(old_ind, new);
+                open.push((old_loop, old_ind));
+            }
+            self.bodies(into, std::slice::from_ref(copy))?;
         }
-        for (path, group) in groups {
-            self.map.clear();
-            self.nest(into, &path, &group)?;
+        while let Some((_, old_ind)) = open.pop() {
+            into.push(Op::EndLoop);
+            self.map.remove(&old_ind);
         }
         Ok(())
     }
 
-    /// Emit `path`'s loop nest, with `group`'s copies in the innermost body.
-    fn nest(
-        &mut self,
-        into: &mut Kernel,
-        path: &[(OpId, OpId)],
-        group: &[Copy],
-    ) -> Result<(), ttStatus> {
-        let Some(((old_loop, old_ind), rest)) = path.split_first() else {
-            return self.bodies(into, group);
-        };
-        let Op::Loop { bound } = *self.old.at(*old_loop) else {
-            return Err(ttStatus::TT_ERROR_ENDLOOP_WITHOUT_LOOP);
-        };
-        let bound = self.clone_value(into, bound)?;
-        let new = into.push(Op::Loop { bound });
-        self.map.insert(*old_ind, new);
-        self.nest(into, rest, group)?;
-        into.push(Op::EndLoop);
-        Ok(())
-    }
-
-    /// Emit one group's copies.
+    /// Emit one group's moves.
     fn bodies(&mut self, into: &mut Kernel, group: &[Copy]) -> Result<(), ttStatus> {
         for copy in group {
+            match copy.op.clone() {
+                Op::Expand {
+                    src,
+                    pages,
+                    span,
+                    from,
+                } => {
+                    self.new_ring(src)?;
+                    let src = self.clone_value(into, src)?;
+                    let pages = self.clone_value(into, pages)?;
+                    let span = self.clone_span(into, span)?;
+                    let from = self.clone_span(into, from)?;
+                    into.push(Op::Expand {
+                        src,
+                        pages,
+                        span,
+                        from,
+                    });
+                    continue;
+                }
+                Op::Roll { src, span, by } => {
+                    self.new_ring(src)?;
+                    let src = self.clone_value(into, src)?;
+                    let span = self.clone_span(into, span)?;
+                    let dx = self.clone_value(into, by[0])?;
+                    let dy = self.clone_value(into, by[1])?;
+                    into.push(Op::Roll {
+                        src,
+                        span,
+                        by: [dx, dy],
+                    });
+                    continue;
+                }
+                _ => {}
+            }
             let Op::Copy {
                 dst,
                 src,
                 dst_offset,
                 src_offset,
                 shape,
+                span,
             } = copy.op
             else {
                 return Err(crate::status::internal_bug(
@@ -476,6 +587,7 @@ impl Mover<'_> {
             let src = self.clone_value(into, src)?;
             let dst_offset = self.clone_value(into, dst_offset)?;
             let src_offset = self.clone_value(into, src_offset)?;
+            let span = self.clone_span(into, span)?;
             // The producer reserves a free page and publishes it; the consumer
             // waits for a published page and releases it (tt-metal's
             // `writer_unary_1.cpp` is `cb_wait_front`/`cb_pop_front`). Those
@@ -486,9 +598,36 @@ impl Mover<'_> {
                 dst_offset,
                 src_offset,
                 shape,
+                span,
             });
         }
         Ok(())
+    }
+
+    /// Rebuild a span inside the segment being built.
+    fn clone_span(
+        &mut self,
+        into: &mut Kernel,
+        span: crate::ir::Span,
+    ) -> Result<crate::ir::Span, ttStatus> {
+        Ok(crate::ir::Span {
+            x: self.clone_extent(into, span.x)?,
+            y: self.clone_extent(into, span.y)?,
+        })
+    }
+
+    fn clone_extent(
+        &mut self,
+        into: &mut Kernel,
+        extent: crate::ir::Extent,
+    ) -> Result<crate::ir::Extent, ttStatus> {
+        Ok(match extent {
+            crate::ir::Extent::Whole => crate::ir::Extent::Whole,
+            crate::ir::Extent::At(a) => crate::ir::Extent::At(self.clone_value(into, a)?),
+            crate::ir::Extent::Range(a, b) => {
+                crate::ir::Extent::Range(self.clone_value(into, a)?, self.clone_value(into, b)?)
+            }
+        })
     }
 
     /// Whether `id` is a value this pass created (rather than one of the old
@@ -561,6 +700,7 @@ impl Mover<'_> {
                 buffer,
                 offset,
                 shape,
+                ..
             } => {
                 let buffer = self.clone_value(into, buffer)?;
                 let offset = self.clone_value(into, offset)?;
@@ -568,6 +708,7 @@ impl Mover<'_> {
                     buffer,
                     offset,
                     shape,
+                    into: None,
                 }))
             }
             other => {
