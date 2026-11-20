@@ -1091,7 +1091,6 @@ mod tests {
     use crate::mir::LReg;
 
     const NEG: &str = "\
-version 9
 grid 1,1
 %in = param f32 4096
 %out = param f32 4096

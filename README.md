@@ -21,7 +21,6 @@ inside one `libskamandros.so`, about 1 MB on the disk.
 A simple matmul, distributed over a grid of Tensix cores, with symbolic dims:
 
 ```
-version 9
 %nx = param i32 0
 %ny = param i32 0
 %ntiles = param i32 0
@@ -183,7 +182,7 @@ Working end to end through the C ABI:
 - [x] `matmul`,
 - [x] `transpose` of a bf16 tile, including `q @ kᵀ` (the first GEMM of attention); an `f32` tile is
   `TT_TODO_TRANSPOSE`,
-- [x] interleaved DRAM tensors: `ttMemAllocInterleaved` stripes a tensor's pages across the channels, and a
+- [x] interleaved DRAM tensors: `ttMemAlloc` stripes a tensor's pages across the channels, and a
   parameter declared `interleaved` resolves each page's channel on the core (tt-metal's `InterleavedAddrGen`),
 - [x] `rms_norm` over two tokens and the real hidden size,
 - [x] a symbolic loop bound,

@@ -17,7 +17,6 @@ use crate::status::ttStatus;
 #[test]
 fn the_unified_program_round_trips() {
     const PROGRAM: &str = "\
-version 9
 grid 4,6
 %p0 = param bf16 1024,132,453
 %p1 = param bf16 1024,232
@@ -59,7 +58,6 @@ matmul %m %a %b
     // Symbolic grid and symbolic parameter dims, with the grid after the values
     // it reads: a scalar parameter is a rank-0 shape.
     const SYMBOLIC: &str = "\
-version 9
 %d = param i32 0
 %x = param bf16 1024,%d
 grid %d,8
@@ -77,13 +75,13 @@ grid %d,8
 #[test]
 fn a_buffer_shape_that_is_not_one_or_a_multiple_of_32_is_refused() {
     for shape in ["33,32", "32,33", "16,32"] {
-        let text = format!("version 9\n%x = buffer f32 {shape}\ngrid 1,1\n");
+        let text = format!("%x = buffer f32 {shape}\ngrid 1,1\n");
         let err = Kernel::parse(&text).expect_err(shape);
         assert_eq!(err, ttStatus::TT_ERROR_BUFFER_SHAPE, "{shape}");
     }
     // A buffer is always two-dimensional and always constant.
     for shape in ["32", "32,%d"] {
-        let text = format!("version 9\n%d = const i32 4\n%x = buffer f32 {shape}\ngrid 1,1\n");
+        let text = format!("%d = const i32 4\n%x = buffer f32 {shape}\ngrid 1,1\n");
         assert!(
             Kernel::parse(&text).is_err(),
             "{shape} is not a buffer shape"
@@ -93,7 +91,7 @@ fn a_buffer_shape_that_is_not_one_or_a_multiple_of_32_is_refused() {
 
 #[test]
 fn a_zero_dimension_is_not_the_way_to_write_a_tensor() {
-    let text = "version 9\n%p = param f32 0,32\ngrid 1,1\n";
+    let text = "%p = param f32 0,32\ngrid 1,1\n";
     let err = Kernel::parse(text).expect_err("a zero in a dimension list");
     assert_eq!(err, ttStatus::TT_ERROR_ZERO_DIMENSION);
 }
@@ -111,7 +109,7 @@ fn a_bf16_constant_is_the_high_half_of_its_literal() {
         ("1.1", 0x3f8c),
         ("0.1", 0x3dcc),
     ] {
-        let text = format!("version 9\n%c = const bf16 {literal}\ngrid 1,1\n");
+        let text = format!("%c = const bf16 {literal}\ngrid 1,1\n");
         let k = Kernel::parse(&text).expect("a bf16 constant parses");
         let (_, op) = k.ops().next().expect("the constant");
         assert_eq!(
@@ -132,11 +130,11 @@ fn a_bf16_constant_is_the_high_half_of_its_literal() {
         };
         let printed = k.to_string();
         assert_eq!(
-            printed.lines().nth(1),
+            printed.lines().next(),
             Some(format!("%c = const bf16 {decimal}").as_str()),
             "the printed form of {literal}: {printed}"
         );
-        let again = Kernel::parse(&format!("version 9\n%c = const bf16 {decimal}\ngrid 1,1\n"))
+        let again = Kernel::parse(&format!("%c = const bf16 {decimal}\ngrid 1,1\n"))
             .expect("the printed constant parses back");
         assert_eq!(
             *again.ops().next().expect("the constant").1,
@@ -152,7 +150,7 @@ fn a_bf16_constant_is_the_high_half_of_its_literal() {
 fn a_bf16_constant_is_not_its_f32_literal() {
     // `0.1` is neither a bf16 nor an f32 datum: the constant keeps the high
     // half, which is a different number.
-    let text = "version 9\n%c = const bf16 0.1\ngrid 1,1\n";
+    let text = "%c = const bf16 0.1\ngrid 1,1\n";
     let k = Kernel::parse(text).expect("it parses");
     let (_, op) = k.ops().next().expect("the constant");
     let Op::Const { bits, .. } = *op else {
@@ -165,7 +163,6 @@ fn a_bf16_constant_is_not_its_f32_literal() {
 #[test]
 fn an_implicit_dtype_conversion_is_refused() {
     let text = "\
-version 9
 %a = const f32 1.0
 %b = const i32 1
 %c = add %a %b
@@ -177,7 +174,7 @@ grid 1,1
 
 #[test]
 fn a_use_before_its_definition_is_refused() {
-    let text = "version 9\n%x = add %a %b\n%a = const i32 1\n%b = const i32 2\ngrid 1,1\n";
+    let text = "%x = add %a %b\n%a = const i32 1\n%b = const i32 2\ngrid 1,1\n";
     let err = Kernel::parse(text).expect_err("undefined value");
     assert_eq!(err, ttStatus::TT_ERROR_VALUE_UNDEFINED);
 }
@@ -185,7 +182,6 @@ fn a_use_before_its_definition_is_refused() {
 #[test]
 fn a_value_does_not_escape_its_loop() {
     let text = "\
-version 9
 %n = const i32 4
 %i = loop %n
 %x = add %i %n
@@ -199,16 +195,10 @@ grid 1,1
 
 #[test]
 fn a_program_needs_exactly_one_grid() {
-    let err = Kernel::parse("version 9\n%x = const i32 1\n").expect_err("no grid");
+    let err = Kernel::parse("%x = const i32 1\n").expect_err("no grid");
     assert_eq!(err, ttStatus::TT_ERROR_GRID);
-    let err = Kernel::parse("version 9\ngrid 1,1\ngrid 2,2\n").expect_err("two grids");
+    let err = Kernel::parse("grid 1,1\ngrid 2,2\n").expect_err("two grids");
     assert_eq!(err, ttStatus::TT_ERROR_GRID);
-}
-
-#[test]
-fn an_unknown_version_is_refused() {
-    let err = Kernel::parse("version 1\ngrid 1,1\n").expect_err("version 1");
-    assert_eq!(err, ttStatus::TT_ERROR_VERSION);
 }
 
 /// A copy kernel over a two-page buffer: the compiler derives the mover
@@ -216,7 +206,6 @@ fn an_unknown_version_is_refused() {
 #[test]
 fn a_copy_kernel_compiles_to_mover_programs_only() {
     const COPY: &str = "\
-version 9
 %in = param f32 8192
 %out = param f32 8192
 %b0 = buffer f32 32,64
@@ -228,36 +217,46 @@ grid 1,1
 ";
     let k = Kernel::parse(COPY).expect("the copy kernel parses");
     let m = compile::compile(&k).expect("the copy kernel compiles");
-    assert_eq!(m.params, vec![ParamKind::Tensor, ParamKind::Tensor]);
+    assert_eq!(
+        m.params,
+        vec![
+            ParamKind::Tensor { page: 4096 },
+            ParamKind::Tensor { page: 4096 }
+        ]
+    );
     assert!(!m.reader.is_empty(), "two inbound copies");
     assert!(!m.writer.is_empty(), "two outbound copies");
     assert!(m.cores.iter().all(Vec::is_empty), "no compute");
 }
 
-/// An interleaved tensor: the declaration round-trips, and the compiled module
-/// labels the parameter so the runtime hands it a per-channel block.
+/// A tensor parameter names pages and nothing else: the launch hands the
+/// module the DRAM bank table, so the compiled parameter is one kind whatever
+/// the buffer's allocation is, and its page is one tile of its dtype.
 #[test]
-fn an_interleaved_parameter_round_trips() {
+fn a_tensor_parameter_is_one_kind_whatever_its_allocation() {
     const PROGRAM: &str = "\
-version 9
 %in = param f32 1024
-%w = param f32 4096 interleaved
+%w = param f32 4096
 %out = param f32 1024
 %b0 = buffer f32 32,32
 copy 32,32 %b0 [0] = %in [0]
 copy 32,32 %out [0] = %b0 [0]
 grid 1,1
 ";
-    let k = Kernel::parse(PROGRAM).expect("an interleaved parameter parses");
+    let k = Kernel::parse(PROGRAM).expect("a parameter parses");
     let text = k.to_string();
     assert!(
-        text.contains("%w = param f32 4096 interleaved"),
-        "the layout round-trips: {text}"
+        text.contains("%w = param f32 4096\n"),
+        "the declaration is the dtype and the count: {text}"
     );
     let m = compile::compile(&k).expect("it compiles");
     assert_eq!(
         m.params,
-        vec![ParamKind::Tensor, ParamKind::Interleaved, ParamKind::Tensor]
+        vec![
+            ParamKind::Tensor { page: 4096 },
+            ParamKind::Tensor { page: 4096 },
+            ParamKind::Tensor { page: 4096 }
+        ]
     );
 }
 
@@ -266,7 +265,6 @@ grid 1,1
 #[test]
 fn an_elementwise_kernel_compiles_to_all_five_programs() {
     const NEG: &str = "\
-version 9
 %in = param f32 4096
 %out = param f32 4096
 %bi = buffer f32 32,32
@@ -294,7 +292,6 @@ grid 1,1
 #[test]
 fn a_direct_parameter_access_gets_its_movers() {
     const DIRECT: &str = "\
-version 9
 %in = param f32 4096
 %out = param f32 4096
 load 32,32 %x = %in [0]
@@ -342,7 +339,6 @@ grid 1,1
 #[test]
 fn a_symbolic_offset_into_a_row_buffer_reads_one_datum() {
     const ROW: &str = "\
-version 9
 grid 1,1
 %ids = param i32 1024
 %ib = buffer i32 1,32
@@ -379,7 +375,6 @@ load 1,32 %y = %ib [0]
 #[test]
 fn the_offset_counts_units_of_the_access_shape() {
     const PROGRAM: &str = "\
-version 9
 grid 1,1
 %p = param f32 2048
 %b = buffer f32 32,64
@@ -427,7 +422,6 @@ load 1,1 %d = %b [7]
 #[test]
 fn a_narrow_parameter_access_is_staged_as_its_own_page() {
     const PROGRAM: &str = "\
-version 9
 grid 1,1
 %p = param f32 1024
 %o = param f32 1024
@@ -484,7 +478,6 @@ fn an_access_shape_is_the_unit_a_copy_moves() {
     assert_eq!(
         refused(
             "\
-version 9
 grid 1,1
 %p = param f32 1024
 %b = buffer f32 1,1
@@ -497,7 +490,6 @@ copy 1,1 %b [0] = %p [0]
     assert_eq!(
         refused(
             "\
-version 9
 grid 1,1
 %p = param f32 1024
 %b = buffer f32 32,32
@@ -511,7 +503,6 @@ copy 16,16 %b [0] = %p [0]
     // fill the page exactly, so 32 rows of a tile-sized buffer gather in 32
     // requests.
     const GATHER: &str = "\
-version 9
 grid 1,1
 %ids = param i32 32
 %w = param f32 32768
@@ -534,7 +525,6 @@ copy 32,32 %out [0] = %wb [0]
     assert_eq!(
         refused(
             "\
-version 9
 grid 1,1
 %pid = param i32 32
 %w = param f32 32768
@@ -552,7 +542,6 @@ copy 32,32 %b [0] = %w [%i]
     assert_eq!(
         refused(
             "\
-version 9
 grid 1,1
 %pid = param i32 32
 %w = param f32 32768
@@ -592,7 +581,6 @@ fn a_narrow_access_names_a_page_of_its_own_unit() {
     for shape in ["1,32", "32,1"] {
         let text = format!(
             "\
-version 9
 grid 1,1
 %p = param f32 1024
 %b = buffer f32 32,32
@@ -607,7 +595,6 @@ load {shape} %x = %b [0]
     // face, so a row taken from a tile page feeds it without an unpack.
     Kernel::parse(
         "\
-version 9
 grid 1,1
 %p = param f32 1024
 %o = param f32 1024
@@ -629,7 +616,6 @@ copy 32,32 %o [0] = %bo [0]
     // and the pack writes the two rows back.
     Kernel::parse(
         "\
-version 9
 grid 1,1
 %p = param f32 1024
 %o = param f32 1024
@@ -649,7 +635,6 @@ copy 1,32 %o [0] = %v [0]
     case(
         "a bf16 row of a parameter",
         "\
-version 9
 grid 1,1
 %p = param bf16 1024
 %v = buffer bf16 1,32
@@ -664,7 +649,6 @@ copy 1,32 %v [0] = %p [0]
     case(
         "a 32,1 copy from a parameter",
         "\
-version 9
 grid 1,1
 %p = param f32 1024
 %v = buffer f32 32,1
@@ -680,7 +664,6 @@ load 32,1 %x = %v [0]
     for shape in ["1,32", "32,1", "1,1"] {
         let text = format!(
             "\
-version 9
 grid 1,1
 %out = param f32 1024
 %bo = buffer f32 32,32
@@ -704,7 +687,6 @@ copy 32,32 %out [0] = %bo [0]
 #[test]
 fn a_constant_loop_becomes_a_branch() {
     const LOOP_TWO: &str = "\
-version 9
 %in = param f32 2048
 %out = param f32 2048
 %bi = buffer f32 32,64
@@ -751,7 +733,6 @@ fn has_backward_jump(words: &[u32]) -> bool {
 #[test]
 fn a_dynamic_loop_becomes_a_branch() {
     const DYNAMIC: &str = "\
-version 9
 %n = param i32 0
 %in = param f32 2048
 %out = param f32 2048
@@ -780,7 +761,6 @@ grid 1,1
 #[test]
 fn the_grid_is_symbolic_and_the_coordinate_is_a_value() {
     const SYMBOLIC: &str = "\
-version 9
 %nx = param i32 0
 %ny = param i32 0
 %in = param f32 2048
@@ -805,8 +785,8 @@ grid %nx,%ny
         vec![
             ParamKind::Scalar,
             ParamKind::Scalar,
-            ParamKind::Tensor,
-            ParamKind::Tensor
+            ParamKind::Tensor { page: 4096 },
+            ParamKind::Tensor { page: 4096 }
         ]
     );
 }
@@ -816,7 +796,6 @@ grid %nx,%ny
 #[test]
 fn comparisons_make_a_bool_and_sel_takes_one() {
     const SELECT: &str = "\
-version 9
 %x = const i32 3
 %y = const i32 5
 %lt = cmplt %x %y
@@ -836,11 +815,11 @@ grid 1,1
     assert_eq!(k.dtype(of("m")), DType::I32, "sel is i32");
 
     // A bool condition is required, and a value with no bool is not one.
-    let bad = "version 9\n%x = const i32 3\n%m = sel %x %x %x\ngrid 1,1\n";
+    let bad = "%x = const i32 3\n%m = sel %x %x %x\ngrid 1,1\n";
     let err = Kernel::parse(bad).expect_err("an i32 condition is refused");
     assert_eq!(err, ttStatus::TT_ERROR_CONDITION_NOT_BOOL);
 
-    let err = Kernel::parse("version 9\n%x = const i32 3\n%y = relu %x\ngrid 1,1\n")
+    let err = Kernel::parse("%x = const i32 3\n%y = relu %x\ngrid 1,1\n")
         .expect_err("relu is not an op");
     assert_eq!(err, ttStatus::TT_ERROR_PARSE);
 }
@@ -850,7 +829,6 @@ grid 1,1
 #[test]
 fn a_bitcast_is_the_same_bits_under_another_name() {
     const SAME: &str = "\
-version 9
 %in = param f32 2048
 %out = param i32 2048
 %bi = buffer f32 32,32
@@ -878,7 +856,6 @@ grid 1,1
 
     // 32 bits do not fit a 16-bit dtype, and a bitcast may not convert.
     const NARROW: &str = "\
-version 9
 %b = buffer f32 32,32
 load 32,32 %x = %b [0]
 %y = bitcast %x to bf16
@@ -892,7 +869,6 @@ grid 1,1
 /// be `load`s, because the Matrix Unit's `SrcA`/`SrcB` are filled by the
 /// unpacker from a CB page.
 const MATMUL: &str = "\
-version 9
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -934,7 +910,6 @@ fn a_matmul_is_refused_for_what_the_matrix_unit_cannot_take() {
     // stages it: it owns a page and packs the value into it, so the Matrix Unit
     // still reads `Src` from L1. Three caller buffers plus that page.
     const NEGATED: &str = "\
-version 9
 grid 1,1
 %pa = param f32 1024
 %out = param f32 1024
@@ -962,7 +937,6 @@ copy 32,32 %out [0] = %bo [0]
     case(
         "a buffer where the accumulator goes",
         "\
-version 9
 grid 1,1
 %pa = param f32 1024
 %out = param f32 1024
@@ -984,7 +958,6 @@ copy 32,32 %out [0] = %bo [0]
     case(
         "a 1,32 accumulator",
         "\
-version 9
 grid 1,1
 %pa = param f32 1024
 %out = param f32 1024
@@ -1008,7 +981,6 @@ copy 32,32 %out [0] = %bo [0]
     case(
         "bf16 accumulation beside an f32 value",
         "\
-version 9
 grid 1,1
 %pa = param bf16 1024
 %pf = param f32 1024
@@ -1043,7 +1015,6 @@ copy 32,32 %out [0] = %bo [0]
     case(
         "f32 operands, bf16 accumulator",
         "\
-version 9
 grid 1,1
 %pa = param f32 1024
 %out = param bf16 1024
@@ -1069,7 +1040,6 @@ copy 32,32 %out [0] = %bo [0]
     case(
         "i32 operands",
         "\
-version 9
 grid 1,1
 %pa = param i32 1024
 %out = param i32 1024
@@ -1097,25 +1067,25 @@ fn an_acc_is_one_32x32_tile_of_an_accumulating_dtype() {
     };
     case(
         "a 16x16 accumulator",
-        "version 9\n%m = acc f32 16,16\ngrid 1,1\n",
+        "%m = acc f32 16,16\ngrid 1,1\n",
         S::TT_ERROR_ACC_SHAPE,
     );
     case(
         "an i32 accumulator",
-        "version 9\n%m = acc i32 32,32\ngrid 1,1\n",
+        "%m = acc i32 32,32\ngrid 1,1\n",
         S::TT_ERROR_ACC_DTYPE,
     );
     // The four shapes an `acc` may have. `32,32` is `matmul`'s; the others are
     // a reduce's, and the shape picks the fold.
     for shape in ["1,32", "32,1", "1,1", "32,32"] {
-        let text = format!("version 9\n%m = acc f32 {shape}\ngrid 1,1\n");
+        let text = format!("%m = acc f32 {shape}\ngrid 1,1\n");
         let k = Kernel::parse(&text).unwrap_or_else(|e| panic!("acc f32 {shape}: {e}"));
         assert_eq!(k.len(), 4, "acc f32 {shape}");
     }
     // `tf32` is a real format with no path yet: named, never guessed.
     case(
         "a tf32 parameter",
-        "version 9\n%p = param tf32 1024\ngrid 1,1\n",
+        "%p = param tf32 1024\ngrid 1,1\n",
         S::TT_TODO_TF32,
     );
     // A store into an accumulator names no offset, and only a constant fills
@@ -1123,7 +1093,6 @@ fn an_acc_is_one_32x32_tile_of_an_accumulating_dtype() {
     case(
         "an offset on an accumulator store",
         "\
-version 9
 grid 1,1
 %m = acc f32 32,32
 %zero = const f32 0
@@ -1134,7 +1103,6 @@ store 32,32 %m [1024] = %zero
     case(
         "a tile stored into an accumulator",
         "\
-version 9
 grid 1,1
 %p = param f32 1024
 %b = buffer f32 32,32
@@ -1151,7 +1119,7 @@ store 32,32 %m = %x
 /// reduce gate is written as. `acc` is the accumulator's shape, which is also
 /// the fold; `with_scaler` adds the second operand, which `max` does not name.
 fn reduce_program(acc: &str, body: &str, with_scaler: bool) -> String {
-    let mut s = String::from("version 9\ngrid 1,1\n%px = param f32 1024\n");
+    let mut s = String::from("grid 1,1\n%px = param f32 1024\n");
     if with_scaler {
         s.push_str("%ps = param f32 1024\n");
     }
@@ -1206,7 +1174,6 @@ fn the_reduce_forms_parse() {
 #[test]
 fn a_wider_acc_parses_and_compiles() {
     const PROGRAM: &str = "\
-version 9
 grid 1,1
 %px = param bf16 1024
 %ps = param bf16 1024
@@ -1291,7 +1258,6 @@ fn a_reduce_is_refused_for_what_the_src_path_cannot_take() {
     case(
         "an f32 tile with a bf16 scaler",
         "\
-version 9
 grid 1,1
 %px = param f32 1024
 %ps = param bf16 1024
@@ -1316,7 +1282,6 @@ copy 32,32 %out [0] = %bo [0]
     case(
         "f32 operands into a bf16 accumulator",
         "\
-version 9
 grid 1,1
 %px = param f32 1024
 %ps = param f32 1024
@@ -1351,7 +1316,6 @@ copy 32,32 %out [0] = %bo [0]
 #[test]
 fn a_transpose_is_one_tile() {
     const PROGRAM: &str = "\
-version 9
 grid 1,1
 %pin = param bf16 1024
 %pout = param f32 1024
@@ -1371,7 +1335,6 @@ copy 32,32 %pout [0] = %bout [0]
 
     // The 32-bit arm is not lowered: ttsim refuses tt-metal's first half move.
     const F32: &str = "\
-version 9
 grid 1,1
 %pin = param f32 1024
 %pout = param f32 1024
@@ -1391,7 +1354,6 @@ copy 32,32 %pout [0] = %bout [0]
 
     // A row is not a square: the op names one whole tile.
     const ROW: &str = "\
-version 9
 grid 1,1
 %pin = param bf16 32
 %pout = param f32 32
@@ -1415,7 +1377,6 @@ copy 1,32 %pout [0] = %bout [0]
 #[test]
 fn a_ring_moved_by_two_different_bounds_does_not_compile() {
     const PROGRAM: &str = "\
-version 9
 grid 1,1
 %n = param i32 0
 %m = param i32 0
@@ -1449,7 +1410,6 @@ fn a_program_may_not_write_its_own_ring_hand_offs() {
     for word in ["wait", "reserve", "push", "pop"] {
         let text = format!(
             "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -1477,7 +1437,6 @@ copy 32,32 %out [0] = %b [0]
 fn a_collective_names_its_cores() {
     use crate::ir::Extent;
     const PROGRAM: &str = "\
-version 9
 %a = buffer bf16 32,32
 %five = const i32 5
 %seven = const i32 7
@@ -1526,7 +1485,7 @@ fn a_collective_that_moves_nothing_is_refused() {
     use ttStatus as S;
     let refused = |text: &str| Kernel::parse(text).expect_err("the program is refused");
     let program = |body: &str| {
-        format!("version 9\n%a = buffer bf16 32,32\n%p = param bf16 1024\n{body}\ngrid 8,8\n")
+        format!("%a = buffer bf16 32,32\n%p = param bf16 1024\n{body}\ngrid 8,8\n")
     };
 
     // `..` on every axis is the receiver's own page: the pick is not narrower
@@ -1567,30 +1526,29 @@ fn a_collective_that_moves_nothing_is_refused() {
     );
 }
 
-/// A copy's span says which cores issue the request, and it round-trips: the
-/// whole-grid form is implicit, every narrower one is printed.
+/// A copy's span names the cores whose L1 holds the ring page, and it
+/// round-trips: the whole-grid form is implicit, every narrower one is printed.
 #[test]
 fn a_copy_span_round_trips() {
     const PROGRAM: &str = "\
-version 9
 %in = param f32 1024
 %b0 = buffer f32 32,32
 %x = grid.x
 %y = grid.y
-copy 32,32 %b0 [0] = %in [%x] in [0, ..]
-copy 32,32 %b0 [0] = %in [%x] in [1..3, %y]
+copy 32,32 %b0 [0] cores [0, ..] = %in [%x]
+copy 32,32 %b0 [0] cores [1..3, %y] = %in [%x]
 copy 32,32 %b0 [0] = %in [%x]
 grid 4,2
 ";
     let k = Kernel::parse(PROGRAM).expect("a spanned copy parses");
     let text = k.to_string();
     assert!(
-        text.contains("in [0, ..]") && text.contains("in [1..3, %"),
+        text.contains("cores [0, ..]") && text.contains("cores [1..3, %"),
         "a narrowed span round-trips: {text}"
     );
     // The whole-grid span is every core, so it is left implicit: exactly two
-    // of the three copies print an `in` clause.
-    assert_eq!(text.matches(" in [").count(), 2, "{text}");
+    // of the three copies print a `cores` clause.
+    assert_eq!(text.matches(" cores [").count(), 2, "{text}");
     k.verify().expect("a spanned copy verifies");
 }
 
@@ -1599,19 +1557,19 @@ fn an_accumulator_is_a_tile_or_a_block_of_tiles() {
     // A `Dst` region is one tile; a block of tiles is a block of regions, which
     // is what `out_subblock_h x out_subblock_w` and tt-lang's `ttl.block` are.
     for shape in ["32,32", "1,32", "32,1", "1,1", "64,64", "64,32", "32,64", "96,64"] {
-        let text = format!("version 9\n%a = acc f32 {shape}\ngrid 1,1\n");
+        let text = format!("%a = acc f32 {shape}\ngrid 1,1\n");
         Kernel::parse(&text).unwrap_or_else(|e| panic!("{shape} is an accumulator: {e}"));
     }
     // Not tiles: not a multiple of 32, or a shape that is not tile-aligned.
     for shape in ["16,16", "33,32", "32,33"] {
-        let text = format!("version 9\n%a = acc f32 {shape}\ngrid 1,1\n");
+        let text = format!("%a = acc f32 {shape}\ngrid 1,1\n");
         let err = Kernel::parse(&text).expect_err(shape);
         assert_eq!(err, ttStatus::TT_ERROR_ACC_SHAPE, "{shape}");
     }
     // More tiles than the 32-bit `Dst` file holds: a band, spilled by the
     // program into `interm`, not one accumulator.
     for shape in ["128,128", "64,160"] {
-        let text = format!("version 9\n%a = acc f32 {shape}\ngrid 1,1\n");
+        let text = format!("%a = acc f32 {shape}\ngrid 1,1\n");
         let err = Kernel::parse(&text).expect_err(shape);
         assert_eq!(err, ttStatus::TT_ERROR_DST_SLOTS_EXHAUSTED, "{shape}");
     }

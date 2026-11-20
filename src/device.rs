@@ -179,7 +179,7 @@ const DRAM_FIRST: u64 = 0x10_0080;
 const INTERLEAVED_TAG: u64 = 1 << 63;
 
 /// A tensor whose pages are striped across the DRAM channels. See
-/// [`Device::alloc_interleaved`].
+/// [`Device::alloc`].
 pub struct Interleaved {
     /// Bytes in one page.
     pub page: u32,
@@ -1365,40 +1365,9 @@ impl Device {
         Ok((channel, offset))
     }
 
-    /// Reserve `bytes` of DRAM, 64-byte aligned, and return its flat address
-    /// (`channel * CHANNEL_BYTES + offset`). This is what a caller passes back
-    /// to `ttMemcpy` and `ttLaunch`.
-    /// The channel is the one with the most free space, as tt-metal's
-    /// `ChannelAllocator` picks a bank — `free_size` per bank and the largest
-    /// first (`allocator.cpp:57-100`, `bank_manager.cpp:417-446`). No range is
-    /// ever freed here, so "most free" is "least used".
-    pub fn alloc_dram(&mut self, bytes: usize) -> Result<u64, ttStatus> {
-        if bytes == 0 {
-            return Err(ttStatus::TT_ERROR_ALLOC_ZERO);
-        }
-        let bytes = bytes as u64;
-        let mut best: Option<(u8, u64)> = None;
-        for channel in self.dram.channels() {
-            let used = self.dram_used[usize::from(channel.index())];
-            let at = used.next_multiple_of(64);
-            let fits = at
-                .checked_add(bytes)
-                .is_some_and(|end| end <= CHANNEL_BYTES);
-            if fits && best.is_none_or(|(_, free)| used < free) {
-                best = Some((channel.index(), used));
-            }
-        }
-        let Some((index, used)) = best else {
-            let _ = bytes;
-            return Err(ttStatus::TT_ERROR_DRAM_FULL);
-        };
-        let at = used.next_multiple_of(64);
-        self.dram_used[usize::from(index)] = at + bytes;
-        Ok(u64::from(index) * CHANNEL_BYTES + at)
-    }
-
-    /// Reserve a tensor whose pages are striped across the channels, and
-    /// return its handle.
+    /// Reserve a tensor: `bytes` in `page`-sized pages, striped across the
+    /// channels, and return its handle. Every DRAM tensor is allocated this
+    /// way -- the channels are the bandwidth.
     ///
     /// Page `p` lives on channel `p % channels` at
     /// `base[channel] + (p / channels) * page`, which is tt-metal's
@@ -1413,7 +1382,7 @@ impl Device {
     /// The handle is a tag and an index: no DRAM address has bit 63 set, so a
     /// handle can be told from one, and [`Device::dram_write`] and the launch
     /// read the layout back from it.
-    pub fn alloc_interleaved(&mut self, bytes: usize, page: usize) -> Result<u64, ttStatus> {
+    pub fn alloc(&mut self, bytes: usize, page: usize) -> Result<u64, ttStatus> {
         if bytes == 0 || page == 0 {
             return Err(ttStatus::TT_ERROR_ALLOC_ZERO);
         }

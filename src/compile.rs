@@ -16,7 +16,11 @@ pub use crate::module::{GridTerm, Module, ParamKind};
 ///
 /// Every refusal is an error, never a partial module.
 pub fn compile(k: &Kernel) -> Result<Module, ttStatus> {
-    let k = crate::unfold::unfold(k)?;
+    // A `loop ... unroll` body is written out first: everything after it sees
+    // one straight-line copy per trip, with the induction folded, exactly as if
+    // the program had spelled the trips itself.
+    let k = crate::unroll::unroll(k)?;
+    let k = crate::unfold::unfold(&k)?;
     let k = &k;
     let mut k = crate::mover::add_movers(k)?;
     crate::sync_cbs::sync_cbs(&mut k)?;
@@ -130,14 +134,13 @@ pub fn render(m: &MachineKernel) -> Result<Module, ttStatus> {
 
 /// Words one argument block holds for `params` (`Module::args_words`).
 fn module_params_words(params: &[ParamKind]) -> u32 {
-    // A striped tensor names every channel's page base, then the count and the
-    // page: the shape `args_for` writes.
-    let interleaved = 2 * crate::mover::MAX_BANKS as u32 + 2;
+    // A tensor names every channel's page base, then the count and the page:
+    // the shape `args_for` writes.
     params
         .iter()
         .map(|kind| match kind {
-            ParamKind::Interleaved => interleaved,
-            _ => 2,
+            ParamKind::Tensor { .. } => crate::mover::INTERLEAVED_WORDS as u32,
+            ParamKind::Scalar => 2,
         })
         .sum()
 }
@@ -174,10 +177,11 @@ pub fn parameter_kinds(k: &Kernel) -> Vec<ParamKind> {
     let mut kinds = Vec::new();
     for (_, op) in k.ops() {
         match *op {
-            crate::ir::Op::Param { interleaved, .. } => kinds.push(if interleaved {
-                ParamKind::Interleaved
-            } else {
-                ParamKind::Tensor
+            // A tensor's page is one 32x32 tile of its dtype: the unit every
+            // mover access names, and the size a contiguous buffer is
+            // described with.
+            crate::ir::Op::Param { dtype, .. } => kinds.push(ParamKind::Tensor {
+                page: crate::lower::TILE_DATUMS * u32::from(dtype.bytes()),
             }),
             crate::ir::Op::Variable { .. } => kinds.push(ParamKind::Scalar),
             _ => {}

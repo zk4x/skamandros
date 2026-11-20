@@ -52,11 +52,12 @@ pub(crate) enum Elem {
 #[derive(Debug, Clone, Default)]
 pub struct Stream {
     pub(crate) elems: Vec<Elem>,
-    /// The callee-saved pair this program took as its third loop counters, when
-    /// it nests three loops. The executor calls a program as a function and
-    /// keeps its own frame in `s0`/`s1`, so a program that uses them saves and
-    /// restores them around its body, exactly as a compiled callee would.
-    saved: Option<(u8, u8)>,
+    /// The callee-saved registers this program uses: the third loop level's
+    /// `s0`/`s1`, and the mover's request temporaries. The executor calls a
+    /// program as a function and keeps its own frame in that bank, so a program
+    /// that uses any of them saves and restores them around its body, exactly
+    /// as a compiled callee would.
+    saved: Vec<u8>,
 }
 
 impl Stream {
@@ -64,7 +65,17 @@ impl Stream {
     /// brackets the program with the save and the restore.
     fn save_if_callee(&mut self, pair: (u8, u8), depth: usize) {
         if depth >= 2 {
-            self.saved = Some(pair);
+            self.keep_callee(&[pair.0, pair.1]);
+        }
+    }
+
+    /// Declare callee-saved registers the program's temporaries use, so the
+    /// bracket saves and restores them.
+    fn keep_callee(&mut self, regs: &[u8]) {
+        for reg in regs {
+            if !self.saved.contains(reg) {
+                self.saved.push(*reg);
+            }
         }
     }
 
@@ -125,13 +136,17 @@ impl Stream {
         // The save goes in front and the restore at the end, where every
         // forward skip already lands: branches were patched with relative
         // distances, so shifting the whole body stays correct.
-        if let Some((first, second)) = self.saved {
-            out.extend(crate::riscv::callee_save(first, second).map(Elem::Riscv));
-        }
+        out.extend(
+            crate::riscv::callee_save(&self.saved)
+                .into_iter()
+                .map(Elem::Riscv),
+        );
         out.extend_from_slice(&self.elems);
-        if let Some((first, second)) = self.saved {
-            out.extend(crate::riscv::callee_restore(first, second).map(Elem::Riscv));
-        }
+        out.extend(
+            crate::riscv::callee_restore(&self.saved)
+                .into_iter()
+                .map(Elem::Riscv),
+        );
         out.push(Elem::Riscv(crate::riscv::ret()));
         out
     }
@@ -409,6 +424,10 @@ fn encode_mover(
     if ops.is_empty() {
         return Ok(());
     }
+    // The mover's request temporaries come from the callee-saved bank too (a
+    // request that resolves its page through the launch's channel table needs
+    // more registers than the caller-saved set has), so its run is bracketed.
+    out.keep_callee(&[reg::S2, reg::S3, reg::S4]);
     let niu = if outbound { Niu::Noc1 } else { Niu::Noc0 };
     out.asm(|a| {
         a.li(reg::T5, niu.base() as u32);

@@ -352,7 +352,6 @@ fn unary_looped(dtype: &str, op: &str, pages: usize, bound: &str, scalars: &str)
     let size = pages * 1024;
     format!(
         "\
-version 9
 grid 1,1
 {scalars}%px = param {dtype} {size}
 %out = param {dtype} {size}
@@ -374,7 +373,6 @@ fn binary_looped(dtype: &str, body: &str, pages: usize, bound: &str, scalars: &s
     let size = pages * 1024;
     format!(
         "\
-version 9
 grid 1,1
 {scalars}%px = param {dtype} {size}
 %pc = param {dtype} {size}
@@ -400,7 +398,6 @@ endloop
 fn unary_grid(dtype: &str, op: &str) -> String {
     format!(
         "\
-version 9
 %nx = param i32 0
 %ny = param i32 0
 %px = param {dtype} 4096
@@ -424,7 +421,6 @@ grid %nx,%ny
 fn binary_grid(dtype: &str, body: &str) -> String {
     format!(
         "\
-version 9
 %nx = param i32 0
 %ny = param i32 0
 %px = param {dtype} 4096
@@ -453,7 +449,6 @@ grid %nx,%ny
 fn unary_grid_loop(dtype: &str, op: &str) -> String {
     format!(
         "\
-version 9
 %nx = param i32 0
 %ny = param i32 0
 %n = param i32 0
@@ -483,7 +478,6 @@ grid %nx,%ny
 fn binary_grid_loop(dtype: &str, body: &str) -> String {
     format!(
         "\
-version 9
 %nx = param i32 0
 %ny = param i32 0
 %n = param i32 0

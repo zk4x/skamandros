@@ -80,8 +80,10 @@ pub const INTERLEAVED_WORDS: usize = 2 * MAX_BANKS + 2;
 /// parameter pay for the striped case's channel table.
 pub const fn arg_words(kind: ParamKind) -> usize {
     match kind {
-        ParamKind::Scalar | ParamKind::Tensor => 2,
-        ParamKind::Interleaved => INTERLEAVED_WORDS,
+        ParamKind::Scalar => 2,
+        // A tensor's block is the channel table plus the count and the page,
+        // whether its pages are striped or all in one channel (one entry).
+        ParamKind::Tensor { .. } => INTERLEAVED_WORDS,
     }
 }
 
@@ -506,11 +508,11 @@ impl Mover<'_> {
         let Some(((old_loop, old_ind), rest)) = path.split_first() else {
             return self.bodies(into, group);
         };
-        let Op::Loop { bound } = *self.old.at(*old_loop) else {
+        let Op::Loop { bound, .. } = *self.old.at(*old_loop) else {
             return Err(ttStatus::TT_ERROR_ENDLOOP_WITHOUT_LOOP);
         };
         let bound = self.clone_value(into, bound)?;
-        let new = into.push(Op::Loop { bound });
+        let new = into.push(Op::Loop { bound, unroll: false });
         self.map.insert(*old_ind, new);
         self.nest(into, rest, group)?;
         into.push(Op::EndLoop);

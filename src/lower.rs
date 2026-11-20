@@ -68,10 +68,23 @@ const SCRATCH: [u8; 5] = [reg::A2, reg::A3, reg::A4, reg::A5, reg::T3];
 
 /// A mover program's temporaries: everything it does not keep across ops. `t5`
 /// is its NIU base, `t3` this tile's NOC word, `a0`/`a6` its arguments and CB
-/// table, and `a1..a4` its loop counters, so those are not in the pool. A copy's
-/// whole NoC request — its addresses, its page pointer, its config words and its
-/// spin — allocates from here too.
-const MOVER_POOL: [u8; 6] = [reg::T6, reg::T4, reg::T0, reg::T1, reg::T2, reg::A5];
+/// table, and `a1..a4`/`s0..s1` its loop counters, so those are not in the pool;
+/// `a7` counts only on the compute roles. A copy's whole NoC request — its
+/// addresses, its page pointer, its config words and its spin — allocates from
+/// here too, and resolving a page through the launch's bank table is the widest
+/// of those.
+const MOVER_POOL: [u8; 10] = [
+    reg::T6,
+    reg::T4,
+    reg::T0,
+    reg::T1,
+    reg::T2,
+    reg::A5,
+    reg::A7,
+    reg::S2,
+    reg::S3,
+    reg::S4,
+];
 
 /// The registers a role's index expressions may use, and the simplest allocator
 /// there is: take one before evaluating an operand, give it back the moment the
@@ -481,7 +494,7 @@ fn lower_with(k: &Kernel) -> Result<MachineKernel, ttStatus> {
             | Op::Binary { .. }
             | Op::Select { .. }
                 if types.of(value).shape == RegShape::Scalar => {}
-            Op::Loop { bound } => {
+            Op::Loop { bound, .. } => {
                 let depth = loops.len();
                 if let Some(core) = mover {
                     // A mover segment's loop is that program's own: its own
@@ -5057,16 +5070,6 @@ fn copy_to(
         .get(&buffer)
         .ok_or(ttStatus::TT_ERROR_BUFFER_NOT_PLACED)?;
     let index = *param.get(&argument).ok_or(ttStatus::TT_ERROR_COPY_ENDS)?;
-    // A striped tensor's pages live on different channels, so the request's
-    // address is resolved on the core from the page index rather than added to
-    // one base. See [`emit_request`].
-    let interleaved = matches!(
-        *k.at(argument),
-        Op::Param {
-            interleaved: true,
-            ..
-        }
-    );
     // The index is in access units, so one step is the unit's bytes.
     let bytes = (access[0] * access[1])
         .checked_mul(dtype.bytes())
@@ -5101,7 +5104,7 @@ fn copy_to(
     // compute roles' counters and its own `a1..a4` are not interchangeable.
     let mut ops = Vec::new();
     let mut pool = Pool::new(&MOVER_POOL);
-    // `in [span]` says which cores issue the request. It is a runtime test over
+    // `cores [span]` says which cores issue the request. It is a runtime test over
     // this core's own coordinate, because the program is one text; a whole-grid
     // span emits no test at all, which is what every copy that does not name one
     // gets. See [`span_cond`].
@@ -5175,7 +5178,6 @@ fn copy_to(
                 page_unit,
                 value,
                 None,
-                interleaved,
             )?;
         } else {
             let scale = pool.take()?;
@@ -5239,7 +5241,6 @@ fn copy_to(
                 None,
                 ring_page,
                 ring_page_reg,
-                interleaved,
             )?;
             if let Some(off) = ring_page_reg {
                 pool.give(off);
@@ -5294,7 +5295,6 @@ fn copy_to(
                 page_unit,
                 value,
                 Some(counter),
-                interleaved,
             )?;
         } else {
             ops.push(MirOp::Li {
@@ -5319,7 +5319,6 @@ fn copy_to(
                 None,
                 None,
                 None,
-                interleaved,
             )?;
         }
         ops.push(MirOp::EndLoop);
@@ -6536,7 +6535,6 @@ fn narrow_pair(
     page_unit: RegShape,
     value: u8,
     lane: Option<u8>,
-    interleaved: bool,
 ) -> Result<(), ttStatus> {
     let el = u32::from(dtype.bytes());
     // A request's two addresses must be congruent mod 64 for a read
@@ -6690,7 +6688,6 @@ fn narrow_pair(
         Some(ring),
         None,
         None,
-        interleaved,
     )?;
     // The second half: the next face on the parameter side, and the next face's
     // row (or the datums after the first sixteen) on the ring side.
@@ -6721,7 +6718,6 @@ fn narrow_pair(
         Some(ring),
         None,
         None,
-        interleaved,
     )?;
     pool.give(ring);
     pool.give(second);
@@ -6867,35 +6863,15 @@ fn emit_request(
     ring_offset: Option<u8>,
     ring_page: Option<u32>,
     ring_page_reg: Option<u8>,
-    interleaved: bool,
 ) -> Result<(), ttStatus> {
     use crate::riscv::cb::{RD_PTR, STRIDE, WR_PTR};
     use tt_isa::arch::blackhole::noc::niu::{CMD_RD, CMD_WR, RESP_MARKED, STATIC_VC_1, initiator};
     if bytes == 0 || bytes > tt_isa::arch::blackhole::noc::niu::MAX_REQUEST_BYTES {
         return Err(ttStatus::TT_ERROR_NOC_REQUEST_BYTES);
     }
-    let (lo_arg, hi_arg) = (block, block + 4);
-    let (lo, hi) = if interleaved {
-        interleaved_address(ops, pool, block, value)?
-    } else {
-        let lo = pool.take()?;
-        let hi = pool.take()?;
-        ops.push(MirOp::LoadArg {
-            reg: lo,
-            arg: lo_arg,
-        });
-        ops.push(MirOp::IArith {
-            op: IOp::Add,
-            d: lo,
-            a: lo,
-            b: value,
-        });
-        ops.push(MirOp::LoadArg {
-            reg: hi,
-            arg: hi_arg,
-        });
-        (lo, hi)
-    };
+    // Every parameter is a table of channel bases, a count and a page: a
+    // buffer that lives in one channel is one entry of that table.
+    let (lo, hi) = interleaved_address(ops, pool, block, value)?;
     let page = pool.take()?;
     // A read from DRAM publishes into the ring (its write pointer); a write to
     // DRAM drains the page the ring's read pointer names.
@@ -7290,7 +7266,6 @@ mod tests {
     #[test]
     fn a_dst_write_after_a_post_waits_for_the_packer() {
         const PROGRAM: &str = "\
-version 9
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -7362,7 +7337,6 @@ copy 32,32 %out [1] = %bo [0]
     #[test]
     fn an_integer_broadcast_is_refused_as_an_sfpu_todo() {
         const PROGRAM: &str = "\
-version 9
 grid 1,1
 %pi = param i32 1024
 %po = param i32 1024

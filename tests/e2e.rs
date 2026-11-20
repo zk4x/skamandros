@@ -95,8 +95,7 @@ type ModuleUnload = unsafe extern "C" fn(*mut c_void, *mut *mut c_char) -> c_int
 type Free = unsafe extern "C" fn(*mut c_void);
 type Init = unsafe extern "C" fn(*mut *mut c_char) -> c_int;
 type Release = unsafe extern "C" fn(*mut *mut c_char) -> c_int;
-type MemAlloc = unsafe extern "C" fn(usize, *mut u64, *mut *mut c_char) -> c_int;
-type MemAllocInterleaved = unsafe extern "C" fn(usize, usize, *mut u64, *mut *mut c_char) -> c_int;
+type MemAlloc = unsafe extern "C" fn(usize, usize, *mut u64, *mut *mut c_char) -> c_int;
 type MemcpyH2D = unsafe extern "C" fn(u64, *const u8, usize, *mut *mut c_char) -> c_int;
 type MemcpyD2H = unsafe extern "C" fn(*mut u8, u64, usize, *mut *mut c_char) -> c_int;
 type Launch = unsafe extern "C" fn(*mut c_void, *const u64, usize, *mut *mut c_char) -> c_int;
@@ -174,7 +173,6 @@ fn build_library(path: &Path) {
 }
 
 const COPY: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -225,7 +223,7 @@ fn a_refused_program_comes_back_as_an_error_not_a_crash() {
     let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
 
-    let bad = "version 9\ngrid 1,1\n%out = param f32 1024\n%x = neg %y\n";
+    let bad = "grid 1,1\n%out = param f32 1024\n%x = neg %y\n";
     let mut module: *mut c_void = std::ptr::null_mut();
     let mut err: *mut c_char = std::ptr::null_mut();
     let code = unsafe { compile(bad.as_ptr().cast(), bad.len(), &mut module, &mut err) };
@@ -284,7 +282,7 @@ fn the_error_codes_are_the_documented_ones() {
 
     // Argument checks that need no device.
     let mut addr = 0u64;
-    assert_eq!(unsafe { alloc(0, &mut addr, &mut err) }, TT_ERROR_ARGUMENT);
+    assert_eq!(unsafe { alloc(0, 4096, &mut addr, &mut err) }, TT_ERROR_ARGUMENT);
     assert_eq!(addr, 0);
     let _ = take_error(&free, err);
     let host = [0u8; 4];
@@ -304,7 +302,6 @@ fn the_error_codes_are_the_documented_ones() {
 /// A copy kernel over a two-page buffer: DRAM into L1, and the same L1 buffer
 /// back into DRAM, in 32x32 units.
 const COPY_8K: &str = "\
-version 9
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
@@ -318,7 +315,6 @@ copy 32,32 %out [1] = %b0 [1]
 /// One 32x32 tile through the datapath: DRAM into L1, unpack, negate, pack,
 /// L1 into DRAM. The program names no core, no `Dst` slot and no unpacker.
 const NEG_TILE: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -335,7 +331,6 @@ copy 32,32 %out [0] = %bo [0]
 /// the step are constants, so the loop becomes a RISC-V branch in the movers and
 /// each iteration's addresses are computed from the counter.
 const NEG_TWO_TILES: &str = "\
-version 9
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
@@ -358,7 +353,6 @@ endloop
 /// The inner two run once here so the test is about the counters, not the math:
 /// the third pair is `s0`/`s1`, and a clobber would show as a wrong datum.
 const NEG_THREE_DEEP: &str = "\
-version 9
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
@@ -386,7 +380,6 @@ endloop
 /// start row is its `W` counter, set per pack (`SETADC`, tt-metal's
 /// `set_dst_write_addr`); a packer stuck on row 0 repeats the first value.
 const NEG_TWO_LIVE: &str = "\
-version 9
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
@@ -408,7 +401,6 @@ copy 32,32 %out [1] = %bo [1]
 /// named directly and `mover::add_movers` supplies the staging and the traffic,
 /// as zyx's `tt_add_movers` does.
 const NEG_TILE_DIRECT: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -441,13 +433,13 @@ fn a_copy_kernel_runs_on_the_simulator() {
 
     let (mut input, mut output) = (0u64, 0u64);
     assert_eq!(
-        unsafe { alloc(8192, &mut input, &mut err) },
+        unsafe { alloc(8192, 4096, &mut input, &mut err) },
         TT_OK,
         "input: {}",
         take_error(&free, err)
     );
     assert_eq!(
-        unsafe { alloc(8192, &mut output, &mut err) },
+        unsafe { alloc(8192, 4096, &mut output, &mut err) },
         TT_OK,
         "output: {}",
         take_error(&free, err)
@@ -506,7 +498,6 @@ fn a_copy_kernel_runs_on_the_simulator() {
 #[test]
 fn a_hash_comment_runs_to_the_end_of_its_line() {
     const ANNOTATED: &str = "\
-version 9           # the only version this build reads
 grid 1,1            # one tile, one core
 %in = param f32 1024
 %out = param f32 1024
@@ -548,13 +539,13 @@ fn an_elementwise_kernel_runs_on_the_simulator() {
     let bytes = 1024 * 4;
     let (mut input, mut output) = (0u64, 0u64);
     assert_eq!(
-        unsafe { alloc(bytes, &mut input, &mut err) },
+        unsafe { alloc(bytes, 4096, &mut input, &mut err) },
         TT_OK,
         "input: {}",
         take_error(&free, err)
     );
     assert_eq!(
-        unsafe { alloc(bytes, &mut output, &mut err) },
+        unsafe { alloc(bytes, 4096, &mut output, &mut err) },
         TT_OK,
         "output: {}",
         take_error(&free, err)
@@ -640,13 +631,13 @@ fn two_live_values_pack_from_their_own_dst_rows() {
     let bytes = 2048 * 4;
     let (mut input, mut output) = (0u64, 0u64);
     assert_eq!(
-        unsafe { alloc(bytes, &mut input, &mut err) },
+        unsafe { alloc(bytes, 4096, &mut input, &mut err) },
         TT_OK,
         "input: {}",
         take_error(&free, err)
     );
     assert_eq!(
-        unsafe { alloc(bytes, &mut output, &mut err) },
+        unsafe { alloc(bytes, 4096, &mut output, &mut err) },
         TT_OK,
         "output: {}",
         take_error(&free, err)
@@ -728,7 +719,7 @@ fn a_direct_parameter_kernel_runs_on_the_simulator() {
     let (mut input, mut output) = (0u64, 0u64);
     for (name, at) in [("input", &mut input), ("output", &mut output)] {
         assert_eq!(
-            unsafe { alloc(bytes, at, &mut err) },
+            unsafe { alloc(bytes, 4096, at, &mut err) },
             TT_OK,
             "{name}: {}",
             take_error(&free, err)
@@ -809,13 +800,13 @@ fn a_constant_loop_runs_on_the_simulator() {
     let bytes = count * 4;
     let (mut input, mut output) = (0u64, 0u64);
     assert_eq!(
-        unsafe { alloc(bytes, &mut input, &mut err) },
+        unsafe { alloc(bytes, 4096, &mut input, &mut err) },
         TT_OK,
         "input: {}",
         take_error(&free, err)
     );
     assert_eq!(
-        unsafe { alloc(bytes, &mut output, &mut err) },
+        unsafe { alloc(bytes, 4096, &mut output, &mut err) },
         TT_OK,
         "output: {}",
         take_error(&free, err)
@@ -877,7 +868,6 @@ fn a_constant_loop_runs_on_the_simulator() {
 /// [`NEG_THREE_DEEP`] without a compute body: a copy in and a copy out under
 /// three loops, which exercises the movers' third counter pair alone.
 const COPY_THREE_DEEP: &str = "\
-version 9
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
@@ -936,7 +926,6 @@ fn a_three_deep_loop_runs_on_the_simulator() {
 #[test]
 fn arithmetic_ops_run_on_the_simulator() {
     const TWO_LOAD: &str = "\
-version 9
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
@@ -951,7 +940,6 @@ store 32,32 %bo [0] = %r
 copy 32,32 %out [0] = %bo [0]
 ";
     const ONE_LOAD: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -986,13 +974,13 @@ copy 32,32 %out [0] = %bo [0]
 
     let (mut input, mut output) = (0u64, 0u64);
     assert_eq!(
-        unsafe { alloc(8192, &mut input, &mut err) },
+        unsafe { alloc(8192, 4096, &mut input, &mut err) },
         TT_OK,
         "input: {}",
         take_error(&free, err)
     );
     assert_eq!(
-        unsafe { alloc(8192, &mut output, &mut err) },
+        unsafe { alloc(8192, 4096, &mut output, &mut err) },
         TT_OK,
         "output: {}",
         take_error(&free, err)
@@ -1091,7 +1079,6 @@ copy 32,32 %out [0] = %bo [0]
 #[test]
 fn comparisons_select_and_max_run_on_the_simulator() {
     const TEMPLATE: &str = "\
-version 9
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
@@ -1132,7 +1119,7 @@ copy 32,32 %out [0] = %bo [0]
         (8192, &mut output, "output"),
     ] {
         assert_eq!(
-            unsafe { alloc(bytes, addr, &mut err) },
+            unsafe { alloc(bytes, 4096, addr, &mut err) },
             TT_OK,
             "{name}: {}",
             take_error(&free, err)
@@ -1212,7 +1199,6 @@ copy 32,32 %out [0] = %bo [0]
 #[test]
 fn bitwise_ops_run_on_the_simulator() {
     const TWO_LOAD: &str = "\
-version 9
 grid 1,1
 %in = param i32 2048
 %out = param i32 2048
@@ -1227,7 +1213,6 @@ store 32,32 %bo [0] = %r
 copy 32,32 %out [0] = %bo [0]
 ";
     const ONE_LOAD: &str = "\
-version 9
 grid 1,1
 %in = param i32 1024
 %out = param i32 1024
@@ -1266,7 +1251,7 @@ copy 32,32 %out [0] = %bo [0]
         (8192, &mut output, "output"),
     ] {
         assert_eq!(
-            unsafe { alloc(bytes, addr, &mut err) },
+            unsafe { alloc(bytes, 4096, addr, &mut err) },
             TT_OK,
             "{name}: {}",
             take_error(&free, err)
@@ -1342,7 +1327,6 @@ copy 32,32 %out [0] = %bo [0]
 /// count is a scalar argument, loaded by the movers and by each compute role,
 /// and branched on in RISC-V; both tiles come back negated.
 const NEG_SYMBOLIC_LOOP: &str = "\
-version 9
 grid 1,1
 %n = param i32 0
 %in = param f32 2048
@@ -1386,13 +1370,13 @@ fn a_symbolic_loop_bound_runs_on_the_simulator() {
     let bytes = count * 4;
     let (mut input, mut output) = (0u64, 0u64);
     assert_eq!(
-        unsafe { alloc(bytes, &mut input, &mut err) },
+        unsafe { alloc(bytes, 4096, &mut input, &mut err) },
         TT_OK,
         "input: {}",
         take_error(&free, err)
     );
     assert_eq!(
-        unsafe { alloc(bytes, &mut output, &mut err) },
+        unsafe { alloc(bytes, 4096, &mut output, &mut err) },
         TT_OK,
         "output: {}",
         take_error(&free, err)
@@ -1448,7 +1432,6 @@ fn a_symbolic_loop_bound_runs_on_the_simulator() {
 /// A symbolic `2,2` grid: each of the four tiles negates its own slice, selected
 /// from `grid.x`/`grid.y`. Four executors run and all four slices come back.
 const NEG_GRID: &str = "\
-version 9
 %nx = param i32 0
 %ny = param i32 0
 %in = param f32 4096
@@ -1495,13 +1478,13 @@ fn a_symbolic_grid_runs_each_tiles_own_slice() {
     let bytes = count * 4;
     let (mut input, mut output) = (0u64, 0u64);
     assert_eq!(
-        unsafe { alloc(bytes, &mut input, &mut err) },
+        unsafe { alloc(bytes, 4096, &mut input, &mut err) },
         TT_OK,
         "input: {}",
         take_error(&free, err)
     );
     assert_eq!(
-        unsafe { alloc(bytes, &mut output, &mut err) },
+        unsafe { alloc(bytes, 4096, &mut output, &mut err) },
         TT_OK,
         "output: {}",
         take_error(&free, err)
@@ -1601,13 +1584,13 @@ fn a_repeat_launch_is_fanned_out_on_the_card() {
     for round in 0..2u32 {
         let (mut input, mut output) = (0u64, 0u64);
         assert_eq!(
-            unsafe { alloc(bytes, &mut input, &mut err) },
+            unsafe { alloc(bytes, 4096, &mut input, &mut err) },
             TT_OK,
             "input: {}",
             take_error(&free, err)
         );
         assert_eq!(
-            unsafe { alloc(bytes, &mut output, &mut err) },
+            unsafe { alloc(bytes, 4096, &mut output, &mut err) },
             TT_OK,
             "output: {}",
             take_error(&free, err)
@@ -1656,7 +1639,6 @@ fn a_repeat_launch_is_fanned_out_on_the_card() {
 
 /// [`NEG_GRID`] over the whole part: twelve columns, ten rows, one page a tile.
 const NEG_FULL_GRID: &str = "\
-version 9
 %nx = param i32 0
 %ny = param i32 0
 %in = param f32 122880
@@ -1720,13 +1702,13 @@ fn a_full_grid_repeat_launch_is_fanned_out_on_the_card() {
     for round in 0..2u32 {
         let (mut input, mut output) = (0u64, 0u64);
         assert_eq!(
-            unsafe { alloc(bytes, &mut input, &mut err) },
+            unsafe { alloc(bytes, 4096, &mut input, &mut err) },
             TT_OK,
             "input: {}",
             take_error(&free, err)
         );
         assert_eq!(
-            unsafe { alloc(bytes, &mut output, &mut err) },
+            unsafe { alloc(bytes, 4096, &mut output, &mut err) },
             TT_OK,
             "output: {}",
             take_error(&free, err)
@@ -1787,7 +1769,6 @@ fn a_full_grid_repeat_launch_is_fanned_out_on_the_card() {
 /// loop is a `LoopReg` over that value. Here 11 tiles over 8 sites: sites 0-2
 /// copy two tiles, the rest one.
 const TAIL_TILES: &str = "\
-version 9
 %nx = param i32 0
 %ny = param i32 0
 %ntiles = param i32 0
@@ -1870,8 +1851,32 @@ fn run_kernel_scalars(
     run_kernel_scalars_paged(program, scalars, inputs, &[], out_bytes)
 }
 
-/// The same launch, with the inputs that name a page striped across the
-/// channels: `pages[i]` is input `i`'s page size, or 0 for a contiguous tensor.
+/// The page each tensor parameter names: one 32x32 tile of its dtype. The
+/// launch allocates every tensor that way, so the harness has to as well;
+/// `pages[i]` overrides it for a test that wants another page.
+fn tensor_pages(program: &str) -> Vec<usize> {
+    program
+        .lines()
+        .filter_map(|line| {
+            let line = line.split('#').next().unwrap_or("");
+            let (_, rest) = line.split_once("= param ")?;
+            let (dtype, shape) = rest.trim().split_once(' ')?;
+            // A scalar parameter is `param i32 0`: one word, not a tile.
+            if shape.trim() == "0" {
+                return None;
+            }
+            let bytes = match dtype {
+                "bf16" => 2,
+                "f32" | "i32" => 4,
+                _ => return None,
+            };
+            Some(1024 * bytes)
+        })
+        .collect()
+}
+
+/// The same launch, with `pages[i]` overriding input `i`'s page size (`0` takes
+/// the program's own, which is the tensor parameter's tile).
 fn run_kernel_scalars_paged(
     program: &str,
     scalars: &[u64],
@@ -1901,10 +1906,6 @@ fn run_kernel_launches(
     let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
     let init: Symbol<Init> = unsafe { lib.get(b"ttInit\0") }.expect("ttInit");
     let alloc: Symbol<MemAlloc> = unsafe { lib.get(b"ttMemAlloc\0") }.expect("ttMemAlloc");
-    let alloc_interleaved: Symbol<MemAllocInterleaved> = unsafe {
-        lib.get(b"ttMemAllocInterleaved\0")
-            .expect("ttMemAllocInterleaved")
-    };
     let h2d: Symbol<MemcpyH2D> = unsafe { lib.get(b"ttMemcpyH2D\0") }.expect("ttMemcpyH2D");
     let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
     let launch: Symbol<Launch> = unsafe { lib.get(b"ttLaunch\0") }.expect("ttLaunch");
@@ -1916,25 +1917,24 @@ fn run_kernel_launches(
         "ttInit: {}",
         take_error(&free, err)
     );
+    // Every tensor is allocated the way a launch hands one over: in pages,
+    // striped across the DRAM channels. The page is the program's own -- one
+    // 32x32 tile of the parameter's dtype -- unless the test overrides it.
+    let named = tensor_pages(program);
     let mut tensors: Vec<u64> = Vec::new();
     for (i, input) in inputs.iter().enumerate() {
         let mut at = 0u64;
-        let page = pages.get(i).copied().unwrap_or(0);
-        if page == 0 {
-            assert_eq!(
-                unsafe { alloc(input.len(), &mut at, &mut err) },
-                TT_OK,
-                "input {i}: {}",
-                take_error(&free, err)
-            );
-        } else {
-            assert_eq!(
-                unsafe { alloc_interleaved(input.len(), page, &mut at, &mut err) },
-                TT_OK,
-                "interleaved input {i}: {}",
-                take_error(&free, err)
-            );
-        }
+        let page = pages.get(i).copied().filter(|page| *page != 0).unwrap_or_else(|| {
+            *named
+                .get(i)
+                .unwrap_or_else(|| panic!("input {i} has no tensor parameter in the program"))
+        });
+        assert_eq!(
+            unsafe { alloc(input.len(), page, &mut at, &mut err) },
+            TT_OK,
+            "input {i}: {}",
+            take_error(&free, err)
+        );
         assert_eq!(
             unsafe { h2d(at, input.as_ptr(), input.len(), &mut err) },
             TT_OK,
@@ -1943,9 +1943,10 @@ fn run_kernel_launches(
         );
         tensors.push(at);
     }
+    let out_page = *named.last().expect("the output's tensor parameter");
     let mut output_at = 0u64;
     assert_eq!(
-        unsafe { alloc(out_bytes, &mut output_at, &mut err) },
+        unsafe { alloc(out_bytes, out_page, &mut output_at, &mut err) },
         TT_OK,
         "output: {}",
         take_error(&free, err)
@@ -1989,7 +1990,6 @@ fn run_kernel_launches(
 
 /// `(int)f`: truncation toward zero, in two's complement.
 const CAST_F32_TO_I32: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param i32 1024
@@ -2004,7 +2004,6 @@ copy 32,32 %out [0] = %bo [0]
 
 /// `(float)i`: two's complement to FP32, round to nearest even.
 const CAST_I32_TO_F32: &str = "\
-version 9
 grid 1,1
 %in = param i32 1024
 %out = param f32 1024
@@ -2019,7 +2018,6 @@ copy 32,32 %out [0] = %bo [0]
 
 /// The same bits under another name: no instruction at all.
 const BITCAST_F32_TO_I32: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param i32 1024
@@ -2035,7 +2033,6 @@ copy 32,32 %out [0] = %bo [0]
 /// A comparison writes `-1`/`0` in the lane; a cast to an integer is the C
 /// value, one or zero.
 const CAST_BOOL_TO_I32: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param i32 1024
@@ -2092,7 +2089,6 @@ fn casts_and_bitcasts_run_on_the_simulator() {
 /// the packer writes 16-bit datums back. A negation only flips the sign bit, so
 /// every pattern -- zeros, subnormals, infinities, NaN payloads -- is exact.
 const NEG_BF16: &str = "\
-version 9
 grid 1,1
 %in = param bf16 1024
 %out = param bf16 1024
@@ -2156,7 +2152,6 @@ fn widen_bf16(bits: u16) -> f32 {
 /// bf16 arithmetic in the 16-bit `Dst`: two tiles in, one out, every datum the
 /// SFPU's widening and truncating round trip.
 const BF16_TWO_LOAD: &str = "\
-version 9
 grid 1,1
 %in = param bf16 2048
 %out = param bf16 1024
@@ -2194,13 +2189,13 @@ fn bf16_arithmetic_runs_on_the_simulator() {
     );
     let (mut input, mut output) = (0u64, 0u64);
     assert_eq!(
-        unsafe { alloc(4096, &mut input, &mut err) },
+        unsafe { alloc(4096, 4096, &mut input, &mut err) },
         TT_OK,
         "input: {}",
         take_error(&free, err)
     );
     assert_eq!(
-        unsafe { alloc(2048, &mut output, &mut err) },
+        unsafe { alloc(2048, 4096, &mut output, &mut err) },
         TT_OK,
         "output: {}",
         take_error(&free, err)
@@ -2301,7 +2296,6 @@ fn bf16_arithmetic_runs_on_the_simulator() {
 
 /// The 32-bit `Dst` kernel's bf16 output: the packer narrows as it writes.
 const CAST_F32_TO_BF16: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param bf16 1024
@@ -2316,7 +2310,6 @@ copy 32,32 %out [0] = %bo [0]
 
 /// `i32` to bf16: `(float)i` in the lane, then the same narrowing.
 const CAST_I32_TO_BF16: &str = "\
-version 9
 grid 1,1
 %in = param i32 1024
 %out = param bf16 1024
@@ -2331,7 +2324,6 @@ copy 32,32 %out [0] = %bo [0]
 
 /// A comparison's `bool` to bf16: one or zero.
 const CAST_BOOL_TO_BF16: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param bf16 1024
@@ -2349,7 +2341,6 @@ copy 32,32 %out [0] = %bo [0]
 /// bf16 to bf16, the 16-bit `Dst`'s identity: the store truncates what the load
 /// widened, so every normal comes back unchanged.
 const CAST_BF16_TO_BF16: &str = "\
-version 9
 grid 1,1
 %in = param bf16 1024
 %out = param bf16 1024
@@ -2365,7 +2356,6 @@ copy 32,32 %out [0] = %bo [0]
 /// bf16 into `f32` has no `Dst` path: the unpacker cannot widen a bf16 page into
 /// a 32-bit `Dst`, and a 16-bit `Dst` cannot pack `f32`.
 const CAST_BF16_TO_F32: &str = "\
-version 9
 grid 1,1
 %in = param bf16 1024
 %out = param f32 1024
@@ -2381,7 +2371,6 @@ copy 32,32 %out [0] = %bo [0]
 /// `sel` on bf16: against `y`, so the `bool` lives in the 16-bit `Dst` as the
 /// `-1.0`/`0.0` lane the comparison writes, and the result is the smaller value.
 const BF16_MIN: &str = "\
-version 9
 grid 1,1
 %in = param bf16 2048
 %out = param bf16 1024
@@ -2524,8 +2513,7 @@ fn a_bf16_constant_multiplies_in_both_spellings() {
             ),
         ] {
             let program = format!(
-                "version 9
-grid 1,1
+                "grid 1,1
 %in = param bf16 1024
 %out = param bf16 1024
 %bi = buffer bf16 32,32
@@ -2562,8 +2550,7 @@ copy 32,32 %out [0] = %bo [0]
     for literal in ["0.3", "-1.5", "0.5"] {
         let c = literal.parse::<f32>().expect("a literal");
         let program = format!(
-            "version 9
-grid 1,1
+            "grid 1,1
 %in = param f32 1024
 %out = param f32 1024
 %bi = buffer f32 32,32
@@ -2590,7 +2577,6 @@ copy 32,32 %out [0] = %bo [0]
 /// / `SrcB` path (unpacked straight from their CB pages), the accumulator is the
 /// 32-bit `Dst`, and the packer drains it.
 const MATMUL_F32: &str = "\
-version 9
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -2613,7 +2599,6 @@ copy 32,32 %out [0] = %bo [0]
 /// The same product, with `%a` also feeding a datapath op: the load keeps its
 /// `Dst` unpack and the matmul unpacks the same page again into `Src`.
 const MATMUL_F32_MIXED: &str = "\
-version 9
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -2647,7 +2632,7 @@ fn bf16_transcendentals_run_in_the_lane() {
             .flat_map(|v| truncate_to_bf16(*v).to_le_bytes())
             .collect();
         let program = format!(
-            "version 9\ngrid 1,1\n%in = param bf16 1024\n%out = param bf16 1024\n\
+            "grid 1,1\n%in = param bf16 1024\n%out = param bf16 1024\n\
              %b0 = buffer bf16 32,32\n%bo = buffer bf16 32,32\n\
              copy 32,32 %b0 [0] = %in [0]\nload 32,32 %x = %b0 [0]\n\
              %r = {name} %x\nstore 32,32 %bo [0] = %r\ncopy 32,32 %out [0] = %bo [0]\n"
@@ -2676,7 +2661,6 @@ fn bf16_transcendentals_run_in_the_lane() {
 
     // `div`: a bf16 numerator over a bf16 divisor, every datum.
     const DIV: &str = "\
-version 9
 grid 1,1
 %in = param bf16 2048
 %out = param bf16 1024
@@ -2798,7 +2782,6 @@ fn matmul_runs_on_the_simulator() {
 /// the Matrix Unit reads only `Src`, so the compiler packs `%n` into a page it
 /// owns and the product is `(-a) x b`.
 const MATMUL_F32_STAGED: &str = "\
-version 9
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -2822,7 +2805,6 @@ copy 32,32 %out [0] = %bo [0]
 /// The same with the other operand staged: `%n = neg %b` and the product is
 /// `a x (-b)`.
 const MATMUL_F32_STAGED_B: &str = "\
-version 9
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -2886,7 +2868,6 @@ fn a_computed_matmul_operand_is_staged_into_a_page() {
 /// they are, the Matrix Unit accumulates in the 32-bit `Dst`, and the packer
 /// writes the f32 result.
 const MATMUL_BF16_F32: &str = "\
-version 9
 grid 1,1
 %pa = param bf16 1024
 %pb = param bf16 1024
@@ -2908,7 +2889,6 @@ copy 32,32 %out [0] = %bo [0]
 
 /// bf16 operands over a `bf16` accumulator: the 16-bit `Dst`, the native path.
 const MATMUL_BF16: &str = "\
-version 9
 grid 1,1
 %pa = param bf16 1024
 %pb = param bf16 1024
@@ -2968,7 +2948,6 @@ fn bf16_matmul_runs_on_the_simulator() {
 /// Every table is full-width, so one page is one 32-wide slice of the head and
 /// the rotation never crosses a page.
 const ROPE_INTERLEAVED: &str = "\
-version 9
 grid 1,1
 %px = param f32 4096
 %pc = param f32 4096
@@ -3009,7 +2988,6 @@ endloop
 /// multiplies and an add per output page — no matmul, no data movement. The
 /// `+64` half reuses the low half's cos/sin page.
 const ROPE_SPLIT_HALF: &str = "\
-version 9
 grid 1,1
 %px = param f32 4096
 %pc = param f32 2048
@@ -3048,7 +3026,6 @@ endloop
 /// Split-half RoPE at `head_dim = 32`: both halves are inside one page, so the
 /// swap is the block permutation `[[0, I],[-I, 0]]` the Matrix Unit applies.
 const ROPE_SPLIT_HALF_PAGE: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %pc = param f32 1024
@@ -3082,7 +3059,7 @@ store 32,32 %bo [0] = %y
 copy 32,32 %out [0] = %bo [0]
 ";
 
-/// The interleaved rotation: `y[2k] = -x[2k+1]`, `y[2k+1] = x[2k]` — one
+/// The rotation: `y[2k] = -x[2k+1]`, `y[2k+1] = x[2k]` — one
 /// `matmul` against a ±1 page, then the two multiplies and the add.
 #[test]
 fn rope_interleaved_runs_on_the_simulator() {
@@ -3260,7 +3237,6 @@ fn rope_split_half_within_a_page_runs_on_the_simulator() {
 /// this combination (`prepare_reduce_scaler`) — so the product is each row's
 /// sum in column 0 and zeros elsewhere.
 const REDUCE_SUM_ROW: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %ps = param f32 1024
@@ -3334,7 +3310,6 @@ fn sum_row_runs_on_the_simulator() {
 /// of each face (tt-metal's row-0 fill); `max` carries none and the compiler
 /// moves 1.0 into `SrcB` itself.
 const REDUCE_SUM_COL: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %ps = param f32 1024
@@ -3355,7 +3330,6 @@ copy 32,32 %out [0] = %bo [0]
 ";
 
 const REDUCE_MAX_COL: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %out = param f32 1024
@@ -3374,7 +3348,6 @@ copy 32,32 %out [0] = %bo [0]
 /// The same, seeded above every datum: the accumulator is the fold's other
 /// operand, so every column keeps the seed.
 const REDUCE_MAX_COL_SEEDED: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %out = param f32 1024
@@ -3393,7 +3366,6 @@ copy 32,32 %out [0] = %bo [0]
 /// The same, seeded below every datum: the accumulator is the fold's other
 /// operand, so every row's own maximum survives.
 const REDUCE_MAX_ROW: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %out = param f32 1024
@@ -3411,7 +3383,6 @@ copy 32,32 %out [0] = %bo [0]
 
 /// The same with a seed above every datum.
 const REDUCE_MAX_ROW_SEEDED: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %out = param f32 1024
@@ -3462,7 +3433,6 @@ fn col_reduce_oracle(input: &[f32], max: bool, scaler: Option<f32>) -> Vec<f32> 
 /// `x @ scaler`), `sum col` and `max col` (`GAPOOL`/`GMPOOL`), and `max row`.
 /// Every datum is an integer, so bf16 carries each fold exactly.
 const REDUCE_SUM_ROW_BF16: &str = "\
-version 9
 grid 1,1
 %px = param bf16 1024
 %ps = param bf16 1024
@@ -3483,7 +3453,6 @@ copy 32,32 %out [0] = %bo [0]
 ";
 
 const REDUCE_SUM_COL_BF16: &str = "\
-version 9
 grid 1,1
 %px = param bf16 1024
 %ps = param bf16 1024
@@ -3504,7 +3473,6 @@ copy 32,32 %out [0] = %bo [0]
 ";
 
 const REDUCE_MAX_COL_BF16: &str = "\
-version 9
 grid 1,1
 %px = param bf16 1024
 %out = param bf16 1024
@@ -3524,7 +3492,6 @@ copy 32,32 %out [0] = %bo [0]
 /// maximum, and the fold goes through the 16-bit transpose (`MOVD2B`,
 /// `TRNSPSRCB`, the two `ELWADD`s) rather than the 32-bit hi/lo split.
 const REDUCE_MAX_ROW_BF16: &str = "\
-version 9
 grid 1,1
 %px = param bf16 1024
 %out = param bf16 1024
@@ -3753,7 +3720,6 @@ fn max_row_runs_on_the_simulator() {
 /// A buffer the datapath writes and then reads: `store` packs a page, `load`
 /// unpacks the same page. Any role may drive either end of a buffer.
 const ROUND_TRIP: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %out = param f32 1024
@@ -3796,7 +3762,6 @@ fn a_buffer_a_store_wrote_a_load_reads() {
 /// row broadcast reads `SrcB`'s first face row. The narrow value's page is
 /// laid out as a `1,32`: row 0 of faces 0 and 1.
 const BROADCAST_ROW_ADD: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %pm = param f32 1024
@@ -3815,7 +3780,6 @@ copy 32,32 %out [0] = %bo [0]
 
 /// `x * row`, the same shape pair and the multiply's own instruction.
 const BROADCAST_ROW_MUL: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %pm = param f32 1024
@@ -3836,7 +3800,6 @@ copy 32,32 %out [0] = %bo [0]
 /// broadcast reads `SrcB`'s column 0. The subtraction has the tile on the left,
 /// which is the order the instruction takes.
 const BROADCAST_COL_SUB: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %pm = param f32 1024
@@ -3855,7 +3818,6 @@ copy 32,32 %out [0] = %bo [0]
 
 /// `x * column`, the same shape pair and the multiply's own instruction.
 const BROADCAST_COL_MUL: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %pm = param f32 1024
@@ -3875,7 +3837,6 @@ copy 32,32 %out [0] = %bo [0]
 /// `neg x * row`: `SrcA` is a value the datapath computed, so the compiler
 /// stages it into a page the FPU reads, while `SrcB` is the load's own page.
 const BROADCAST_STAGED_A: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %pm = param f32 1024
@@ -3897,7 +3858,6 @@ copy 32,32 %out [0] = %bo [0]
 /// a copy from a parameter: the narrow read names column 0 of faces 0 and 2,
 /// and every row of the tile is multiplied by its own row's first datum.
 const BROADCAST_COL_FROM_PACK: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %pm = param f32 1024
@@ -4024,7 +3984,6 @@ fn a_broadcast_reads_its_narrow_page() {
 /// and a per-tile scale, walked by a `loop` whose index is the copy's offset.
 /// `out[j] = x[j] · m · s[j]`, every datum.
 const SCALE_LOOP: &str = "\
-version 9
 grid 1,1
 %px = param f32 2048
 %ps = param f32 2048
@@ -4154,7 +4113,6 @@ fn a_scale_loop_keeps_every_datum() {
 /// The same three operands without the `loop`: two tiles, each loaded, scaled
 /// by a per-row factor and a per-tile scale, and written back.
 const SCALE_STRAIGHT: &str = "\
-version 9
 grid 1,1
 %px = param f32 2048
 %ps = param f32 2048
@@ -4235,7 +4193,6 @@ fn a_broadcast_reads_a_packed_narrow_page() {
 /// page is loaded as a tile, the tile's reciprocal is stored, and its row is the
 /// broadcast operand of the final multiply.
 const SOFTMAX_COL: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %ps = param f32 1024
@@ -4339,7 +4296,6 @@ fn softmax_runs_on_the_simulator() {
 /// `32,1` column the broadcast multiplies every tile by. The walk over the
 /// hidden tiles is one `loop` for the fold and one for the scale.
 const RMS_NORM: &str = "\
-version 9
 grid 1,1
 %px = param f32 98304
 %ps = param f32 98304
@@ -4490,7 +4446,6 @@ fn a_narrow_multiply_keeps_every_datum() {
     }
     let narrow_bytes: Vec<u8> = narrow.iter().flat_map(|v| v.to_le_bytes()).collect();
     let program = "\
-version 9
 grid 1,1
 %pr = param f32 1024
 %pn = param f32 1024
@@ -4522,7 +4477,6 @@ copy 32,32 %out [0] = %bo [0]
     // The same tile through `add` against a zero page: `ELWADD`/`ELWSUB` are
     // one pass at any fidelity, so they are exact where the multiply is sliced.
     let program_add = "\
-version 9
 grid 1,1
 %pr = param f32 1024
 %pn = param f32 1024
@@ -4557,7 +4511,6 @@ copy 32,32 %out [0] = %bo [0]
     // lowering zeroes the section first, so anything non-zero here is `Dst`
     // content the zeroing did not reach.
     let program_mul0 = "\
-version 9
 grid 1,1
 %pr = param f32 1024
 %pn = param f32 1024
@@ -4592,7 +4545,6 @@ copy 32,32 %out [0] = %bo [0]
 /// the second one does not clear what the first wrote. No loop — the only thing
 /// exercised is that `acc` holds its value from one `matmul` to the next.
 const MATMUL_ACC: &str = "\
-version 9
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -4645,7 +4597,6 @@ fn matmul_accumulates_into_one_dst() {
 /// into an `acc` declared outside it, and one `store_to` after `endloop` — the
 /// accumulator is visible where it is declared, so the pack happens once.
 const MATMUL_ACC_LOOP: &str = "\
-version 9
 grid 1,1
 %pa = param f32 2048
 %pb = param f32 2048
@@ -4705,7 +4656,6 @@ fn a_matmul_accumulates_over_a_k_loop() {
 /// values are what the wait protects on a board; on the simulator they are what
 /// the program produces either way.
 const MATMUL_ACC_REUSED: &str = "\
-version 9
 grid 1,1
 %pa = param f32 1024
 %pb = param f32 1024
@@ -4769,7 +4719,6 @@ fn an_acc_is_reused_after_it_has_been_packed() {
 /// count per core is derived from the grid at launch
 /// (`%per = div %ntiles %nsites`).
 const GATE_PROJ: &str = "\
-version 9
 %nx = param i32 0
 %ny = param i32 0
 %ntiles = param i32 0
@@ -4985,14 +4934,13 @@ fn gate_proj_throughput() {
 fn gate_proj_blocked() -> String {
     let mut s = String::from(
         "\
-version 9
 %nx = param i32 0
 %ny = param i32 0
 %ntiles = param i32 0
 %ktiles = param i32 0
 %ncols = param i32 0
-%pa = param bf16 16384 interleaved
-%pw = param bf16 245760 interleaved
+%pa = param bf16 16384
+%pw = param bf16 245760
 %pc = param f32 245760
 %ba = buffer bf16 32,512
 %bb = buffer bf16 32,512
@@ -5177,7 +5125,7 @@ fn a_blocked_matmul_issues_a_block() {
             &format!("%pc = param f32 {}", M * N),
         );
     let scalars = [NX, NY, ntiles as u64, kt as u64, nt as u64];
-    // tt-metal's tensors live in DRAM interleaved across the channels, one tile
+    // tt-metal's tensors live in DRAM across the channels, one tile
     // a page; a contiguous buffer sends a core's whole stream at one bank.
     let (out, elapsed) = run_kernel_launches(
         &program,
@@ -5230,14 +5178,13 @@ fn gate_proj_block_kb(h: u32, w: u32, kb: u32) -> String {
     let pages_b = kb * w;
     let mut s = format!(
         "\
-version 9
 %nx = param i32 0
 %ny = param i32 0
 %ntiles = param i32 0
 %ktiles = param i32 0
 %ncols = param i32 0
-%pa = param bf16 16384 interleaved
-%pw = param bf16 245760 interleaved
+%pa = param bf16 16384
+%pw = param bf16 245760
 %pc = param f32 245760
 %ba = buffer bf16 32,{}
 %bb = buffer bf16 32,{}
@@ -5473,6 +5420,59 @@ fn a_tt_metal_kernel_matmuls_one_band() {
     }
 }
 
+/// tt-metal's 2D-multicast kernel: `programs/tt_metal_mcast_bmm.ir` on the full
+/// grid.
+///
+/// A 4x4 band per core over 12x10 cores, A read by column 0 and fanned out
+/// along each row, B read by row 0 and fanned down each column -- the
+/// reuse-mcast reader pair, with the block-accumulator compute. K is the `%kt`
+/// launch scalar, so the same text runs any number of k blocks; A's k tile `j`
+/// is the value `j+1` and B is all ones, so a lost, doubled or misplaced block
+/// cannot add up to `32 * sum(1..kt)`.
+#[test]
+fn a_tt_metal_mcast_kernel_matmuls_a_band() {
+    const NX: u64 = 12;
+    const NY: u64 = 10;
+    const OBH: u32 = 4;
+    const OBW: u32 = 4;
+    const KB: u32 = 2;
+    let kblocks: u32 = std::env::var("SKAM_KBLOCKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let (m, n, k) = (
+        32 * OBH as usize * NY as usize,
+        32 * OBW as usize * NX as usize,
+        32 * KB as usize * kblocks as usize,
+    );
+    let kt = k / 32;
+
+    const ONE_BF16: [u8; 2] = 0x3F80u16.to_le_bytes();
+    let mut a: Vec<u8> = Vec::with_capacity(m * k * 2);
+    for page in 0..m * k / 1024 {
+        let bits = (((page % kt) + 1) as f32).to_bits() >> 16;
+        for _ in 0..1024 {
+            a.extend_from_slice(&(bits as u16).to_le_bytes());
+        }
+    }
+    let b: Vec<u8> = ONE_BF16.iter().cycle().take(n * k * 2).copied().collect();
+    let expected = 32.0 * (1..=kt).map(|j| j as f32).sum::<f32>();
+
+    let program = include_str!("../programs/tt_metal_mcast_bmm.ir")
+        .replace("%pa = param bf16 16384", &format!("%pa = param bf16 {}", m * k))
+        .replace("%pw = param bf16 245760", &format!("%pw = param bf16 {}", n * k))
+        .replace("%pc = param f32 245760", &format!("%pc = param f32 {}", m * n));
+    let scalars = [NX, NY, kt as u64, (n / 32) as u64];
+    let out = run_kernel_launches(&program, &scalars, &[&a, &b], &[2048, 2048], m * n * 4, 1).0;
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (row, column) in (0..m).flat_map(|r| (0..n).map(move |c| (r, c))) {
+        assert_eq!(got[row * n + column], expected, "({row}, {column})");
+    }
+}
+
 /// The 2x2 block with `in0_block_w = 2`: the same program, smaller body.
 
 /// The blocked program's arithmetic, at a shape the simulator can run.
@@ -5607,13 +5607,12 @@ fn a_block_accumulator_matmuls_two_by_two() {
     // `n * Kt + k` order; the ring's layout is the program's, and a dense block
     // is what lets the compute name it as one block.
     let program = "\
-version 9
-%pa = param bf16 8192 interleaved
-%pw = param bf16 8192 interleaved
+%pa = param bf16 8192
+%pw = param bf16 8192
 %pc = param f32 4096
-%ba = buffer bf16 32,256 block 8
-%bb = buffer bf16 32,256 block 8
-%bc = buffer f32 32,128 block 4
+%ba = buffer bf16 32,256
+%bb = buffer bf16 32,256
+%bc = buffer f32 32,128
 %acc = acc f32 64,64
 %zero = const f32 0
 store 64,64 %acc = %zero
@@ -5892,7 +5891,6 @@ fn matmul_breakdown() {
         .unwrap_or(20);
 
     const FLOOR: &str = "\
-version 9
 %nx = param i32 0
 %ny = param i32 0
 %pc = param f32 245760
@@ -5967,7 +5965,6 @@ fn a_row_fans_out_from_its_leader() {
     const NX: u64 = 4;
     const NY: u64 = 3;
     const EXPAND: &str = "\
-version 9
 %nx = const i32 4
 %ny = const i32 3
 %in = param f32 12288
@@ -6031,7 +6028,6 @@ fn fan_out_perf() {
     let program = |only_leaders: bool| {
         format!(
             "\
-version 9
 %nx = const i32 {NX}
 %ny = const i32 {NY}
 %pages = const i32 {PAGES}
@@ -6045,14 +6041,14 @@ version 9
 %base = mul %t %pages
 %i = loop %pages
 %at = add %base %i
-copy 32,32 %b [0] = %in [%at]{span}
+copy 32,32 %b [0]{span} = %in [%at]
 expand %b [1] [.., ..] from [0, ..]
 copy 32,32 %out [%at] = %b [0]
 endloop
 grid %nx,%ny
 ",
             n = ntiles * PAGES * 1024,
-            span = if only_leaders { " in [0, ..]" } else { "" },
+            span = if only_leaders { " cores [0, ..]" } else { "" },
         )
     };
     let bytes_len = (ntiles * PAGES * 1024) as usize * 4;
@@ -6089,7 +6085,6 @@ fn only_the_leaders_read_the_parameter() {
     const NX: u64 = 4;
     const NY: u64 = 3;
     const LEADERS_READ: &str = "\
-version 9
 %nx = const i32 4
 %ny = const i32 3
 %in = param f32 12288
@@ -6099,7 +6094,7 @@ version 9
 %y = grid.y
 %row = mul %y %nx
 %t = add %row %x
-copy 32,32 %b [0] = %in [%t] in [0, ..]
+copy 32,32 %b [0] cores [0, ..] = %in [%t]
 expand %b [1] [.., ..] from [0, ..]
 copy 32,32 %out [%t] = %b [0]
 grid %nx,%ny
@@ -6137,7 +6132,6 @@ fn a_column_fans_out_from_its_leader() {
     const NX: u64 = 3;
     const NY: u64 = 4;
     const EXPAND: &str = "\
-version 9
 %nx = const i32 3
 %ny = const i32 4
 %in = param f32 12288
@@ -6185,7 +6179,6 @@ fn one_leader_fills_the_grid() {
     const NX: u64 = 3;
     const NY: u64 = 3;
     const EXPAND: &str = "\
-version 9
 %nx = const i32 3
 %ny = const i32 3
 %in = param f32 9216
@@ -6225,16 +6218,15 @@ grid %nx,%ny
 }
 
 /// A weight tile whose pages are striped across the DRAM channels: the kernel
-/// resolves each page's channel from the page index (tt-metal's interleaved
+/// resolves each page's channel from the page index (tt-metal's
 /// address generator), so the four weight pages land on four different banks
 /// and the four GEMMs must still see the pages the host wrote.
 #[test]
 fn an_interleaved_tensor_is_read_page_by_page() {
     const INTERLEAVED: &str = "\
-version 9
 grid 1,1
 %pa = param bf16 1024
-%pw = param bf16 4096 interleaved
+%pw = param bf16 4096
 %pc = param f32 4096
 %ba = buffer bf16 32,32
 %bw = buffer bf16 32,32
@@ -6308,7 +6300,6 @@ endloop
 #[test]
 fn exp2_runs_on_the_simulator() {
     const PROGRAM: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -6357,7 +6348,6 @@ fn check_unary(program: &str, host: &[f32], want: impl Fn(f32) -> f32, tol: f32,
 }
 
 const ONE_LOAD: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -6400,7 +6390,6 @@ fn sin_and_cos_are_unfolded_into_primitives() {
 #[test]
 fn pow_is_unfolded_into_exp2_and_log2() {
     const POW: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -6423,7 +6412,6 @@ copy 32,32 %out [0] = %bo [0]
 #[test]
 fn div_is_unfolded_into_a_reciprocal() {
     const DIV: &str = "\
-version 9
 grid 1,1
 %in = param f32 2048
 %out = param f32 1024
@@ -6460,7 +6448,6 @@ copy 32,32 %out [0] = %bo [0]
 fn activation_program(chain: &str) -> String {
     format!(
         "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024
@@ -6595,7 +6582,6 @@ fn gelu_runs_on_the_simulator() {
 fn bf16_activation_program(chain: &str) -> String {
     format!(
         "\
-version 9
 grid 1,1
 %in = param bf16 1024
 %out = param bf16 1024
@@ -6665,7 +6651,6 @@ fn bf16_activations_run_on_the_simulator() {
 /// accumulator, and the coefficients at the tile's dtype. `%zero` stays f32
 /// because the accumulator's fill is the one thing that must be f32.
 const RMS_NORM_BF16: &str = "\
-version 9
 grid 1,1
 %px = param bf16 98304
 %ps = param bf16 98304
@@ -6718,7 +6703,6 @@ endloop
 /// `Dst`, so every tile's fold is added to a bf16 datum. This is the rms_norm
 /// fold, isolated.
 const SUM_ROW_MANY_BF16: &str = "\
-version 9
 grid 1,1
 %px = param bf16 98304
 %pone = param bf16 1024
@@ -6803,7 +6787,6 @@ fn bf16_sum_row_over_many_tiles() {
 fn sum_row_probe_program(n: u32, dt: &str, acc: &str, out: &str) -> String {
     format!(
         "\
-version 9
 grid 1,1
 %px = param {dt} 98304
 %pone = param {dt} 1024
@@ -6841,7 +6824,6 @@ copy 32,32 %out [0] = %bo [0]
 fn sum_loaded_probe_program(n: u32, dt: &str, acc: &str, out: &str) -> String {
     format!(
         "\
-version 9
 grid 1,1
 %px = param {dt} 98304
 %pone = param {dt} 1024
@@ -6877,7 +6859,6 @@ copy 32,32 %out [0] = %bo [0]
 fn mul_store_probe_program(n: u32, dt: &str) -> String {
     format!(
         "\
-version 9
 grid 1,1
 %px = param {dt} 98304
 %out = param {dt} 98304
@@ -7301,7 +7282,6 @@ fn bf16_rms_norm_runs_on_the_simulator() {
 /// `softmax` down a tile's columns in a bf16 kernel: a 16-bit `Dst`, a bf16
 /// accumulator, and constants at the tile's dtype.
 const SOFTMAX_COL_BF16: &str = "\
-version 9
 grid 1,1
 %px = param bf16 1024
 %ps = param bf16 1024
@@ -7408,7 +7388,6 @@ fn bf16_softmax_runs_on_the_simulator() {
 /// gather moves those two halves. That is also why the ids page is written the
 /// way a tile holds row 0.
 const GATHER: &str = "\
-version 9
 grid 1,1
 %ids = param i32 1024
 %w = param f32 32768
@@ -7463,7 +7442,6 @@ fn a_gather_is_pure_data_movement() {
 /// the writer's, so a page the writer touches has to be filled by the writer
 /// too.
 const SCATTER: &str = "\
-version 9
 grid 1,1
 %src = param f32 1024
 %zero = param f32 1024
@@ -7514,7 +7492,6 @@ fn a_row_scatter_writes_a_parameter_in_the_tile_layout() {
 #[test]
 fn transpose_runs_on_the_simulator() {
     const TRANSPOSE: &str = "\
-version 9
 grid 1,1
 %pin = param bf16 1024
 %pout = param bf16 1024
@@ -7560,7 +7537,6 @@ copy 32,32 %pout [0] = %bout [0]
 #[test]
 fn q_times_k_transposed_runs_on_the_simulator() {
     const QK_TRANSPOSED: &str = "\
-version 9
 grid 1,1
 %pq = param bf16 1024
 %pk = param bf16 1024
@@ -7630,7 +7606,6 @@ copy 32,32 %pout [0] = %bo [0]
 /// negative where it is in the future. The rest is `SOFTMAX_COL`'s chain, so the
 /// mask is the one new input.
 const MASKED_SOFTMAX: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %pm = param f32 1024
@@ -7737,7 +7712,6 @@ fn a_causal_mask_hides_the_future_keys() {
 /// and a ring, so the page makes the round trip through a register — one `load`
 /// and one `store` per head, which is the same store the caller would issue.
 const REPEAT_KV: &str = "\
-version 9
 grid 1,1
 %pk = param f32 1024
 %out = param f32 4096
@@ -7782,7 +7756,6 @@ fn repeat_kv_copies_a_head_into_every_query_head() {
 /// through the tile softmax and the probabilities multiply V. `q @ kᵀ` is the
 /// one piece this kernel cannot name (`Op::Matmul` has no transpose).
 const SOFTMAX_TIMES_V: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %pv = param f32 1024
@@ -7875,7 +7848,6 @@ fn softmax_then_attention_times_v_runs_on_the_simulator() {
 /// SwiGLU: `down(silu(gate(x)) * up(x))`, every projection a tile GEMM, the
 /// activation the sigmoid chain the `silu` gate already covers.
 const SWIGLU: &str = "\
-version 9
 grid 1,1
 %px = param f32 1024
 %pg = param f32 1024
@@ -7982,7 +7954,6 @@ fn swiglu_runs_on_the_simulator() {
 /// parameter is `TT_TODO_ACCESS_SHAPE`, not an undefined request. A bf16 row
 /// has to move at page granularity, which is the next step for this path.
 const EMBEDDING_CAST: &str = "\
-version 9
 grid 1,1
 %ids = param i32 1024
 %w = param bf16 32768
@@ -8027,7 +7998,6 @@ fn a_bf16_row_gather_is_refused_by_the_alignment_rule() {
 /// page has one live row, which is what the pre-lm_head narrow leaves behind;
 /// every other row of the product is zero.
 const LM_HEAD: &str = "\
-version 9
 grid 1,1
 %pa = param f32 1024
 %pw = param f32 1024
@@ -8107,13 +8077,12 @@ fn gate_proj_mcast(h: u32, w: u32, kb: u32) -> String {
     let depth_b = 2 * w * kb;
     let mut s = format!(
         "\
-version 9
 %nx = param i32 0
 %ny = param i32 0
 %ktiles = param i32 0
 %ncols = param i32 0
-%pa = param bf16 16384 interleaved
-%pw = param bf16 245760 interleaved
+%pa = param bf16 16384
+%pw = param bf16 245760
 %pc = param f32 245760
 %ba = buffer bf16 32,{a}
 %bb = buffer bf16 32,{b}
@@ -8218,14 +8187,14 @@ version 9
     for j in 0..kb {
         for r in 0..h {
             s.push_str(&format!(
-                "copy 32,32 %ba [{}] = %pa [{}] in [0, ..]\n",
+                "copy 32,32 %ba [{}] cores [0, ..] = %pa [{}]\n",
                 page_a(r, j),
                 step_name("ka", r, j)
             ));
         }
         for c in 0..w {
             s.push_str(&format!(
-                "copy 32,32 %bb [{}] = %pw [{}] in [.., 0]\n",
+                "copy 32,32 %bb [{}] cores [.., 0] = %pw [{}]\n",
                 page_b(c, j),
                 step_name("kbv", c, j)
             ));
@@ -8397,7 +8366,6 @@ fn a_multicast_matmul_runs_on_the_card() {
 /// k-block and packs it back at the bottom, so no accumulator lives in `Dst`
 /// across the loop; the answer must still be the whole K sum.
 const SPILL_K_LOOP: &str = "\
-version 9
 grid 1,1
 %in = param bf16 16384
 %w = param bf16 16384
@@ -8431,15 +8399,14 @@ copy 32,32 %out [0] = %bc [0]
 /// block operands. The four tiles are one section, so the reload, the math and
 /// the pack move them as one hand-off per iteration.
 const BLOCK_SPILL_K_LOOP: &str = "\
-version 9
 grid 1,1
 %in = param bf16 16384
 %w = param bf16 16384
 %out = param f32 4096
-%ba = buffer bf16 32,128 block 4
-%bb = buffer bf16 32,128 block 4
-%interm = buffer f32 32,128 block 4
-%bc = buffer f32 32,128 block 4
+%ba = buffer bf16 32,128
+%bb = buffer bf16 32,128
+%interm = buffer f32 32,128
+%bc = buffer f32 32,128
 %acc = acc f32 64,64
 %zero = const f32 0
 %izero = const i32 0
@@ -8518,13 +8485,12 @@ fn gate_proj_mcast_band(h: u32, w: u32, kb: u32) -> String {
     assert!(h % 2 == 0 && w % 2 == 0, "subblocks are 2x2");
     let mut s = format!(
         "\
-version 9
 %nx = param i32 0
 %ny = param i32 0
 %ktiles = param i32 0
 %ncols = param i32 0
-%pa = param bf16 16384 interleaved
-%pw = param bf16 245760 interleaved
+%pa = param bf16 16384
+%pw = param bf16 245760
 %pc = param f32 245760
 %ba = buffer bf16 32,{a}
 %bb = buffer bf16 32,{b}
@@ -8629,14 +8595,14 @@ version 9
         for j in 0..kb {
             for r in 0..h {
                 s.push_str(&format!(
-                    "copy 32,32 %ba [{}] = %pa [{}] in [0, ..]\n",
+                    "copy 32,32 %ba [{}] cores [0, ..] = %pa [{}]\n",
                     r * kb + j,
                     step_name("ka", r, j)
                 ));
             }
             for c in 0..w {
                 s.push_str(&format!(
-                    "copy 32,32 %bb [{}] = %pw [{}] in [.., 0]\n",
+                    "copy 32,32 %bb [{}] cores [.., 0] = %pw [{}]\n",
                     c * kb + j,
                     step_name("kbv", c, j)
                 ));

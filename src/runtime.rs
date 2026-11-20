@@ -234,15 +234,11 @@ pub fn release() -> Result<(), ttStatus> {
 }
 
 /// Reserve `bytes` of DRAM and return its address.
-pub fn alloc(bytes: usize) -> Result<u64, ttStatus> {
-    with_device(|d| d.alloc_dram(bytes))
+pub fn alloc(bytes: usize, page: usize) -> Result<u64, ttStatus> {
+    with_device(|d| d.alloc(bytes, page))
 }
 
 /// Reserve a tensor striped across the DRAM channels and return its handle.
-pub fn alloc_interleaved(bytes: usize, page: usize) -> Result<u64, ttStatus> {
-    with_device(|d| d.alloc_interleaved(bytes, page))
-}
-
 /// Copy host bytes into DRAM at `address`.
 pub fn h2d(address: u64, bytes: &[u8]) -> Result<(), ttStatus> {
     with_device(|d| d.dram_write(address, bytes))
@@ -398,41 +394,37 @@ fn args_for(
         for (index, kind) in module.params.iter().enumerate() {
             let word = params[index];
             let channel_bytes = tt_isa::arch::blackhole::dram::CHANNEL_BYTES;
-            if *kind == crate::compile::ParamKind::Interleaved {
-                // A striped tensor: a pair per channel, then the count and the
-                // page, exactly what the mover's address arithmetic reads.
-                let layout = device
-                    .interleaved_at(word)
-                    .ok_or(ttStatus::TT_ERROR_ARGUMENT)?;
-                let mut pairs = 0u32;
-                for (bank, base) in layout.base.iter().enumerate() {
-                    let flat = u64::from(bank as u32) * channel_bytes + base;
-                    args.push((flat % channel_bytes) as u32);
-                    args.push(device.dram_hi(flat, *niu)?);
-                    pairs += 1;
-                }
-                for _ in pairs..crate::mover::MAX_BANKS as u32 {
-                    args.push(0);
-                    args.push(0);
-                }
-                args.push(pairs);
-                args.push(layout.page);
+            let crate::compile::ParamKind::Tensor { page } = *kind else {
+                args.push(word as u32);
+                args.push(0);
                 continue;
-            }
-            let (low, high) = match kind {
-                crate::compile::ParamKind::Scalar => (word as u32, 0),
-                // A tensor names its channel's endpoint in the high word and
-                // the offset inside that channel in the low one, as tt-metal's
-                // `get_noc_addr_from_bank_id` does: the endpoint comes from the
-                // bank, the address is the bank-local offset
-                // (`dataflow_api_addrgen.h:516-533`).
-                _ => {
-                    let hi = device.dram_hi(word, *niu)?;
-                    ((word % channel_bytes) as u32, hi)
-                }
             };
-            args.push(low);
-            args.push(high);
+            // A tensor is a table of channel bases, then the count and the
+            // page: exactly what the mover's address arithmetic reads. A
+            // buffer that lives in one channel -- an ordinary allocation --
+            // is one entry, and the same arithmetic degenerates to
+            // `base + page * page_size`, so the program never names a layout.
+            let (bases, channels, page): (Vec<u64>, u32, u32) = match device.interleaved_at(word) {
+                Some(layout) => (
+                    layout.base.iter().map(|base| *base).collect(),
+                    layout.base.len() as u32,
+                    layout.page,
+                ),
+                None => (vec![word], 1, page),
+            };
+            let mut pairs = 0u32;
+            for base in bases {
+                let flat = u64::from(pairs) * channel_bytes + base;
+                args.push((flat % channel_bytes) as u32);
+                args.push(device.dram_hi(flat, *niu)?);
+                pairs += 1;
+            }
+            for _ in pairs..crate::mover::MAX_BANKS as u32 {
+                args.push(0);
+                args.push(0);
+            }
+            args.push(channels);
+            args.push(page);
         }
         if (args_at(*niu) as u64) + 4 * args.len() as u64
             > tt_isa::arch::blackhole::l1::PROGRAM_CACHE.end

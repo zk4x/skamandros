@@ -1036,7 +1036,6 @@ mod tests {
     fn activation(op: &str) -> String {
         format!(
             "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024

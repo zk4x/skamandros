@@ -19,7 +19,7 @@
 //! dtypes and shapes are not a side table: a leaf op carries its own, and every
 //! other op's is [`Kernel::dtype`]/[`Kernel::shape`], recomputed on demand.
 //!
-//! The text form is the only program form, and [`VERSION`] its version line.
+//! The text form is the only program form.
 
 use core::fmt;
 use std::borrow::Cow;
@@ -415,14 +415,10 @@ pub enum Op {
     Shape(Box<[OpId]>),
     /// A tensor parameter in DRAM, with its logical shape.
     /// A tensor parameter: `shape` is its element count, which the caller's
-    /// DRAM buffer holds. `interleaved` is the buffer's layout: its pages are
-    /// striped across the device's DRAM channels (tt-metal's interleaved
-    /// buffer, `InterleavedBuffer`), instead of lying in one channel.
-    Param {
-        dtype: DType,
-        shape: OpId,
-        interleaved: bool,
-    },
+    /// DRAM buffer holds. Where the pages live is the launch's business: a
+    /// page is named by its index, and the launch hands the mover the DRAM
+    /// bank table that index resolves through (tt-metal's tensor accessor).
+    Param { dtype: DType, shape: OpId },
     /// A scalar parameter: one word in DRAM, the value a launch argument
     /// carries (the shape `0` in the text form). Its shape is the empty one.
     Variable { dtype: DType },
@@ -434,17 +430,10 @@ pub enum Op {
         page: [Dim; 2],
         /// Pages in the ring.
         len: Dim,
-        /// Pages handed off together: the ring's block, when the program states
-        /// one (`%bi = buffer f32 32,64 block 4`).
-        ///
-        /// A hand-off is the compiler's, but its *size* is not: `load %ba [p]`
-        /// and `store %ba [p]` name a page inside the block the program is
-        /// walking, and the base the page is added to is the block's first
-        /// page. When every page index is a constant the block is read off
-        /// them (`max p + 1`). A page index that is a loop value names no
-        /// maximum, so the program states the block instead of the compiler
-        /// guessing -- tt-metal's reader passes `in0_block_num_tiles` the same
-        /// way (`reader_bmm_tile_layout.cpp`).
+        /// Pages handed off together: the ring's block. Not program text --
+        /// `sync_cbs` derives it from the pages the accesses name (a `copy`
+        /// moves one page, a block `load`/`store` moves its `m * n`), and the
+        /// lowering reads it to place a loop's page index inside the block.
         block: Option<u32>,
     },
     /// A named accumulator: one `Dst` region that `matmul`, `sum`/`max` and
@@ -458,7 +447,14 @@ pub enum Op {
     /// The launch grid, as two terms: Tensix cores are a 2-D grid.
     Grid { x: OpId, y: OpId },
     /// `%i = loop %bound`.
-    Loop { bound: OpId },
+    Loop {
+        bound: OpId,
+        /// `loop ... unroll`: the body is written out at compile time, once per
+        /// trip, with the induction variable folded to a constant. A program
+        /// says the shape; the walks with constant page indices are the
+        /// compiler's to spell.
+        unroll: bool,
+    },
     /// `endloop`.
     EndLoop,
     /// The end of the reader's segment: the ops before it run on the inbound
@@ -654,7 +650,7 @@ impl Op {
             Op::Shape(ref ops) => ops.get(idx).copied(),
             Op::Param { shape, .. } => [shape].get(idx).copied(),
             Op::Grid { x, y } => [x, y].get(idx).copied(),
-            Op::Loop { bound } => [bound].get(idx).copied(),
+            Op::Loop { bound, .. } => [bound].get(idx).copied(),
             Op::Copy {
                 dst,
                 src,
@@ -776,7 +772,7 @@ impl Op {
             Op::Shape(ops) => ParamsMut::Slice(ops.iter_mut()),
             Op::Param { shape, .. } => ParamsMut::One(Some(shape)),
             Op::Grid { x, y } => ParamsMut::Two(Some(x), Some(y)),
-            Op::Loop { bound } => ParamsMut::One(Some(bound)),
+            Op::Loop { bound, .. } => ParamsMut::One(Some(bound)),
             Op::Copy {
                 dst,
                 src,
@@ -1017,6 +1013,40 @@ pub fn renumber(op: &mut Op, map: &BTreeMap<OpId, OpId>) -> Result<(), ttStatus>
             .copied()
             .ok_or(ttStatus::TT_ERROR_VALUE_UNDEFINED)?;
         *param = to;
+    }
+    // A collective's span coordinates are operands too, but they are not in
+    // `parameters_mut` (which walks the fixed fields); a pass copying a
+    // program has to rebind them or the copy names the old program's values.
+    match op {
+        Op::Copy { span, .. } => renumber_span(span, map)?,
+        Op::Expand { span, from, .. } => {
+            renumber_span(span, map)?;
+            renumber_span(from, map)?;
+        }
+        Op::Roll { span, .. } => renumber_span(span, map)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Rewrite a span's coordinate operands through `map`.
+fn renumber_span(span: &mut Span, map: &BTreeMap<OpId, OpId>) -> Result<(), ttStatus> {
+    let one = |id: &mut OpId| -> Result<(), ttStatus> {
+        *id = map
+            .get(id)
+            .copied()
+            .ok_or(ttStatus::TT_ERROR_VALUE_UNDEFINED)?;
+        Ok(())
+    };
+    for extent in [&mut span.x, &mut span.y] {
+        match extent {
+            Extent::Whole => {}
+            Extent::At(a) => one(a)?,
+            Extent::Range(a, b) => {
+                one(a)?;
+                one(b)?;
+            }
+        }
     }
     Ok(())
 }
@@ -1371,7 +1401,7 @@ impl Kernel {
                         return Err(ttStatus::TT_ERROR_GRID_AXIS);
                     }
                 }
-                Op::Loop { bound } => {
+                Op::Loop { bound, .. } => {
                     self.expect_index_scalar(bound, at)?;
                     loops.push(at);
                     visible[at] = true;
@@ -1915,16 +1945,12 @@ fn acc_reg_shape(shape: [Dim; 2]) -> RegShape {
 // Forms
 // ---------------------------------------------------------------------------
 
-/// The IR version this build reads.
-pub const VERSION: u32 = 9;
-
 impl Kernel {
     /// Parse the text form.
     ///
     /// The grammar is the one the tests write:
     ///
     /// ```text
-    /// version 9
     /// grid 1,1
     /// %in = param f32 2048
     /// %s  = param i32 0
@@ -1958,8 +1984,7 @@ impl Parser {
 
     /// Parse every line, in order.
     fn run(&mut self, text: &str) -> Result<Kernel, ttStatus> {
-        let mut version = false;
-        for line in text.lines() {
+            for line in text.lines() {
             // `#` starts a comment wherever it appears and runs to the end of
             // the line, so a statement can be annotated after it. Cutting it
             // off here, before the line is tokenised, keeps the rule out of
@@ -1971,16 +1996,6 @@ impl Parser {
                 continue;
             }
             let mut t = Tokens::new(line);
-            if !version {
-                if t.word() != Some("version") {
-                    return Err(ttStatus::TT_ERROR_VERSION);
-                }
-                if t.number()? != VERSION {
-                    return Err(ttStatus::TT_ERROR_VERSION);
-                }
-                version = true;
-                continue;
-            }
             if let Some(word) = t.peek_word() {
                 match word {
                     "grid" => {
@@ -1997,6 +2012,10 @@ impl Parser {
                         let shape = t.shape2()?;
                         let dst = self.value(&mut t)?;
                         let dst_offset = t.bracket(self)?;
+                        // `cores [span]` qualifies the local side of the copy:
+                        // the ring page exists only on those cores, and only
+                        // they issue the request. Without it, every core does.
+                        let mut span = self.cores(&mut t)?;
                         t.eq()?;
                         let src = self.value(&mut t)?;
                         let src_offset = if t.peek_char() == Some('[') {
@@ -2004,14 +2023,15 @@ impl Parser {
                         } else {
                             dst_offset
                         };
-                        // `in [span]` is optional: without it the copy runs on
-                        // every core, which is the whole-grid span.
-                        let span = if t.peek_word() == Some("in") {
-                            t.word();
-                            t.span(self)?
-                        } else {
-                            Span::WHOLE
-                        };
+                        // The local side may be either end: an outbound copy's
+                        // ring is its source.
+                        if let Some(named) = self.cores(&mut t)? {
+                            if span.is_some() {
+                                return Err(ttStatus::TT_ERROR_PARSE);
+                            }
+                            span = Some(named);
+                        }
+                        let span = span.unwrap_or(Span::WHOLE);
                         t.end()?;
                         self.push(Op::Copy {
                             dst,
@@ -2186,9 +2206,6 @@ impl Parser {
             // Everything else is a definition: `%name = ...`.
             self.definition(&mut t)?;
         }
-        if !version {
-            return Err(ttStatus::TT_ERROR_VERSION);
-        }
         let k = self.take()?;
         k.check()?;
         // The ring hand-offs are the compiler's, not the program's: `sync_cbs`
@@ -2215,7 +2232,6 @@ impl fmt::Display for Kernel {
             f: f as &mut dyn fmt::Write,
             loop_depth: 0,
         };
-        writeln!(p.f, "version {VERSION}")?;
         for (id, op) in self.ops() {
             p.op(id, op)?;
         }
@@ -2277,6 +2293,15 @@ impl Parser {
         self.term(t)
     }
 
+    /// An optional `cores [span]` on a copy's local side.
+    fn cores(&mut self, t: &mut Tokens<'_>) -> Result<Option<Span>, ttStatus> {
+        if t.peek_word() != Some("cores") {
+            return Ok(None);
+        }
+        t.word();
+        Ok(Some(t.span(self)?))
+    }
+
     fn definition(&mut self, t: &mut Tokens<'_>) -> Result<(), ttStatus> {
         let name = t.name()?;
         t.eq()?;
@@ -2305,21 +2330,13 @@ impl Parser {
                     }
                     self.push(Op::Shape(terms.into_boxed_slice()))
                 };
-                let interleaved = t.peek_word() == Some("interleaved");
-                if interleaved {
-                    t.word();
-                }
                 t.end()?;
                 let id = self.ops.len();
                 self.define(name, id)?;
                 if scalar {
                     self.push(Op::Variable { dtype });
                 } else {
-                    self.push(Op::Param {
-                        dtype,
-                        shape,
-                        interleaved,
-                    });
+                    self.push(Op::Param { dtype, shape });
                 }
             }
             "buffer" => {
@@ -2327,14 +2344,6 @@ impl Parser {
                 let a = t.number()?;
                 t.comma()?;
                 let b = t.number()?;
-                // An optional `block n`: the pages one hand-off moves. Only a
-                // program whose page index is a loop value has to state it.
-                let block = if t.peek_word() == Some("block") {
-                    let _ = t.word();
-                    Some(t.number()?)
-                } else {
-                    None
-                };
                 t.end()?;
                 let (page, len) = cb_ring([a, b], dtype)?;
                 let id = self.ops.len();
@@ -2343,7 +2352,9 @@ impl Parser {
                     dtype,
                     page,
                     len,
-                    block,
+                    // Derived from the accesses by `sync_cbs`; never written by
+                    // the program.
+                    block: None,
                 });
             }
             "acc" => {
@@ -2361,10 +2372,14 @@ impl Parser {
             }
             "loop" => {
                 let bound = self.term(t)?;
+                let unroll = t.peek_word() == Some("unroll");
+                if unroll {
+                    t.word();
+                }
                 t.end()?;
                 let id = self.ops.len();
                 self.define(name, id)?;
-                self.push(Op::Loop { bound });
+                self.push(Op::Loop { bound, unroll });
             }
             "grid" => {
                 t.dot()?;
@@ -2490,45 +2505,31 @@ impl Printer<'_, '_> {
                     Err(_) => return Err(fmt::Error),
                 }
             ),
-            Op::Param {
-                dtype,
-                shape,
-                interleaved,
-            } => {
+            Op::Param { dtype, shape } => {
                 write!(self.f, "{} = param {} ", self.name(id), dtype.name())?;
                 let terms: Vec<OpId> = match *k.at(shape) {
                     Op::Shape(ref ops) => ops.to_vec(),
                     _ => Vec::new(),
                 };
                 let text: Vec<String> = terms.iter().map(|t| self.name(*t)).collect();
-                writeln!(
-                    self.f,
-                    "{}{}",
-                    text.join(","),
-                    if interleaved { " interleaved" } else { "" }
-                )
+                writeln!(self.f, "{}", text.join(","))
             }
             Op::Variable { dtype } => {
                 writeln!(self.f, "{} = param {} 0", self.name(id), dtype.name())
             }
             Op::Cb {
-                dtype,
-                page,
-                len,
-                block,
+                dtype, page, len, ..
             } => {
-                write!(
+                // The hand-off block is derived, not written: it is not part of
+                // the program.
+                writeln!(
                     self.f,
                     "{} = buffer {} {},{}",
                     self.name(id),
                     dtype.name(),
                     page[0],
                     page[1] * len
-                )?;
-                match block {
-                    Some(n) => writeln!(self.f, " block {n}"),
-                    None => writeln!(self.f),
-                }
+                )
             }
             Op::Acc { dtype, shape } => writeln!(
                 self.f,
@@ -2539,9 +2540,15 @@ impl Printer<'_, '_> {
                 shape[1]
             ),
             Op::Grid { x, y } => writeln!(self.f, "grid {},{}", self.name(x), self.name(y)),
-            Op::Loop { bound } => {
+            Op::Loop { bound, unroll } => {
                 self.loop_depth += 1;
-                writeln!(self.f, "{} = loop {}", self.name(id), self.name(bound))
+                writeln!(
+                    self.f,
+                    "{} = loop {}{}",
+                    self.name(id),
+                    self.name(bound),
+                    if unroll { " unroll" } else { "" }
+                )
             }
             Op::EndLoop => {
                 self.loop_depth = self.loop_depth.saturating_sub(1);
@@ -2568,20 +2575,20 @@ impl Printer<'_, '_> {
                 span,
             } => writeln!(
                 self.f,
-                "copy {},{} {} [{}] = {} [{}]{}",
+                "copy {},{} {} [{}]{} = {} [{}]",
                 shape[0],
                 shape[1],
                 self.name(dst),
                 self.name(dst_offset),
-                self.name(src),
-                self.name(src_offset),
                 // `[.., ..]` is every core, so it is left implicit; any other
                 // span is printed because it changes which cores read.
                 if span.is_whole() {
                     String::new()
                 } else {
-                    format!(" in {}", self.span(span))
-                }
+                    format!(" cores {}", self.span(span))
+                },
+                self.name(src),
+                self.name(src_offset),
             ),
             Op::Expand {
                 src,

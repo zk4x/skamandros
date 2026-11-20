@@ -30,6 +30,7 @@ mod slab;
 mod status;
 mod sync_cbs;
 mod unfold;
+mod unroll;
 mod verify;
 
 /// The hash set zyx's `Slab` keeps its free list in. zyx uses the crate's own

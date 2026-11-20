@@ -27,7 +27,7 @@
 #   with `i` inside `reserve_back(out_subblock_num_tiles)`.
 #
 # Two ends are peeled because this IR has no runtime `if`, and tt-metal's kernel
-# branches on the block index twice: `enable_reload = false` for block 0, and
+# branches on the block index twice: `enable_reload = false` for, and
 # `last_out` for block `num_blocks - 1`.  The peeled first block computes into
 # `interm` without a reload; the peeled last block reloads and packs to the
 # output ring.  The loop between them covers `1 .. num_blocks-2`, and the reader
@@ -37,18 +37,17 @@
 # subblock nest (`in0_subblock`/`in1_subblock`) is the `%si`/`%sj` loop pair,
 # the accumulator is one `acc f32 64,64` block (tt-metal's `out_subblock_h x
 # out_subblock_w` `Dst` region), and the operand loads name blocks, not tiles.
-version 9
 %nx = param i32 0
 %ny = param i32 0
 %kt = param i32 0
 %ncols = param i32 0
-%pa = param bf16 16384 interleaved
-%pw = param bf16 245760 interleaved
+%pa = param bf16 16384
+%pw = param bf16 245760
 %pc = param f32 245760
-%ba = buffer bf16 32,512 block 8
-%bb = buffer bf16 32,512 block 8
-%interm = buffer f32 32,1024 block 4
-%bc = buffer f32 32,256 block 4
+%ba = buffer bf16 32,512
+%bb = buffer bf16 32,512
+%interm = buffer f32 32,1024
+%bc = buffer f32 32,256
 %acc = acc f32 64,64 
 %zero = const f32 0
 %izero = const i32 0

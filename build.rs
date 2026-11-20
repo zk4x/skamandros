@@ -33,11 +33,6 @@ const DECLARATIONS: &[(&str, &str, &str)] = &[
     (
         "ttMemAlloc",
         "ttStatus",
-        "size_t bytes, uint64_t *addr, char **err",
-    ),
-    (
-        "ttMemAllocInterleaved",
-        "ttStatus",
         "size_t bytes, size_t page, uint64_t *addr, char **err",
     ),
     (

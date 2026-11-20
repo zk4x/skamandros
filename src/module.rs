@@ -10,14 +10,16 @@ use crate::ir::BOp;
 pub enum ParamKind {
     /// A scalar parameter: the argument is its value.
     Scalar,
-    /// A tensor parameter: the argument is its DRAM address.
-    Tensor,
-    /// A tensor parameter whose pages are striped across the DRAM channels.
-    /// Its argument block is the per-channel page bases, the channel count and
-    /// the page size, so the program can resolve a page's channel itself — the
-    /// device-side half of tt-metal's interleaved address generator
-    /// (`InterleavedAddrGen` / `get_noc_addr_from_bank_id`).
-    Interleaved,
+    /// A tensor parameter. Its argument block is the per-channel page bases,
+    /// the channel count and the page size, so the program resolves a page's
+    /// channel itself — the device-side half of tt-metal's address generator
+    /// (`InterleavedAddrGen` / `get_noc_addr_from_bank_id`). A buffer that
+    /// lives in one channel is the same block with one channel, `base` and
+    /// this page size, so the program never names a layout.
+    Tensor {
+        /// One page's byte size, from the parameter's dtype (a 32x32 tile).
+        page: u32,
+    },
 }
 
 /// One grid extent, resolved at launch from the scalar arguments. A `Dim` is a

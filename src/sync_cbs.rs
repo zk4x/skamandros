@@ -196,6 +196,89 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
             .collect::<Result<Vec<Option<i32>>, ttStatus>>()?;
         producer_paths.entry(*ring).or_default().push(path);
     }
+    // The block: the pages one hand-off of a ring moves. A `copy` moves the
+    // page it names; a block `load`/`store` moves its `m * n` tile pages, all
+    // at the hand-off's base. tt-metal's reader reserves a block, issues every
+    // read of it, barriers once and pushes once
+    // (`reader_bmm_tile_layout.cpp:76-113`), and its compute waits the same
+    // block and walks the tiles by index (`bmm_large_block_zm.cpp:46-126`).
+    //
+    // The block is one number for the ring, not one per side: the write pointer
+    // and the read pointer only stay in step if both advance the same amount
+    // per hand-off. It is the highest page either side names; a page index that
+    // is a loop value names no maximum, so such a ring takes the other side's
+    // count.
+    let named_pages = |pages: &[(OpId, Option<u32>, u32)]| -> BTreeMap<OpId, Option<u32>> {
+        let mut named: BTreeMap<OpId, Option<u32>> = BTreeMap::new();
+        for (ring, page, moves) in pages {
+            let entry = named.entry(*ring).or_insert(Some(0));
+            match (page, *entry) {
+                (Some(p), Some(n)) => *entry = Some(n.max(p.saturating_add(*moves))),
+                _ => *entry = None,
+            }
+        }
+        named
+    };
+    let write_pages = named_pages(
+        &write_info
+            .iter()
+            .map(|(at, (ring, _, page, _))| Ok((*ring, *page, access_pages(k, *at)?)))
+            .collect::<Result<Vec<_>, ttStatus>>()?,
+    );
+    let read_pages = named_pages(
+        &consumers
+            .iter()
+            .map(|consumer| Ok((consumer.ring, consumer.page, access_pages(k, consumer.at)?)))
+            .collect::<Result<Vec<_>, ttStatus>>()?,
+    );
+    let mut block: BTreeMap<OpId, u32> = BTreeMap::new();
+    {
+        let rings: BTreeSet<OpId> = write_pages
+            .keys()
+            .chain(read_pages.keys())
+            .copied()
+            .collect();
+        for ring in rings {
+            let written = write_pages.get(&ring).copied().flatten();
+            let read = read_pages.get(&ring).copied().flatten();
+            let pages = match (written, read) {
+                // Both sides name pages: the same block on both, or the two
+                // pointers would advance by different amounts.
+                (Some(a), Some(b)) if a != b => {
+                    let _ = (ring, a, b);
+                    return Err(ttStatus::TT_ERROR_CB_BLOCK);
+                }
+                (Some(a), Some(_)) => a,
+                // One side's page index is a loop value: the other side's
+                // count is the ring's.
+                (Some(a), None) | (None, Some(a)) => a,
+                // Neither side names a page: the hand-off count would be a
+                // guess.
+                (None, None) => {
+                    let _ = ring;
+                    return Err(ttStatus::TT_ERROR_CB_BLOCK);
+                }
+            };
+            if pages > 1 {
+                block.insert(ring, pages);
+            }
+        }
+    }
+    // The lowering places a loop's page index inside the block, so the derived
+    // number goes back into the ring op.
+    for (ring, pages) in &block {
+        if let Op::Cb {
+            dtype, page, len, ..
+        } = *k.at(*ring)
+        {
+            k.ops[*ring].op = Op::Cb {
+                dtype,
+                page,
+                len,
+                block: Some(*pages),
+            };
+        }
+    }
     // A load whose page is still needed by a `Src` reader cannot have another
     // read of *the same page* in between: that read would take the page the
     // first one is still using. A read of a different page is the whole point
@@ -216,7 +299,7 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
         // this -- `matmul_tiles(in0_index, in1_index, ...)` with the indices
         // from the subblock loops (`bmm_large_block_zm.cpp`) -- and the block
         // hand-off is one per block whatever the indices are.
-        if matches!(k.at(ring), Op::Cb { block: Some(_), .. }) {
+        if block.contains_key(&ring) {
             continue;
         }
         let (Some(&from), Some(&to)) = (position.get(load), position.get(reader)) else {
@@ -253,89 +336,6 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
     // publishes the page the copy before it reserved rather than a new one, so
     // it takes no `Reserve` and the copy it follows leaves the `Push` to it: the
     // page is only complete once the fan-out has landed.
-    // The block: the pages one hand-off of a ring moves. Both sides name it the
-    // same way -- `copy 32,32 %ba [3]` fills page 3, `load ... = %ba [3]` reads
-    // it -- and the pages between one `reserve`/`wait` and one `push`/`pop` are
-    // the block. tt-metal's reader reserves a block, issues every read of it,
-    // barriers once and pushes once (`reader_bmm_tile_layout.cpp:76-113`), and
-    // its compute waits the same block and walks the tiles by index
-    // (`bmm_large_block_zm.cpp:46-126`).
-    //
-    // The block is one number for the ring, not one per side: the write pointer
-    // and the read pointer only stay in step if both advance the same amount per
-    // hand-off. It is the highest page either side names; a program that states
-    // one (`buffer ... block n`) overrides that. A page index that is a loop
-    // value names no maximum, so such a ring *must* state its block -- otherwise
-    // the hand-off count would be a guess, and the page offset would be added on
-    // top of a pointer that already moved.
-    let mut stated: BTreeMap<OpId, u32> = BTreeMap::new();
-    for (id, op) in k.ops() {
-        if let Op::Cb {
-            block: Some(n), ..
-        } = *op
-        {
-            stated.insert(id, n);
-        }
-    }
-    // The highest page a side names, `None` when any of its pages is a loop
-    // value (no maximum).
-    let named_pages = |pages: &[(OpId, Option<u32>)]| -> BTreeMap<OpId, Option<u32>> {
-        let mut named: BTreeMap<OpId, Option<u32>> = BTreeMap::new();
-        for (ring, page) in pages {
-            let entry = named.entry(*ring).or_insert(Some(0));
-            match (page, *entry) {
-                (Some(p), Some(n)) => *entry = Some(n.max(p + 1)),
-                _ => *entry = None,
-            }
-        }
-        named
-    };
-    let write_pages = named_pages(
-        &write_info
-            .values()
-            .map(|(ring, _, page, _)| (*ring, *page))
-            .collect::<Vec<_>>(),
-    );
-    let read_pages = named_pages(
-        &consumers
-            .iter()
-            .map(|consumer| (consumer.ring, consumer.page))
-            .collect::<Vec<_>>(),
-    );
-    let mut block: BTreeMap<OpId, u32> = BTreeMap::new();
-    {
-        let rings: BTreeSet<OpId> = write_pages
-            .keys()
-            .chain(read_pages.keys())
-            .copied()
-            .collect();
-        for ring in rings {
-            let written = write_pages.get(&ring).copied().flatten();
-            let read = read_pages.get(&ring).copied().flatten();
-            let pages = match (stated.get(&ring).copied(), written, read) {
-                (Some(n), _, _) => n,
-                // Both sides name pages: the same block on both, or the two
-                // pointers would advance by different amounts.
-                (None, Some(a), Some(b)) if a != b => {
-                    let _ = (ring, a, b);
-                    return Err(ttStatus::TT_ERROR_CB_BLOCK);
-                }
-                (None, Some(a), Some(b)) => a.max(b),
-                // One side names no page (its index is a loop value): the other
-                // side's block is the ring's.
-                (None, Some(a), None) | (None, None, Some(a)) => a,
-                // Neither side names a page and the program states no block:
-                // the hand-off count would be a guess.
-                (None, None, None) => {
-                    let _ = ring;
-                    return Err(ttStatus::TT_ERROR_CB_BLOCK);
-                }
-            };
-            if pages > 1 {
-                block.insert(ring, pages);
-            }
-        }
-    }
     // A hand-off run is a straight-line stretch of a ring's writes at one loop
     // depth. The peeled prologue and the peeled epilogue are both depth 0, but
     // the k loop sits between them, so they are two blocks, not one: tt-metal's
@@ -690,7 +690,7 @@ fn check_rings_balanced(k: &Kernel) -> Result<(), ttStatus> {
             Op::Cb { len, .. } => {
                 depth.insert(id, i64::from(len));
             }
-            Op::Loop { bound } => labels.push(bounds.key(k, bound)?),
+            Op::Loop { bound, .. } => labels.push(bounds.key(k, bound)?),
             Op::EndLoop => {
                 if labels.pop().is_none() {
                     return Err(crate::status::internal_bug(
@@ -824,11 +824,24 @@ fn consumer_ring(consumers: &[Consumer], load: OpId) -> Result<OpId, ttStatus> {
 /// run-time. Two spellings that fold alike are the same scope; the clones the
 /// mover makes of a run-time bound are the same `None`.
 fn scope_key(k: &Kernel, loop_op: OpId) -> Result<Option<i32>, ttStatus> {
-    let Op::Loop { bound } = *k.at(loop_op) else {
+    let Op::Loop { bound, .. } = *k.at(loop_op) else {
         eprintln!("libskamandros: sync_cbs: {loop_op} is not a loop");
         return Err(ttStatus::TT_INTERNAL_BUG);
     };
     Ok(k.const_i32(bound))
+}
+
+/// The pages one access moves: a `copy` moves the page it names, a block
+/// `load`/`store` moves its `m * n` tile pages, and an `expand` publishes the
+/// pages it names (its page index is already the last of them).
+fn access_pages(k: &Kernel, at: OpId) -> Result<u32, ttStatus> {
+    Ok(match *k.at(at) {
+        Op::Copy { shape, .. } | Op::Load { shape, .. } | Op::Store { shape, .. } => {
+            let (m, n) = crate::ir::access_shape(shape)?.tiles();
+            m * n
+        }
+        _ => 1,
+    })
 }
 
 /// The ring an op writes, if it writes one.
@@ -886,7 +899,6 @@ mod tests {
     /// One loop, both rings written and read inside it: the shape every
     /// pipeline has, and the one the whole suite is built on.
     const BALANCED: &str = "\
-version 9
 grid 1,1
 %n = param i32 0
 %in = param f32 2048
@@ -915,7 +927,6 @@ endloop
     #[test]
     fn a_ring_moved_by_two_different_bounds_is_refused() {
         let text = "\
-version 9
 grid 1,1
 %n = param i32 0
 %m = param i32 0
@@ -946,7 +957,6 @@ endloop
     #[test]
     fn a_bound_rebuilt_per_segment_is_still_one_bound() {
         let text = "\
-version 9
 grid 1,1
 %a = param i32 0
 %b = param i32 0
@@ -970,7 +980,7 @@ endloop
         let bounds: Vec<OpId> = k
             .ops()
             .filter_map(|(_, op)| match *op {
-                Op::Loop { bound } => Some(bound),
+                Op::Loop { bound, .. } => Some(bound),
                 _ => None,
             })
             .collect();
@@ -990,7 +1000,6 @@ endloop
     #[test]
     fn nested_bounds_match_in_either_order() {
         let text = "\
-version 9
 grid 1,1
 %n = param i32 0
 %m = param i32 0
@@ -1020,7 +1029,6 @@ endloop
     #[test]
     fn a_leftover_that_fits_the_ring_is_accepted() {
         let text = "\
-version 9
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048
@@ -1041,7 +1049,6 @@ copy 32,32 %out [0] = %bo [0]
     #[test]
     fn a_leftover_deeper_than_the_ring_is_refused() {
         let text = "\
-version 9
 grid 1,1
 %in = param f32 2048
 %out = param f32 2048

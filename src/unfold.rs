@@ -226,7 +226,6 @@ mod tests {
     use super::*;
 
     const LOG2: &str = "\
-version 9
 grid 1,1
 %in = param f32 1024
 %out = param f32 1024

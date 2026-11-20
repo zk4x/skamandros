@@ -37,6 +37,11 @@ pub mod reg {
     pub const T6: u8 = 31;
     pub const S0: u8 = 8;
     pub const S1: u8 = 9;
+    /// The rest of the callee-saved bank (x18..x27). The third loop level is
+    /// `s0`/`s1`; the mover keeps its request temporaries here.
+    pub const S2: u8 = 18;
+    pub const S3: u8 = 19;
+    pub const S4: u8 = 20;
     /// The caller's stack pointer, used only to bracket a callee-saved pair.
     pub const SP: u8 = 2;
 }
@@ -220,28 +225,31 @@ pub fn ret() -> u32 {
     0x0000_8067
 }
 
-/// Save the callee-saved pair a role program takes as its third loop counters:
-/// `addi sp, sp, -8; sw first, 4(sp); sw second, 0(sp)`.
+/// Save the callee-saved registers a role program uses: `addi sp, sp, -4n`,
+/// then one `sw` each.
 ///
 /// The executor calls a program as a function (`firmware/src/bin/exec_b.rs`:
-/// "It may use the caller-saved registers only"), so the pair it keeps its own
-/// frame in belongs to the caller. `sp` is valid because that call is an
-/// ordinary Rust call with a stack in the core's local data RAM.
-pub fn callee_save(first: u8, second: u8) -> [u32; 3] {
-    [
-        addi(reg::SP, reg::SP, -8),
-        sw(first, reg::SP, 4),
-        sw(second, reg::SP, 0),
-    ]
+/// "It may use the caller-saved registers only"), so the callee-saved bank
+/// belongs to the caller -- the third loop level's `s0`/`s1`, and whatever the
+/// mover's request temporaries take from it. `sp` is valid because that call is
+/// an ordinary Rust call with a stack in the core's local data RAM.
+pub fn callee_save(regs: &[u8]) -> Vec<u32> {
+    let bytes = 4 * regs.len() as i32;
+    let mut out = vec![addi(reg::SP, reg::SP, -bytes)];
+    for (i, reg) in regs.iter().enumerate() {
+        out.push(sw(*reg, reg::SP, (regs.len() - 1 - i) as i32 * 4));
+    }
+    out
 }
 
-/// Undo [`callee_save`]: `lw second, 0(sp); lw first, 4(sp); addi sp, sp, 8`.
-pub fn callee_restore(first: u8, second: u8) -> [u32; 3] {
-    [
-        lw(second, reg::SP, 0),
-        lw(first, reg::SP, 4),
-        addi(reg::SP, reg::SP, 8),
-    ]
+/// Undo [`callee_save`], in the opposite order.
+pub fn callee_restore(regs: &[u8]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(regs.len() + 1);
+    for (i, reg) in regs.iter().enumerate() {
+        out.push(lw(*reg, reg::SP, (regs.len() - 1 - i) as i32 * 4));
+    }
+    out.push(addi(reg::SP, reg::SP, 4 * regs.len() as i32));
+    out
 }
 
 /// Block this core until the Tensix coprocessor has finished every instruction
