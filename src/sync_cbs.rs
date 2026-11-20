@@ -211,10 +211,15 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
     let named_pages = |pages: &[(OpId, Option<u32>, u32)]| -> BTreeMap<OpId, Option<u32>> {
         let mut named: BTreeMap<OpId, Option<u32>> = BTreeMap::new();
         for (ring, page, moves) in pages {
-            let entry = named.entry(*ring).or_insert(Some(0));
-            match (page, *entry) {
-                (Some(p), Some(n)) => *entry = Some(n.max(p.saturating_add(*moves))),
-                _ => *entry = None,
+            let entry = named.entry(*ring).or_insert(None);
+            // An access whose page index is a loop value names no maximum, but
+            // it does not erase the pages another access on the same side does
+            // name: the block is the extent the side names, and the unknown
+            // walk stays inside it. A side whose every access is unknown is
+            // `None`, and then the other side's extent is the ring's.
+            if let Some(p) = page {
+                let known = entry.unwrap_or(0);
+                *entry = Some(known.max(p.saturating_add(*moves)));
             }
         }
         named
@@ -279,6 +284,94 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
             };
         }
     }
+    // A block's hand-off lives in the scope that publishes the block, not in
+    // the loops below it: the `expand` that fans the reservation out sits at
+    // the block's own scope while the pages are filled by the walk under it.
+    // A run is the writes that fill one block, ending at its publish (the
+    // `expand`, or the write that reaches the block's last page); the peeled
+    // prologue and epilogue are runs of their own because each publishes its
+    // own block.
+    struct Run {
+        first: OpId,
+        publish: OpId,
+        /// The shallowest loop stack the run's writes sit in: the block's scope.
+        level: Vec<OpId>,
+        /// The stack of the run's first write, which is where its walk starts.
+        first_stack: Vec<OpId>,
+    }
+    let mut runs: BTreeMap<OpId, Vec<Run>> = BTreeMap::new();
+    {
+        let mut by_ring: BTreeMap<OpId, Vec<OpId>> = BTreeMap::new();
+        for (at, (ring, _, _, _)) in &write_info {
+            by_ring.entry(*ring).or_default().push(*at);
+        }
+        for (ring, list) in by_ring {
+            let Some(&pages) = block.get(&ring) else {
+                continue;
+            };
+            let mut at = 0usize;
+            while at < list.len() {
+                let first = list[at];
+                let first_stack = write_info[&first].1.clone();
+                let mut level = first_stack.clone();
+                let mut extent = 0u32;
+                let (publish, next) = {
+                    let mut next = at;
+                    loop {
+                        let id = list[next];
+                        let (_, stack, page, _) = &write_info[&id];
+                        if stack.len() < level.len() {
+                            level = stack.clone();
+                        }
+                        let moved = access_pages(k, id)?;
+                        if let Some(page) = page {
+                            extent = extent.max(page.saturating_add(moved));
+                        }
+                        if matches!(*k.at(id), Op::Expand { .. }) {
+                            break (id, next + 1);
+                        }
+                        // A copy that reaches the block's last page still
+                        // leaves the publish to the `expand` that follows it.
+                        let followed = list.get(next + 1).copied();
+                        let followed_by_expand = followed.is_some_and(|f| {
+                            matches!(*k.at(f), Op::Expand { src, .. } if src == ring)
+                        });
+                        if extent >= pages && !followed_by_expand {
+                            break (id, next + 1);
+                        }
+                        next += 1;
+                        if next >= list.len() {
+                            if extent < pages {
+                                // The program's writes do not add up to the
+                                // block it states.
+                                return Err(ttStatus::TT_ERROR_CB_BLOCK);
+                            }
+                            break (id, next);
+                        }
+                    }
+                };
+                runs.entry(ring).or_default().push(Run {
+                    first,
+                    publish,
+                    level,
+                    first_stack,
+                });
+                at = next;
+            }
+        }
+    }
+    let mut publish_paths: BTreeMap<OpId, Vec<Vec<Option<i32>>>> = BTreeMap::new();
+    for (ring, list) in &runs {
+        for run in list {
+            let path = run
+                .level
+                .iter()
+                .map(|loop_op| scope_key(k, *loop_op))
+                .collect::<Result<Vec<Option<i32>>, ttStatus>>()?;
+            publish_paths.entry(*ring).or_default().push(path);
+        }
+    }
+
     // A load whose page is still needed by a `Src` reader cannot have another
     // read of *the same page* in between: that read would take the page the
     // first one is still using. A read of a different page is the whole point
@@ -332,37 +425,26 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
     // `(at, op, before)` insertions, applied after the scan so the ids stay
     // valid. A write is one page, so `n` is one throughout.
     let mut edits: Vec<(OpId, Op, bool)> = Vec::new();
-    // Producer hand-offs, in program order, around each write. An `expand`
-    // publishes the page the copy before it reserved rather than a new one, so
-    // it takes no `Reserve` and the copy it follows leaves the `Push` to it: the
-    // page is only complete once the fan-out has landed.
-    // A hand-off run is a straight-line stretch of a ring's writes at one loop
-    // depth. The peeled prologue and the peeled epilogue are both depth 0, but
-    // the k loop sits between them, so they are two blocks, not one: tt-metal's
-    // reader reserves and pushes each block it reads (`reader_bmm_tile_layout.
-    // cpp`), and the peeled first/last blocks are separate reads.
-    // `region` advances at every structural op, so writes on either side of a
-    // loop are never merged.
-    let mut region_of: BTreeMap<OpId, u32> = BTreeMap::new();
-    let mut region = 0u32;
-    for (at, op) in k.ops() {
-        region_of.insert(at, region);
-        if matches!(
-            *op,
-            Op::Loop { .. } | Op::EndLoop | Op::EndReader | Op::EndCompute
-        ) {
-            region += 1;
-        }
-    }
-    // The first and last write of each run, so its `reserve` and `push` sit at
-    // the edges rather than around every page.
-    let mut first_of: BTreeMap<(OpId, Vec<OpId>, u32), OpId> = BTreeMap::new();
-    let mut last_of: BTreeMap<(OpId, Vec<OpId>, u32), OpId> = BTreeMap::new();
-    for (at, (ring, stack, _, _)) in &write_info {
-        if block.contains_key(ring) {
-            let key = (*ring, stack.clone(), region_of[at]);
-            first_of.entry(key.clone()).or_insert(*at);
-            last_of.insert(key, *at);
+    // Producer hand-offs. A block ring's hand-off is its runs': the reserve
+    // sits at the block's level, before the first op that leads into the walk,
+    // and the push at the publish. A ring without a stated block keeps one
+    // reserve and push per write, and an `expand` that follows a copy publishes
+    // the copy's page rather than a new one.
+    for (ring, list) in &runs {
+        let n = block[ring];
+        for run in list {
+            if run.first == run.publish && matches!(*k.at(run.publish), Op::Expand { .. }) {
+                // A publish with nothing before it reserves nothing.
+                continue;
+            }
+            // The walk's outermost loop when the pages are filled below the
+            // block's scope; the first write itself when they are not.
+            let anchor = match run.first_stack.get(run.level.len()) {
+                Some(loop_op) => *loop_op,
+                None => run.first,
+            };
+            edits.push((anchor, Op::Reserve { cb: *ring, n }, true));
+            edits.push((run.publish, Op::Push { cb: *ring, n }, false));
         }
     }
     let writes_in_order: Vec<(OpId, Op)> = k.ops().map(|(at, op)| (at, op.clone())).collect();
@@ -370,6 +452,9 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
         let Some(ring) = write_ring(op, &rings) else {
             continue;
         };
+        if block.contains_key(&ring) {
+            continue;
+        }
         let expand_publishes = matches!(op, Op::Expand { .. });
         // The expand that publishes this page is the next op to touch the ring;
         // the values it is computed from may sit in between, and they are not
@@ -388,31 +473,11 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
                 }
             }
         }
-        // A block's pages are reserved once and published once; a ring without
-        // one keeps a hand-off per write.
-        let n = block.get(&ring).copied().unwrap_or(1);
-        // A ring with a block gets one hand-off at the run's edges; one without
-        // keeps a hand-off around every write, as it always had.
-        let (reserve, push) = match block.get(&ring) {
-            Some(_) => {
-                let stack = write_info.get(at).map(|(_, s, _, _)| s.clone()).unwrap_or_default();
-                let key = (ring, stack, region_of[at]);
-                (
-                    first_of.get(&key) == Some(at),
-                    last_of.get(&key) == Some(at),
-                )
-            }
-            None => (true, true),
-        };
-        // An `expand` reserves nothing: the pages it fans out are the ones the
-        // copies before it reserved. It publishes the *block* when it is the
-        // last write of the run, so a block of pages goes out one request at a
-        // time and is published once, as tt-metal's reader does
-        // (`dfb_in0.push_back(in0_block_num_tiles)` after every multicast).
-        if !expand_publishes && reserve {
+        let n = 1;
+        if !expand_publishes {
             edits.push((*at, Op::Reserve { cb: ring, n }, true));
         }
-        if !next_publishes_it && push {
+        if !next_publishes_it {
             edits.push((*at, Op::Push { cb: ring, n }, false));
         }
     }
@@ -474,40 +539,44 @@ pub fn sync_cbs(k: &mut Kernel) -> Result<(), ttStatus> {
             return Err(ttStatus::TT_INTERNAL_BUG);
         };
         let depth = consumer.stack.len();
-        // A write of this ring at the read's own depth anywhere in the program
-        // is a hand-off at that scope (a peeled tail reads what the loop's last
-        // iteration wrote; a spill and the reload that follows it in the same
-        // subblock nest are one hand-off per subblock).
-        let same_depth_write = producer_depths
-            .get(&consumer.ring)
-            .is_some_and(|d| d.contains(&depth));
-        if !same_depth_write {
-            // The read is inside a deeper nest than the writer's: hoist its
-            // hand-off to the writer scope that encloses it.
-            let read_keys = consumer
-                .stack
+        // The hand-off's level is the scope that publishes the block: the
+        // `expand` sits at the block's scope while the pages are filled in the
+        // loops below it, so the wait and pop belong to that scope whether or
+        // not the read's nest happens to have the writer's depth. A read that
+        // sits below the publishing scope is hoisted to it; a read directly in
+        // it hands off per read.
+        let read_keys = consumer
+            .stack
+            .iter()
+            .map(|loop_op| scope_key(k, *loop_op))
+            .collect::<Result<Vec<Option<i32>>, ttStatus>>()?;
+        let paths = if block.contains_key(&consumer.ring) {
+            publish_paths.get(&consumer.ring)
+        } else {
+            producer_paths.get(&consumer.ring)
+        };
+        let Some(paths) = paths else {
+            eprintln!(
+                "libskamandros: sync_cbs: ring {} is read at {} but never written",
+                consumer.ring, consumer.at
+            );
+            return Err(ttStatus::TT_INTERNAL_BUG);
+        };
+        let producer_depth = (0..=read_keys.len()).rev().find(|depth| {
+            paths
                 .iter()
-                .map(|loop_op| scope_key(k, *loop_op))
-                .collect::<Result<Vec<Option<i32>>, ttStatus>>()?;
-            let producer_depth = (0..=read_keys.len()).rev().find(|depth| {
-                producer_paths
-                    .get(&consumer.ring)
-                    .is_some_and(|paths| {
-                        paths
-                            .iter()
-                            .any(|path| path.len() == *depth && path[..] == read_keys[..*depth])
-                    })
-            });
-            let Some(producer_depth) = producer_depth else {
-                eprintln!(
-                    "libskamandros: sync_cbs: ring {} is read before it is written",
-                    consumer.ring
-                );
-                return Err(ttStatus::TT_INTERNAL_BUG);
-            };
-            // A ring without a block can be written in more than one place, so
-            // its publish count says nothing about one hand-off; only a stated
-            // block may span the nest.
+                .any(|path| path.len() == *depth && path[..] == read_keys[..*depth])
+        });
+        let Some(producer_depth) = producer_depth else {
+            eprintln!(
+                "libskamandros: sync_cbs: ring {} is read before it is written",
+                consumer.ring
+            );
+            return Err(ttStatus::TT_INTERNAL_BUG);
+        };
+        if producer_depth < read_keys.len() {
+            // The read is below the scope that publishes the block: its
+            // hand-off is hoisted to that scope and shared by the whole loop.
             let pages = block.get(&consumer.ring).copied();
             if pages.is_none() && writes.get(&consumer.ring) != Some(&1) {
                 return Err(ttStatus::TT_TODO_RING_MULTI_WRITE_OUTSIDE_LOOP);

@@ -130,7 +130,7 @@ The build generates `skamandros.h` next to `libskamandros.so`, from the code tha
 
 - `ttAbiVersion` — the ABI version this library implements, `1`. A consumer compares it against the header it was built with.
 - `ttCompile` — compiles a program's text form into an opaque `ttModule` handle; `*out` is the handle, or null with the code saying why.
-- `ttMemAlloc` — reserves a byte range of DRAM and returns its address, 64-byte aligned. The address is opaque: hand it back to the copies and the launch.
+- `ttMemAlloc` — reserves `bytes` of DRAM in `page`-sized pages, striped across the channels, and returns the handle, 64-byte aligned. The handle is opaque: hand it back to the copies and the launch.
 - `ttMemcpyH2D` — copies host bytes into DRAM at an address `ttMemAlloc` returned. A null pointer or a zero length is refused, nothing read.
 - `ttMemcpyD2H` — copies DRAM bytes back into host memory, the other direction of the same transfer. Same argument rules as `ttMemcpyH2D`.
 - `ttLaunch` — runs a module over its grid, synchronously: every program has finished when it returns. `params` holds one word per kernel parameter in program order, a DRAM address for a tensor and the value itself for a scalar.
@@ -182,8 +182,9 @@ Working end to end through the C ABI:
 - [x] `matmul`,
 - [x] `transpose` of a bf16 tile, including `q @ kᵀ` (the first GEMM of attention); an `f32` tile is
   `TT_TODO_TRANSPOSE`,
-- [x] interleaved DRAM tensors: `ttMemAlloc` stripes a tensor's pages across the channels, and a
-  parameter declared `interleaved` resolves each page's channel on the core (tt-metal's `InterleavedAddrGen`),
+- [x] interleaved DRAM tensors: every allocation is striped, `ttMemAlloc` gives each channel its
+  share of the pages, and the kernel resolves a page's channel from the page index (tt-metal's
+  `InterleavedAddrGen`),
 - [x] `rms_norm` over two tokens and the real hidden size,
 - [x] a symbolic loop bound,
 - [x] a symbolic grid,

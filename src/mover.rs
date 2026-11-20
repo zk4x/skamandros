@@ -81,8 +81,7 @@ pub const INTERLEAVED_WORDS: usize = 2 * MAX_BANKS + 2;
 pub const fn arg_words(kind: ParamKind) -> usize {
     match kind {
         ParamKind::Scalar => 2,
-        // A tensor's block is the channel table plus the count and the page,
-        // whether its pages are striped or all in one channel (one entry).
+        // A tensor's block is the channel table plus the count and the page.
         ParamKind::Tensor { .. } => INTERLEAVED_WORDS,
     }
 }

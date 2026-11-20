@@ -13,9 +13,8 @@ pub enum ParamKind {
     /// A tensor parameter. Its argument block is the per-channel page bases,
     /// the channel count and the page size, so the program resolves a page's
     /// channel itself — the device-side half of tt-metal's address generator
-    /// (`InterleavedAddrGen` / `get_noc_addr_from_bank_id`). A buffer that
-    /// lives in one channel is the same block with one channel, `base` and
-    /// this page size, so the program never names a layout.
+    /// (`InterleavedAddrGen` / `get_noc_addr_from_bank_id`). Every DRAM tensor
+    /// is allocated striped, so the block always has one entry per channel.
     Tensor {
         /// One page's byte size, from the parameter's dtype (a 32x32 tile).
         page: u32,

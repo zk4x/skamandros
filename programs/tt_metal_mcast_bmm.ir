@@ -86,18 +86,18 @@
 %n0 = mul %x %c4
 %arow = mul %m0 %kt
 %brow = mul %n0 %kt
-%ah = loop %obh unroll
+%ah = loop %obh
 %ahr = mul %ah %kt
 %arh = add %arow %ahr
 %ak = add %arh %izero
-%aw = loop %kb unroll
+%aw = loop %kb
 %ai = add %ak %aw
 %ap = mul %ah %kb
 %apw = add %ap %aw
 copy 32,32 %ba [%apw] cores [0, ..] = %pa [%ai]
 endloop
 endloop
-%bh = loop %obw unroll
+%bh = loop %obw
 %bhr = mul %bh %kt
 %brh = add %brow %bhr
 %bk = add %brh %izero
@@ -105,7 +105,7 @@ endloop
 %bj = mul %bjs %c4
 %bwm = mod %bh %sbw
 %b0 = add %bj %bwm
-%bi = loop %kb unroll
+%bi = loop %kb
 %bii = mul %bi %sbw
 %bp = add %b0 %bii
 %bix = add %bk %bi
@@ -128,18 +128,18 @@ endloop
 %k = loop %kloop
 %kn = add %k %tile
 %k8 = mul %kn %kb
-%ahm = loop %obh unroll
+%ahm = loop %obh
 %ahrm = mul %ahm %kt
 %arhm = add %arow %ahrm
 %akm = add %arhm %k8
-%awm = loop %kb unroll
+%awm = loop %kb
 %aim = add %akm %awm
 %apm = mul %ahm %kb
 %apwm = add %apm %awm
 copy 32,32 %ba [%apwm] cores [0, ..] = %pa [%aim]
 endloop
 endloop
-%bhm = loop %obw unroll
+%bhm = loop %obw
 %bhrm = mul %bhm %kt
 %brhm = add %brow %bhrm
 %bkm = add %brhm %k8
@@ -147,7 +147,7 @@ endloop
 %bjm = mul %bjsm %c4
 %bwmm = mod %bhm %sbw
 %b0m = add %bjm %bwmm
-%bim = loop %kb unroll
+%bim = loop %kb
 %biim = mul %bim %sbw
 %bpm = add %b0m %biim
 %bixm = add %bkm %bim
@@ -168,18 +168,18 @@ store 64,64 %interm [%izero] = %acc
 endloop
 endloop
 endloop
-%ahl = loop %obh unroll
+%ahl = loop %obh
 %ahrl = mul %ahl %kt
 %arhl = add %arow %ahrl
 %akl = add %arhl %klast
-%awl = loop %kb unroll
+%awl = loop %kb
 %ail = add %akl %awl
 %apl = mul %ahl %kb
 %apwl = add %apl %awl
 copy 32,32 %ba [%apwl] cores [0, ..] = %pa [%ail]
 endloop
 endloop
-%bhl = loop %obw unroll
+%bhl = loop %obw
 %bhrl = mul %bhl %kt
 %brhl = add %brow %bhrl
 %bkl = add %brhl %klast
@@ -187,7 +187,7 @@ endloop
 %bjl = mul %bjsl %c4
 %bwml = mod %bhl %sbw
 %b0l = add %bjl %bwml
-%bil = loop %kb unroll
+%bil = loop %kb
 %biil = mul %bil %sbw
 %bpl = add %b0l %biil
 %bixl = add %bkl %bil

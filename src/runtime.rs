@@ -233,18 +233,18 @@ pub fn release() -> Result<(), ttStatus> {
     result
 }
 
-/// Reserve `bytes` of DRAM and return its address.
+/// Reserve `bytes` of DRAM in `page`-sized pages, striped across the channels,
+/// and return its handle.
 pub fn alloc(bytes: usize, page: usize) -> Result<u64, ttStatus> {
     with_device(|d| d.alloc(bytes, page))
 }
 
-/// Reserve a tensor striped across the DRAM channels and return its handle.
-/// Copy host bytes into DRAM at `address`.
+/// Copy host bytes into the tensor `address` names.
 pub fn h2d(address: u64, bytes: &[u8]) -> Result<(), ttStatus> {
     with_device(|d| d.dram_write(address, bytes))
 }
 
-/// Copy DRAM at `address` into host bytes.
+/// Copy the tensor `address` names into host bytes.
 pub fn d2h(address: u64, out: &mut [u8]) -> Result<(), ttStatus> {
     with_device(|d| d.dram_read(address, out))
 }
@@ -394,24 +394,22 @@ fn args_for(
         for (index, kind) in module.params.iter().enumerate() {
             let word = params[index];
             let channel_bytes = tt_isa::arch::blackhole::dram::CHANNEL_BYTES;
-            let crate::compile::ParamKind::Tensor { page } = *kind else {
+            let crate::compile::ParamKind::Tensor { .. } = *kind else {
                 args.push(word as u32);
                 args.push(0);
                 continue;
             };
             // A tensor is a table of channel bases, then the count and the
-            // page: exactly what the mover's address arithmetic reads. A
-            // buffer that lives in one channel -- an ordinary allocation --
-            // is one entry, and the same arithmetic degenerates to
-            // `base + page * page_size`, so the program never names a layout.
-            let (bases, channels, page): (Vec<u64>, u32, u32) = match device.interleaved_at(word) {
-                Some(layout) => (
-                    layout.base.iter().map(|base| *base).collect(),
-                    layout.base.len() as u32,
-                    layout.page,
-                ),
-                None => (vec![word], 1, page),
+            // page: exactly what the mover's address arithmetic reads. Every
+            // DRAM tensor is allocated striped, so the handle always names its
+            // table; a tensor argument that is not an allocation is refused,
+            // never given a one-channel table it does not have.
+            let Some(layout) = device.interleaved_at(word) else {
+                return Err(ttStatus::TT_ERROR_ARGUMENT);
             };
+            let bases = layout.base.clone();
+            let channels = layout.base.len() as u32;
+            let page = layout.page;
             let mut pairs = 0u32;
             for base in bases {
                 let flat = u64::from(pairs) * channel_bytes + base;

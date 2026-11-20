@@ -6869,8 +6869,8 @@ fn emit_request(
     if bytes == 0 || bytes > tt_isa::arch::blackhole::noc::niu::MAX_REQUEST_BYTES {
         return Err(ttStatus::TT_ERROR_NOC_REQUEST_BYTES);
     }
-    // Every parameter is a table of channel bases, a count and a page: a
-    // buffer that lives in one channel is one entry of that table.
+    // Every parameter is a table of channel bases, a count and a page: one
+    // entry per DRAM channel, always.
     let (lo, hi) = interleaved_address(ops, pool, block, value)?;
     let page = pool.take()?;
     // A read from DRAM publishes into the ring (its write pointer); a write to

@@ -84,7 +84,7 @@ type ModuleUnload = unsafe extern "C" fn(*mut c_void, *mut *mut c_char) -> c_int
 type Free = unsafe extern "C" fn(*mut c_void);
 type Init = unsafe extern "C" fn(*mut *mut c_char) -> c_int;
 type Release = unsafe extern "C" fn(*mut *mut c_char) -> c_int;
-type MemAlloc = unsafe extern "C" fn(usize, *mut u64, *mut *mut c_char) -> c_int;
+type MemAlloc = unsafe extern "C" fn(usize, usize, *mut u64, *mut *mut c_char) -> c_int;
 type MemcpyH2D = unsafe extern "C" fn(u64, *const u8, usize, *mut *mut c_char) -> c_int;
 type MemcpyD2H = unsafe extern "C" fn(*mut u8, u64, usize, *mut *mut c_char) -> c_int;
 type Launch = unsafe extern "C" fn(*mut c_void, *const u64, usize, *mut *mut c_char) -> c_int;
@@ -151,6 +151,29 @@ fn take_error(free: &Symbol<Free>, err: *mut c_char) -> String {
     msg
 }
 
+/// One page per tensor parameter, in program order: a 32x32 tile of the
+/// parameter's dtype, which is what the allocation's pages have to be.
+fn tensor_pages(program: &str) -> Vec<usize> {
+    program
+        .lines()
+        .filter_map(|line| {
+            let line = line.split('#').next().unwrap_or("");
+            let (_, rest) = line.split_once("= param ")?;
+            let (dtype, shape) = rest.trim().split_once(' ')?;
+            // A scalar parameter is `param i32 0`: one word, not a tile.
+            if shape.trim() == "0" {
+                return None;
+            }
+            let bytes = match dtype {
+                "bf16" => 2,
+                "f32" | "i32" => 4,
+                _ => return None,
+            };
+            Some(1024 * bytes)
+        })
+        .collect()
+}
+
 /// Compile `program`, upload `inputs`, launch with `scalars` first and the
 /// output parameter last, and return the output bytes.
 fn run_kernel_scalars(
@@ -171,6 +194,18 @@ fn run_kernel_scalars(
     let d2h: Symbol<MemcpyD2H> = unsafe { lib.get(b"ttMemcpyD2H\0") }.expect("ttMemcpyD2H");
     let launch: Symbol<Launch> = unsafe { lib.get(b"ttLaunch\0") }.expect("ttLaunch");
 
+    // Each tensor's page is its own: one 32x32 tile of its dtype. The
+    // parameters are the launch's tensor arguments, in program order, with the
+    // output last, so the page of input `i` is the page of tensor `i`.
+    let pages = tensor_pages(program);
+    assert_eq!(
+        pages.len(),
+        inputs.len() + 1,
+        "the program names {} tensors for {} inputs and an output",
+        pages.len(),
+        inputs.len()
+    );
+
     let mut err: *mut c_char = std::ptr::null_mut();
     assert_eq!(
         unsafe { init(&mut err) },
@@ -182,7 +217,7 @@ fn run_kernel_scalars(
     for (i, input) in inputs.iter().enumerate() {
         let mut at = 0u64;
         assert_eq!(
-            unsafe { alloc(input.len(), &mut at, &mut err) },
+            unsafe { alloc(input.len(), pages[i], &mut at, &mut err) },
             TT_OK,
             "input {i}: {}",
             take_error(&free, err)
@@ -197,7 +232,14 @@ fn run_kernel_scalars(
     }
     let mut output_at = 0u64;
     assert_eq!(
-        unsafe { alloc(out_bytes, &mut output_at, &mut err) },
+        unsafe {
+            alloc(
+                out_bytes,
+                *pages.last().expect("the output's page"),
+                &mut output_at,
+                &mut err,
+            )
+        },
         TT_OK,
         "output: {}",
         take_error(&free, err)
