@@ -44,22 +44,49 @@ pub const FACE_DATUMS: u32 = TILE_DATUMS / 4;
 /// from zero and the body may use it as a value. `encode` opens the loop with
 /// the same pair, so `eval` and the branch agree on the index register.
 ///
-/// The compute roles have two levels (`t4`/`t5`, then `a7`/`a1`); the movers
-/// have (`a1`/`a2`, then `a3`/`a4`) because `t5` is their NIU base.
-/// The compute roles' loop counters, innermost last: the k-block, the output
-/// subblock and `inner_dim`, as tt-metal's matmul body nests them
-/// (`bmm_large_block_zm.cpp:46-118`).
-pub(crate) const COMPUTE_PAIRS: [(u8, u8); 3] =
-    [(reg::T4, reg::T5), (reg::A7, reg::A1), (reg::S0, reg::S1)];
+/// The compute roles start with the caller-saved pair `t4`/`t5` and then `a7`/
+/// `a1`; the movers start with (`a1`/`a2`, then `a3`/`a4`) because `t5` is
+/// their NIU base. From the third level on both take the callee-saved bank,
+/// which `encode` saves and restores around the program.
+///
+/// The compute roles' loop counters, innermost last: the out-block walk, the
+/// k-block, the output subblock and `inner_dim`, as tt-metal's matmul body
+/// nests them (`bmm_large_block_zm_fused_bias_activation_metal2.cpp:383-420`).
+pub(crate) const COMPUTE_PAIRS: [(u8, u8); 5] = [
+    (reg::T4, reg::T5),
+    (reg::A7, reg::A1),
+    (reg::S0, reg::S1),
+    (reg::S2, reg::S3),
+    (reg::S4, reg::S5),
+];
 /// The movers' loop counters, innermost last. tt-metal's reader nests the
-/// k-block, the operand row and the operand column (`reader_bmm_tile_layout.cpp:
-/// 70-101`), so a mover needs three pairs for the same body.
-pub(crate) const MOVER_PAIRS: [(u8, u8); 3] =
-    [(reg::A1, reg::A2), (reg::A3, reg::A4), (reg::S0, reg::S1)];
+/// out-block walk, the k-block, the operand row and the operand column
+/// (`reader_bmm_tile_layout_in0_sender.cpp`), so a mover needs four pairs for
+/// the same body. `s2`/`s3`/`s4` are its request temporaries ([`MOVER_POOL`]),
+/// so the deeper levels take the bank above them.
+pub(crate) const MOVER_PAIRS: [(u8, u8); 5] = [
+    (reg::A1, reg::A2),
+    (reg::A3, reg::A4),
+    (reg::S0, reg::S1),
+    (reg::S6, reg::S7),
+    (reg::S8, reg::S9),
+];
 
 /// The index registers `eval` reads an induction value from, by depth.
-const COMPUTE_INDEX: [u8; 3] = [COMPUTE_PAIRS[0].0, COMPUTE_PAIRS[1].0, COMPUTE_PAIRS[2].0];
-const MOVER_INDEX: [u8; 3] = [MOVER_PAIRS[0].0, MOVER_PAIRS[1].0, MOVER_PAIRS[2].0];
+const COMPUTE_INDEX: [u8; 5] = [
+    COMPUTE_PAIRS[0].0,
+    COMPUTE_PAIRS[1].0,
+    COMPUTE_PAIRS[2].0,
+    COMPUTE_PAIRS[3].0,
+    COMPUTE_PAIRS[4].0,
+];
+const MOVER_INDEX: [u8; 5] = [
+    MOVER_PAIRS[0].0,
+    MOVER_PAIRS[1].0,
+    MOVER_PAIRS[2].0,
+    MOVER_PAIRS[3].0,
+    MOVER_PAIRS[4].0,
+];
 
 /// Registers a role owns for evaluating a bound expression. They are disjoint
 /// from `a0` (the launch arguments), `a6` (the CB interface), the loop counters
@@ -68,11 +95,11 @@ const SCRATCH: [u8; 5] = [reg::A2, reg::A3, reg::A4, reg::A5, reg::T3];
 
 /// A mover program's temporaries: everything it does not keep across ops. `t5`
 /// is its NIU base, `t3` this tile's NOC word, `a0`/`a6` its arguments and CB
-/// table, and `a1..a4`/`s0..s1` its loop counters, so those are not in the pool;
-/// `a7` counts only on the compute roles. A copy's whole NoC request — its
-/// addresses, its page pointer, its config words and its spin — allocates from
-/// here too, and resolving a page through the launch's bank table is the widest
-/// of those.
+/// table, and `a1..a4`/`s0..s5` its loop counters, so those are not in the
+/// pool; `a7` counts only on the compute roles. A copy's whole NoC request —
+/// its addresses, its page pointer, its config words and its spin — allocates
+/// from here too, and resolving a page through the launch's bank table is the
+/// widest of those.
 const MOVER_POOL: [u8; 10] = [
     reg::T6,
     reg::T4,

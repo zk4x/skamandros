@@ -886,6 +886,95 @@ endloop
 endloop
 ";
 
+/// [`COPY_THREE_DEEP`] with the callee-saved bank all the way down: five
+/// nested loops, so the two deeper counter pairs (`s2`/`s3`, `s4`/`s5`) are
+/// taken, saved and restored around the movers' program.
+const COPY_FIVE_DEEP: &str = "\
+grid 1,1
+%in = param f32 2048
+%out = param f32 2048
+%bi = buffer f32 32,64
+%two = const i32 2
+%one = const i32 1
+%step = const i32 1
+%i = loop %two
+%o = mul %i %step
+%j = loop %one
+%k = loop %one
+%l = loop %one
+%m = loop %one
+copy 32,32 %bi [0] = %in [%o]
+copy 32,32 %out [%o] = %bi [%o]
+endloop
+endloop
+endloop
+endloop
+endloop
+";
+
+/// The movers under five loops: the third, fourth and fifth counter pairs all
+/// sit in the callee-saved bank, so this is the save/restore bracket and the
+/// index registers at once.
+#[test]
+fn a_five_deep_copy_runs_on_the_simulator() {
+    let host: Vec<f32> = (0..2048).map(|i| i as f32 * 0.5).collect();
+    let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_launches(COPY_FIVE_DEEP, &[], &[&bytes], &[], 2048 * 4, 1).0;
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(got, host, "the copies moved both tiles");
+}
+
+/// [`NEG_THREE_DEEP`] under five loops: the compute roles' fourth and fifth
+/// counter pairs, with the `Dst` hand-off inside them.
+const NEG_FIVE_DEEP: &str = "\
+grid 1,1
+%in = param f32 2048
+%out = param f32 2048
+%bi = buffer f32 32,64
+%bo = buffer f32 32,64
+%two = const i32 2
+%one = const i32 1
+%step = const i32 1
+%i = loop %two
+%o = mul %i %step
+%j = loop %one
+%k = loop %one
+%l = loop %one
+%m = loop %one
+copy 32,32 %bi [0] = %in [%o]
+load 32,32 %x = %bi [0]
+%y = neg %x
+store 32,32 %bo [0] = %y
+copy 32,32 %out [%o] = %bo [0]
+endloop
+endloop
+endloop
+endloop
+endloop
+";
+
+#[test]
+fn a_five_deep_loop_runs_on_the_simulator() {
+    let host: Vec<f32> = (0..2048)
+        .map(|i| {
+            let v = (i as f32 - 1024.0) * 0.125;
+            if i % 7 == 0 { -v } else { v }
+        })
+        .collect();
+    let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = run_kernel_launches(NEG_FIVE_DEEP, &[], &[&bytes], &[], 2048 * 4, 1).0;
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (i, (x, y)) in host.iter().zip(&got).enumerate() {
+        assert_eq!(*y, -*x, "datum {i}: {x} negated is {}", -*x);
+    }
+}
+
 /// The movers under three loops: if this runs, the third counter pair is sound
 /// and a failure of [`NEG_THREE_DEEP`] is the `Dst` hand-off's placement.
 #[test]
@@ -5420,15 +5509,119 @@ fn a_tt_metal_kernel_matmuls_one_band() {
     }
 }
 
+/// `programs/tt_metal_mcast_bmm.ir` at one tiling.
+///
+/// The artifact ships the benchmark's tiling -- 8x8 tiles per out block, eight
+/// out blocks each way, `in0_block_w = 8`, a 2x4 subblock -- and names the
+/// tiling as constants, spelling every size that follows from it (ring pages,
+/// the accumulator's shape, the operand loads).  A test that hands the same
+/// program a smaller tiling rewrites those constants and the sizes they
+/// determine, nothing else: the shape itself (K, N, the grid) is launch
+/// scalars.
+///
+/// The ring depths are tt-metal's and do not change with the tiling: A's and
+/// B's rings are two k blocks deep (`MCAST_INPUT_BUFFERING_DEPTH`), `interm0`
+/// and `out` are one out block each
+/// (`matmul_multicore_reuse_mcast_2d_program_factory.cpp:417-434`).
+#[allow(clippy::too_many_arguments)]
+fn mcast_bmm_tiled(
+    obh: u32,
+    obw: u32,
+    kb: u32,
+    sbh: u32,
+    sbw: u32,
+    nobh: u32,
+    nobw: u32,
+) -> String {
+    let (nisub, njsub) = (obh / sbh, obw / sbw);
+    let (pm, pn) = (obh * nobh, obw * nobw);
+    // `SKAM_DEPTH` deepens the operand rings, to tell a depth/credit deadlock
+    // from a protocol one; tt-metal's two is the default.
+    let depth: u32 = std::env::var("SKAM_DEPTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+    let (a_ring, b_ring) = (depth * obh * kb, depth * obw * kb);
+    // `SKAM_ODEPTH` deepens the output rings the same way.
+    let od: u32 = std::env::var("SKAM_ODEPTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let out_block = obh * obw;
+    let (ah, aw) = (sbh * 32, sbw * 32);
+    let bk = kb * 32;
+    include_str!("../programs/tt_metal_mcast_bmm.ir")
+        .replace("%pm = const i32 64", &format!("%pm = const i32 {pm}"))
+        .replace("%pn = const i32 64", &format!("%pn = const i32 {pn}"))
+        .replace("%obh = const i32 8", &format!("%obh = const i32 {obh}"))
+        .replace("%obw = const i32 8", &format!("%obw = const i32 {obw}"))
+        .replace("%kb = const i32 8", &format!("%kb = const i32 {kb}"))
+        .replace("%sbh = const i32 2", &format!("%sbh = const i32 {sbh}"))
+        .replace("%sbw = const i32 4", &format!("%sbw = const i32 {sbw}"))
+        .replace("%nisub = const i32 4", &format!("%nisub = const i32 {nisub}"))
+        .replace("%njsub = const i32 2", &format!("%njsub = const i32 {njsub}"))
+        .replace("%nobh = const i32 8", &format!("%nobh = const i32 {nobh}"))
+        .replace("%nobw = const i32 8", &format!("%nobw = const i32 {nobw}"))
+        .replace(
+            "%apages = const i32 64",
+            &format!("%apages = const i32 {}", obh * kb),
+        )
+        .replace(
+            "%bpages = const i32 64",
+            &format!("%bpages = const i32 {}", obw * kb),
+        )
+        .replace(
+            "%ba = buffer bf16 32,4096",
+            &format!("%ba = buffer bf16 32,{}", 32 * a_ring),
+        )
+        .replace(
+            "%bb = buffer bf16 32,4096",
+            &format!("%bb = buffer bf16 32,{}", 32 * b_ring),
+        )
+        .replace(
+            "%interm = buffer bf16 32,2048",
+            &format!("%interm = buffer bf16 32,{}", 32 * out_block * od),
+        )
+        .replace(
+            "%bc = buffer bf16 32,2048",
+            &format!("%bc = buffer bf16 32,{}", 32 * out_block * od),
+        )
+        .replace(
+            "%acc = acc bf16 64,128",
+            &format!("%acc = acc bf16 {ah},{aw}"),
+        )
+        .replace(
+            "store 64,128 %acc = %zero",
+            &format!("store {ah},{aw} %acc = %zero"),
+        )
+        .replace(
+            "store 64,128 %interm",
+            &format!("store {ah},{aw} %interm"),
+        )
+        .replace("store 64,128 %bc", &format!("store {ah},{aw} %bc"))
+        .replace(
+            "load 64,128 %acc = %interm",
+            &format!("load {ah},{aw} %acc = %interm"),
+        )
+        .replace("load 64,256 %sa", &format!("load {ah},{bk} %sa"))
+        .replace("load 64,256 %am", &format!("load {ah},{bk} %am"))
+        .replace("load 64,256 %al", &format!("load {ah},{bk} %al"))
+        .replace("load 256,128 %sb", &format!("load {bk},{aw} %sb"))
+        .replace("load 256,128 %bm", &format!("load {bk},{aw} %bm"))
+        .replace("load 256,128 %bl", &format!("load {bk},{aw} %bl"))
+}
+
 /// tt-metal's 2D-multicast kernel: `programs/tt_metal_mcast_bmm.ir` on the full
 /// grid.
 ///
-/// A 4x4 band per core over 12x10 cores, A read by column 0 and fanned out
-/// along each row, B read by row 0 and fanned down each column -- the
-/// reuse-mcast reader pair, with the block-accumulator compute. K is the `%kt`
-/// launch scalar, so the same text runs any number of k blocks; A's k tile `j`
-/// is the value `j+1` and B is all ones, so a lost, doubled or misplaced block
-/// cannot add up to `32 * sum(1..kt)`.
+/// One out block per core (4x4 tiles) over 12x10 cores, A read by column 0 and
+/// fanned out along each row, B read by row 0 and fanned down each column --
+/// the reuse-mcast reader pair, with the block-accumulator compute. K is the
+/// `%kt` launch scalar, so the same text runs any number of k blocks; A's k
+/// tile `j` is the value `j+1` and B is all ones, so a lost, doubled or
+/// misplaced block cannot add up to `32 * sum(1..kt)`.  The accumulator is
+/// tt-metal's 16-bit `Dst`, and every partial sum here is a multiple of 32
+/// below 2048, which bf16 holds exactly.
 #[test]
 fn a_tt_metal_mcast_kernel_matmuls_a_band() {
     const NX: u64 = 12;
@@ -5440,9 +5633,19 @@ fn a_tt_metal_mcast_kernel_matmuls_a_band() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4);
+    // The out-block walk's size, so the case can be asked for more than one out
+    // block per core without inventing a second program.
+    let nobh: u32 = std::env::var("SKAM_NOBH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let nobw: u32 = std::env::var("SKAM_NOBW")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
     let (m, n, k) = (
-        32 * OBH as usize * NY as usize,
-        32 * OBW as usize * NX as usize,
+        32 * OBH as usize * nobh as usize * NY as usize,
+        32 * OBW as usize * nobw as usize * NX as usize,
         32 * KB as usize * kblocks as usize,
     );
     let kt = k / 32;
@@ -5458,19 +5661,157 @@ fn a_tt_metal_mcast_kernel_matmuls_a_band() {
     let b: Vec<u8> = ONE_BF16.iter().cycle().take(n * k * 2).copied().collect();
     let expected = 32.0 * (1..=kt).map(|j| j as f32).sum::<f32>();
 
-    let program = include_str!("../programs/tt_metal_mcast_bmm.ir")
+    let program = mcast_bmm_tiled(OBH, OBW, KB, 2, 2, nobh, nobw)
         .replace("%pa = param bf16 16384", &format!("%pa = param bf16 {}", m * k))
         .replace("%pw = param bf16 245760", &format!("%pw = param bf16 {}", n * k))
-        .replace("%pc = param f32 245760", &format!("%pc = param f32 {}", m * n));
+        .replace("%pc = param bf16 245760", &format!("%pc = param bf16 {}", m * n));
     let scalars = [NX, NY, kt as u64, (n / 32) as u64];
-    let out = run_kernel_launches(&program, &scalars, &[&a, &b], &[2048, 2048], m * n * 4, 1).0;
+    let out = run_kernel_launches(&program, &scalars, &[&a, &b], &[2048, 2048], m * n * 2, 1).0;
     let got: Vec<f32> = out
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .chunks_exact(2)
+        .map(|c| f32::from_bits((u16::from_le_bytes(c.try_into().unwrap()) as u32) << 16))
         .collect();
     for (row, column) in (0..m).flat_map(|r| (0..n).map(move |c| (r, c))) {
         assert_eq!(got[row * n + column], expected, "({row}, {column})");
     }
+}
+
+/// The benchmark program itself: `20480 x 24576 x 24576` on the 12x10 grid,
+/// per-core 64x64 tiles, out blocks 8x8 tiles, `in0_block_w = 8`, subblock 2x4.
+///
+/// It is compiled, not launched: the point of the case is the artifact's size
+/// against the arena. The rings are tt-metal's (`2 * out_block * in0_block_w`
+/// for A and B, one out block each for `interm0` and `out`); `in0_block_w = 8`
+/// rather than the benchmark's 16 is the one reduction its L1 budget forces
+/// (`get_multi_dim_per_core_factor`'s all-DRAM branch). At 16 the rings alone
+/// are 1280 KiB, the whole region above the kernel config block.
+#[test]
+fn the_benchmark_program_compiles_and_fits() {
+    const M: usize = 20480;
+    const N: usize = 24576;
+    const K: usize = 24576;
+    let program = mcast_bmm_tiled(8, 8, 8, 2, 4, 8, 8)
+        .replace("%pa = param bf16 16384", &format!("%pa = param bf16 {}", M * K))
+        .replace("%pw = param bf16 245760", &format!("%pw = param bf16 {}", N * K))
+        .replace("%pc = param bf16 245760", &format!("%pc = param bf16 {}", M * N));
+    let lib = library();
+    let compile: Symbol<Compile> = unsafe { lib.get(b"ttCompile\0") }.expect("ttCompile");
+    let unload: Symbol<ModuleUnload> =
+        unsafe { lib.get(b"ttModuleUnload\0") }.expect("ttModuleUnload");
+    let free: Symbol<Free> = unsafe { lib.get(b"ttFree\0") }.expect("ttFree");
+    let mut module: *mut c_void = std::ptr::null_mut();
+    let mut err: *mut c_char = std::ptr::null_mut();
+    let code = unsafe { compile(program.as_ptr().cast(), program.len(), &mut module, &mut err) };
+    assert_eq!(code, TT_OK, "ttCompile: {}", take_error(&free, err));
+    assert_eq!(
+        unsafe { unload(module, &mut err) },
+        TT_OK,
+        "unload: {}",
+        take_error(&free, err)
+    );
+}
+
+/// The benchmark shape end to end: tt-metal's `20480 x 24576 x 24576` on the
+/// 12x10 grid, per-core 64x64 tiles, out blocks 8x8 tiles, `in0_block_w = 8`,
+/// subblock 2x4 -- the whole per-core band, 64 out blocks per core over 768 k
+/// tiles.
+///
+/// A is all ones; B's tile column `n` is one when `n` is even and two when it
+/// is odd.  An output datum is therefore `32 * kt` or `64 * kt` by its column:
+/// B read as `[N, K]` pairs the k tiles with the wrong columns and misses both
+/// values by orders of magnitude.
+///
+/// The accumulator is tt-metal's 16-bit `Dst` with `packer_l1_acc`, so the sum
+/// over 768 k tiles rounds at every step and the comparison is relative, 1e-3.
+#[test]
+fn the_benchmark_shape_runs_on_the_card() {
+    const TOLERANCE: f64 = 0.001;
+    // `SKAM_KT` shrinks K, keeping every other size and the whole per-core
+    // band: a launch waits at most a second on silicon, so a shape this large
+    // is measured in K as well as in wall time.  `SKAM_NOBH`/`SKAM_NOBW` shrink
+    // the out-block walk, so a single out block can be measured on its own.
+    let kt: usize = std::env::var("SKAM_KT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(768);
+    let nobh: usize = std::env::var("SKAM_NOBH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    let nobw: usize = std::env::var("SKAM_NOBW")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    // The tiling itself, so the hang can be bisected one quantity at a time.
+    let (ob, kb, sb) = (
+        std::env::var("SKAM_OB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8u32),
+        std::env::var("SKAM_KB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8u32),
+        std::env::var("SKAM_SB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4u32),
+    );
+    let (sbh, sbw) = (2u32, sb);
+    let m = 10 * nobh * ob as usize * 32;
+    let n = 12 * nobw * ob as usize * 32;
+
+    let k = kt * 32;
+    const ONE: [u8; 2] = 0x3F80u16.to_le_bytes();
+    const TWO: [u8; 2] = 0x4000u16.to_le_bytes();
+
+    let a: Vec<u8> = ONE.iter().cycle().take(m * k * 2).copied().collect();
+    let mut b: Vec<u8> = Vec::with_capacity(n * k * 2);
+    for _ in 0..kt {
+        for column in 0..n / 32 {
+            let value = if column % 2 == 0 { ONE } else { TWO };
+            for _ in 0..1024 {
+                b.extend_from_slice(&value);
+            }
+        }
+    }
+
+    let program = mcast_bmm_tiled(ob, ob, kb, sbh, sbw, nobh as u32, nobw as u32)
+        .replace("%pa = param bf16 16384", &format!("%pa = param bf16 {}", m * k))
+        .replace("%pw = param bf16 245760", &format!("%pw = param bf16 {}", n * k))
+        .replace("%pc = param bf16 245760", &format!("%pc = param bf16 {}", m * n));
+    let scalars = [12u64, 10u64, kt as u64, (n / 32) as u64];
+    let (out, elapsed) =
+        run_kernel_launches(&program, &scalars, &[&a, &b], &[2048, 2048], m * n * 2, 1);
+
+    let mut worst = 0.0f64;
+    for row in 0..m {
+        for column in 0..n {
+            let want = if (column / 32) % 2 == 0 {
+                32.0 * kt as f64
+            } else {
+                64.0 * kt as f64
+            };
+            let at = (row * n + column) * 2;
+            let got = f32::from_bits(
+                (u16::from_le_bytes([out[at], out[at + 1]]) as u32) << 16,
+            ) as f64;
+            let error = (got - want).abs() / want;
+            if error > worst {
+                worst = error;
+            }
+            assert!(
+                error <= TOLERANCE,
+                "({row}, {column}): {got} for {want}, relative error {error}"
+            );
+        }
+    }
+    let flops = 2.0 * (m * n * k) as f64;
+    eprintln!(
+        "the benchmark shape (kt {kt}): worst relative error {worst} of {TOLERANCE}, \
+         {:.2} TFLOP/s over {elapsed:?}",
+        flops / elapsed.as_secs_f64() / 1e12
+    );
 }
 
 /// The 2x2 block with `in0_block_w = 2`: the same program, smaller body.

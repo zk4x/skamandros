@@ -52,11 +52,11 @@ pub(crate) enum Elem {
 #[derive(Debug, Clone, Default)]
 pub struct Stream {
     pub(crate) elems: Vec<Elem>,
-    /// The callee-saved registers this program uses: the third loop level's
-    /// `s0`/`s1`, and the mover's request temporaries. The executor calls a
-    /// program as a function and keeps its own frame in that bank, so a program
-    /// that uses any of them saves and restores them around its body, exactly
-    /// as a compiled callee would.
+    /// The callee-saved registers this program uses: the loop counters from the
+    /// third level on, and the mover's request temporaries. The executor calls
+    /// a program as a function and keeps its own frame in that bank, so a
+    /// program that uses any of them saves and restores them around its body,
+    /// exactly as a compiled callee would.
     saved: Vec<u8>,
 }
 

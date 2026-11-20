@@ -1,28 +1,45 @@
-# tt-metal's large-block matmul, transcribed into skamandros IR.
+# tt-metal's large-block 2D-multicast matmul at the benchmark shape, as skamandros IR.
 #
-# The compute kernel is `bmm_large_block_zm.cpp` (ttnn/cpp/ttnn/operations/
-# matmul/device/kernels/compute/); the reader is the 2D-multicast pair
-# `reader_bmm_tile_layout_in0.cpp` (sender) / `reader_bmm_tile_layout_in0_receiver_metal2.cpp`
-# from the reuse-mcast factory, and the writer `writer_bmm_tile_layout.cpp`.
-# One core owns a 4x4 band of output tiles (`obh`/`obw`), walked in 2x2
-# subblocks (`out_subblock_h`/`out_subblock_w`), with `in0_block_w = 2` tiles
-# of K per k block.
+# The compute kernel is `bmm_large_block_zm_fused_bias_activation_metal2.cpp`
+# (ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/): its `bh`/`bw`
+# out-block walk, its subblock nest and its peeled first/last k block.  The
+# reader/writer pair is tt-metal's 2D-multicast one (`reader_bmm_tile_layout_in0_sender_*`
+# reading A and multicasting it along each row, `reader_bmm_tile_layout_in1_sender_*`
+# reading B and multicasting it down each column, `writer_bmm_tile_layout.cpp`).
+# The configuration is the benchmark's own
+# (`tests/ttnn/unit_tests/benchmarks/test_benchmark.py:440-530`): per-core 64x64
+# tiles, `out_block_h = out_block_w = 8`, subblock `(2, 4)`,
+# `fp32_dest_acc_en = False` with `packer_l1_acc = True`.
+#
+# `in0_block_w` is the one quantity that gives.  `get_multi_dim_per_core_factor`
+# on the 2D path's all-DRAM branch
+# (`ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp:137-185`)
+# shrinks it first and keeps the output block, against the CB estimate in
+# `utilities/matmul_utilities.cpp:25-70`, whose input depth is
+# `MCAST_INPUT_BUFFERING_DEPTH = 2` and whose partials are the packer-L1-acc
+# tile size (`Float16_b` for this card's compute config).  At the benchmark's
+# `in0_block_w = 16` that estimate is 1280 KiB of rings, more than the whole
+# arena above the kernel config block; at 8 it is 768 KiB.  The rings below are
+# that estimate tile for tile: A and B `out_block * in0_block_w` two deep,
+# `interm0` and `out` `out_block_tiles` once.
 #
 # A's block is read from DRAM by the cores in column 0 (`cores [0, ..]`) and
 # fanned out along each row; B's by the cores in row 0 (`cores [.., 0]`) and
-# fanned down each column.  That is tt-metal's `noc_async_read_multicast` pair, and it is
-# what keeps one core's DRAM read from being repeated by every core in its row
-# or column.
+# fanned down each column.  B arrives `[K, N]` (`in1_tensor_stride_w = 1`,
+# `in1_tensor_stride_h = N`, factory :608-612).
 #
-# The shape this text holds is the program's: the grid scales the band over the
-# chip (`grid.x`/`grid.y` place the core's `m0`/`n0`), `%kt`/`%ncols` are launch
-# scalars, and K is whatever `%kt` says.  The three `param` sizes are the
-# buffers the launch hands over; the test substitutes the real sizes, exactly
-# as tt-metal's tensors arrive as launch arguments.
+# The text carries the shape's tiling as named constants and every size that
+# follows from it, so a test can hand the same program a smaller tiling the
+# simulator can run; the shape itself (K, N, the grid) is launch scalars.
+#
+# The nesting is tt-metal's: `bh`, `bw`, the k block, then the operand's row and
+# k tile (readers) or the subblock's row and column (compute).  The writer's
+# last two loops are `unroll`ed, as the tiling constants they are, so its ring
+# hand-off stays one per subblock.
 #
 # Rings and why they are laid out this way:
 #
-# - `%ba` is A's `obh x in0_block_w` block, row-major (`h*kb + inner`), which is
+# - `%ba` is A's `obh x kb` block, row-major (`h*kb + inner`), which is
 #   tt-metal's `in0_index`; a subblock's `sbh x kb` block is then dense.
 # - `%bb` is B's block written **subblock-major**
 #   (`jsub*kb*sbw + inner*sbw + w`), so a subblock's `kb x sbw` block is dense
@@ -33,198 +50,209 @@
 #   reload names page 0 of that hand-off -- `pack_tile(i, dfb)`/`copy_tile(i, i)`
 #   with `i` inside `reserve_back(out_subblock_num_tiles)`.
 #
-# Two ends are peeled because this IR has no runtime `if`, and tt-metal's kernel
-# branches on the block index twice: `enable_reload = false` for, and
-# `last_out` for block `num_blocks - 1`.  The peeled first block computes into
-# `interm` without a reload; the peeled last block reloads and packs to the
-# output ring.  The loop between them covers `1 .. num_blocks-2`, and the reader
+# Two ends are peeled inside each out block because this IR has no runtime `if`,
+# and tt-metal's kernel branches on the k index twice: `enable_reload = false`
+# for, and `last_out` for block `num_blocks - 1`.  The peeled first block
+# computes into `interm` without a reload; the peeled last block reloads, packs
+# to the output ring, and the writer stores that block before the next one
+# starts.  The loop between them covers `1 .. num_blocks-2`, and the reader
 # mirrors that structure so a ring's hand-off is one block per body.
 #
 # Every tile of the band is walked by the codes as tt-metal walks it: the
-# subblock nest (`in0_subblock`/`in1_subblock`) is the `%si`/`%sj` loop pair,
-# the accumulator is one `acc f32 64,64` block (tt-metal's `out_subblock_h x
-# out_subblock_w` `Dst` region), and the operand loads name blocks, not tiles.
+# subblock nest (`in0_subblock`/`in1_subblock`) is the `%sis`/`%sjs` loop pair,
+# the accumulator is one `acc bf16 64,128` block (tt-metal's `out_subblock_h x
+# out_subblock_w` `Dst` region in 16-bit mode), and the operand loads name
+# blocks, not tiles.
 %nx = param i32 0
 %ny = param i32 0
 %kt = param i32 0
 %ncols = param i32 0
 %pa = param bf16 16384
 %pw = param bf16 245760
-%pc = param f32 245760
-%ba = buffer bf16 32,512
-%bb = buffer bf16 32,512
-%interm = buffer f32 32,1024
-%bc = buffer f32 32,256
-%acc = acc f32 64,64 
-%zero = const f32 0
+%pc = param bf16 245760
+%ba = buffer bf16 32,4096
+%bb = buffer bf16 32,4096
+%interm = buffer bf16 32,2048
+%bc = buffer bf16 32,2048
+%acc = acc bf16 64,128
+%zero = const bf16 0
 %izero = const i32 0
 %tile = const i32 1
-%kb = const i32 2
-%nisub = const i32 2
+%kb = const i32 8
+%obh = const i32 8
+%obw = const i32 8
+%sbh = const i32 2
+%sbw = const i32 4
+%nisub = const i32 4
 %njsub = const i32 2
-%obh = const i32 4
-%obw = const i32 4
-%sbw = const i32 2
-%c0 = const i32 0
-%apages = const i32 8
-%bpages = const i32 8
-%c1 = const i32 1
-%c2 = const i32 2
-%c3 = const i32 3
-%c4 = const i32 4
-%c5 = const i32 5
-%c6 = const i32 6
-%c7 = const i32 7
-%c8 = const i32 8
+%nobh = const i32 8
+%nobw = const i32 8
+%pm = const i32 64
+%pn = const i32 64
+%apages = const i32 64
+%bpages = const i32 64
 %kblocks = div %kt %kb
 %kmid = sub %kblocks %tile
 %kloop = sub %kmid %tile
 %klast = mul %kmid %kb
 %x = grid.x
 %y = grid.y
-%m0 = mul %y %c4
-%n0 = mul %x %c4
-%arow = mul %m0 %kt
-%brow = mul %n0 %kt
-%ah = loop %obh
-%ahr = mul %ah %kt
-%arh = add %arow %ahr
-%ak = add %arh %izero
-%aw = loop %kb
-%ai = add %ak %aw
-%ap = mul %ah %kb
-%apw = add %ap %aw
-copy 32,32 %ba [%apw] cores [0, ..] = %pa [%ai]
+%m0 = mul %y %pm
+%n0 = mul %x %pn
+%oh = loop %nobh
+%om = mul %oh %obh
+%omr = add %m0 %om
+%ow = loop %nobw
+%on = mul %ow %obw
+%onc = add %n0 %on
+%ahf = loop %obh
+%ahrf = add %omr %ahf
+%aif = mul %ahrf %kt
+%apf = mul %ahf %kb
+%awf = loop %kb
+%akf = add %aif %awf
+%apwf = add %apf %awf
+copy 32,32 %ba [%apwf] cores [0, ..] = %pa [%akf]
 endloop
 endloop
-%bh = loop %obw
-%bhr = mul %bh %kt
-%brh = add %brow %bhr
-%bk = add %brh %izero
-%bjs = div %bh %sbw
-%bj = mul %bjs %c4
-%bwm = mod %bh %sbw
-%b0 = add %bj %bwm
-%bi = loop %kb
-%bii = mul %bi %sbw
-%bp = add %b0 %bii
-%bix = add %bk %bi
-copy 32,32 %bb [%bp] cores [.., 0] = %pw [%bix]
+%bcf = loop %obw
+%bjsf = div %bcf %sbw
+%bkjf = mul %bjsf %kb
+%bjf = mul %bkjf %sbw
+%bwmf = mod %bcf %sbw
+%b0f = add %bjf %bwmf
+%bnf = add %onc %bcf
+%bkf = loop %kb
+%biif = mul %bkf %sbw
+%bpf = add %b0f %biif
+%bnif = mul %bkf %ncols
+%bixf = add %bnif %bnf
+copy 32,32 %bb [%bpf] cores [.., 0] = %pw [%bixf]
 endloop
 endloop
 expand %ba [%apages] [.., ..] from [0, ..]
 expand %bb [%bpages] [.., ..] from [.., 0]
-%si = loop %nisub
-%as = mul %si %c4
-%sj = loop %njsub
-%bs = mul %sj %c4
-store 64,64 %acc = %zero
-load 64,64 %a = %ba [%as]
-load 64,64 %b = %bb [%bs]
-matmul %acc %a %b
-store 64,64 %interm [%izero] = %acc
+%sis = loop %nisub
+%sir = mul %sis %sbh
+%sas = mul %sir %kb
+%sjs = loop %njsub
+%sjc = mul %sjs %sbw
+%sbs = mul %sjc %kb
+store 64,128 %acc = %zero
+load 64,256 %sa = %ba [%sas]
+load 256,128 %sb = %bb [%sbs]
+matmul %acc %sa %sb
+store 64,128 %interm [%izero] = %acc
 endloop
 endloop
-%k = loop %kloop
-%kn = add %k %tile
-%k8 = mul %kn %kb
+%kk = loop %kloop
+%kn = add %kk %tile
+%k0 = mul %kn %kb
 %ahm = loop %obh
-%ahrm = mul %ahm %kt
-%arhm = add %arow %ahrm
-%akm = add %arhm %k8
-%awm = loop %kb
-%aim = add %akm %awm
+%ahrm = add %omr %ahm
+%aim = mul %ahrm %kt
+%aimk = add %aim %k0
 %apm = mul %ahm %kb
+%awm = loop %kb
+%akm = add %aimk %awm
 %apwm = add %apm %awm
-copy 32,32 %ba [%apwm] cores [0, ..] = %pa [%aim]
+copy 32,32 %ba [%apwm] cores [0, ..] = %pa [%akm]
 endloop
 endloop
-%bhm = loop %obw
-%bhrm = mul %bhm %kt
-%brhm = add %brow %bhrm
-%bkm = add %brhm %k8
-%bjsm = div %bhm %sbw
-%bjm = mul %bjsm %c4
-%bwmm = mod %bhm %sbw
+%bcm = loop %obw
+%bjsm = div %bcm %sbw
+%bkmj = mul %bjsm %kb
+%bjm = mul %bkmj %sbw
+%bwmm = mod %bcm %sbw
 %b0m = add %bjm %bwmm
-%bim = loop %kb
-%biim = mul %bim %sbw
+%bnm = add %onc %bcm
+%bkm = loop %kb
+%biim = mul %bkm %sbw
 %bpm = add %b0m %biim
-%bixm = add %bkm %bim
+%bnim = mul %bkm %ncols
+%bnimk = add %bnim %k0
+%bixm = add %bnimk %bnm
 copy 32,32 %bb [%bpm] cores [.., 0] = %pw [%bixm]
 endloop
 endloop
 expand %ba [%apages] [.., ..] from [0, ..]
 expand %bb [%bpages] [.., ..] from [.., 0]
 %sim = loop %nisub
-%asm = mul %sim %c4
+%sirm = mul %sim %sbh
+%sasm = mul %sirm %kb
 %sjm = loop %njsub
-%bsm = mul %sjm %c4
-load 64,64 %acc = %interm [%izero]
-load 64,64 %am = %ba [%asm]
-load 64,64 %bm = %bb [%bsm]
+%sjcm = mul %sjm %sbw
+%sbsm = mul %sjcm %kb
+load 64,128 %acc = %interm [%izero]
+load 64,256 %am = %ba [%sasm]
+load 256,128 %bm = %bb [%sbsm]
 matmul %acc %am %bm
-store 64,64 %interm [%izero] = %acc
+store 64,128 %interm [%izero] = %acc
 endloop
 endloop
 endloop
 %ahl = loop %obh
-%ahrl = mul %ahl %kt
-%arhl = add %arow %ahrl
-%akl = add %arhl %klast
-%awl = loop %kb
-%ail = add %akl %awl
+%ahrl = add %omr %ahl
+%ail = mul %ahrl %kt
+%ailk = add %ail %klast
 %apl = mul %ahl %kb
+%awl = loop %kb
+%akl = add %ailk %awl
 %apwl = add %apl %awl
-copy 32,32 %ba [%apwl] cores [0, ..] = %pa [%ail]
+copy 32,32 %ba [%apwl] cores [0, ..] = %pa [%akl]
 endloop
 endloop
-%bhl = loop %obw
-%bhrl = mul %bhl %kt
-%brhl = add %brow %bhrl
-%bkl = add %brhl %klast
-%bjsl = div %bhl %sbw
-%bjl = mul %bjsl %c4
-%bwml = mod %bhl %sbw
-%b0l = add %bjl %bwml
+%bcx = loop %obw
+%bjsl = div %bcx %sbw
+%bklj = mul %bjsl %kb
+%bjl = mul %bklj %sbw
+%bcwl = mod %bcx %sbw
+%b0l = add %bjl %bcwl
+%bnl = add %onc %bcx
 %bil = loop %kb
 %biil = mul %bil %sbw
 %bpl = add %b0l %biil
-%bixl = add %bkl %bil
+%bnil = mul %bil %ncols
+%bnilk = add %bnil %klast
+%bixl = add %bnilk %bnl
 copy 32,32 %bb [%bpl] cores [.., 0] = %pw [%bixl]
 endloop
 endloop
 expand %ba [%apages] [.., ..] from [0, ..]
 expand %bb [%bpages] [.., ..] from [.., 0]
 %sil = loop %nisub
-%asl = mul %sil %c4
+%silr = mul %sil %sbh
+%sil_a = mul %silr %kb
 %sjl = loop %njsub
-%bsl = mul %sjl %c4
-load 64,64 %acc = %interm [%izero]
-load 64,64 %al = %ba [%asl]
-load 64,64 %bl = %bb [%bsl]
+%sjlc = mul %sjl %sbw
+%sjlb = mul %sjlc %kb
+load 64,128 %acc = %interm [%izero]
+load 64,256 %al = %ba [%sil_a]
+load 256,128 %bl = %bb [%sjlb]
 matmul %acc %al %bl
-store 64,64 %bc [%izero] = %acc
+store 64,128 %bc [%izero] = %acc
 endloop
 endloop
 # tt-metal's writer walks the subblock's `out_subblock_h x out_subblock_w`
-# tiles (2x2 here) and stores each to its own `%bc` page; the 2x2 is the loop
-# nest, not four statements.
+# tiles and stores each to its own `%bc` page; the product is the loop nest,
+# not a statement per tile.
 %wsi = loop %nisub
-%ws = mul %wsi %c2
+%wsr0 = mul %wsi %sbh
+%wsr = add %omr %wsr0
 %wsj = loop %njsub
-%wn = mul %wsj %c2
-%wrow = add %m0 %ws
-%wcol = add %n0 %wn
-%wr = loop %c2 unroll
-%wrp = mul %wr %c2
-%wrowr = add %wrow %wr
-%wrpi = mul %wrowr %ncols
-%wc = loop %c2 unroll
+%wsc0 = mul %wsj %sbw
+%wsc = add %onc %wsc0
+%wr = loop %sbh unroll
+%wrp = mul %wr %sbw
+%wrr = add %wsr %wr
+%wrpi = mul %wrr %ncols
+%wc = loop %sbw unroll
 %bci = add %wrp %wc
-%wcolc = add %wcol %wc
-%widx = add %wrpi %wcolc
+%wcc = add %wsc %wc
+%widx = add %wrpi %wcc
 copy 32,32 %pc [%widx] = %bc [%bci]
+endloop
+endloop
 endloop
 endloop
 endloop

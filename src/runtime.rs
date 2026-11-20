@@ -635,6 +635,8 @@ fn launch_steps(
         // a mover run. Staged: a repeat launch writes only the words that differ.
         device.stage_words(u64::from(args_reader(module)), &args)?;
         device.stage_words(u64::from(args_writer(module)), &writer_args)?;
+        let iface = device.read32(u64::from(args_reader(module)) + 8)?;
+        device.note_iface(iface);
         // The semaphore setup is placed here but not run: the descriptor names
         // it, and B runs it on T0 before it starts the roles, as BRISC
         // initialises the semaphores before it releases the TRISCs. It runs on

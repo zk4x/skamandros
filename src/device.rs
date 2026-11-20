@@ -655,6 +655,9 @@ pub struct Device {
     /// the host. Cleared whenever the tiles are reset or their executors
     /// restart.
     installed: Option<u64>,
+    /// The CB interface table's L1 address, from the launch's arguments, so a
+    /// timed-out launch can say which buffer each role is waiting on.
+    iface_at: u32,
 }
 
 impl Device {
@@ -704,6 +707,7 @@ impl Device {
             backend_released: Vec::new(),
             dram_dirty: false,
             installed: None,
+            iface_at: 0,
         };
         // Before any tile is named: with translation off, a logical column number
         // is a physical one, and the first n of them are the wrong set.
@@ -771,6 +775,7 @@ impl Device {
             backend_released: Vec::new(),
             dram_dirty: false,
             installed: None,
+            iface_at: 0,
         };
         // The ARC publishes every address the rest of this reads, so it is
         // waited for first, as tt-metal waits before it creates its messenger or
@@ -1671,6 +1676,12 @@ impl Device {
         self.installed = Some(fingerprint);
     }
 
+    /// Remember where this launch's CB interface table lives, so a timeout can
+    /// print what each buffer's counters say.
+    pub fn note_iface(&mut self, at: u32) {
+        self.iface_at = at;
+    }
+
     /// The tiles no longer hold a complete installation: the next launch has to
     /// stage it from the host again.
     pub fn forget_installed(&mut self) {
@@ -2126,6 +2137,41 @@ impl Device {
                             self.read32(other.status())?,
                             self.read32(other.panic_code())?,
                         );
+                    }
+                    // Every live buffer: `num_pages - (received - acked)` is what
+                    // `reserve_back` waits for room in and `received - acked` what
+                    // `wait_front` waits for. Each role has its own table, named by
+                    // its arguments block.
+                    let mut ifaces: Vec<(u32, u32)> = vec![(0, self.iface_at)];
+                    for other in Self::launch_mailboxes() {
+                        let args = self.read32(other.args())?;
+                        if args == 0 {
+                            continue;
+                        }
+                        let at = self.read32(u64::from(args) + 8)?;
+                        if at != 0 && !ifaces.iter().any(|(_, a)| *a == at) {
+                            ifaces.push((u64::from(args) as u32, at));
+                        }
+                    }
+                    for (args, iface) in ifaces {
+                        if iface == 0 {
+                            continue;
+                        }
+                        eprintln!("  iface {iface:#x} (args {args:#x}):");
+                        for cb in 0..crate::riscv::cb::COUNT {
+                            let at = u64::from(iface) + u64::from(cb * crate::riscv::cb::STRIDE);
+                            let num_pages = self.read32(at + 12)?;
+                            if num_pages == 0 {
+                                continue;
+                            }
+                            let counters = self.read32(at + 24)?;
+                            let (acked, received) = (counters & 0xFFFF, counters >> 16);
+                            eprintln!(
+                                "    cb {cb}: pages {num_pages} rd {} wr {} acked {acked} received {received}",
+                                self.read32(at + 16)?,
+                                self.read32(at + 20)?,
+                            );
+                        }
                     }
                 }
                 return Err(ttStatus::TT_ERROR_FIRMWARE_TIMEOUT);

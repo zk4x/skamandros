@@ -37,11 +37,17 @@ pub mod reg {
     pub const T6: u8 = 31;
     pub const S0: u8 = 8;
     pub const S1: u8 = 9;
-    /// The rest of the callee-saved bank (x18..x27). The third loop level is
-    /// `s0`/`s1`; the mover keeps its request temporaries here.
+    /// The rest of the callee-saved bank (x18..x27). The third, fourth and
+    /// fifth loop levels are `s0`/`s1`, `s2`/`s3`, `s4`/`s5`; the mover keeps
+    /// its request temporaries in what is left.
     pub const S2: u8 = 18;
     pub const S3: u8 = 19;
     pub const S4: u8 = 20;
+    pub const S5: u8 = 21;
+    pub const S6: u8 = 22;
+    pub const S7: u8 = 23;
+    pub const S8: u8 = 24;
+    pub const S9: u8 = 25;
     /// The caller's stack pointer, used only to bracket a callee-saved pair.
     pub const SP: u8 = 2;
 }

@@ -459,19 +459,28 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
     // The rank of each data post on its edge within its body: the n-th post of
     // that edge in that scope.
     let mut rank: Vec<(usize, Option<(usize, usize)>, usize)> = Vec::new();
-    let mut counted: Vec<(Edge, Option<(usize, usize)>, usize)> = Vec::new();
+    // Ranked by *distinct* posting position, because the posts below collapse
+    // two posts at one position into one publish (the token carries no
+    // identity). Ranking every post while publishing one per position gave a
+    // take three more waits per accumulator section than there were tokens,
+    // and the Sync Unit's four-bit count then stalled the producer once enough
+    // output blocks had gone by -- a hang the simulator, whose `SEMPOST` into a
+    // full semaphore is only verified, never shows.
+    let mut counted: Vec<(Edge, Option<(usize, usize)>, usize, usize)> = Vec::new();
     let mut data_posts: Vec<&(Edge, usize, usize, usize)> = data.iter().collect();
     data_posts.sort_by_key(|(_, post, _, _)| *post);
     for (edge, post, _, epoch) in &data_posts {
         let at = scope(*post);
-        let n = match counted.iter().position(|(e, s, _)| e == edge && *s == at) {
-            Some(i) => {
-                counted[i].2 += 1;
-                counted[i].2
-            }
+        let where_ = post_at(*post);
+        let n = match counted
+            .iter()
+            .find(|(e, s, p, _)| e == edge && *s == at && *p == where_)
+        {
+            Some(k) => k.3,
             None => {
-                counted.push((*edge, at, 1));
-                1
+                let n = counted.iter().filter(|(e, s, _, _)| e == edge && *s == at).count() + 1;
+                counted.push((*edge, at, where_, n));
+                n
             }
         };
         rank.push((*epoch, at, n));
@@ -599,15 +608,15 @@ pub fn reg_sync(m: &mut MachineKernel) -> Result<(), ttStatus> {
     // non-contractual verify there, a stalled thread here), and it grows with
     // the number of output blocks, which is why the one-block program passed
     // and the reuse kernel never finished.
-    let mut posted: Vec<(Edge, usize)> = Vec::new();
+    let mut posted: Vec<(Edge, Option<(usize, usize)>, usize)> = Vec::new();
     for (edge, post, _, _) in &data {
-        let post = post_at(*post);
-        if posted.contains(&(*edge, post)) {
+        let at = post_at(*post);
+        if posted.contains(&(*edge, scope(*post), at)) {
             continue;
         }
-        posted.push((*edge, post));
-        inserts.push((post, (edge.producer, MirOp::SemPost { sem: sem(*edge)? })));
-        inserts.push((post, (edge.producer, MirOp::SemWaitFree { sem: sem(*edge)? })));
+        posted.push((*edge, scope(*post), at));
+        inserts.push((at, (edge.producer, MirOp::SemPost { sem: sem(*edge)? })));
+        inserts.push((at, (edge.producer, MirOp::SemWaitFree { sem: sem(*edge)? })));
     }
     // Apply from the back, so the earlier positions stay valid.
     inserts.sort_by(|a, b| b.0.cmp(&a.0));
@@ -1040,7 +1049,7 @@ pub fn verify(m: &MachineKernel) -> Result<(), ttStatus> {
                 MirOp::Loop { count } => {
                     let _ = count;
                     depth += 1;
-                    if depth > 3 {
+                    if depth > 5 {
                         let _ = (name, at, depth);
                         return Err(ttStatus::TT_TODO_LOOP_DEPTH);
                     }
@@ -1048,7 +1057,7 @@ pub fn verify(m: &MachineKernel) -> Result<(), ttStatus> {
                 MirOp::LoopReg { reg } => {
                     let _ = reg;
                     depth += 1;
-                    if depth > 3 {
+                    if depth > 5 {
                         let _ = (name, at, depth);
                         return Err(ttStatus::TT_TODO_LOOP_DEPTH);
                     }

@@ -75,6 +75,10 @@ pub fn run_exec(mb: Mailbox, icache_mask: u32) -> ! {
     let mut generation = unsafe { l1_read32(mb.generation()) };
     loop {
         if generation != 0 {
+            // A launch starts with both NIUs' transaction counters at zero, so a
+            // run that ended on an unanswered acknowledgement (`noc::reset`) does
+            // not wedge this tile for the next one.
+            crate::noc::reset();
             let enables = unsafe { l1_read32(mb.enables()) };
             let program = unsafe { l1_read32(mb.program_addr()) } as u64;
             let words = unsafe { l1_read32(mb.program_len()) };
