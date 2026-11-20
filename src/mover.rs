@@ -471,50 +471,62 @@ impl Mover<'_> {
         Ok(out)
     }
 
-    /// One mover segment: its copies, each inside a copy of the loops it lived
-    /// under, with the ring hand-offs around it.
+    /// One mover segment: its moves, in program order, each inside a copy of
+    /// the loops it lived under.
+    ///
+    /// The loops are shared between moves that live under the same old loop,
+    /// not reopened per move: the reader's A block and B block are two nests in
+    /// one iteration of the k loop, which is how tt-metal's reader reads them
+    /// (`reader_bmm_tile_layout_in0.cpp`: `cb_reserve_back`, the in0 reads, the
+    /// in1 reads, the multicasts, `cb_push_back`, all in one `block` iteration).
+    /// Reopening the k loop per nest would read every A block before any B
+    /// block and publish them all after, which is neither that order nor a
+    /// hand-off the rings can hold.
+    ///
+    /// A peeled prologue and a peeled epilogue share the empty path but the k
+    /// loop sits between them, so the nesting is still closed around it: the
+    /// loops a move needs are opened from the common prefix with the last move,
+    /// and the prefix is what keeps the k loop open across a block's reads.
     fn segment(&mut self, into: &mut Kernel, reader: bool) -> Result<(), ttStatus> {
-        // A maximal run of copies at one loop path, in program order. Not
-        // grouped by path across the whole program: a peeled prologue and a
-        // peeled epilogue share the empty path, and the k loop must sit between
-        // them or the epilogue's block is written before the blocks it follows.
         let moves: Vec<Copy> = self
             .copies
             .iter()
             .filter(|copy| copy.reader == reader)
             .cloned()
             .collect();
-        let mut at = 0usize;
-        while at < moves.len() {
-            let path = moves[at].path.clone();
-            let start = at;
-            while at < moves.len() && moves[at].path == path {
-                at += 1;
+        // The old `(loop, induction)` pair of every loop the segment is
+        // currently inside, outermost first.
+        let mut open: Vec<(OpId, OpId)> = Vec::new();
+        for copy in &moves {
+            let common = open
+                .iter()
+                .zip(&copy.path)
+                .take_while(|(here, there)| here.0 == there.0)
+                .count();
+            while open.len() > common {
+                let Some((_, old_ind)) = open.pop() else {
+                    return Err(crate::status::internal_bug(
+                        "mover: the loop stack underflowed while closing it",
+                    ));
+                };
+                into.push(Op::EndLoop);
+                self.map.remove(&old_ind);
             }
-            self.map.clear();
-            self.nest(into, &path, &moves[start..at])?;
+            for (old_loop, old_ind) in copy.path[common..].iter().copied() {
+                let Op::Loop { bound, .. } = *self.old.at(old_loop) else {
+                    return Err(ttStatus::TT_ERROR_ENDLOOP_WITHOUT_LOOP);
+                };
+                let bound = self.clone_value(into, bound)?;
+                let new = into.push(Op::Loop { bound, unroll: false });
+                self.map.insert(old_ind, new);
+                open.push((old_loop, old_ind));
+            }
+            self.bodies(into, std::slice::from_ref(copy))?;
         }
-        Ok(())
-    }
-
-    /// Emit `path`'s loop nest, with `group`'s copies in the innermost body.
-    fn nest(
-        &mut self,
-        into: &mut Kernel,
-        path: &[(OpId, OpId)],
-        group: &[Copy],
-    ) -> Result<(), ttStatus> {
-        let Some(((old_loop, old_ind), rest)) = path.split_first() else {
-            return self.bodies(into, group);
-        };
-        let Op::Loop { bound, .. } = *self.old.at(*old_loop) else {
-            return Err(ttStatus::TT_ERROR_ENDLOOP_WITHOUT_LOOP);
-        };
-        let bound = self.clone_value(into, bound)?;
-        let new = into.push(Op::Loop { bound, unroll: false });
-        self.map.insert(*old_ind, new);
-        self.nest(into, rest, group)?;
-        into.push(Op::EndLoop);
+        while let Some((_, old_ind)) = open.pop() {
+            into.push(Op::EndLoop);
+            self.map.remove(&old_ind);
+        }
         Ok(())
     }
 

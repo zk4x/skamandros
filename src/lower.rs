@@ -5964,6 +5964,13 @@ fn expand_to(
     load_at(&mut ops, cond, sbase, SITE_IS_LEADER);
     ops.push(MirOp::IfNonZero { cond });
     pool.give(cond);
+    // The pages this block fans out are the leader's own reads, and they have
+    // to be in L1 before the NIU reads them out: tt-metal waits here
+    // (`reader_bmm_tile_layout_in0_sender_padding_metal2.cpp`: "Barrier! make
+    // sure the reads are done", then `sender->send(...)`, line 407). The ring's hand-off
+    // drains after the send ([`drain_niu`]), which is too late for a fan-out
+    // that reads the same pages.
+    ops.push(niu_drain());
 
     // Its rectangle: the span's whole extent on an axis the pick pins to one
     // cell (a scalar pick is one value for the whole group), and its own
@@ -7006,21 +7013,28 @@ fn emit_request(
 
 /// The mover's NoC barrier: wait until every request this core issued has
 /// completed. It is tt-metal's `noc_async_read_barrier()` before `push_back`
-/// (`reader_bmm_tile_layout.cpp:110`) and `noc_async_write_barrier()` before
-/// `pop_front`: a page changes hands only when the NoC is done with it.
+/// (`reader_bmm_tile_layout.cpp:110`) and before a multicast send
+/// (`reader_bmm_tile_layout_in0_sender_padding_metal2.cpp:352-353`), and its
+/// `noc_async_write_barrier()` before `pop_front`: a page changes hands only
+/// when the NoC is done with it.
 ///
 /// That is why a request is not drained when it is issued. Issuing several and
 /// waiting once is what lets the NoC hold more than one request, which is the
-/// difference between a round trip per page and a block in flight; the ring
-/// hand-off is where the order is observable, so the barrier lives there.
+/// difference between a round trip per page and a block in flight; the two
+/// places the order is observable are the ring hand-off and a fan-out that
+/// sends the pages it just read.
 fn drain_niu(m: &mut MachineKernel, core: Core) {
-    m.push(
-        core,
-        MirOp::NiuPoll {
-            reg: reg::T4,
-            field: tt_isa::arch::blackhole::noc::niu::reqs_outstanding(crate::mover::TXN) as i32,
-        },
-    );
+    m.push(core, niu_drain());
+}
+
+/// [`drain_niu`] as a machine op, for the sites that emit into an `ops` list
+/// rather than a machine kernel: a multicast's source is the leader's own reads,
+/// so the barrier belongs between the copies and the send.
+fn niu_drain() -> MirOp {
+    MirOp::NiuPoll {
+        reg: reg::T4,
+        field: tt_isa::arch::blackhole::noc::niu::reqs_outstanding(crate::mover::TXN) as i32,
+    }
 }
 
 /// The L1 address of the page a lane index reads its bases out of, and the width
